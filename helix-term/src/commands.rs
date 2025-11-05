@@ -3162,6 +3162,7 @@ fn buffer_picker(cx: &mut Context) {
     struct BufferMeta {
         id: DocumentId,
         path: Option<PathBuf>,
+        display_name: String,
         is_modified: bool,
         is_current: bool,
         focused_at: std::time::Instant,
@@ -3170,6 +3171,7 @@ fn buffer_picker(cx: &mut Context) {
     let new_meta = |doc: &Document| BufferMeta {
         id: doc.id(),
         path: doc.path().cloned(),
+        display_name: doc.display_name().to_string(),
         is_modified: doc.is_modified(),
         is_current: doc.id() == current,
         focused_at: doc.focused_at,
@@ -3198,15 +3200,7 @@ fn buffer_picker(cx: &mut Context) {
             flags.into()
         }),
         PickerColumn::new("path", |meta: &BufferMeta, _| {
-            let path = meta
-                .path
-                .as_deref()
-                .map(helix_stdx::path::get_relative_path);
-            path.as_deref()
-                .and_then(Path::to_str)
-                .unwrap_or(SCRATCH_BUFFER_NAME)
-                .to_string()
-                .into()
+            meta.display_name.as_str().into()
         }),
     ];
     let initial_cursor = if items.len() <= 1 { 0 } else { 1 };

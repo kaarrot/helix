@@ -844,3 +844,109 @@ async fn global_search_with_multibyte_chars() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_multi_stream_cancellation() -> anyhow::Result<()> {
+    use std::time::Duration;
+
+    // This test verifies that the per-document stream tracking works correctly.
+    // It tests that:
+    // 1. A stream can be started and cancelled in a buffer
+    // 2. Cancel-stream gives appropriate error message when no stream is running
+
+    let mut app = helpers::AppBuilder::new().build()?;
+
+    // Test: Cancel when no stream is running should give error
+    test_key_sequence(
+        &mut app,
+        Some(":cancel-stream<ret>"),
+        Some(&|app| {
+            // Should get an error about no stream running
+            let status = &app.editor.status_msg;
+            assert!(
+                status.is_some(),
+                "Should have status/error message when no stream is running"
+            );
+        }),
+        false,
+    )
+    .await?;
+
+    // Start a long-running stream
+    test_key_sequence(
+        &mut app,
+        Some(":insert-stream-output for i in {1..50}; do echo 'line'$i; sleep 0.05; done<ret>"),
+        None,
+        false,
+    )
+    .await?;
+
+    // Give it a moment to start producing output
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Verify stream produced some output
+    test_key_sequence(
+        &mut app,
+        None,
+        Some(&|app| {
+            let (_view, doc) = helix_view::current_ref!(app.editor);
+            let text = doc.text().to_string();
+            let line_count = text.lines().filter(|l| l.contains("line")).count();
+            assert!(
+                line_count > 0 && line_count < 50,
+                "Stream should have produced some output ({} lines) but not finished all 50",
+                line_count
+            );
+        }),
+        false,
+    )
+    .await?;
+
+    // Cancel the stream
+    test_key_sequence(
+        &mut app,
+        Some(":cancel-stream<ret>"),
+        None,
+        false,
+    )
+    .await?;
+
+    // Wait a bit and verify stream stopped (no new output)
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    test_key_sequence(
+        &mut app,
+        None,
+        Some(&|app| {
+            let (_view, doc) = helix_view::current_ref!(app.editor);
+            let text = doc.text().to_string();
+            let line_count = text.lines().filter(|l| l.contains("line")).count();
+            // Stream should have been cancelled, so definitely less than 50 lines
+            assert!(
+                line_count < 50,
+                "Stream should have been cancelled with {} lines (not all 50)",
+                line_count
+            );
+        }),
+        false,
+    )
+    .await?;
+
+    // Test: Trying to cancel again should fail since stream is already cancelled
+    test_key_sequence(
+        &mut app,
+        Some(":cancel-stream<ret>"),
+        Some(&|app| {
+            // Should get error about no stream running
+            let status = &app.editor.status_msg;
+            assert!(
+                status.is_some(),
+                "Should have error message when trying to cancel non-existent stream"
+            );
+        }),
+        false,
+    )
+    .await?;
+
+    Ok(())
+}

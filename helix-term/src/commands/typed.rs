@@ -2427,6 +2427,19 @@ fn cancel_stream(
     Ok(())
 }
 
+fn cancel_all_streams(
+    cx: &mut compositor::Context,
+    _args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+
+    cancel_all_streams_command(cx);
+    Ok(())
+}
+
 fn pipe_to(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow::Result<()> {
     pipe_impl(cx, args, event, &ShellBehavior::Ignore)
 }
@@ -3645,8 +3658,19 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     TypableCommand {
         name: "cancel-stream",
         aliases: &[],
-        doc: "Cancel the currently running stream process.",
+        doc: "Cancel the stream process running in the current buffer.",
         fun: cancel_stream,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "cancel-all-streams",
+        aliases: &[],
+        doc: "Cancel all running stream processes in all buffers.",
+        fun: cancel_all_streams,
         completer: CommandCompleter::none(),
         signature: Signature {
             positionals: (0, Some(0)),

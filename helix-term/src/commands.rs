@@ -96,9 +96,9 @@ use ignore::{DirEntry, WalkBuilder, WalkState};
 use std::sync::{Arc, Mutex};
 use tokio::sync::oneshot;
 
-// Global state to track running stream processes
-static STREAM_PROCESSES: Lazy<Arc<Mutex<Option<oneshot::Sender<()>>>>> =
-    Lazy::new(|| Arc::new(Mutex::new(None)));
+// Global state to track running stream processes per document
+static STREAM_PROCESSES: Lazy<Arc<Mutex<HashMap<DocumentId, oneshot::Sender<()>>>>> =
+    Lazy::new(|| Arc::new(Mutex::new(HashMap::new())));
 
 pub type OnKeyCallback = Box<dyn FnOnce(&mut Context, KeyEvent)>;
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
@@ -6475,14 +6475,34 @@ fn shell(cx: &mut compositor::Context, cmd: &str, behavior: &ShellBehavior) {
 }
 
 fn cancel_stream_command(cx: &mut compositor::Context) {
+    let (_view, doc) = current!(cx.editor);
+    let doc_id = doc.id();
+
     let mut processes = STREAM_PROCESSES.lock().unwrap();
-    if let Some(cancel_tx) = processes.take() {
+    if let Some(cancel_tx) = processes.remove(&doc_id) {
         // Send cancellation signal
         let _ = cancel_tx.send(());
         cx.editor.set_status("Stream cancelled");
     } else {
-        cx.editor.set_error("No stream process is currently running");
+        cx.editor.set_error("No stream process is currently running in this buffer");
     }
+}
+
+fn cancel_all_streams_command(cx: &mut compositor::Context) {
+    let mut processes = STREAM_PROCESSES.lock().unwrap();
+    let count = processes.len();
+
+    if count == 0 {
+        cx.editor.set_error("No stream processes are currently running");
+        return;
+    }
+
+    // Send cancellation to all streams
+    for (_doc_id, cancel_tx) in processes.drain() {
+        let _ = cancel_tx.send(());
+    }
+
+    cx.editor.set_status(format!("Cancelled {} stream(s)", count));
 }
 
 fn shell_stream(cx: &mut compositor::Context, cmd: &str, behavior: &ShellBehavior) {
@@ -6532,14 +6552,14 @@ fn shell_stream(cx: &mut compositor::Context, cmd: &str, behavior: &ShellBehavio
         // Create a cancellation channel
         let (cancel_tx, mut cancel_rx) = oneshot::channel::<()>();
 
-        // Store the cancellation sender globally
+        // Store the cancellation sender for this document
         {
             let mut processes = STREAM_PROCESSES.lock().unwrap();
-            if processes.is_some() {
-                // There's already a stream running, report error
-                bail!("A stream process is already running. Use :cancel-stream to stop it first.");
+            if processes.contains_key(&doc_id) {
+                // There's already a stream running for this document
+                bail!("A stream process is already running in this buffer. Use :cancel-stream to stop it first.");
             }
-            *processes = Some(cancel_tx);
+            processes.insert(doc_id, cancel_tx);
         }
 
         let mut process = Command::new(&shell[0]);
@@ -6657,10 +6677,10 @@ fn shell_stream(cx: &mut compositor::Context, cmd: &str, behavior: &ShellBehavio
             }
         }
 
-        // Clean up the global cancellation handle
+        // Clean up the cancellation handle for this document
         {
             let mut processes = STREAM_PROCESSES.lock().unwrap();
-            *processes = None;
+            processes.remove(&doc_id);
         }
 
         // Wait for process to complete (if not already killed)

@@ -1298,6 +1298,39 @@ impl Document {
         self.scratch_buffer_name = name;
     }
 
+    /// Update the scratch buffer name based on the first line of the document.
+    /// Only updates if this is a scratch buffer (no path).
+    fn update_scratch_buffer_name_from_first_line(&mut self) {
+        if self.path.is_some() {
+            // Not a scratch buffer, don't update
+            return;
+        }
+
+        let text = self.text();
+        if text.len_lines() == 0 {
+            self.scratch_buffer_name = None;
+            return;
+        }
+
+        // Get the first line
+        let first_line = text.line(0);
+        let first_line_str = first_line.to_string();
+        let trimmed = first_line_str.trim();
+
+        if trimmed.is_empty() {
+            // First line is empty, use default scratch buffer name
+            self.scratch_buffer_name = None;
+        } else {
+            // Use first line as buffer name, limit to 50 characters
+            let name = if trimmed.len() > 50 {
+                format!("{}...", &trimmed[..47])
+            } else {
+                trimmed.to_string()
+            };
+            self.scratch_buffer_name = Some(name);
+        }
+    }
+
     /// Set the programming language for the file and load associated data (e.g. highlighting)
     /// if it exists.
     pub fn set_language(
@@ -1581,6 +1614,12 @@ impl Document {
                 changes.compose(transaction.changes().clone())
             });
         }
+
+        // Update scratch buffer name based on first line if this is a scratch buffer
+        if success && self.path.is_none() && !transaction.changes().is_empty() {
+            self.update_scratch_buffer_name_from_first_line();
+        }
+
         success
     }
     /// Apply a [`Transaction`] to the [`Document`] to change its text.

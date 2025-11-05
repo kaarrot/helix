@@ -2508,6 +2508,56 @@ fn insert_stream_output(
         return Ok(());
     }
 
+    // Check if a stream is already running
+    let process_info = {
+        let processes = STREAM_PROCESSES.lock().unwrap();
+        processes.as_ref().map(|p| {
+            (p.stdin_tx.clone(), p.buffer_name.clone(), p.doc_id, p.view_id)
+        })
+    };
+
+    // If stream is running and args provided, send input to it
+    if let Some((stdin_tx, buffer_name, doc_id, view_id)) = process_info {
+        if !args.is_empty() {
+            let input = args.join(" ");
+            send_stream_input(stdin_tx, input, doc_id, view_id, &buffer_name, cx);
+            return Ok(());
+        } else {
+            // No args - show prompt for input
+            show_stream_input_prompt(cx, stdin_tx, doc_id, view_id, buffer_name);
+            return Ok(());
+        }
+    }
+
+    // No stream running - start a new stream
+    // If no args, show prompt with history
+    if args.is_empty() {
+        show_new_stream_prompt(cx);
+        return Ok(());
+    }
+
+    // If current buffer is file-backed, try to switch to last stream buffer
+    {
+        let (_, doc) = current!(cx.editor);
+        if doc.path().is_some() {
+            // Current buffer is file-backed, check for last stream buffer
+            let last_doc_id = { LAST_STREAM_DOC_ID.lock().unwrap().clone() };
+            if let Some(doc_id) = last_doc_id {
+                // Check if that document still exists
+                if cx.editor.document(doc_id).is_some() {
+                    cx.editor.switch(doc_id, Action::Replace);
+                }
+            }
+        }
+    }
+
+    // Move cursor to end of buffer before running command
+    {
+        let (view, doc) = current!(cx.editor);
+        let end = doc.text().len_chars();
+        doc.set_selection(view.id, Selection::point(end));
+    }
+
     shell_stream(cx, &args.join(" "), &ShellBehavior::Insert);
     Ok(())
 }
@@ -3980,10 +4030,14 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     TypableCommand {
         name: "insert-stream-output",
         aliases: &["\\"],
-        doc: "Run shell command, streaming output in real-time before the primary selection.",
+        doc: "Run shell command, streaming output in real-time. With no args, shows prompt with history.",
         fun: insert_stream_output,
         completer: SHELL_COMPLETER,
-        signature: SHELL_SIGNATURE,
+        signature: Signature {
+            positionals: (0, Some(2)),  // Allow 0 args for history prompt
+            raw_after: Some(1),
+            ..Signature::DEFAULT
+        },
     },
     TypableCommand {
         name: "cancel-stream",

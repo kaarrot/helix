@@ -95,12 +95,59 @@ use grep_searcher::{sinks, BinaryDetection, SearcherBuilder};
 use ignore::{DirEntry, WalkBuilder, WalkState};
 
 use std::sync::{Arc, Mutex};
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 
 // Global state to track running stream processes
-// Stores (cancellation sender, buffer name)
-static STREAM_PROCESSES: Lazy<Arc<Mutex<Option<(oneshot::Sender<()>, String)>>>> =
+struct StreamProcess {
+    cancel_tx: oneshot::Sender<()>,
+    stdin_tx: mpsc::UnboundedSender<String>,
+    buffer_name: String,
+    doc_id: DocumentId,
+    view_id: ViewId,
+}
+
+static STREAM_PROCESSES: Lazy<Arc<Mutex<Option<StreamProcess>>>> =
     Lazy::new(|| Arc::new(Mutex::new(None)));
+
+// Track the last buffer where a stream command was run (for quick re-access)
+static LAST_STREAM_DOC_ID: Lazy<Arc<Mutex<Option<DocumentId>>>> =
+    Lazy::new(|| Arc::new(Mutex::new(None)));
+
+// Stream command history persistence
+fn stream_history_path() -> std::path::PathBuf {
+    helix_loader::cache_dir().join("stream-history")
+}
+
+/// Load stream command history from file
+pub fn load_stream_history() -> Vec<String> {
+    let path = stream_history_path();
+    std::fs::read_to_string(&path)
+        .unwrap_or_default()
+        .lines()
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect()
+}
+
+/// Save a stream command to history file
+fn save_stream_command(cmd: &str) {
+    use std::io::Write;
+    if cmd.trim().is_empty() {
+        return;
+    }
+    let path = stream_history_path();
+    // Ensure parent directory exists
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = writeln!(file, "{}", cmd);
+    }
+}
 
 pub type OnKeyCallback = Box<dyn FnOnce(&mut Context, KeyEvent)>;
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
@@ -3185,7 +3232,6 @@ fn buffer_picker(cx: &mut Context) {
 
     struct BufferMeta {
         id: DocumentId,
-        path: Option<PathBuf>,
         display_name: String,
         is_modified: bool,
         is_current: bool,
@@ -3194,7 +3240,6 @@ fn buffer_picker(cx: &mut Context) {
 
     let new_meta = |doc: &Document| BufferMeta {
         id: doc.id(),
-        path: doc.path().cloned(),
         display_name: doc.display_name().to_string(),
         is_modified: doc.is_modified(),
         is_current: doc.id() == current,
@@ -7225,12 +7270,138 @@ fn shell(cx: &mut compositor::Context, cmd: &str, behavior: &ShellBehavior) {
     view.ensure_cursor_in_view(doc, config.scrolloff);
 }
 
+/// Send input to running stream process and echo to buffer
+fn send_stream_input(
+    stdin_tx: mpsc::UnboundedSender<String>,
+    input: String,
+    doc_id: DocumentId,
+    view_id: ViewId,
+    buffer_name: &str,
+    cx: &mut compositor::Context,
+) {
+    // Send to process stdin via channel
+    if stdin_tx.send(input.clone()).is_err() {
+        cx.editor.set_error("Failed to send input - process may have exited");
+        return;
+    }
+
+    // Echo to buffer for visibility
+    if let Some(doc) = cx.editor.document_mut(doc_id) {
+        let text = doc.text();
+        let pos = text.len_chars();
+
+        let echo = format!(">>> {}\n", input);
+        let output = Tendril::from(echo);
+
+        let transaction = Transaction::change(
+            doc.text(),
+            [(pos, pos, Some(output))].into_iter()
+        );
+        doc.apply(&transaction, view_id);
+        cx.editor.ensure_cursor_in_view(view_id);
+    }
+
+    cx.editor.set_status(format!("Input sent to '{}'", buffer_name));
+}
+
+/// Show prompt to capture stream input
+fn show_stream_input_prompt(
+    cx: &mut compositor::Context,
+    stdin_tx: mpsc::UnboundedSender<String>,
+    doc_id: DocumentId,
+    view_id: ViewId,
+    buffer_name: String,
+) {
+    let callback = Box::pin(async move {
+        let call: job::Callback = Callback::EditorCompositor(Box::new(
+            move |_editor: &mut Editor, compositor: &mut Compositor| {
+                let prompt = Prompt::new(
+                    "Stream input: ".into(),
+                    Some('\\'),  // Use \ register for stream command history
+                    |_editor, _input| Vec::new(),  // No completion
+                    move |cx, input, event| {
+                        if event != PromptEvent::Validate {
+                            return;
+                        }
+
+                        if input.trim().is_empty() {
+                            return;
+                        }
+
+                        send_stream_input(
+                            stdin_tx.clone(),
+                            input.to_string(),
+                            doc_id,
+                            view_id,
+                            &buffer_name,
+                            cx,
+                        );
+                    },
+                );
+                compositor.push(Box::new(prompt));
+            },
+        ));
+        Ok(call)
+    });
+    cx.jobs.callback(callback);
+}
+
+/// Show prompt for starting a new stream command (with \ register history)
+pub fn show_new_stream_prompt(cx: &mut compositor::Context) {
+    let callback = Box::pin(async move {
+        let call: job::Callback = Callback::EditorCompositor(Box::new(
+            move |_editor: &mut Editor, compositor: &mut Compositor| {
+                let prompt = Prompt::new(
+                    "Stream command: ".into(),
+                    Some('\\'),  // Use \ register for stream command history
+                    |_editor, _input| Vec::new(),  // No completion
+                    move |cx, input, event| {
+                        if event != PromptEvent::Validate {
+                            return;
+                        }
+
+                        let cmd = input.trim();
+                        if cmd.is_empty() {
+                            return;
+                        }
+
+                        // If current buffer is file-backed, switch to last stream buffer
+                        {
+                            let (_, doc) = current!(cx.editor);
+                            if doc.path().is_some() {
+                                let last_doc_id = { LAST_STREAM_DOC_ID.lock().unwrap().clone() };
+                                if let Some(doc_id) = last_doc_id {
+                                    if cx.editor.document(doc_id).is_some() {
+                                        cx.editor.switch(doc_id, Action::Replace);
+                                    }
+                                }
+                            }
+                        }
+
+                        // Move cursor to end of buffer
+                        {
+                            let (view, doc) = current!(cx.editor);
+                            let end = doc.text().len_chars();
+                            doc.set_selection(view.id, Selection::point(end));
+                        }
+
+                        shell_stream(cx, cmd, &ShellBehavior::Insert);
+                    },
+                );
+                compositor.push(Box::new(prompt));
+            },
+        ));
+        Ok(call)
+    });
+    cx.jobs.callback(callback);
+}
+
 fn cancel_stream_command(cx: &mut compositor::Context) {
     let mut processes = STREAM_PROCESSES.lock().unwrap();
-    if let Some((cancel_tx, buffer_name)) = processes.take() {
+    if let Some(process) = processes.take() {
         // Send cancellation signal
-        let _ = cancel_tx.send(());
-        cx.editor.set_status(format!("Stream cancelled (buffer: {})", buffer_name));
+        let _ = process.cancel_tx.send(());
+        cx.editor.set_status(format!("Stream cancelled (buffer: {})", process.buffer_name));
     } else {
         cx.editor.set_error("No stream process is currently running");
     }
@@ -7240,7 +7411,7 @@ fn shell_stream(cx: &mut compositor::Context, cmd: &str, behavior: &ShellBehavio
     // Check if a stream is already running
     let existing_stream = {
         let processes = STREAM_PROCESSES.lock().unwrap();
-        processes.as_ref().map(|(_, buffer_name)| buffer_name.clone())
+        processes.as_ref().map(|p| p.buffer_name.clone())
     };
 
     if let Some(buffer_name) = existing_stream {
@@ -7316,6 +7487,10 @@ fn shell_stream(cx: &mut compositor::Context, cmd: &str, behavior: &ShellBehavio
     // Show status message that stream is starting
     cx.editor.set_status(format!("Starting stream in '{}': {}", buffer_name, cmd));
 
+    // Save command to persistent history (file) and register (in-session)
+    save_stream_command(&cmd);
+    let _ = cx.editor.registers.push('\\', cmd.clone());
+
     log::info!("shell_stream: Scheduling async callback for cmd: {}", cmd);
 
     cx.jobs.callback(async move {
@@ -7351,15 +7526,6 @@ fn shell_stream(cx: &mut compositor::Context, cmd: &str, behavior: &ShellBehavio
         // Create a cancellation channel
         let (cancel_tx, mut cancel_rx) = oneshot::channel::<()>();
 
-        // Store the cancellation sender globally with buffer name
-        {
-            let mut processes = STREAM_PROCESSES.lock().unwrap();
-            // Note: We don't check if processes.is_some() here because cancel_stream_command
-            // already clears it before calling shell_stream again. If by some race condition
-            // it's still set, we'll just replace it (the old stream was already sent a cancel signal).
-            *processes = Some((cancel_tx, buffer_name.clone()));
-        }
-
         let mut process = Command::new(&shell[0]);
         process
             .args(&shell[1..])
@@ -7371,24 +7537,61 @@ fn shell_stream(cx: &mut compositor::Context, cmd: &str, behavior: &ShellBehavio
             // buffering until the internal buffer (typically 4-8KB) is full.
             .env("PYTHONUNBUFFERED", "1");
 
-        if input.is_some() || cfg!(windows) {
-            process.stdin(Stdio::piped());
-        } else {
-            process.stdin(Stdio::null());
-        }
+        // Always pipe stdin to enable interactive input via :stream-input command
+        process.stdin(Stdio::piped());
 
         log::info!("shell_stream async: About to spawn process for cmd: {}", cmd);
         let mut child = process.spawn()?;
         log::info!("shell_stream async: Process spawned successfully for cmd: {}", cmd);
 
-        // Handle stdin if needed
-        if let Some(mut stdin) = child.stdin.take() {
-            if let Some(input) = input {
-                tokio::spawn(async move {
-                    let _ = helix_view::document::to_writer(&mut stdin, (encoding::UTF_8, false), &input).await;
-                });
-            }
+        // Create channel for interactive input
+        let (stdin_tx, mut stdin_rx) = mpsc::unbounded_channel::<String>();
+
+        // Store process state globally for :stream-input and :cancel-stream commands
+        {
+            let mut processes = STREAM_PROCESSES.lock().unwrap();
+            *processes = Some(StreamProcess {
+                cancel_tx,
+                stdin_tx: stdin_tx.clone(),
+                buffer_name: buffer_name.clone(),
+                doc_id,
+                view_id,
+            });
         }
+
+        // Track this buffer for quick re-access from file-backed buffers
+        {
+            let mut last_doc = LAST_STREAM_DOC_ID.lock().unwrap();
+            *last_doc = Some(doc_id);
+        }
+
+        // Spawn stdin writer task for interactive input support
+        let mut stdin_handle = child.stdin.take().unwrap();
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+
+            // First, write any initial input from selection (if pipe mode)
+            if let Some(input) = input {
+                let _ = helix_view::document::to_writer(
+                    &mut stdin_handle,
+                    (encoding::UTF_8, false),
+                    &input
+                ).await;
+            }
+
+            // Then listen for interactive input from :stream-input command
+            while let Some(text) = stdin_rx.recv().await {
+                if stdin_handle.write_all(text.as_bytes()).await.is_err() {
+                    break;
+                }
+                if stdin_handle.write_all(b"\n").await.is_err() {
+                    break;
+                }
+                if stdin_handle.flush().await.is_err() {
+                    break;
+                }
+            }
+        });
 
         let mut stdout = child.stdout.take().unwrap();
         let mut stderr = child.stderr.take().unwrap();

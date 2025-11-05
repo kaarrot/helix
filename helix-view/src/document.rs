@@ -156,6 +156,8 @@ pub struct Document {
 
     path: Option<PathBuf>,
     relative_path: OnceCell<Option<PathBuf>>,
+    /// Custom name for scratch buffers (when path is None)
+    scratch_buffer_name: Option<String>,
     encoding: &'static encoding::Encoding,
     has_bom: bool,
 
@@ -702,6 +704,7 @@ impl Document {
             active_snippet: None,
             path: None,
             relative_path: OnceCell::new(),
+            scratch_buffer_name: None,
             encoding,
             has_bom,
             text,

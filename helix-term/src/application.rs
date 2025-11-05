@@ -21,6 +21,7 @@ use tui::backend::Backend;
 
 use crate::{
     args::Args,
+    commands::load_stream_history,
     compositor::{Compositor, Event},
     config::Config,
     handlers,
@@ -144,6 +145,14 @@ impl Application {
             terminal.backend().supports_true_color(),
             theme_mode,
         );
+
+        // Load stream command history into the '\' register
+        let stream_history = load_stream_history();
+        if !stream_history.is_empty() {
+            // History is stored oldest-first in file, but registers expect newest-first for navigation
+            let reversed: Vec<_> = stream_history.into_iter().rev().collect();
+            let _ = editor.registers.write('\\', reversed);
+        }
 
         let keys = Box::new(Map::new(Arc::clone(&config), |config: &Config| {
             &config.keys

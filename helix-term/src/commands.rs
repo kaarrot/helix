@@ -93,6 +93,13 @@ use grep_regex::RegexMatcherBuilder;
 use grep_searcher::{sinks, BinaryDetection, SearcherBuilder};
 use ignore::{DirEntry, WalkBuilder, WalkState};
 
+use std::sync::{Arc, Mutex};
+use tokio::sync::oneshot;
+
+// Global state to track running stream processes
+static STREAM_PROCESSES: Lazy<Arc<Mutex<Option<oneshot::Sender<()>>>>> =
+    Lazy::new(|| Arc::new(Mutex::new(None)));
+
 pub type OnKeyCallback = Box<dyn FnOnce(&mut Context, KeyEvent)>;
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
 pub enum OnKeyCallbackKind {
@@ -6467,6 +6474,17 @@ fn shell(cx: &mut compositor::Context, cmd: &str, behavior: &ShellBehavior) {
     view.ensure_cursor_in_view(doc, config.scrolloff);
 }
 
+fn cancel_stream_command(cx: &mut compositor::Context) {
+    let mut processes = STREAM_PROCESSES.lock().unwrap();
+    if let Some(cancel_tx) = processes.take() {
+        // Send cancellation signal
+        let _ = cancel_tx.send(());
+        cx.editor.set_status("Stream cancelled");
+    } else {
+        cx.editor.set_error("No stream process is currently running");
+    }
+}
+
 fn shell_stream(cx: &mut compositor::Context, cmd: &str, behavior: &ShellBehavior) {
     use tokio::io::{AsyncBufReadExt, BufReader};
     use std::process::Stdio;
@@ -6503,9 +6521,25 @@ fn shell_stream(cx: &mut compositor::Context, cmd: &str, behavior: &ShellBehavio
     let doc_id = doc.id();
     let cmd = cmd.to_string();
 
+    // Show status message that stream is starting
+    cx.editor.set_status(format!("Starting stream: {}", cmd));
+
     cx.jobs.callback(async move {
         if shell.is_empty() {
             bail!("No shell set");
+        }
+
+        // Create a cancellation channel
+        let (cancel_tx, mut cancel_rx) = oneshot::channel::<()>();
+
+        // Store the cancellation sender globally
+        {
+            let mut processes = STREAM_PROCESSES.lock().unwrap();
+            if processes.is_some() {
+                // There's already a stream running, report error
+                bail!("A stream process is already running. Use :cancel-stream to stop it first.");
+            }
+            *processes = Some(cancel_tx);
         }
 
         let mut process = Command::new(&shell[0]);
@@ -6542,8 +6576,15 @@ fn shell_stream(cx: &mut compositor::Context, cmd: &str, behavior: &ShellBehavio
         let mut has_error = false;
         let mut error_message = String::new();
 
+        let mut cancelled = false;
         loop {
             tokio::select! {
+                _ = &mut cancel_rx => {
+                    // Cancellation requested
+                    cancelled = true;
+                    let _ = child.kill().await;
+                    break;
+                }
                 line_result = stdout_reader.next_line() => {
                     match line_result {
                         Ok(Some(line)) => {
@@ -6616,8 +6657,18 @@ fn shell_stream(cx: &mut compositor::Context, cmd: &str, behavior: &ShellBehavio
             }
         }
 
-        // Wait for process to complete
+        // Clean up the global cancellation handle
+        {
+            let mut processes = STREAM_PROCESSES.lock().unwrap();
+            *processes = None;
+        }
+
+        // Wait for process to complete (if not already killed)
         let status = child.wait().await?;
+
+        if cancelled {
+            bail!("Stream cancelled by user");
+        }
 
         if has_error {
             bail!(error_message);
@@ -6644,6 +6695,7 @@ fn shell_stream(cx: &mut compositor::Context, cmd: &str, behavior: &ShellBehavio
             doc.set_selection(view_id, selection);
 
             editor.ensure_cursor_in_view(view_id);
+            editor.set_status("Stream completed");
         })))
     });
 }

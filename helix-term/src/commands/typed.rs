@@ -2414,6 +2414,19 @@ fn insert_stream_output(
     Ok(())
 }
 
+fn cancel_stream(
+    cx: &mut compositor::Context,
+    _args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+
+    cancel_stream_command(cx);
+    Ok(())
+}
+
 fn pipe_to(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow::Result<()> {
     pipe_impl(cx, args, event, &ShellBehavior::Ignore)
 }
@@ -3628,6 +3641,17 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         fun: insert_stream_output,
         completer: SHELL_COMPLETER,
         signature: SHELL_SIGNATURE,
+    },
+    TypableCommand {
+        name: "cancel-stream",
+        aliases: &[],
+        doc: "Cancel the currently running stream process.",
+        fun: cancel_stream,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
+            ..Signature::DEFAULT
+        },
     },
     TypableCommand {
         name: "append-output",

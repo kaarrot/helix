@@ -6519,10 +6519,13 @@ fn shell_stream(cx: &mut compositor::Context, cmd: &str, behavior: &ShellBehavio
 
                             let input = input.trim().to_lowercase();
                             if input == "y" || input == "yes" {
+                                log::info!("User confirmed cancellation, starting new stream");
                                 // Cancel the existing stream
                                 cancel_stream_command(cx);
-                                // Start the new stream
+                                // Start the new stream - cx has access to jobs, so this should work
+                                log::info!("Calling shell_stream for command: {}", cmd);
                                 shell_stream(cx, &cmd, &behavior);
+                                log::info!("shell_stream returned");
                             } else {
                                 cx.editor.set_status("Stream start cancelled");
                             }
@@ -6561,25 +6564,46 @@ fn shell_stream(cx: &mut compositor::Context, cmd: &str, behavior: &ShellBehavio
         None
     };
 
-    let from = match behavior {
-        ShellBehavior::Replace => range.from(),
-        ShellBehavior::Insert => range.from(),
-        ShellBehavior::Append => range.to(),
-        _ => range.from(),
-    };
-
     let view_id = view.id;
     let doc_id = doc.id();
     let buffer_name = doc.display_name().to_string();
     let cmd = cmd.to_string();
+    let behavior_copy = *behavior;
 
     // Show status message that stream is starting
     cx.editor.set_status(format!("Starting stream in '{}': {}", buffer_name, cmd));
 
+    log::info!("shell_stream: Scheduling async callback for cmd: {}", cmd);
+
     cx.jobs.callback(async move {
+        log::info!("shell_stream async: Starting async execution for cmd: {}", cmd);
         if shell.is_empty() {
             bail!("No shell set");
         }
+
+        // Get the insertion position NOW (when the job runs), not when shell_stream was called.
+        // This ensures we insert at the correct position even if other streams have modified the buffer.
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        job::dispatch(move |editor, _compositor| {
+            let from = if let Some(doc) = editor.document(doc_id) {
+                // Get current selection/cursor position
+                let selection = doc.selection(view_id);
+                let range = selection.primary();
+                match behavior_copy {
+                    ShellBehavior::Replace => range.from(),
+                    ShellBehavior::Insert => range.from(),
+                    ShellBehavior::Append => range.to(),
+                    _ => range.from(),
+                }
+            } else {
+                // If document doesn't exist, insert at position 0
+                0
+            };
+            let _ = tx.send(from);
+        }).await;
+
+        let from = rx.await.unwrap_or(0);
+        log::info!("shell_stream async: Insertion position for cmd '{}' is: {}", cmd, from);
 
         // Create a cancellation channel
         let (cancel_tx, mut cancel_rx) = oneshot::channel::<()>();
@@ -6587,10 +6611,9 @@ fn shell_stream(cx: &mut compositor::Context, cmd: &str, behavior: &ShellBehavio
         // Store the cancellation sender globally with buffer name
         {
             let mut processes = STREAM_PROCESSES.lock().unwrap();
-            if processes.is_some() {
-                // There's already a stream running, report error
-                bail!("A stream process is already running. Use :cancel-stream to stop it first.");
-            }
+            // Note: We don't check if processes.is_some() here because cancel_stream_command
+            // already clears it before calling shell_stream again. If by some race condition
+            // it's still set, we'll just replace it (the old stream was already sent a cancel signal).
             *processes = Some((cancel_tx, buffer_name.clone()));
         }
 
@@ -6607,7 +6630,9 @@ fn shell_stream(cx: &mut compositor::Context, cmd: &str, behavior: &ShellBehavio
             process.stdin(Stdio::null());
         }
 
+        log::info!("shell_stream async: About to spawn process for cmd: {}", cmd);
         let mut child = process.spawn()?;
+        log::info!("shell_stream async: Process spawned successfully for cmd: {}", cmd);
 
         // Handle stdin if needed
         if let Some(mut stdin) = child.stdin.take() {
@@ -6627,6 +6652,37 @@ fn shell_stream(cx: &mut compositor::Context, cmd: &str, behavior: &ShellBehavio
         let mut current_pos = from;
         let mut has_error = false;
         let mut error_message = String::new();
+
+        // Insert the command as the first line
+        let command_line = format!("{}\n", cmd);
+        let command_output = Tendril::from(command_line);
+        let command_len = command_output.chars().count();
+        current_pos += command_len;
+
+        job::dispatch(move |editor, _compositor| {
+            let Some(doc) = editor.document_mut(doc_id) else {
+                return;
+            };
+
+            let transaction = Transaction::change(
+                doc.text(),
+                [(from, from, Some(command_output))].into_iter()
+            );
+            doc.apply(&transaction, view_id);
+
+            // If this is a scratch buffer (no path), set its name to the command
+            if doc.path().is_none() {
+                // Limit the name to the first 50 characters for readability
+                let name = if cmd.len() > 50 {
+                    format!("{}...", &cmd[..47])
+                } else {
+                    cmd.clone()
+                };
+                doc.set_scratch_buffer_name(Some(name));
+            }
+
+            editor.ensure_cursor_in_view(view_id);
+        }).await;
 
         let mut cancelled = false;
         loop {

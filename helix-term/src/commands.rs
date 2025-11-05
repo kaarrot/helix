@@ -6473,6 +6473,187 @@ fn shell(cx: &mut compositor::Context, cmd: &str, behavior: &ShellBehavior) {
     view.ensure_cursor_in_view(doc, config.scrolloff);
 }
 
+fn shell_stream(cx: &mut compositor::Context, cmd: &str, behavior: &ShellBehavior) {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    use std::process::Stdio;
+    use tokio::process::Command;
+
+    let pipe = match behavior {
+        ShellBehavior::Replace | ShellBehavior::Ignore => true,
+        ShellBehavior::Insert | ShellBehavior::Append => false,
+    };
+
+    let config = cx.editor.config();
+    let shell = config.shell.clone();
+
+    let (view, doc) = current!(cx.editor);
+    let selection = doc.selection(view.id);
+
+    // Get the insertion point (we only support the primary selection for streaming)
+    let range = selection.primary();
+    let text = doc.text().slice(..);
+    let input = if pipe {
+        Some(range.slice(text).into())
+    } else {
+        None
+    };
+
+    let from = match behavior {
+        ShellBehavior::Replace => range.from(),
+        ShellBehavior::Insert => range.from(),
+        ShellBehavior::Append => range.to(),
+        _ => range.from(),
+    };
+
+    let view_id = view.id;
+    let doc_id = doc.id();
+    let cmd = cmd.to_string();
+
+    cx.jobs.callback(async move {
+        if shell.is_empty() {
+            bail!("No shell set");
+        }
+
+        let mut process = Command::new(&shell[0]);
+        process
+            .args(&shell[1..])
+            .arg(&cmd)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        if input.is_some() || cfg!(windows) {
+            process.stdin(Stdio::piped());
+        } else {
+            process.stdin(Stdio::null());
+        }
+
+        let mut child = process.spawn()?;
+
+        // Handle stdin if needed
+        if let Some(mut stdin) = child.stdin.take() {
+            if let Some(input) = input {
+                tokio::spawn(async move {
+                    let _ = helix_view::document::to_writer(&mut stdin, (encoding::UTF_8, false), &input).await;
+                });
+            }
+        }
+
+        let stdout = child.stdout.take().unwrap();
+        let stderr = child.stderr.take().unwrap();
+
+        let mut stdout_reader = BufReader::new(stdout).lines();
+        let mut stderr_reader = BufReader::new(stderr).lines();
+
+        let mut current_pos = from;
+        let mut has_error = false;
+        let mut error_message = String::new();
+
+        loop {
+            tokio::select! {
+                line_result = stdout_reader.next_line() => {
+                    match line_result {
+                        Ok(Some(line)) => {
+                            let mut output = line;
+                            output.push('\n');
+                            let output = Tendril::from(output);
+                            let output_len = output.chars().count();
+
+                            let pos = current_pos;
+                            current_pos += output_len;
+
+                            // Dispatch callback to insert the line
+                            job::dispatch(move |editor, _compositor| {
+                                let Some(doc) = editor.document_mut(doc_id) else {
+                                    return;
+                                };
+
+                                let transaction = Transaction::change(
+                                    doc.text(),
+                                    [(pos, pos, Some(output))].into_iter()
+                                );
+                                doc.apply(&transaction, view_id);
+
+                                // Update view to show new content
+                                editor.ensure_cursor_in_view(view_id);
+                            }).await;
+                        }
+                        Ok(None) => break,
+                        Err(e) => {
+                            error_message = format!("Error reading stdout: {}", e);
+                            has_error = true;
+                            break;
+                        }
+                    }
+                }
+                line_result = stderr_reader.next_line() => {
+                    match line_result {
+                        Ok(Some(line)) => {
+                            let mut output = line;
+                            output.push('\n');
+                            let output = Tendril::from(output);
+                            let output_len = output.chars().count();
+
+                            let pos = current_pos;
+                            current_pos += output_len;
+
+                            // Also insert stderr output
+                            job::dispatch(move |editor, _compositor| {
+                                let Some(doc) = editor.document_mut(doc_id) else {
+                                    return;
+                                };
+
+                                let transaction = Transaction::change(
+                                    doc.text(),
+                                    [(pos, pos, Some(output))].into_iter()
+                                );
+                                doc.apply(&transaction, view_id);
+
+                                editor.ensure_cursor_in_view(view_id);
+                            }).await;
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            error_message = format!("Error reading stderr: {}", e);
+                            has_error = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Wait for process to complete
+        let status = child.wait().await?;
+
+        if has_error {
+            bail!(error_message);
+        }
+
+        if !status.success() {
+            match status.code() {
+                Some(code) => bail!("Shell command failed: status {}", code),
+                None => bail!("Shell command failed"),
+            }
+        }
+
+        Ok(Callback::Editor(Box::new(move |editor| {
+            // Update selection to end of inserted content
+            let Some(doc) = editor.document_mut(doc_id) else {
+                return;
+            };
+
+            let new_range = Range::new(current_pos, current_pos);
+            let selection = Selection::new(
+                SmallVec::from_buf([new_range]),
+                0
+            );
+            doc.set_selection(view_id, selection);
+
+            editor.ensure_cursor_in_view(view_id);
+        })))
+    });
+}
+
 fn shell_prompt<F>(cx: &mut Context, prompt: Cow<'static, str>, mut callback_fn: F)
 where
     F: FnMut(&mut compositor::Context, Args) + 'static,

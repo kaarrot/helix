@@ -1,14 +1,15 @@
 use std::sync::Arc;
 
 use helix_core::{Rope, RopeSlice};
-use imara_diff::{IndentHeuristic, IndentLevel, InternedInput};
+use imara_diff::{Algorithm, IndentHeuristic, IndentLevel, InternedInput};
 use parking_lot::RwLock;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::Notify;
 use tokio::time::{timeout, timeout_at, Duration};
 
 use crate::diff::{
-    DiffInner, Event, RenderLock, ALGORITHM, DIFF_DEBOUNCE_TIME_ASYNC, DIFF_DEBOUNCE_TIME_SYNC,
+    CharHunk, CharHunkKind, DiffInner, Event, RenderLock, ALGORITHM, DIFF_DEBOUNCE_TIME_ASYNC,
+    DIFF_DEBOUNCE_TIME_SYNC,
 };
 
 use super::line_cache::InternedRopeLines;
@@ -71,12 +72,129 @@ impl DiffWorker {
     /// To improve performance this function tries to reuse the allocation of the old diff previously stored in `self.line_diffs`
     fn apply_hunks(&mut self, diff_base: Rope, doc: Rope) {
         let mut diff = self.diff.write();
-        diff.diff_base = diff_base;
-        diff.doc = doc;
+        diff.diff_base = diff_base.clone();
+        diff.doc = doc.clone();
         diff.hunks.clear();
         diff.hunks.extend(self.diff_alloc.hunks());
+
+        // Compute character-level hunks for modified lines
+        diff.char_hunks.clear();
+        // Clone hunks to avoid borrow checker issues
+        let hunks_clone = diff.hunks.clone();
+        for hunk in &hunks_clone {
+            if let Some(char_hunks) = Self::compute_char_hunks_for_hunk(hunk, &diff_base, &doc) {
+                // Store character hunks for each affected line in the "after" version
+                for line in hunk.after.start..hunk.after.end {
+                    if let Some(hunks_for_line) = Self::get_char_hunks_for_line(
+                        &char_hunks,
+                        line,
+                        hunk,
+                        &diff_base,
+                        &doc,
+                    ) {
+                        diff.char_hunks.insert(line, hunks_for_line);
+                    }
+                }
+            }
+        }
+
         drop(diff);
         self.diff_finished_notify.notify_waiters();
+    }
+
+    /// Compute character-level hunks for a single line-level hunk.
+    /// Returns None if the hunk is a pure insertion/removal or too large.
+    fn compute_char_hunks_for_hunk(
+        hunk: &imara_diff::Hunk,
+        diff_base: &Rope,
+        doc: &Rope,
+    ) -> Option<Vec<imara_diff::Hunk>> {
+        let len_before = hunk.before.len();
+        let len_after = hunk.after.len();
+
+        // Skip pure insertions/removals and very large changes (same heuristic as helix-core)
+        if len_before == 0
+            || len_after == 0
+            || len_after > 5 * len_before
+            || 5 * len_after < len_before && len_before > 10
+            || len_before + len_after > 200
+        {
+            return None;
+        }
+
+        // Extract text from both versions
+        let before_start = diff_base.line_to_char(hunk.before.start as usize);
+        let before_end = diff_base.line_to_char(hunk.before.end as usize);
+        let before_text: Vec<u8> = diff_base
+            .slice(before_start..before_end)
+            .to_string()
+            .into_bytes();
+
+        let after_start = doc.line_to_char(hunk.after.start as usize);
+        let after_end = doc.line_to_char(hunk.after.end as usize);
+        let after_text: Vec<u8> = doc.slice(after_start..after_end).to_string().into_bytes();
+
+        // Compute character-level diff using Myers algorithm
+        let input = InternedInput::new(&before_text[..], &after_text[..]);
+        let mut char_diff = imara_diff::Diff::default();
+        char_diff.compute_with(
+            Algorithm::Myers,
+            &input.before,
+            &input.after,
+            input.interner.num_tokens(),
+        );
+
+        Some(char_diff.hunks().collect())
+    }
+
+    /// Extract character hunks for a specific line from the full character hunks.
+    fn get_char_hunks_for_line(
+        char_hunks: &[imara_diff::Hunk],
+        line: u32,
+        line_hunk: &imara_diff::Hunk,
+        _diff_base: &Rope,
+        doc: &Rope,
+    ) -> Option<Vec<CharHunk>> {
+        // Calculate the character offset of this line relative to the hunk start
+        let line_start_in_doc = doc.line_to_char(line as usize);
+        let hunk_start_in_doc = doc.line_to_char(line_hunk.after.start as usize);
+        let line_end_in_doc = doc.line_to_char((line + 1) as usize);
+
+        let line_start_offset = line_start_in_doc - hunk_start_in_doc;
+        let line_end_offset = line_end_in_doc - hunk_start_in_doc;
+
+        let mut result = Vec::new();
+
+        for char_hunk in char_hunks {
+            let char_start = char_hunk.after.start as usize;
+            let char_end = char_hunk.after.end as usize;
+
+            // Check if this character hunk intersects with this line
+            if char_end > line_start_offset && char_start < line_end_offset {
+                // Adjust the character hunk to be relative to the line start
+                let adjusted_start = char_start.saturating_sub(line_start_offset);
+                let adjusted_end = (char_end - line_start_offset).min(line_end_offset - line_start_offset);
+
+                let kind = if char_hunk.before.is_empty() {
+                    CharHunkKind::Insert
+                } else if char_hunk.after.is_empty() {
+                    CharHunkKind::Delete
+                } else {
+                    CharHunkKind::Modify
+                };
+
+                result.push(CharHunk {
+                    after: adjusted_start..adjusted_end,
+                    kind,
+                });
+            }
+        }
+
+        if result.is_empty() {
+            None
+        } else {
+            Some(result)
+        }
     }
 
     fn perform_diff(&mut self, input: &InternedInput<RopeSlice>) {

@@ -1,4 +1,6 @@
+use std::collections::HashMap;
 use std::iter::Peekable;
+use std::ops::Range;
 use std::sync::Arc;
 
 use helix_core::Rope;
@@ -15,6 +17,25 @@ pub use imara_diff::Hunk;
 
 mod line_cache;
 mod worker;
+
+/// Represents a character-level change within a line
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CharHunk {
+    /// Character range in the "after" (modified) version of the line
+    pub after: Range<usize>,
+    /// Whether this is an insertion, deletion, or modification
+    pub kind: CharHunkKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CharHunkKind {
+    /// Only in after (insertion)
+    Insert,
+    /// Only in before (deletion) - can't be shown inline
+    Delete,
+    /// In both, but modified
+    Modify,
+}
 
 /// A rendering lock passed to the differ the prevents redraws from occurring
 struct RenderLock {
@@ -33,6 +54,8 @@ struct DiffInner {
     diff_base: Rope,
     doc: Rope,
     hunks: Vec<Hunk>,
+    /// Character-level hunks indexed by line number (in the "after" version)
+    char_hunks: HashMap<u32, Vec<CharHunk>>,
 }
 
 /// Representation of a diff that can be updated.
@@ -273,6 +296,12 @@ impl Diff<'_> {
                 }
             }
         }
+    }
+
+    /// Returns character-level hunks for a specific line, if any exist.
+    /// Returns None if there are no character-level changes on this line.
+    pub fn char_hunks_at(&self, line: u32) -> Option<&[CharHunk]> {
+        self.diff.char_hunks.get(&line).map(|v| v.as_slice())
     }
 }
 

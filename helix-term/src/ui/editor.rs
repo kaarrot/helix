@@ -140,6 +140,7 @@ impl EditorView {
         }
 
         Self::doc_diagnostics_highlights_into(doc, theme, &mut overlays);
+        Self::doc_inline_diff_highlights_into(doc, view_offset.anchor, inner.height, theme, &mut overlays);
 
         if is_focused {
             if let Some(tabstops) = Self::tabstop_highlights(doc, theme) {
@@ -457,6 +458,70 @@ impl EditorView {
                 ranges: error_vec,
             },
         ]);
+    }
+
+    /// Get highlight spans for inline diff changes (character-level within lines)
+    pub fn doc_inline_diff_highlights_into(
+        doc: &Document,
+        anchor: usize,
+        height: u16,
+        theme: &Theme,
+        overlay_highlights: &mut Vec<OverlayHighlights>,
+    ) {
+        let Some(diff_handle) = doc.diff_handle() else {
+            return;
+        };
+
+        let diff = diff_handle.load();
+        let text = doc.text().slice(..);
+
+        // Get visible line range
+        let visible_start_line = text.char_to_line(anchor.min(text.len_chars()));
+        let visible_end_line = (visible_start_line + height as usize).min(text.len_lines());
+
+        // Collect character-level highlights
+        let mut insert_ranges = Vec::new();
+        let mut modify_ranges = Vec::new();
+
+        for line_idx in visible_start_line..visible_end_line {
+            if let Some(char_hunks) = diff.char_hunks_at(line_idx as u32) {
+                let line_start = text.line_to_char(line_idx);
+
+                for char_hunk in char_hunks {
+                    use helix_vcs::CharHunkKind;
+                    let doc_start = line_start + char_hunk.after.start;
+                    let doc_end = line_start + char_hunk.after.end;
+
+                    match char_hunk.kind {
+                        CharHunkKind::Insert => insert_ranges.push(doc_start..doc_end),
+                        CharHunkKind::Modify => modify_ranges.push(doc_start..doc_end),
+                        CharHunkKind::Delete => {
+                            // Can't highlight deleted text inline (it's not there)
+                        }
+                    }
+                }
+            }
+        }
+
+        // Add highlights for insertions
+        if let Some(highlight) = theme.find_highlight_exact("diff.plus.inline") {
+            if !insert_ranges.is_empty() {
+                overlay_highlights.push(OverlayHighlights::Homogeneous {
+                    highlight,
+                    ranges: insert_ranges,
+                });
+            }
+        }
+
+        // Add highlights for modifications
+        if let Some(highlight) = theme.find_highlight_exact("diff.delta.inline") {
+            if !modify_ranges.is_empty() {
+                overlay_highlights.push(OverlayHighlights::Homogeneous {
+                    highlight,
+                    ranges: modify_ranges,
+                });
+            }
+        }
     }
 
     /// Get highlight spans for selections in a document view.

@@ -41,6 +41,8 @@
 "diff.plus" = "green"
 "diff.delta" = "gold"
 "diff.minus" = "red"
+"diff.plus.inline" = { bg = "green", fg = "black" }
+"diff.delta.inline" = { bg = "gold", fg = "black" }
 
 "diagnostic.info".underline = { color = "blue", style = "curl" } 
 "diagnostic.hint".underline = { color = "green", style = "curl" } 

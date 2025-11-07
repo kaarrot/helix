@@ -27,7 +27,7 @@ fn get_repo_dir(file: &Path) -> Result<&Path> {
     file.parent().context("file has no parent directory")
 }
 
-pub fn get_diff_base(file: &Path) -> Result<Vec<u8>> {
+pub fn get_diff_base(file: &Path, commit_ref: Option<&str>) -> Result<Vec<u8>> {
     debug_assert!(!file.exists() || file.is_file());
     debug_assert!(file.is_absolute());
     let file = gix::path::realpath(file).context("resolve symlinks")?;
@@ -38,8 +38,30 @@ pub fn get_diff_base(file: &Path) -> Result<Vec<u8>> {
     let repo = open_repo(repo_dir)
         .context("failed to open git repo")?
         .to_thread_local();
-    let head = repo.head_commit()?;
-    let file_oid = find_file_in_commit(&repo, &head, &file)?;
+
+    // Use custom commit ref if provided, otherwise use HEAD
+    let commit = match commit_ref {
+        Some(ref_spec) => {
+            // Try to find the reference (branch, tag, etc.) or parse as a commit SHA
+            let oid = if let Ok(reference) = repo.find_reference(ref_spec) {
+                // It's a reference (branch/tag), peel it to get the commit
+                reference
+                    .into_fully_peeled_id()
+                    .with_context(|| format!("Failed to resolve reference: {}", ref_spec))?
+                    .detach()
+            } else if let Ok(oid) = ObjectId::from_hex(ref_spec.as_bytes()) {
+                // It's a commit SHA
+                oid
+            } else {
+                bail!("Invalid commit reference: {}", ref_spec);
+            };
+
+            repo.find_commit(oid)?
+        }
+        None => repo.head_commit()?,
+    };
+
+    let file_oid = find_file_in_commit(&repo, &commit, &file)?;
 
     let file_object = repo.find_object(file_oid)?;
     let data = file_object.detach().data;

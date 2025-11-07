@@ -1447,6 +1447,40 @@ fn reload(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> anyh
     Ok(())
 }
 
+fn diff_base(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+
+    let scrolloff = cx.editor.config().scrolloff;
+    let (view, doc) = current!(cx.editor);
+
+    let commit_ref = if args.is_empty() {
+        // No args means reset to HEAD
+        None
+    } else {
+        Some(args.get(0).unwrap().to_string())
+    };
+
+    // Set the custom diff base commit
+    doc.set_diff_base_commit(commit_ref.clone());
+
+    // Reload the document to refresh the diff with the new base
+    doc.reload(view, &cx.editor.diff_providers).map(|_| {
+        view.ensure_cursor_in_view(doc, scrolloff);
+    })?;
+
+    // Show status message
+    let msg = if let Some(ref commit) = commit_ref {
+        format!("Diff base set to: {}", commit)
+    } else {
+        "Diff base reset to HEAD".to_string()
+    };
+    cx.editor.set_status(msg);
+
+    Ok(())
+}
+
 fn reload_all(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> anyhow::Result<()> {
     if event != PromptEvent::Validate {
         return Ok(());
@@ -3318,6 +3352,17 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         completer: CommandCompleter::none(),
         signature: Signature {
             positionals: (0, Some(0)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "diff-base",
+        aliases: &["db"],
+        doc: "Set diff base to a specific commit (branch, tag, SHA, or HEAD~N). No arguments resets to HEAD.",
+        fun: diff_base,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(1)),
             ..Signature::DEFAULT
         },
     },

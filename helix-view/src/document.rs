@@ -200,6 +200,7 @@ pub struct Document {
 
     diff_handle: Option<DiffHandle>,
     version_control_head: Option<Arc<ArcSwap<Box<str>>>>,
+    diff_base_commit: Option<String>,
 
     // when document was used for most-recent-used buffer picker
     pub focused_at: std::time::Instant,
@@ -728,6 +729,7 @@ impl Document {
             diff_handle: None,
             config,
             version_control_head: None,
+            diff_base_commit: None,
             focused_at: std::time::Instant::now(),
             readonly: false,
             jump_labels: HashMap::new(),
@@ -1248,7 +1250,7 @@ impl Document {
         self.pickup_last_saved_time();
         self.detect_indent_and_line_ending();
 
-        match provider_registry.get_diff_base(&path) {
+        match provider_registry.get_diff_base(&path, self.diff_base_commit.as_deref()) {
             Some(diff_base) => self.set_diff_base(diff_base),
             None => self.diff_handle = None,
         }
@@ -1943,6 +1945,14 @@ impl Document {
         version_control_head: Option<Arc<ArcSwap<Box<str>>>>,
     ) {
         self.version_control_head = version_control_head;
+    }
+
+    pub fn diff_base_commit(&self) -> Option<&str> {
+        self.diff_base_commit.as_deref()
+    }
+
+    pub fn set_diff_base_commit(&mut self, commit_ref: Option<String>) {
+        self.diff_base_commit = commit_ref;
     }
 
     #[inline]

@@ -30,10 +30,10 @@ pub struct DiffProviderRegistry {
 impl DiffProviderRegistry {
     /// Get the given file from the VCS. This provides the unedited document as a "base"
     /// for a diff to be created.
-    pub fn get_diff_base(&self, file: &Path) -> Option<Vec<u8>> {
+    pub fn get_diff_base(&self, file: &Path, commit_ref: Option<&str>) -> Option<Vec<u8>> {
         self.providers
             .iter()
-            .find_map(|provider| match provider.get_diff_base(file) {
+            .find_map(|provider| match provider.get_diff_base(file, commit_ref) {
                 Ok(res) => Some(res),
                 Err(err) => {
                     log::debug!("{err:#?}");
@@ -102,10 +102,10 @@ enum DiffProvider {
 }
 
 impl DiffProvider {
-    fn get_diff_base(&self, file: &Path) -> Result<Vec<u8>> {
+    fn get_diff_base(&self, file: &Path, commit_ref: Option<&str>) -> Result<Vec<u8>> {
         match self {
             #[cfg(feature = "git")]
-            Self::Git => git::get_diff_base(file),
+            Self::Git => git::get_diff_base(file, commit_ref),
             Self::None => bail!("No diff support compiled in"),
         }
     }

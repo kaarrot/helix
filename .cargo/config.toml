@@ -8,7 +8,7 @@
 # to set those most of the time. If downstream does overwrite this its not a huge
 # deal since it will only break tests anyway
 [target."cfg(all())"]
-rustflags = ["--cfg", "tokio_unstable", "-C", "target-feature=-crt-static"]
+rustflags = ["--cfg", "tokio_unstable", "-C", "target-feature=-crt-static", "-C", "link-arg=-B/data/data/com.termux/files/usr/lib/bin", "-C", "link-arg=-fuse-ld=mold"]
 
 
 [alias]

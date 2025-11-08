@@ -504,7 +504,12 @@ impl EditorView {
         }
 
         // Add highlights for insertions
-        if let Some(highlight) = theme.find_highlight_exact("diff.plus.inline") {
+        // Try inline-specific scope first, fall back to gutter scope
+        let insert_highlight = theme
+            .find_highlight_exact("diff.plus.inline")
+            .or_else(|| theme.find_highlight_exact("diff.plus"));
+
+        if let Some(highlight) = insert_highlight {
             if !insert_ranges.is_empty() {
                 overlay_highlights.push(OverlayHighlights::Homogeneous {
                     highlight,
@@ -514,7 +519,12 @@ impl EditorView {
         }
 
         // Add highlights for modifications
-        if let Some(highlight) = theme.find_highlight_exact("diff.delta.inline") {
+        // Try inline-specific scope first, fall back to gutter scope
+        let modify_highlight = theme
+            .find_highlight_exact("diff.delta.inline")
+            .or_else(|| theme.find_highlight_exact("diff.delta"));
+
+        if let Some(highlight) = modify_highlight {
             if !modify_ranges.is_empty() {
                 overlay_highlights.push(OverlayHighlights::Homogeneous {
                     highlight,

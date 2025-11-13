@@ -201,6 +201,13 @@ pub struct Document {
     diff_handle: Option<DiffHandle>,
     version_control_head: Option<Arc<ArcSwap<Box<str>>>>,
 
+    /// Toggle for character-level diff highlighting
+    pub char_diff_enabled: bool,
+
+    /// The git reference (branch, tag, or commit hash) to use as diff base
+    /// If None, uses HEAD (default behavior)
+    diff_base_ref: Option<String>,
+
     // when document was used for most-recent-used buffer picker
     pub focused_at: std::time::Instant,
 
@@ -731,6 +738,8 @@ impl Document {
             diff_handle: None,
             config,
             version_control_head: None,
+            char_diff_enabled: false,
+            diff_base_ref: None,
             focused_at: std::time::Instant::now(),
             readonly: false,
             jump_labels: HashMap::new(),
@@ -1935,6 +1944,32 @@ impl Document {
             self.diff_handle = Some(DiffHandle::new(diff_base, self.text.clone()))
         } else {
             self.diff_handle = None;
+        }
+    }
+
+    /// Set the diff base to a specific git reference (branch, tag, or commit hash)
+    pub fn set_diff_base_from_ref(&mut self, ref_name: String) -> anyhow::Result<()> {
+        if let Some(path) = self.path() {
+            use helix_vcs::git;
+            let diff_base = git::get_diff_base_from_ref(path, &ref_name)?;
+            self.set_diff_base(diff_base);
+            self.diff_base_ref = Some(ref_name);
+            Ok(())
+        } else {
+            anyhow::bail!("document has no path")
+        }
+    }
+
+    /// Reset the diff base to HEAD (default behavior)
+    pub fn reset_diff_base(&mut self) -> anyhow::Result<()> {
+        if let Some(path) = self.path() {
+            use helix_vcs::git;
+            let diff_base = git::get_diff_base(path)?;
+            self.set_diff_base(diff_base);
+            self.diff_base_ref = None;
+            Ok(())
+        } else {
+            anyhow::bail!("document has no path")
         }
     }
 

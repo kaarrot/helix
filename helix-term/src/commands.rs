@@ -582,6 +582,8 @@ impl MappableCommand {
         goto_prev_entry, "Goto previous pairing",
         goto_next_paragraph, "Goto next paragraph",
         goto_prev_paragraph, "Goto previous paragraph",
+        goto_next_hunk, "Goto next change",
+        goto_prev_hunk, "Goto previous change",
         dap_launch, "Launch debug target",
         dap_restart, "Restart debugging session",
         dap_toggle_breakpoint, "Toggle breakpoint",
@@ -1270,6 +1272,88 @@ fn goto_prev_paragraph(cx: &mut Context) {
 
 fn goto_next_paragraph(cx: &mut Context) {
     goto_para_impl(cx, movement::move_next_paragraph)
+}
+
+fn goto_next_hunk(cx: &mut Context) {
+    let (view, doc) = current!(cx.editor);
+
+    let diff_handle = match doc.diff_handle() {
+        Some(handle) => handle,
+        None => {
+            drop(doc);
+            drop(view);
+            cx.editor.set_status("Diff is not available in current buffer");
+            return;
+        }
+    };
+
+    let diff = diff_handle.load();
+    let line = doc.selection(view.id).primary().cursor_line(doc.text().slice(..));
+
+    let hunk_idx = match diff.next_hunk(line as u32) {
+        Some(idx) => idx,
+        None => {
+            drop(diff);
+            drop(doc);
+            drop(view);
+            cx.editor.set_status("No next hunk");
+            return;
+        }
+    };
+
+    let hunk = diff.nth_hunk(hunk_idx);
+    let new_line = hunk.after.start as usize;
+    drop(diff); // Drop diff to release the immutable borrow
+
+    let pos = doc.text().line_to_char(new_line);
+    let selection = doc.selection(view.id).clone().transform(|range| {
+        range.put_cursor(doc.text().slice(..), pos, false)
+    });
+
+    push_jump(view, doc);
+    doc.set_selection(view.id, selection);
+    align_view(doc, view, Align::Center);
+}
+
+fn goto_prev_hunk(cx: &mut Context) {
+    let (view, doc) = current!(cx.editor);
+
+    let diff_handle = match doc.diff_handle() {
+        Some(handle) => handle,
+        None => {
+            drop(doc);
+            drop(view);
+            cx.editor.set_status("Diff is not available in current buffer");
+            return;
+        }
+    };
+
+    let diff = diff_handle.load();
+    let line = doc.selection(view.id).primary().cursor_line(doc.text().slice(..));
+
+    let hunk_idx = match diff.prev_hunk(line as u32) {
+        Some(idx) => idx,
+        None => {
+            drop(diff);
+            drop(doc);
+            drop(view);
+            cx.editor.set_status("No previous hunk");
+            return;
+        }
+    };
+
+    let hunk = diff.nth_hunk(hunk_idx);
+    let new_line = hunk.after.start as usize;
+    drop(diff); // Drop diff to release the immutable borrow
+
+    let pos = doc.text().line_to_char(new_line);
+    let selection = doc.selection(view.id).clone().transform(|range| {
+        range.put_cursor(doc.text().slice(..), pos, false)
+    });
+
+    push_jump(view, doc);
+    doc.set_selection(view.id, selection);
+    align_view(doc, view, Align::Center);
 }
 
 fn goto_file_start(cx: &mut Context) {

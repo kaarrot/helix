@@ -2757,6 +2757,271 @@ pub const SHELL_COMPLETER: CommandCompleter = CommandCompleter::positional(&[
     completers::repeating_filenames,
 ]);
 
+fn toggle_char_diff(
+    cx: &mut compositor::Context,
+    _args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+
+    let (view, doc) = current!(cx.editor);
+    let view_id = view.id;
+
+    // Check if we're in a diff view - if so, toggle both panes
+    if let Some(diff_state) = cx.editor.diff_views.get(&view_id).cloned() {
+        // Toggle both base and working documents
+        let new_state = !doc.char_diff_enabled;
+
+        if let Some(base_doc) = cx.editor.documents.get_mut(&diff_state.base_doc_id) {
+            base_doc.char_diff_enabled = new_state;
+        }
+        if let Some(working_doc) = cx.editor.documents.get_mut(&diff_state.working_doc_id) {
+            working_doc.char_diff_enabled = new_state;
+        }
+
+        let status = if new_state {
+            "Character-level diff highlighting enabled (both panes)"
+        } else {
+            "Character-level diff highlighting disabled (both panes)"
+        };
+        cx.editor.set_status(status);
+    } else if let Some(merge_state) = cx.editor.merge_views.get(&view_id).cloned() {
+        // Toggle for merge view - toggle OURS and THEIRS panes
+        let new_state = !doc.char_diff_enabled;
+
+        if let Some(ours_doc) = cx.editor.documents.get_mut(&merge_state.ours_doc_id) {
+            ours_doc.char_diff_enabled = new_state;
+        }
+        if let Some(theirs_doc) = cx.editor.documents.get_mut(&merge_state.theirs_doc_id) {
+            theirs_doc.char_diff_enabled = new_state;
+        }
+
+        let status = if new_state {
+            "Character-level diff highlighting enabled (OURS and THEIRS panes)"
+        } else {
+            "Character-level diff highlighting disabled (OURS and THEIRS panes)"
+        };
+        cx.editor.set_status(status);
+    } else {
+        // Not in a diff/merge view - just toggle current buffer
+        doc.char_diff_enabled = !doc.char_diff_enabled;
+
+        let status = if doc.char_diff_enabled {
+            "Character-level diff highlighting enabled"
+        } else {
+            "Character-level diff highlighting disabled"
+        };
+        cx.editor.set_status(status);
+    }
+
+    // Force a redraw to apply the decoration
+    cx.editor.clear_idle_timer();
+
+    Ok(())
+}
+
+fn diff_commit(
+    cx: &mut compositor::Context,
+    args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    use helix_view::editor::DiffRange;
+
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+
+    let range_str = args.first().context("missing git reference argument")?;
+
+    match DiffRange::parse(range_str) {
+        Ok(diff_range) => {
+            let display = diff_range.display();
+            cx.editor.diff_range = Some(diff_range);
+            cx.editor.set_status(format!("Diff range set to: {}", display));
+        }
+        Err(err) => {
+            cx.editor.set_error(format!("Failed to parse diff range: {}", err));
+        }
+    }
+
+    Ok(())
+}
+
+fn diff_reset(
+    cx: &mut compositor::Context,
+    _args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+
+    cx.editor.diff_range = None;
+    cx.editor.set_status("Diff range reset");
+
+    Ok(())
+}
+
+fn diff_files(
+    cx: &mut compositor::Context,
+    args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    use helix_vcs::FileChange;
+    use helix_view::editor::DiffRange;
+    use helix_view::theme::Style;
+    use std::path::PathBuf;
+
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+
+    // Get diff range from argument or editor state
+    let diff_range = if let Some(range_str) = args.first() {
+        DiffRange::parse(range_str)?
+    } else if let Some(ref range) = cx.editor.diff_range {
+        range.clone()
+    } else {
+        // Default to HEAD vs working tree
+        DiffRange {
+            base_ref: "HEAD".to_string(),
+            target_ref: None,
+        }
+    };
+
+    let base_ref = diff_range.base_ref.clone();
+    let target_ref = diff_range.target_ref.clone();
+
+    let cwd = helix_stdx::env::current_working_dir();
+    if !cwd.exists() {
+        cx.editor
+            .set_error("Current working directory does not exist");
+        return Ok(());
+    }
+
+    let modified = cx.editor.theme.get("diff.delta");
+    let deleted = cx.editor.theme.get("diff.minus");
+    let renamed = cx.editor.theme.get("diff.delta.moved");
+
+    let callback = async move {
+        use tui::text::Span;
+
+        #[derive(Clone)]
+        pub struct DiffFileChangeData {
+            cwd: PathBuf,
+            style_modified: Style,
+            style_deleted: Style,
+            style_renamed: Style,
+        }
+
+        let call: job::Callback = job::Callback::EditorCompositor(Box::new(
+            move |_editor: &mut Editor, compositor: &mut Compositor| {
+                let columns = [
+                    ui::PickerColumn::new("change", |change: &FileChange, data: &DiffFileChangeData| {
+                        match change {
+                            FileChange::Modified { .. } => Span::styled("~ modified", data.style_modified),
+                            FileChange::Deleted { .. } => Span::styled("- deleted", data.style_deleted),
+                            FileChange::Renamed { .. } => Span::styled("> renamed", data.style_renamed),
+                            _ => Span::raw("  changed"),
+                        }
+                        .into()
+                    }),
+                    ui::PickerColumn::new("path", |change: &FileChange, data: &DiffFileChangeData| {
+                        let display_path = |path: &PathBuf| {
+                            path.strip_prefix(&data.cwd)
+                                .unwrap_or(path)
+                                .display()
+                                .to_string()
+                        };
+                        match change {
+                            FileChange::Modified { path } => display_path(path),
+                            FileChange::Deleted { path } => display_path(path),
+                            FileChange::Renamed { from_path, to_path} => {
+                                format!("{} -> {}", display_path(from_path), display_path(to_path))
+                            }
+                            FileChange::Untracked { path } => display_path(path),
+                            FileChange::Conflict { path } => display_path(path),
+                        }
+                        .into()
+                    }),
+                ];
+
+                let base_ref_for_callback = base_ref.clone();
+                let picker = ui::Picker::new(
+                    columns,
+                    1, // path column
+                    [],
+                    DiffFileChangeData {
+                        cwd: cwd.clone(),
+                        style_modified: modified,
+                        style_deleted: deleted,
+                        style_renamed: renamed,
+                    },
+                    move |cx, meta: &FileChange, action| {
+                        let path_to_open = meta.path();
+                        if let Err(e) = cx.editor.open(path_to_open, action) {
+                            let err = if let Some(err) = e.source() {
+                                format!("{}", err)
+                            } else {
+                                format!("unable to open \"{}\"", path_to_open.display())
+                            };
+                            cx.editor.set_error(err);
+                            return;
+                        }
+
+                        // Set the diff base for the opened file
+                        let (_view, doc) = current!(cx.editor);
+                        match doc.set_diff_base_from_ref(base_ref_for_callback.clone()) {
+                            Ok(()) => {
+                                // Always enable char diff highlighting
+                                doc.char_diff_enabled = true;
+                                cx.editor.clear_idle_timer();
+                            }
+                            Err(err) => {
+                                cx.editor
+                                    .set_error(format!("Failed to set diff base: {}", err));
+                            }
+                        }
+                    },
+                )
+                .with_preview(|_editor, meta| Some((meta.path().into(), None)));
+
+                let injector = picker.injector();
+                let base_ref_for_thread = base_ref.clone();
+                let target_ref_for_thread = target_ref.clone();
+
+                // Spawn thread to populate the picker with changed files
+                std::thread::spawn(move || {
+                    use helix_vcs::git;
+                    let result = git::for_each_changed_file_between_refs(
+                        &cwd,
+                        &base_ref_for_thread,
+                        target_ref_for_thread.as_deref(),
+                        move |change| {
+                            match change {
+                                Ok(change) => injector.push(change).is_ok(),
+                                Err(_err) => true,
+                            }
+                        }
+                    );
+
+                    if let Err(err) = result {
+                        log::error!("Failed to get diff files: {}", err);
+                    }
+                });
+
+                compositor.push(Box::new(overlaid(picker)));
+            },
+        ));
+        Ok(call)
+    };
+
+    cx.jobs.callback(callback);
+    Ok(())
+}
+
 const WRITE_NO_FORMAT_FLAG: Flag = Flag {
     name: "no-format",
     doc: "skip auto-formatting",
@@ -3786,6 +4051,50 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         completer: CommandCompleter::none(),
         signature: Signature {
             positionals: (0, None),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "toggle-char-diff",
+        aliases: &["tcd"],
+        doc: "Toggle character-level diff highlighting for the current buffer.",
+        fun: toggle_char_diff,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "diff-commit",
+        aliases: &["dc"],
+        doc: "Set the diff base to a specific git reference (branch, tag, or commit hash).",
+        fun: diff_commit,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (1, Some(1)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "diff-reset",
+        aliases: &["dr"],
+        doc: "Reset the diff base to HEAD (default behavior).",
+        fun: diff_reset,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "diff-files",
+        aliases: &["df"],
+        doc: "Show a picker with all files changed between current branch and specified commit.",
+        fun: diff_files,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (1, Some(1)),
             ..Signature::DEFAULT
         },
     },

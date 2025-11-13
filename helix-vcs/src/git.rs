@@ -79,6 +79,70 @@ pub fn get_current_head_name(file: &Path) -> Result<Arc<ArcSwap<Box<str>>>> {
     Ok(Arc::new(ArcSwap::from_pointee(name.into_boxed_str())))
 }
 
+/// Get the contents of a file at a specific commit reference (e.g., "HEAD~1", "main", commit hash)
+pub fn get_file_at_commit(file: &Path, commit_ref: &str) -> Result<Vec<u8>> {
+    debug_assert!(!file.exists() || file.is_file());
+    debug_assert!(file.is_absolute());
+    let file = gix::path::realpath(file).context("resolve symlinks")?;
+
+    let repo_dir = get_repo_dir(&file)?;
+    let repo = open_repo(repo_dir)
+        .context("failed to open git repo")?
+        .to_thread_local();
+
+    // Parse the commit reference
+    let commit = if commit_ref == "HEAD" {
+        // Simple case: get HEAD commit directly
+        repo.head_commit()?
+    } else if let Some(ancestors) = commit_ref.strip_prefix("HEAD~") {
+        // Handle HEAD~N syntax
+        let n: usize = ancestors
+            .parse()
+            .with_context(|| format!("invalid ancestor count: {}", ancestors))?;
+        let mut commit = repo.head_commit()?;
+        for _ in 0..n {
+            let parents = commit.parent_ids().collect::<Vec<_>>();
+            if parents.is_empty() {
+                bail!("commit {} has no parent", commit.id);
+            }
+            let parent_id = parents[0];
+            commit = repo.find_commit(parent_id)?;
+        }
+        commit
+    } else if commit_ref.len() >= 7 && commit_ref.chars().all(|c| c.is_ascii_hexdigit()) {
+        // Try to parse as a commit hash (at least 7 hex characters)
+        let oid = gix::ObjectId::from_hex(commit_ref.as_bytes())
+            .with_context(|| format!("invalid commit hash: {}", commit_ref))?;
+        repo.find_commit(oid)?
+    } else {
+        // For now, only HEAD, HEAD~N, and commit hashes are supported
+        // Branch names, tags, and other references require more complex gix API usage
+        bail!(
+            "Unsupported commit reference '{}'. Use HEAD, HEAD~N, or a commit hash (at least 7 hex digits).",
+            commit_ref
+        )
+    };
+
+    let file_oid = find_file_in_commit(&repo, &commit, &file)?;
+
+    let file_object = repo.find_object(file_oid)?;
+    let data = file_object.detach().data;
+
+    // Apply git filters (e.g., CRLF conversion) to match working tree format
+    if let Some(work_dir) = repo.workdir() {
+        let rela_path = file.strip_prefix(work_dir)?;
+        let rela_path = gix::path::try_into_bstr(rela_path)?;
+        let (mut pipeline, _) = repo.filter_pipeline(None)?;
+        let mut worktree_outcome =
+            pipeline.convert_to_worktree(&data, rela_path.as_ref(), Delay::Forbid)?;
+        let mut buf = Vec::with_capacity(data.len());
+        worktree_outcome.read_to_end(&mut buf)?;
+        Ok(buf)
+    } else {
+        Ok(data)
+    }
+}
+
 pub fn for_each_changed_file(cwd: &Path, f: impl Fn(Result<FileChange>) -> bool) -> Result<()> {
     status(&open_repo(cwd)?.to_thread_local(), f)
 }

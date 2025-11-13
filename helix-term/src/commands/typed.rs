@@ -1946,6 +1946,63 @@ fn hsplit_new(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> 
     Ok(())
 }
 
+fn diff(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow::Result<()> {
+    use std::io::Write;
+
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+
+    // Get commit reference (default to HEAD)
+    let commit_ref = args.first().map(|s| s.as_ref()).unwrap_or("HEAD");
+
+    // Get current document path
+    let (_view, doc) = current!(cx.editor);
+    let path = doc
+        .path()
+        .ok_or_else(|| anyhow!("Document has no path, cannot diff"))?
+        .clone();
+
+    // Ensure path is absolute
+    if !path.is_absolute() {
+        bail!("Document path must be absolute");
+    }
+
+    // Fetch file content from git at specified commit
+    let diff_provider = &cx.editor.diff_providers;
+    let commit_content = diff_provider
+        .get_file_at_commit(&path, commit_ref)
+        .ok_or_else(|| anyhow!("Failed to get file at commit '{}'", commit_ref))?;
+
+    // Create a temporary file for the commit version
+    let temp_dir = std::env::temp_dir();
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("file");
+    let temp_path = temp_dir.join(format!("{}@{}", file_name, commit_ref.replace("/", "_")));
+
+    // Write content to temp file
+    {
+        let mut temp_file = std::fs::File::create(&temp_path)?;
+        temp_file.write_all(&commit_content)?;
+    }
+
+    // Open the temp file in a vertical split
+    cx.editor.open(&temp_path, Action::VerticalSplit)?;
+
+    // Get the newly opened document and mark it as readonly
+    let (_, commit_doc) = current!(cx.editor);
+    commit_doc.readonly = true;
+
+    cx.editor.set_status(format!(
+        "Showing diff: current file (right) vs {} (left)",
+        commit_ref
+    ));
+
+    Ok(())
+}
+
 fn debug_eval(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow::Result<()> {
     if event != PromptEvent::Validate {
         return Ok(());
@@ -3421,6 +3478,17 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         completer: CommandCompleter::none(),
         signature: Signature {
             positionals: (0, Some(0)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "diff",
+        aliases: &[],
+        doc: "Show diff against a git commit in a vertical split. Usage: :diff [commit-ref]. Default is HEAD.",
+        fun: diff,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(1)),
             ..Signature::DEFAULT
         },
     },

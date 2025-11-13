@@ -20,6 +20,10 @@ mod status;
 
 pub use status::FileChange;
 
+mod inline_diff;
+
+pub use inline_diff::{compute_inline_diff, ChangeType, InlineDiffConfig, InlineDiffHighlight};
+
 /// Contains all active diff providers. Diff providers are compiled in via features. Currently
 /// only `git` is supported.
 #[derive(Clone)]
@@ -52,6 +56,25 @@ impl DiffProviderRegistry {
                 Err(err) => {
                     log::debug!("{err:#?}");
                     log::debug!("failed to obtain current head name for {}", file.display());
+                    None
+                }
+            })
+    }
+
+    /// Get the contents of a file at a specific commit reference.
+    /// Supports HEAD, HEAD~N, branch names, tags, and commit hashes.
+    pub fn get_file_at_commit(&self, file: &Path, commit_ref: &str) -> Option<Vec<u8>> {
+        self.providers
+            .iter()
+            .find_map(|provider| match provider.get_file_at_commit(file, commit_ref) {
+                Ok(res) => Some(res),
+                Err(err) => {
+                    log::debug!("{err:#?}");
+                    log::debug!(
+                        "failed to get file {} at commit {}",
+                        file.display(),
+                        commit_ref
+                    );
                     None
                 }
             })
@@ -114,6 +137,14 @@ impl DiffProvider {
         match self {
             #[cfg(feature = "git")]
             Self::Git => git::get_current_head_name(file),
+            Self::None => bail!("No diff support compiled in"),
+        }
+    }
+
+    fn get_file_at_commit(&self, file: &Path, commit_ref: &str) -> Result<Vec<u8>> {
+        match self {
+            #[cfg(feature = "git")]
+            Self::Git => git::get_file_at_commit(file, commit_ref),
             Self::None => bail!("No diff support compiled in"),
         }
     }

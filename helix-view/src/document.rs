@@ -213,6 +213,15 @@ pub struct Document {
 
     pub readonly: bool,
 
+    /// If this document is a virtual read-only base revision (for diff views)
+    pub is_virtual_base: bool,
+
+    /// Display name override for virtual documents (e.g., "file.rs @ HEAD")
+    pub display_name_override: Option<String>,
+
+    /// If this doc is part of a diff pair, stores the linked doc ID
+    pub linked_diff_doc: Option<DocumentId>,
+
     pub previous_diagnostic_id: Option<String>,
 
     /// Custom name for scratch buffers (buffers without a file path)
@@ -742,6 +751,9 @@ impl Document {
             diff_base_ref: None,
             focused_at: std::time::Instant::now(),
             readonly: false,
+            is_virtual_base: false,
+            display_name_override: None,
+            linked_diff_doc: None,
             jump_labels: HashMap::new(),
             color_swatches: None,
             color_swatch_controller: TaskController::new(),
@@ -759,6 +771,39 @@ impl Document {
         let line_ending: LineEnding = config.load().default_line_ending.into();
         let text = Rope::from(line_ending.as_str());
         Self::from(text, None, config, syn_loader)
+    }
+
+    /// Create a virtual read-only document from git revision content.
+    ///
+    /// This is used for side-by-side diff views where we need to display
+    /// the base revision alongside the working copy.
+    pub fn from_git_revision(
+        content: Vec<u8>,
+        original_path: &Path,
+        git_ref: &str,
+        config: Arc<dyn DynAccess<Config>>,
+        syn_loader: Arc<ArcSwap<syntax::Loader>>,
+    ) -> Result<Self, Error> {
+        let text = Rope::from(String::from_utf8(content)?);
+        let mut doc = Document::from(text, Some((encoding::UTF_8, false)), config, syn_loader.clone());
+
+        // Mark as virtual and read-only
+        doc.is_virtual_base = true;
+        doc.readonly = true;
+
+        // Set display name with git ref info
+        let filename = original_path
+            .file_name()
+            .map(|s| s.to_string_lossy())
+            .unwrap_or_default();
+        doc.display_name_override = Some(format!("{} @ {}", filename, git_ref));
+
+        // Set path (without making it a real file path) and detect language for syntax highlighting
+        doc.path = Some(original_path.to_path_buf());
+        let loader: arc_swap::access::DynGuard<syntax::Loader> = syn_loader.load();
+        doc.detect_language(&loader);
+
+        Ok(doc)
     }
 
     // TODO: async fn?
@@ -2088,16 +2133,12 @@ impl Document {
     }
 
     pub fn display_name(&self) -> Cow<'_, str> {
-        self.relative_path().map_or_else(
-            || {
-                // For scratch buffers, use the custom name if set
-                self.scratch_buffer_name
-                    .as_deref()
-                    .map(Cow::Borrowed)
-                    .unwrap_or_else(|| SCRATCH_BUFFER_NAME.into())
-            },
-            |path| path.to_string_lossy(),
-        )
+        // Check for display name override first (used by virtual diff documents)
+        if let Some(ref name) = self.display_name_override {
+            return Cow::Borrowed(name);
+        }
+        self.relative_path()
+            .map_or_else(|| SCRATCH_BUFFER_NAME.into(), |path| path.to_string_lossy())
     }
 
     // transact(Fn) ?

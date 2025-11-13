@@ -2893,16 +2893,55 @@ fn toggle_char_diff(
         return Ok(());
     }
 
-    let (_view, doc) = current!(cx.editor);
-    doc.char_diff_enabled = !doc.char_diff_enabled;
+    let (view, doc) = current!(cx.editor);
+    let view_id = view.id;
 
-    let status = if doc.char_diff_enabled {
-        "Character-level diff highlighting enabled"
+    // Check if we're in a diff view - if so, toggle both panes
+    if let Some(diff_state) = cx.editor.diff_views.get(&view_id).cloned() {
+        // Toggle both base and working documents
+        let new_state = !doc.char_diff_enabled;
+
+        if let Some(base_doc) = cx.editor.documents.get_mut(&diff_state.base_doc_id) {
+            base_doc.char_diff_enabled = new_state;
+        }
+        if let Some(working_doc) = cx.editor.documents.get_mut(&diff_state.working_doc_id) {
+            working_doc.char_diff_enabled = new_state;
+        }
+
+        let status = if new_state {
+            "Character-level diff highlighting enabled (both panes)"
+        } else {
+            "Character-level diff highlighting disabled (both panes)"
+        };
+        cx.editor.set_status(status);
+    } else if let Some(merge_state) = cx.editor.merge_views.get(&view_id).cloned() {
+        // Toggle for merge view - toggle OURS and THEIRS panes
+        let new_state = !doc.char_diff_enabled;
+
+        if let Some(ours_doc) = cx.editor.documents.get_mut(&merge_state.ours_doc_id) {
+            ours_doc.char_diff_enabled = new_state;
+        }
+        if let Some(theirs_doc) = cx.editor.documents.get_mut(&merge_state.theirs_doc_id) {
+            theirs_doc.char_diff_enabled = new_state;
+        }
+
+        let status = if new_state {
+            "Character-level diff highlighting enabled (OURS and THEIRS panes)"
+        } else {
+            "Character-level diff highlighting disabled (OURS and THEIRS panes)"
+        };
+        cx.editor.set_status(status);
     } else {
-        "Character-level diff highlighting disabled"
-    };
+        // Not in a diff/merge view - just toggle current buffer
+        doc.char_diff_enabled = !doc.char_diff_enabled;
 
-    cx.editor.set_status(status);
+        let status = if doc.char_diff_enabled {
+            "Character-level diff highlighting enabled"
+        } else {
+            "Character-level diff highlighting disabled"
+        };
+        cx.editor.set_status(status);
+    }
 
     // Force a redraw to apply the decoration
     cx.editor.clear_idle_timer();
@@ -2915,30 +2954,22 @@ fn diff_commit(
     args: Args,
     event: PromptEvent,
 ) -> anyhow::Result<()> {
+    use helix_view::editor::DiffRange;
+
     if event != PromptEvent::Validate {
         return Ok(());
     }
 
-    let ref_name = args.first().context("missing git reference argument")?;
-    let ref_name_owned = ref_name.to_string();
+    let range_str = args.first().context("missing git reference argument")?;
 
-    let result = {
-        let (_view, doc) = current!(cx.editor);
-        doc.set_diff_base_from_ref(ref_name_owned.clone())
-    };
-
-    match result {
-        Ok(()) => {
-            // Always enable char diff highlighting
-            let (_view, doc) = current!(cx.editor);
-            doc.char_diff_enabled = true;
-
-            cx.editor
-                .set_status(format!("Diff base set to: {} (char diff enabled)", ref_name));
-            cx.editor.clear_idle_timer();
+    match DiffRange::parse(range_str) {
+        Ok(diff_range) => {
+            let display = diff_range.display();
+            cx.editor.diff_range = Some(diff_range);
+            cx.editor.set_status(format!("Diff range set to: {}", display));
         }
         Err(err) => {
-            cx.editor.set_error(format!("Failed to set diff base: {}", err));
+            cx.editor.set_error(format!("Failed to parse diff range: {}", err));
         }
     }
 
@@ -2954,17 +2985,8 @@ fn diff_reset(
         return Ok(());
     }
 
-    let (_view, doc) = current!(cx.editor);
-
-    match doc.reset_diff_base() {
-        Ok(()) => {
-            cx.editor.set_status("Diff base reset to HEAD");
-            cx.editor.clear_idle_timer();
-        }
-        Err(err) => {
-            cx.editor.set_error(format!("Failed to reset diff base: {}", err));
-        }
-    }
+    cx.editor.diff_range = None;
+    cx.editor.set_status("Diff range reset");
 
     Ok(())
 }
@@ -2975,6 +2997,7 @@ fn diff_files(
     event: PromptEvent,
 ) -> anyhow::Result<()> {
     use helix_vcs::FileChange;
+    use helix_view::editor::DiffRange;
     use helix_view::theme::Style;
     use std::path::PathBuf;
 
@@ -2982,8 +3005,21 @@ fn diff_files(
         return Ok(());
     }
 
-    let ref_name = args.first().context("missing git reference argument")?;
-    let ref_name_owned = ref_name.to_string();
+    // Get diff range from argument or editor state
+    let diff_range = if let Some(range_str) = args.first() {
+        DiffRange::parse(range_str)?
+    } else if let Some(ref range) = cx.editor.diff_range {
+        range.clone()
+    } else {
+        // Default to HEAD vs working tree
+        DiffRange {
+            base_ref: "HEAD".to_string(),
+            target_ref: None,
+        }
+    };
+
+    let base_ref = diff_range.base_ref.clone();
+    let target_ref = diff_range.target_ref.clone();
 
     let cwd = helix_stdx::env::current_working_dir();
     if !cwd.exists() {
@@ -3039,7 +3075,7 @@ fn diff_files(
                     }),
                 ];
 
-                let ref_name_for_callback = ref_name_owned.clone();
+                let base_ref_for_callback = base_ref.clone();
                 let picker = ui::Picker::new(
                     columns,
                     1, // path column
@@ -3064,7 +3100,7 @@ fn diff_files(
 
                         // Set the diff base for the opened file
                         let (_view, doc) = current!(cx.editor);
-                        match doc.set_diff_base_from_ref(ref_name_for_callback.clone()) {
+                        match doc.set_diff_base_from_ref(base_ref_for_callback.clone()) {
                             Ok(()) => {
                                 // Always enable char diff highlighting
                                 doc.char_diff_enabled = true;
@@ -3080,17 +3116,23 @@ fn diff_files(
                 .with_preview(|_editor, meta| Some((meta.path().into(), None)));
 
                 let injector = picker.injector();
-                let ref_name_for_thread = ref_name_owned.clone();
+                let base_ref_for_thread = base_ref.clone();
+                let target_ref_for_thread = target_ref.clone();
 
                 // Spawn thread to populate the picker with changed files
                 std::thread::spawn(move || {
                     use helix_vcs::git;
-                    let result = git::for_each_changed_file_between_commits(&cwd, &ref_name_for_thread, move |change| {
-                        match change {
-                            Ok(change) => injector.push(change).is_ok(),
-                            Err(_err) => true,
+                    let result = git::for_each_changed_file_between_refs(
+                        &cwd,
+                        &base_ref_for_thread,
+                        target_ref_for_thread.as_deref(),
+                        move |change| {
+                            match change {
+                                Ok(change) => injector.push(change).is_ok(),
+                                Err(_err) => true,
+                            }
                         }
-                    });
+                    );
 
                     if let Err(err) = result {
                         log::error!("Failed to get diff files: {}", err);

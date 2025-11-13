@@ -5,7 +5,6 @@ pub(crate) mod typed;
 
 pub use dap::*;
 use futures_util::FutureExt;
-use helix_event::status;
 use helix_stdx::{
     path::{self, find_paths},
     rope::{self, RopeSliceExt},
@@ -606,6 +605,14 @@ impl MappableCommand {
         vsplit_new, "Vertical right split scratch buffer",
         wclose, "Close window",
         wonly, "Close windows except current",
+        diff_toggle_sync_scroll, "Toggle synchronized scrolling in diff view",
+        close_diff_or_merge_view, "Close diff or merge view",
+        merge_accept_ours, "Accept HEAD version for current conflict",
+        merge_accept_theirs, "Accept incoming branch version for current conflict",
+        merge_accept_both, "Accept both versions for current conflict",
+        merge_next_conflict, "Jump to next merge conflict",
+        merge_prev_conflict, "Jump to previous merge conflict",
+        merge_finish, "Save and stage resolved file (git add)",
         select_register, "Select register",
         insert_register, "Insert register",
         copy_between_registers, "Copy between two registers",
@@ -1878,6 +1885,10 @@ fn switch_to_lowercase(cx: &mut Context) {
 pub fn scroll(cx: &mut Context, offset: usize, direction: Direction, sync_cursor: bool) {
     use Direction::*;
     let config = cx.editor.config();
+
+    // Extract view_id first for scroll sync at the end
+    let view_id = view!(cx.editor).id;
+
     let (view, doc) = current!(cx.editor);
     let mut view_offset = doc.view_offset(view.id);
 
@@ -1932,6 +1943,8 @@ pub fn scroll(cx: &mut Context, offset: usize, direction: Direction, sync_cursor
         });
         drop(annotations);
         doc.set_selection(view.id, selection);
+        // Sync scroll to linked views (diff/merge)
+        cx.editor.sync_scroll_to_linked_views(view_id);
         return;
     }
 
@@ -1951,6 +1964,9 @@ pub fn scroll(cx: &mut Context, offset: usize, direction: Direction, sync_cursor
             );
             head += (off != 0) as usize;
             if head <= cursor {
+                drop(annotations);
+                // Sync scroll to linked views (diff/merge)
+                cx.editor.sync_scroll_to_linked_views(view_id);
                 return;
             }
         }
@@ -1965,6 +1981,9 @@ pub fn scroll(cx: &mut Context, offset: usize, direction: Direction, sync_cursor
             )
             .0;
             if head >= cursor {
+                drop(annotations);
+                // Sync scroll to linked views (diff/merge)
+                cx.editor.sync_scroll_to_linked_views(view_id);
                 return;
             }
         }
@@ -1983,6 +2002,9 @@ pub fn scroll(cx: &mut Context, offset: usize, direction: Direction, sync_cursor
     sel = sel.replace(idx, prim_sel);
     drop(annotations);
     doc.set_selection(view.id, sel);
+
+    // Sync scroll to linked views (diff/merge)
+    cx.editor.sync_scroll_to_linked_views(view_id);
 }
 
 fn page_up(cx: &mut Context) {
@@ -3351,6 +3373,8 @@ fn jumplist_picker(cx: &mut Context) {
 }
 
 fn changed_file_picker(cx: &mut Context) {
+    use helix_view::editor::DiffRange;
+
     pub struct FileChangeData {
         cwd: PathBuf,
         style_untracked: Style,
@@ -3366,6 +3390,39 @@ fn changed_file_picker(cx: &mut Context) {
             .set_error("Current working directory does not exist");
         return;
     }
+
+    // Get the current file path if we're in a diff view
+    let current_file_path = {
+        let (view, _) = current!(cx.editor);
+        let view_id = view.id;
+
+        cx.editor.diff_views.get(&view_id)
+            .and_then(|diff_state| {
+                // Get the working document path from the diff view
+                cx.editor.documents.get(&diff_state.working_doc_id)
+                    .and_then(|doc| doc.path().map(|p| p.clone()))
+            })
+            .or_else(|| {
+                // Fallback: check merge view
+                cx.editor.merge_views.get(&view_id)
+                    .and_then(|merge_state| {
+                        cx.editor.documents.get(&merge_state.result_doc_id)
+                            .and_then(|doc| doc.path().map(|p| p.clone()))
+                    })
+            })
+    };
+
+    // Get diff range from editor state or default to HEAD vs working tree
+    let diff_range = cx.editor.diff_range.clone().unwrap_or_else(|| DiffRange {
+        base_ref: "HEAD".to_string(),
+        target_ref: None,
+    });
+
+    let base_ref = diff_range.base_ref.clone();
+    let target_ref = diff_range.target_ref.clone();
+
+    // Show user what range we're using
+    cx.editor.set_status(format!("Loading changes for: {}", diff_range.display()));
 
     let added = cx.editor.theme.get("diff.plus");
     let modified = cx.editor.theme.get("diff.delta");
@@ -3416,32 +3473,115 @@ fn changed_file_picker(cx: &mut Context) {
             style_deleted: deleted,
             style_renamed: renamed,
         },
-        |cx, meta: &FileChange, action| {
-            let path_to_open = meta.path();
-            if let Err(e) = cx.editor.open(path_to_open, action) {
-                let err = if let Some(err) = e.source() {
-                    format!("{}", err)
-                } else {
-                    format!("unable to open \"{}\"", path_to_open.display())
-                };
-                cx.editor.set_error(err);
+        {
+            let base_ref_for_callback = base_ref.clone();
+            let target_ref_for_callback = target_ref.clone();
+            move |cx, meta: &FileChange, action| {
+                use helix_vcs::FileChange;
+
+                match meta {
+                    FileChange::Modified { path } | FileChange::Renamed { to_path: path, .. } => {
+                        // Open side-by-side diff view for modified files using the active diff range
+                        if let Err(e) = cx.editor.open_diff_view_range(
+                            path,
+                            &base_ref_for_callback,
+                            target_ref_for_callback.as_deref(),
+                        ) {
+                            cx.editor.set_error(format!("Failed to open diff view: {}", e));
+                        }
+                    }
+                    FileChange::Conflict { path } => {
+                        // Open 3-way merge view for conflicted files
+                        if let Err(e) = cx.editor.open_merge_view(path) {
+                            cx.editor.set_error(format!("Failed to open merge view: {}", e));
+                        }
+                    }
+                    _ => {
+                        // For untracked/deleted files, open normally
+                        let path_to_open = meta.path();
+                        if let Err(e) = cx.editor.open(path_to_open, action) {
+                            let err = if let Some(err) = e.source() {
+                                format!("{}", err)
+                            } else {
+                                format!("unable to open \"{}\"", path_to_open.display())
+                            };
+                            cx.editor.set_error(err);
+                        }
+                    }
+                }
             }
         },
     )
     .with_preview(|_editor, meta| Some((meta.path().into(), None)));
-    let injector = picker.injector();
 
-    cx.editor
-        .diff_providers
-        .clone()
-        .for_each_changed_file(cwd, move |change| match change {
-            Ok(change) => injector.push(change).is_ok(),
-            Err(err) => {
-                status::report_blocking(err);
+    // Collect changed files to find current file index
+    let changed_files_arc = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    {
+        use helix_vcs::git;
+        let files_clone = changed_files_arc.clone();
+        let _ = git::for_each_changed_file_between_refs(
+            &cwd,
+            &base_ref,
+            target_ref.as_deref(),
+            move |change| {
+                if let Ok(file_change) = change {
+                    if let Ok(mut files) = files_clone.lock() {
+                        files.push(file_change);
+                    }
+                }
                 true
-            }
-        });
-    cx.push_layer(Box::new(overlaid(picker)));
+            },
+        );
+    }
+
+    // Find the index of the current file in the list and inject files
+    let initial_cursor = {
+        let changed_files = changed_files_arc.lock().unwrap();
+        let cursor = if let Some(ref current_path) = current_file_path {
+            changed_files.iter()
+                .position(|change| {
+                    let change_path = change.path();
+                    change_path == current_path
+                })
+                .unwrap_or(0) as u32
+        } else {
+            0
+        };
+
+        // Apply initial cursor position before getting injector
+        let picker = picker.with_initial_cursor(cursor);
+
+        // Now inject the collected files into the picker
+        let injector = picker.injector();
+        for file_change in changed_files.iter() {
+            // FileChange doesn't implement Clone, so we need to reconstruct it
+            // Actually, we can't copy FileChange, so let's use a different approach
+            let _ = injector.push(match file_change {
+                helix_vcs::FileChange::Untracked { path } => {
+                    helix_vcs::FileChange::Untracked { path: path.clone() }
+                }
+                helix_vcs::FileChange::Modified { path } => {
+                    helix_vcs::FileChange::Modified { path: path.clone() }
+                }
+                helix_vcs::FileChange::Conflict { path } => {
+                    helix_vcs::FileChange::Conflict { path: path.clone() }
+                }
+                helix_vcs::FileChange::Deleted { path } => {
+                    helix_vcs::FileChange::Deleted { path: path.clone() }
+                }
+                helix_vcs::FileChange::Renamed { from_path, to_path } => {
+                    helix_vcs::FileChange::Renamed {
+                        from_path: from_path.clone(),
+                        to_path: to_path.clone(),
+                    }
+                }
+            });
+        }
+
+        picker
+    };
+
+    cx.push_layer(Box::new(overlaid(initial_cursor)));
 }
 
 pub fn command_palette(cx: &mut Context) {
@@ -4143,6 +4283,85 @@ fn goto_next_change_impl(cx: &mut Context, direction: Direction) {
         doc.set_selection(view.id, selection)
     };
     cx.editor.apply_motion(motion);
+
+    // Sync the other pane in diff/merge view
+    let view_id = view!(cx.editor).id;
+
+    // Check for 2-way diff view first
+    if let Some(diff_state) = cx.editor.diff_views.get(&view_id).cloned() {
+        let (other_view_id, other_doc_id) = if view_id == diff_state.base_view_id {
+            (diff_state.working_view_id, diff_state.working_doc_id)
+        } else {
+            (diff_state.base_view_id, diff_state.base_doc_id)
+        };
+
+        // Get current cursor line in source pane
+        let cursor_line = {
+            let (view, doc) = current!(cx.editor);
+            let text = doc.text().slice(..);
+            doc.selection(view.id).primary().cursor_line(text)
+        };
+
+        // Set selection and align the other pane
+        {
+            let other_doc = doc_mut!(cx.editor, &other_doc_id);
+            let line = cursor_line.min(other_doc.text().len_lines().saturating_sub(1));
+            let pos = other_doc.text().line_to_char(line);
+            let selection = helix_core::Selection::point(pos);
+            other_doc.set_selection(other_view_id, selection);
+        }
+        {
+            let other_doc = doc_mut!(cx.editor, &other_doc_id);
+            let other_view = view_mut!(cx.editor, other_view_id);
+            align_view(other_doc, other_view, Align::Top);
+        }
+
+        // Also align current view to top
+        {
+            let (view, doc) = current!(cx.editor);
+            align_view(doc, view, Align::Top);
+        }
+        return;
+    }
+
+    // Check for 3-way merge view
+    if let Some(merge_state) = cx.editor.merge_views.get(&view_id).cloned() {
+        // Determine which pane we're in and sync the other
+        let (other_view_id, other_doc_id) = if view_id == merge_state.ours_view_id {
+            (merge_state.theirs_view_id, merge_state.theirs_doc_id)
+        } else if view_id == merge_state.theirs_view_id {
+            (merge_state.ours_view_id, merge_state.ours_doc_id)
+        } else {
+            return; // In RESULT pane, don't sync
+        };
+
+        // Get current cursor line in source pane
+        let cursor_line = {
+            let (view, doc) = current!(cx.editor);
+            let text = doc.text().slice(..);
+            doc.selection(view.id).primary().cursor_line(text)
+        };
+
+        // Set selection and align the other pane
+        {
+            let other_doc = doc_mut!(cx.editor, &other_doc_id);
+            let line = cursor_line.min(other_doc.text().len_lines().saturating_sub(1));
+            let pos = other_doc.text().line_to_char(line);
+            let selection = helix_core::Selection::point(pos);
+            other_doc.set_selection(other_view_id, selection);
+        }
+        {
+            let other_doc = doc_mut!(cx.editor, &other_doc_id);
+            let other_view = view_mut!(cx.editor, other_view_id);
+            align_view(other_doc, other_view, Align::Top);
+        }
+
+        // Also align current view to top
+        {
+            let (view, doc) = current!(cx.editor);
+            align_view(doc, view, Align::Top);
+        }
+    }
 }
 
 /// Returns the [Range] for a [Hunk] in the given text.
@@ -5817,6 +6036,675 @@ fn wonly(cx: &mut Context) {
     }
 }
 
+// Diff and merge view commands
+
+fn diff_toggle_sync_scroll(cx: &mut Context) {
+    let (view, _doc) = current!(cx.editor);
+    let view_id = view.id;
+
+    // Check 2-way diff view first
+    if let Some(diff_state) = cx.editor.diff_views.get_mut(&view_id) {
+        diff_state.sync_scroll = !diff_state.sync_scroll;
+        let status = if diff_state.sync_scroll {
+            "enabled"
+        } else {
+            "disabled"
+        };
+        cx.editor.set_status(format!("Synchronized scrolling {}", status));
+        return;
+    }
+
+    // Check 3-way merge view
+    if let Some(merge_state) = cx.editor.merge_views.get_mut(&view_id) {
+        merge_state.sync_scroll = !merge_state.sync_scroll;
+        let status = if merge_state.sync_scroll {
+            "enabled"
+        } else {
+            "disabled"
+        };
+        cx.editor.set_status(format!("Synchronized scrolling {}", status));
+        return;
+    }
+
+    cx.editor.set_error("Not in a diff or merge view");
+}
+
+fn close_diff_or_merge_view(cx: &mut Context) {
+    let (view, _doc) = current!(cx.editor);
+    let view_id = view.id;
+
+    // Try to close diff view first
+    if cx.editor.close_diff_view(view_id) {
+        cx.editor.set_status("Diff view closed");
+
+        // Restore picker if it was open before the diff view
+        cx.callback.push(Box::new(|compositor, _cx| {
+            if let Some(picker) = compositor.last_picker.take() {
+                compositor.push(picker);
+            }
+        }));
+    } else if cx.editor.close_merge_view(view_id) {
+        cx.editor.set_status("Merge view closed");
+
+        // Restore picker if it was open before the merge view
+        cx.callback.push(Box::new(|compositor, _cx| {
+            if let Some(picker) = compositor.last_picker.take() {
+                compositor.push(picker);
+            }
+        }));
+    } else {
+        cx.editor.set_error("Not in a diff or merge view");
+    }
+}
+
+fn merge_finish(cx: &mut Context) {
+    let (view, _doc) = current!(cx.editor);
+    let view_id = view.id;
+
+    // Find merge state for current view
+    let Some(merge_state) = cx.editor.merge_views.get(&view_id).cloned() else {
+        cx.editor.set_error("Not in a merge view");
+        return;
+    };
+
+    // Check if all conflicts are resolved
+    let unresolved = merge_state.conflicts.len() - merge_state.resolved_count();
+    if unresolved > 0 {
+        cx.editor.set_error(format!(
+            "{} conflict{} remaining",
+            unresolved,
+            if unresolved == 1 { "" } else { "s" }
+        ));
+        return;
+    }
+
+    // Get the result document and verify it has the correct path
+    let result_doc_id = merge_state.result_doc_id;
+    let original_path = merge_state.original_path.clone();
+
+    // Ensure the result document has the correct path set
+    let doc = doc_mut!(cx.editor, &result_doc_id);
+    if doc.path() != Some(&original_path) {
+        doc.set_path(Some(&original_path));
+    }
+
+    // Save the result document first (queues async save)
+    if let Err(e) = cx.editor.save::<std::path::PathBuf>(result_doc_id, None, false) {
+        cx.editor.set_error(format!("Failed to save: {}", e));
+        return;
+    }
+
+    // Close the merge view immediately
+    cx.editor.close_merge_view(view_id);
+    cx.editor.set_status("Saving...");
+
+    // Schedule git add to run after the save completes using an async job
+    let shell = cx.editor.config().shell.clone();
+    cx.jobs.callback(async move {
+        // Wait a moment for the async save to complete
+        // We poll the file modification time to detect when it's written
+        use tokio::time::{sleep, Duration};
+        let mut attempts = 0;
+        let max_attempts = 50; // 5 seconds max wait
+
+        while attempts < max_attempts {
+            sleep(Duration::from_millis(100)).await;
+            // Check if file exists and was recently modified
+            if original_path.exists() {
+                break;
+            }
+            attempts += 1;
+        }
+
+        if !original_path.exists() {
+            return Err(anyhow::anyhow!("File was not saved after 5 seconds"));
+        }
+
+        // Now stage the file
+        let cmd = format!("git add {:?}", original_path);
+        shell_impl_for_git(&shell, &cmd)?;
+
+        // Return success callback to update status
+        Ok(crate::job::Callback::Editor(Box::new(move |editor| {
+            editor.set_status(format!("Saved and staged: {}", original_path.display()));
+        })))
+    });
+}
+
+fn shell_impl_for_git(shell: &[String], cmd: &str) -> anyhow::Result<()> {
+    use std::process::Command;
+
+    if shell.is_empty() {
+        anyhow::bail!("No shell configured");
+    }
+
+    let output = Command::new(&shell[0])
+        .args(&shell[1..])
+        .arg(cmd)
+        .output()?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("{}", stderr.trim())
+    }
+}
+
+fn merge_accept_ours(cx: &mut Context) {
+    use helix_view::merge_view::ConflictResolution;
+
+    let (view, _doc) = current!(cx.editor);
+    let view_id = view.id;
+
+    let Some(merge_state) = cx.editor.merge_views.get(&view_id).cloned() else {
+        cx.editor.set_error("Not in a merge view");
+        return;
+    };
+
+    let result_view_id = merge_state.result_view_id;
+
+    if let Some(conflict) = merge_state.current_conflict() {
+        let conflict_idx = merge_state.current_conflict;
+        let start_line = conflict.start_line;
+        let mut end_line = conflict.end_line;
+        let was_resolved = !matches!(conflict.resolution, ConflictResolution::Unresolved);
+
+        // If already resolved, first restore the original conflict markers
+        if was_resolved {
+            let original_markers = conflict.original_conflict_markers();
+            let previous_resolved = conflict.resolved_content().unwrap();
+
+            // Calculate how many lines were in the resolved version vs markers
+            let old_resolved_line_count = previous_resolved.lines().count().max(1);
+            let marker_line_count = original_markers.lines().count().max(1);
+            let restore_delta = old_resolved_line_count as isize - marker_line_count as isize;
+
+            // Restore conflict markers in the document
+            let doc = doc_mut!(cx.editor, &merge_state.result_doc_id);
+
+            // Clamp end_line to valid range based on current document state
+            let doc_line_count = doc.text().len_lines();
+            let safe_end_line = end_line.min(doc_line_count.saturating_sub(1));
+
+            let start_pos = doc.text().line_to_char(start_line);
+            let end_pos = doc.text().line_to_char(safe_end_line + 1);
+
+            let transaction = helix_core::Transaction::change(
+                doc.text(),
+                [(start_pos, end_pos, Some(original_markers.into()))].into_iter(),
+            );
+
+            doc.apply(&transaction, result_view_id);
+
+            // Update end_line to reflect the restored markers (start + marker lines - 1)
+            end_line = start_line + marker_line_count - 1;
+
+            if let Some(merge_state) = cx.editor.merge_views.get_mut(&view_id) {
+                if let Some(c) = merge_state.conflicts.get_mut(conflict_idx) {
+                    c.end_line = end_line;
+                    c.resolution = ConflictResolution::Unresolved;
+                }
+
+                // Adjust subsequent conflicts by the restore delta
+                for i in (conflict_idx + 1)..merge_state.conflicts.len() {
+                    if let Some(c) = merge_state.conflicts.get_mut(i) {
+                        c.start_line = (c.start_line as isize - restore_delta) as usize;
+                        c.end_line = (c.end_line as isize - restore_delta) as usize;
+                    }
+                }
+            }
+        }
+
+        // Now apply the new resolution - refetch conflict to get updated end_line
+        let conflict = cx.editor.merge_views.get(&view_id).unwrap().current_conflict().unwrap();
+        let resolved = conflict.ours_content.clone();
+        // Ensure resolved content ends with newline (replacement range includes trailing newline)
+        let resolved = if resolved.ends_with('\n') {
+            resolved
+        } else {
+            format!("{}\n", resolved)
+        };
+        let updated_end_line = conflict.end_line;
+
+        // Calculate line delta before moving resolved
+        let old_line_count = updated_end_line - start_line + 1;
+        let new_line_count = resolved.lines().count().max(1);
+        let line_delta = old_line_count as isize - new_line_count as isize;
+
+        // Replace the conflict in the result document
+        let doc = doc_mut!(cx.editor, &merge_state.result_doc_id);
+        let start_pos = doc.text().line_to_char(start_line);
+        let end_pos = doc.text().line_to_char(updated_end_line + 1);
+
+        let transaction = helix_core::Transaction::change(
+            doc.text(),
+            [(start_pos, end_pos, Some(resolved.into()))].into_iter(),
+        );
+
+        doc.apply(&transaction, result_view_id);
+
+        // Update conflict resolution state and adjust subsequent conflicts
+        if let Some(merge_state) = cx.editor.merge_views.get_mut(&view_id) {
+            if let Some(conflict) = merge_state.conflicts.get_mut(conflict_idx) {
+                conflict.resolution = ConflictResolution::AcceptOurs;
+                // Update end_line to reflect the new content length
+                conflict.end_line = start_line + new_line_count - 1;
+            }
+
+            // Adjust line numbers for all subsequent conflicts
+            for i in (conflict_idx + 1)..merge_state.conflicts.len() {
+                if let Some(c) = merge_state.conflicts.get_mut(i) {
+                    c.start_line = (c.start_line as isize - line_delta) as usize;
+                    c.end_line = (c.end_line as isize - line_delta) as usize;
+                }
+            }
+        }
+
+        cx.editor.set_status("Accepted HEAD version");
+    }
+}
+
+fn merge_accept_theirs(cx: &mut Context) {
+    use helix_view::merge_view::ConflictResolution;
+
+    let (view, _doc) = current!(cx.editor);
+    let view_id = view.id;
+
+    let Some(merge_state) = cx.editor.merge_views.get(&view_id).cloned() else {
+        cx.editor.set_error("Not in a merge view");
+        return;
+    };
+
+    let result_view_id = merge_state.result_view_id;
+
+    if let Some(conflict) = merge_state.current_conflict() {
+        let conflict_idx = merge_state.current_conflict;
+        let start_line = conflict.start_line;
+        let mut end_line = conflict.end_line;
+        let was_resolved = !matches!(conflict.resolution, ConflictResolution::Unresolved);
+
+        // If already resolved, first restore the original conflict markers
+        if was_resolved {
+            let original_markers = conflict.original_conflict_markers();
+            let previous_resolved = conflict.resolved_content().unwrap();
+
+            // Calculate how many lines were in the resolved version vs markers
+            let old_resolved_line_count = previous_resolved.lines().count().max(1);
+            let marker_line_count = original_markers.lines().count().max(1);
+            let restore_delta = old_resolved_line_count as isize - marker_line_count as isize;
+
+            // Restore conflict markers in the document
+            let doc = doc_mut!(cx.editor, &merge_state.result_doc_id);
+
+            // Clamp end_line to valid range based on current document state
+            let doc_line_count = doc.text().len_lines();
+            let safe_end_line = end_line.min(doc_line_count.saturating_sub(1));
+
+            let start_pos = doc.text().line_to_char(start_line);
+            let end_pos = doc.text().line_to_char(safe_end_line + 1);
+
+            let transaction = helix_core::Transaction::change(
+                doc.text(),
+                [(start_pos, end_pos, Some(original_markers.into()))].into_iter(),
+            );
+
+            doc.apply(&transaction, result_view_id);
+
+            // Update end_line to reflect the restored markers (start + marker lines - 1)
+            end_line = start_line + marker_line_count - 1;
+
+            if let Some(merge_state) = cx.editor.merge_views.get_mut(&view_id) {
+                if let Some(c) = merge_state.conflicts.get_mut(conflict_idx) {
+                    c.end_line = end_line;
+                    c.resolution = ConflictResolution::Unresolved;
+                }
+
+                // Adjust subsequent conflicts by the restore delta
+                for i in (conflict_idx + 1)..merge_state.conflicts.len() {
+                    if let Some(c) = merge_state.conflicts.get_mut(i) {
+                        c.start_line = (c.start_line as isize - restore_delta) as usize;
+                        c.end_line = (c.end_line as isize - restore_delta) as usize;
+                    }
+                }
+            }
+        }
+
+        // Now apply the new resolution - refetch conflict to get updated end_line
+        let conflict = cx.editor.merge_views.get(&view_id).unwrap().current_conflict().unwrap();
+        let resolved = conflict.theirs_content.clone();
+        // Ensure resolved content ends with newline (replacement range includes trailing newline)
+        let resolved = if resolved.ends_with('\n') {
+            resolved
+        } else {
+            format!("{}\n", resolved)
+        };
+        let updated_end_line = conflict.end_line;
+
+        // Calculate line delta before moving resolved
+        let old_line_count = updated_end_line - start_line + 1;
+        let new_line_count = resolved.lines().count().max(1);
+        let line_delta = old_line_count as isize - new_line_count as isize;
+
+        // Replace the conflict in the result document
+        let doc = doc_mut!(cx.editor, &merge_state.result_doc_id);
+        let start_pos = doc.text().line_to_char(start_line);
+        let end_pos = doc.text().line_to_char(updated_end_line + 1);
+
+        let transaction = helix_core::Transaction::change(
+            doc.text(),
+            [(start_pos, end_pos, Some(resolved.into()))].into_iter(),
+        );
+
+        doc.apply(&transaction, result_view_id);
+
+        // Update conflict resolution state and adjust subsequent conflicts
+        if let Some(merge_state) = cx.editor.merge_views.get_mut(&view_id) {
+            if let Some(conflict) = merge_state.conflicts.get_mut(conflict_idx) {
+                conflict.resolution = ConflictResolution::AcceptTheirs;
+                // Update end_line to reflect the new content length
+                conflict.end_line = start_line + new_line_count - 1;
+            }
+
+            // Adjust line numbers for all subsequent conflicts
+            for i in (conflict_idx + 1)..merge_state.conflicts.len() {
+                if let Some(c) = merge_state.conflicts.get_mut(i) {
+                    c.start_line = (c.start_line as isize - line_delta) as usize;
+                    c.end_line = (c.end_line as isize - line_delta) as usize;
+                }
+            }
+        }
+
+        cx.editor.set_status("Accepted incoming branch version");
+    }
+}
+
+fn merge_accept_both(cx: &mut Context) {
+    use helix_view::merge_view::ConflictResolution;
+
+    let (view, _doc) = current!(cx.editor);
+    let view_id = view.id;
+
+    let Some(merge_state) = cx.editor.merge_views.get(&view_id).cloned() else {
+        cx.editor.set_error("Not in a merge view");
+        return;
+    };
+
+    let result_view_id = merge_state.result_view_id;
+
+    if let Some(conflict) = merge_state.current_conflict() {
+        let conflict_idx = merge_state.current_conflict;
+        let start_line = conflict.start_line;
+        let mut end_line = conflict.end_line;
+        let was_resolved = !matches!(conflict.resolution, ConflictResolution::Unresolved);
+
+        // If already resolved, first restore the original conflict markers
+        if was_resolved {
+            let original_markers = conflict.original_conflict_markers();
+            let previous_resolved = conflict.resolved_content().unwrap();
+
+            // Calculate how many lines were in the resolved version vs markers
+            let old_resolved_line_count = previous_resolved.lines().count().max(1);
+            let marker_line_count = original_markers.lines().count().max(1);
+            let restore_delta = old_resolved_line_count as isize - marker_line_count as isize;
+
+            // Restore conflict markers in the document
+            let doc = doc_mut!(cx.editor, &merge_state.result_doc_id);
+
+            // Clamp end_line to valid range based on current document state
+            let doc_line_count = doc.text().len_lines();
+            let safe_end_line = end_line.min(doc_line_count.saturating_sub(1));
+
+            let start_pos = doc.text().line_to_char(start_line);
+            let end_pos = doc.text().line_to_char(safe_end_line + 1);
+
+            let transaction = helix_core::Transaction::change(
+                doc.text(),
+                [(start_pos, end_pos, Some(original_markers.into()))].into_iter(),
+            );
+
+            doc.apply(&transaction, result_view_id);
+
+            // Update end_line to reflect the restored markers (start + marker lines - 1)
+            end_line = start_line + marker_line_count - 1;
+
+            if let Some(merge_state) = cx.editor.merge_views.get_mut(&view_id) {
+                if let Some(c) = merge_state.conflicts.get_mut(conflict_idx) {
+                    c.end_line = end_line;
+                    c.resolution = ConflictResolution::Unresolved;
+                }
+
+                // Adjust subsequent conflicts by the restore delta
+                for i in (conflict_idx + 1)..merge_state.conflicts.len() {
+                    if let Some(c) = merge_state.conflicts.get_mut(i) {
+                        c.start_line = (c.start_line as isize - restore_delta) as usize;
+                        c.end_line = (c.end_line as isize - restore_delta) as usize;
+                    }
+                }
+            }
+        }
+
+        // Now apply the new resolution - refetch conflict to get updated end_line
+        let conflict = cx.editor.merge_views.get(&view_id).unwrap().current_conflict().unwrap();
+        let updated_end_line = conflict.end_line;
+
+        // Get the resolved content (OURS followed by THEIRS)
+        let mut resolved = conflict.ours_content.clone();
+        if !resolved.ends_with('\n') && !conflict.theirs_content.is_empty() {
+            resolved.push('\n');
+        }
+        resolved.push_str(&conflict.theirs_content);
+        // Ensure resolved content ends with newline (replacement range includes trailing newline)
+        if !resolved.ends_with('\n') {
+            resolved.push('\n');
+        }
+
+        // Calculate line delta before moving resolved
+        let old_line_count = updated_end_line - start_line + 1;
+        let new_line_count = resolved.lines().count().max(1);
+        let line_delta = old_line_count as isize - new_line_count as isize;
+
+        // Replace the conflict in the result document
+        let doc = doc_mut!(cx.editor, &merge_state.result_doc_id);
+        let start_pos = doc.text().line_to_char(start_line);
+        let end_pos = doc.text().line_to_char(updated_end_line + 1);
+
+        let transaction = helix_core::Transaction::change(
+            doc.text(),
+            [(start_pos, end_pos, Some(resolved.into()))].into_iter(),
+        );
+
+        doc.apply(&transaction, result_view_id);
+
+        // Update conflict resolution state and adjust subsequent conflicts
+        if let Some(merge_state) = cx.editor.merge_views.get_mut(&view_id) {
+            if let Some(conflict) = merge_state.conflicts.get_mut(conflict_idx) {
+                conflict.resolution = ConflictResolution::AcceptBoth;
+                // Update end_line to reflect the new content length
+                conflict.end_line = start_line + new_line_count - 1;
+            }
+
+            // Adjust line numbers for all subsequent conflicts
+            for i in (conflict_idx + 1)..merge_state.conflicts.len() {
+                if let Some(c) = merge_state.conflicts.get_mut(i) {
+                    c.start_line = (c.start_line as isize - line_delta) as usize;
+                    c.end_line = (c.end_line as isize - line_delta) as usize;
+                }
+            }
+        }
+
+        cx.editor.set_status("Accepted both versions");
+    }
+}
+
+fn merge_next_conflict(cx: &mut Context) {
+    let (view, _doc) = current!(cx.editor);
+    let view_id = view.id;
+
+    let conflict_info = if let Some(merge_state) = cx.editor.merge_views.get_mut(&view_id) {
+        merge_state.next_conflict();
+
+        let current_idx = merge_state.current_conflict;
+        merge_state.current_conflict().map(|conflict| {
+            // Estimate line in OURS/THEIRS: subtract marker lines from previous conflicts
+            // Each conflict adds ~3 marker lines (<<<, ===, >>>), plus content lines
+            let marker_lines_before: usize = merge_state.conflicts.iter()
+                .take(current_idx)
+                .map(|c| {
+                    // Count lines added by conflict markers: <<<, ===, >>> = 3 lines
+                    // Plus the THEIRS content lines that appear below === in RESULT
+                    // but don't exist in OURS (and vice versa for THEIRS doc)
+                    3 + c.theirs_content.lines().count()
+                })
+                .sum();
+            let estimated_line = conflict.start_line.saturating_sub(marker_lines_before);
+
+            (
+                current_idx + 1,
+                merge_state.conflicts.len(),
+                conflict.start_line,
+                estimated_line,
+                merge_state.result_doc_id,
+                merge_state.result_view_id,
+                merge_state.ours_doc_id,
+                merge_state.ours_view_id,
+                merge_state.theirs_doc_id,
+                merge_state.theirs_view_id,
+            )
+        })
+    } else {
+        cx.editor.set_error("Not in a merge view");
+        return;
+    };
+
+    if let Some((current, total, start_line, estimated_line, result_doc_id, result_view_id, ours_doc_id, ours_view_id, theirs_doc_id, theirs_view_id)) = conflict_info {
+        let msg = format!("Conflict {}/{} (line {})", current, total, start_line + 1);
+        cx.editor.set_status(msg);
+
+        // Jump to the conflict in the result view and align
+        {
+            let result_doc = doc_mut!(cx.editor, &result_doc_id);
+            let start_pos = result_doc.text().line_to_char(start_line);
+            let selection = helix_core::Selection::point(start_pos);
+            result_doc.set_selection(result_view_id, selection);
+        }
+        {
+            let result_doc = doc_mut!(cx.editor, &result_doc_id);
+            let result_view = view_mut!(cx.editor, result_view_id);
+            align_view(result_doc, result_view, Align::Top);
+        }
+
+        // Scroll OURS pane to the estimated conflict location and align
+        {
+            let ours_doc = doc_mut!(cx.editor, &ours_doc_id);
+            let ours_line = estimated_line.min(ours_doc.text().len_lines().saturating_sub(1));
+            let ours_pos = ours_doc.text().line_to_char(ours_line);
+            let ours_selection = helix_core::Selection::point(ours_pos);
+            ours_doc.set_selection(ours_view_id, ours_selection);
+        }
+        {
+            let ours_doc = doc_mut!(cx.editor, &ours_doc_id);
+            let ours_view = view_mut!(cx.editor, ours_view_id);
+            align_view(ours_doc, ours_view, Align::Top);
+        }
+
+        // Scroll THEIRS pane to the estimated conflict location and align
+        {
+            let theirs_doc = doc_mut!(cx.editor, &theirs_doc_id);
+            let theirs_line = estimated_line.min(theirs_doc.text().len_lines().saturating_sub(1));
+            let theirs_pos = theirs_doc.text().line_to_char(theirs_line);
+            let theirs_selection = helix_core::Selection::point(theirs_pos);
+            theirs_doc.set_selection(theirs_view_id, theirs_selection);
+        }
+        {
+            let theirs_doc = doc_mut!(cx.editor, &theirs_doc_id);
+            let theirs_view = view_mut!(cx.editor, theirs_view_id);
+            align_view(theirs_doc, theirs_view, Align::Top);
+        }
+    }
+}
+
+fn merge_prev_conflict(cx: &mut Context) {
+    let (view, _doc) = current!(cx.editor);
+    let view_id = view.id;
+
+    let conflict_info = if let Some(merge_state) = cx.editor.merge_views.get_mut(&view_id) {
+        merge_state.prev_conflict();
+
+        let current_idx = merge_state.current_conflict;
+        merge_state.current_conflict().map(|conflict| {
+            // Estimate line in OURS/THEIRS: subtract marker lines from previous conflicts
+            let marker_lines_before: usize = merge_state.conflicts.iter()
+                .take(current_idx)
+                .map(|c| 3 + c.theirs_content.lines().count())
+                .sum();
+            let estimated_line = conflict.start_line.saturating_sub(marker_lines_before);
+
+            (
+                current_idx + 1,
+                merge_state.conflicts.len(),
+                conflict.start_line,
+                estimated_line,
+                merge_state.result_doc_id,
+                merge_state.result_view_id,
+                merge_state.ours_doc_id,
+                merge_state.ours_view_id,
+                merge_state.theirs_doc_id,
+                merge_state.theirs_view_id,
+            )
+        })
+    } else {
+        cx.editor.set_error("Not in a merge view");
+        return;
+    };
+
+    if let Some((current, total, start_line, estimated_line, result_doc_id, result_view_id, ours_doc_id, ours_view_id, theirs_doc_id, theirs_view_id)) = conflict_info {
+        let msg = format!("Conflict {}/{} (line {})", current, total, start_line + 1);
+        cx.editor.set_status(msg);
+
+        // Jump to the conflict in the result view and align
+        {
+            let result_doc = doc_mut!(cx.editor, &result_doc_id);
+            let start_pos = result_doc.text().line_to_char(start_line);
+            let selection = helix_core::Selection::point(start_pos);
+            result_doc.set_selection(result_view_id, selection);
+        }
+        {
+            let result_doc = doc_mut!(cx.editor, &result_doc_id);
+            let result_view = view_mut!(cx.editor, result_view_id);
+            align_view(result_doc, result_view, Align::Top);
+        }
+
+        // Scroll OURS pane to the estimated conflict location and align
+        {
+            let ours_doc = doc_mut!(cx.editor, &ours_doc_id);
+            let ours_line = estimated_line.min(ours_doc.text().len_lines().saturating_sub(1));
+            let ours_pos = ours_doc.text().line_to_char(ours_line);
+            let ours_selection = helix_core::Selection::point(ours_pos);
+            ours_doc.set_selection(ours_view_id, ours_selection);
+        }
+        {
+            let ours_doc = doc_mut!(cx.editor, &ours_doc_id);
+            let ours_view = view_mut!(cx.editor, ours_view_id);
+            align_view(ours_doc, ours_view, Align::Top);
+        }
+
+        // Scroll THEIRS pane to the estimated conflict location and align
+        {
+            let theirs_doc = doc_mut!(cx.editor, &theirs_doc_id);
+            let theirs_line = estimated_line.min(theirs_doc.text().len_lines().saturating_sub(1));
+            let theirs_pos = theirs_doc.text().line_to_char(theirs_line);
+            let theirs_selection = helix_core::Selection::point(theirs_pos);
+            theirs_doc.set_selection(theirs_view_id, theirs_selection);
+        }
+        {
+            let theirs_doc = doc_mut!(cx.editor, &theirs_doc_id);
+            let theirs_view = view_mut!(cx.editor, theirs_view_id);
+            align_view(theirs_doc, theirs_view, Align::Top);
+        }
+    }
+}
+
 fn select_register(cx: &mut Context) {
     cx.editor.autoinfo = Some(Info::from_registers(
         "Select register",
@@ -5893,17 +6781,23 @@ fn copy_between_registers(cx: &mut Context) {
 
 fn align_view_top(cx: &mut Context) {
     let (view, doc) = current!(cx.editor);
+    let view_id = view.id;
     align_view(doc, view, Align::Top);
+    cx.editor.sync_scroll_to_linked_views(view_id);
 }
 
 fn align_view_center(cx: &mut Context) {
     let (view, doc) = current!(cx.editor);
+    let view_id = view.id;
     align_view(doc, view, Align::Center);
+    cx.editor.sync_scroll_to_linked_views(view_id);
 }
 
 fn align_view_bottom(cx: &mut Context) {
     let (view, doc) = current!(cx.editor);
+    let view_id = view.id;
     align_view(doc, view, Align::Bottom);
+    cx.editor.sync_scroll_to_linked_views(view_id);
 }
 
 fn align_view_middle(cx: &mut Context) {

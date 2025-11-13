@@ -1956,12 +1956,14 @@ fn diff(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow:
     // Get commit reference (default to HEAD)
     let commit_ref = args.first().map(|s| s.as_ref()).unwrap_or("HEAD");
 
-    // Get current document path
+    // Get current document path and ID
     let (_view, doc) = current!(cx.editor);
     let path = doc
         .path()
         .ok_or_else(|| anyhow!("Document has no path, cannot diff"))?
         .clone();
+    let current_doc_id = doc.id();
+    let current_text = doc.text().clone();
 
     // Ensure path is absolute
     if !path.is_absolute() {
@@ -1973,6 +1975,9 @@ fn diff(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow:
     let commit_content = diff_provider
         .get_file_at_commit(&path, commit_ref)
         .ok_or_else(|| anyhow!("Failed to get file at commit '{}'", commit_ref))?;
+
+    // Convert commit content to Rope for diff comparison
+    let commit_text = Rope::from_reader(&mut commit_content.as_slice())?;
 
     // Create a temporary file for the commit version
     let temp_dir = std::env::temp_dir();
@@ -1993,7 +1998,17 @@ fn diff(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow:
 
     // Get the newly opened document and mark it as readonly
     let (_, commit_doc) = current!(cx.editor);
+    let commit_doc_id = commit_doc.id();
     commit_doc.readonly = true;
+
+    // Set up bidirectional diff highlighting
+    // The commit version (left) compares against current text (right)
+    commit_doc.diff_compare_text = Some(current_text.clone());
+
+    // The current version (right) compares against commit text (left)
+    if let Some(current_doc) = cx.editor.documents.get_mut(&current_doc_id) {
+        current_doc.diff_compare_text = Some(commit_text);
+    }
 
     cx.editor.set_status(format!(
         "Showing diff: current file (right) vs {} (left)",

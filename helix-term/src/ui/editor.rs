@@ -8,7 +8,7 @@ use crate::{
     ui::{
         document::{render_document, LinePos, TextRenderer},
         statusline,
-        text_decorations::{self, Decoration, DecorationManager, InlineDiagnostics},
+        text_decorations::{self, Decoration, DecorationManager, InlineDiagnostics, InlineDiffDecoration},
         Completion, ProgressSpinners,
     },
 };
@@ -196,6 +196,16 @@ impl EditorView {
             inline_diagnostic_config,
             config.end_of_line_diagnostics,
         ));
+
+        // Add inline diff decoration if we're comparing against another version
+        if let Some(ref compare_text) = doc.diff_compare_text {
+            decorations.add_decoration(InlineDiffDecoration::new(
+                doc,
+                compare_text,
+                theme,
+            ));
+        }
+
         render_document(
             surface,
             inner,

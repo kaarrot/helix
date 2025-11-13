@@ -1,5 +1,5 @@
-This is a test file for diff highlighting.
-The quick brown fox jumps over the lazy dog.
+This is a test file for diff highlighting features.
+The quick red fox jumps over the sleepy dog.
 Some unchanged text here.
-Another line of text.
-Final line.
+Another modified line of text.
+Final line with changes.

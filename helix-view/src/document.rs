@@ -199,6 +199,9 @@ pub struct Document {
     diff_handle: Option<DiffHandle>,
     version_control_head: Option<Arc<ArcSwap<Box<str>>>>,
 
+    /// Text to compare against for inline diff highlighting (used in :diff command)
+    pub diff_compare_text: Option<Rope>,
+
     // when document was used for most-recent-used buffer picker
     pub focused_at: std::time::Instant,
 
@@ -723,6 +726,7 @@ impl Document {
             modified_since_accessed: false,
             language_servers: HashMap::new(),
             diff_handle: None,
+            diff_compare_text: None,
             config,
             version_control_head: None,
             focused_at: std::time::Instant::now(),

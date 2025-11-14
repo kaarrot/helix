@@ -3636,7 +3636,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "insert-stream-output",
-        aliases: &[],
+        aliases: &["\\"],
         doc: "Run shell command, streaming output in real-time before the primary selection.",
         fun: insert_stream_output,
         completer: SHELL_COMPLETER,
@@ -3644,7 +3644,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "cancel-stream",
-        aliases: &[],
+        aliases: &["\\\\"],
         doc: "Cancel the currently running stream process.",
         fun: cancel_stream,
         completer: CommandCompleter::none(),

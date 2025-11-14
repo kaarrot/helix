@@ -140,6 +140,7 @@ impl EditorView {
         }
 
         Self::doc_diagnostics_highlights_into(doc, theme, &mut overlays);
+        Self::doc_char_diff_highlights_into(doc, theme, &mut overlays);
 
         if is_focused {
             if let Some(tabstops) = Self::tabstop_highlights(doc, theme) {
@@ -196,6 +197,7 @@ impl EditorView {
             inline_diagnostic_config,
             config.end_of_line_diagnostics,
         ));
+
         render_document(
             surface,
             inner,
@@ -457,6 +459,116 @@ impl EditorView {
                 ranges: error_vec,
             },
         ]);
+    }
+
+    /// Get highlight spans for character-level diffs
+    pub fn doc_char_diff_highlights_into(
+        doc: &Document,
+        theme: &Theme,
+        overlay_highlights: &mut Vec<OverlayHighlights>,
+    ) {
+        use similar::TextDiff;
+
+        if !doc.char_diff_enabled {
+            return;
+        }
+
+        let Some(diff_handle) = doc.diff_handle() else {
+            return;
+        };
+
+        let diff = diff_handle.load();
+        let doc_text = doc.text();
+        let diff_base = diff.diff_base();
+
+        // Get theme highlights for character-level changes
+        // Use diff.plus scope and add REVERSED modifier for better visibility
+        let Some(add_highlight) = theme.find_highlight_exact("diff.plus") else {
+            return;
+        };
+
+        let mut add_ranges = Vec::new();
+
+        // Iterate through all hunks
+        let hunk_count = diff.len();
+        for hunk_idx in 0..hunk_count {
+            let hunk = diff.nth_hunk(hunk_idx);
+            if hunk == helix_vcs::Hunk::NONE {
+                continue;
+            }
+
+            // Process each line in the hunk
+            let start_line = hunk.after.start as usize;
+            let end_line = hunk.after.end as usize;
+
+            for line_idx in start_line..end_line {
+                if line_idx >= doc_text.len_lines() {
+                    break;
+                }
+
+                // Get the line from the current document
+                let doc_line = doc_text.line(line_idx);
+                let doc_line_str = doc_line.to_string();
+                let line_start_char = doc_text.line_to_char(line_idx);
+
+                // Calculate corresponding line in diff_base
+                let line_offset_in_hunk = line_idx - hunk.after.start as usize;
+                let base_line_idx = hunk.before.start as usize + line_offset_in_hunk;
+
+                // If this is a pure insertion, the entire line is new
+                if hunk.is_pure_insertion() {
+                    if !doc_line_str.trim().is_empty() {
+                        let char_count = doc_line_str.chars().count();
+                        add_ranges.push(line_start_char..line_start_char + char_count);
+                    }
+                    continue;
+                }
+
+                // Check if the corresponding line exists in the base
+                if base_line_idx >= diff_base.len_lines() {
+                    continue;
+                }
+
+                let base_line = diff_base.line(base_line_idx);
+                let base_line_str = base_line.to_string();
+
+                // If lines are identical, no highlights needed
+                if doc_line_str == base_line_str {
+                    continue;
+                }
+
+                // Compute character-level diff using similar crate
+                let char_diff = TextDiff::from_chars(&base_line_str, &doc_line_str);
+
+                let mut doc_idx = 0;
+                for change in char_diff.iter_all_changes() {
+                    let value = change.value();
+                    let char_count = value.chars().count();
+
+                    match change.tag() {
+                        similar::ChangeTag::Equal => {
+                            doc_idx += char_count;
+                        }
+                        similar::ChangeTag::Insert => {
+                            let start = line_start_char + doc_idx;
+                            let end = start + char_count;
+                            add_ranges.push(start..end);
+                            doc_idx += char_count;
+                        }
+                        similar::ChangeTag::Delete => {
+                            // Deletions don't appear in the current document
+                        }
+                    }
+                }
+            }
+        }
+
+        if !add_ranges.is_empty() {
+            overlay_highlights.push(OverlayHighlights::Homogeneous {
+                highlight: add_highlight,
+                ranges: add_ranges,
+            });
+        }
     }
 
     /// Get highlight spans for selections in a document view.

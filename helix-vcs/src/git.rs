@@ -59,6 +59,52 @@ pub fn get_diff_base(file: &Path) -> Result<Vec<u8>> {
     }
 }
 
+pub fn get_diff_base_from_ref(file: &Path, ref_name: &str) -> Result<Vec<u8>> {
+    debug_assert!(!file.exists() || file.is_file());
+    debug_assert!(file.is_absolute());
+    let file = gix::path::realpath(file).context("resolve symlinks")?;
+
+    let repo_dir = get_repo_dir(&file)?;
+    let repo = open_repo(repo_dir)
+        .context("failed to open git repo")?
+        .to_thread_local();
+
+    // Try to find the reference or parse as an object ID
+    let object_id = match repo.find_reference(ref_name) {
+        Ok(r) => r.into_fully_peeled_id()?.detach(),
+        Err(_) => {
+            // Try parsing as an object ID (commit hash)
+            use gix::bstr::ByteSlice;
+            ref_name
+                .as_bytes()
+                .as_bstr()
+                .to_str()
+                .ok()
+                .and_then(|s| gix::hash::ObjectId::from_hex(s.as_bytes()).ok())
+                .context("failed to parse reference or commit hash")?
+        }
+    };
+
+    let commit = repo.find_object(object_id)?.try_into_commit()?;
+    let file_oid = find_file_in_commit(&repo, &commit, &file)?;
+
+    let file_object = repo.find_object(file_oid)?;
+    let data = file_object.detach().data;
+
+    if let Some(work_dir) = repo.workdir() {
+        let rela_path = file.strip_prefix(work_dir)?;
+        let rela_path = gix::path::try_into_bstr(rela_path)?;
+        let (mut pipeline, _) = repo.filter_pipeline(None)?;
+        let mut worktree_outcome =
+            pipeline.convert_to_worktree(&data, rela_path.as_ref(), Delay::Forbid)?;
+        let mut buf = Vec::with_capacity(data.len());
+        worktree_outcome.read_to_end(&mut buf)?;
+        Ok(buf)
+    } else {
+        Ok(data)
+    }
+}
+
 pub fn get_current_head_name(file: &Path) -> Result<Arc<ArcSwap<Box<str>>>> {
     debug_assert!(!file.exists() || file.is_file());
     debug_assert!(file.is_absolute());
@@ -81,6 +127,96 @@ pub fn get_current_head_name(file: &Path) -> Result<Arc<ArcSwap<Box<str>>>> {
 
 pub fn for_each_changed_file(cwd: &Path, f: impl Fn(Result<FileChange>) -> bool) -> Result<()> {
     status(&open_repo(cwd)?.to_thread_local(), f)
+}
+
+pub fn for_each_changed_file_between_commits(
+    cwd: &Path,
+    ref_name: &str,
+    f: impl Fn(Result<FileChange>) -> bool,
+) -> Result<()> {
+    let repo = open_repo(cwd)?.to_thread_local();
+    let work_dir = repo
+        .workdir()
+        .ok_or_else(|| anyhow::anyhow!("working tree not found"))?
+        .to_path_buf();
+
+    // Get HEAD commit
+    let head_commit = repo.head_commit()?;
+
+    // Resolve the target commit
+    let target_object_id = match repo.find_reference(ref_name) {
+        Ok(r) => r.into_fully_peeled_id()?.detach(),
+        Err(_) => {
+            use gix::bstr::ByteSlice;
+            ref_name
+                .as_bytes()
+                .as_bstr()
+                .to_str()
+                .ok()
+                .and_then(|s| gix::hash::ObjectId::from_hex(s.as_bytes()).ok())
+                .context("failed to parse reference or commit hash")?
+        }
+    };
+
+    let target_commit = repo.find_object(target_object_id)?.try_into_commit()?;
+
+    // Get trees from both commits
+    let head_tree = head_commit.tree()?;
+    let target_tree = target_commit.tree()?;
+
+    // Diff the trees
+    target_tree.changes()?.for_each_to_obtain_tree(
+        &head_tree,
+        |change| -> Result<_, std::convert::Infallible> {
+            use gix::object::tree::diff::Change;
+
+            let file_change = match change {
+                Change::Addition { entry_mode, .. } => {
+                    if entry_mode.is_blob() {
+                        let path = work_dir.join(gix::path::from_bstr(change.location()));
+                        Some(FileChange::Modified { path })
+                    } else {
+                        None
+                    }
+                }
+                Change::Deletion { entry_mode, .. } => {
+                    if entry_mode.is_blob() {
+                        let path = work_dir.join(gix::path::from_bstr(change.location()));
+                        Some(FileChange::Deleted { path })
+                    } else {
+                        None
+                    }
+                }
+                Change::Modification { entry_mode, .. } => {
+                    if entry_mode.is_blob() {
+                        let path = work_dir.join(gix::path::from_bstr(change.location()));
+                        Some(FileChange::Modified { path })
+                    } else {
+                        None
+                    }
+                }
+                Change::Rewrite { entry_mode, .. } => {
+                    // Handle rewrites (renames) if needed
+                    if entry_mode.is_blob() {
+                        let path = work_dir.join(gix::path::from_bstr(change.location()));
+                        Some(FileChange::Modified { path })
+                    } else {
+                        None
+                    }
+                }
+            };
+
+            if let Some(change_item) = file_change {
+                if !f(Ok(change_item)) {
+                    return Ok(gix::object::tree::diff::Action::Cancel);
+                }
+            }
+
+            Ok(gix::object::tree::diff::Action::Continue)
+        },
+    )?;
+
+    Ok(())
 }
 
 fn open_repo(path: &Path) -> Result<ThreadSafeRepository> {

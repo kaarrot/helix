@@ -481,11 +481,9 @@ impl EditorView {
         let doc_text = doc.text();
         let diff_base = diff.diff_base();
 
-        // Get theme highlights for different change types
-        let Some(add_highlight) = theme
-            .find_highlight_exact("diff.plus")
-            .or_else(|| theme.find_highlight_exact("diff.delta"))
-        else {
+        // Get theme highlights for character-level changes
+        // Use diff.plus scope and add REVERSED modifier for better visibility
+        let Some(add_highlight) = theme.find_highlight_exact("diff.plus") else {
             return;
         };
 

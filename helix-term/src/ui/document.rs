@@ -566,8 +566,19 @@ impl<'t> OverlayHighlighter<'t> {
             HighlightEvent::Push => self.style,
         };
 
+        // Get the diff.plus highlight ID to apply REVERSED modifier for char diffs
+        let diff_plus_highlight = self.theme.find_highlight_exact("diff.plus");
+
         self.style = highlights.fold(base, |acc, highlight| {
-            acc.patch(self.theme.highlight(highlight))
+            let mut style = self.theme.highlight(highlight);
+
+            // Apply REVERSED modifier to diff.plus highlights for better visibility
+            // This makes char-level diff highlighting use background color instead of foreground
+            if Some(highlight) == diff_plus_highlight {
+                style.add_modifier = style.add_modifier | helix_view::graphics::Modifier::REVERSED;
+            }
+
+            acc.patch(style)
         });
         self.update_pos();
     }

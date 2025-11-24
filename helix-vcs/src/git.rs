@@ -69,19 +69,37 @@ pub fn get_diff_base_from_ref(file: &Path, ref_name: &str) -> Result<Vec<u8>> {
         .context("failed to open git repo")?
         .to_thread_local();
 
-    // Try to find the reference or parse as an object ID
-    let object_id = match repo.find_reference(ref_name) {
+    // Try to find the reference or parse as an object ID (supporting short hashes)
+    let object_id: gix::ObjectId = match repo.find_reference(ref_name) {
         Ok(r) => r.into_fully_peeled_id()?.detach(),
         Err(_) => {
-            // Try parsing as an object ID (commit hash)
+            // Try parsing as a full or partial commit hash
             use gix::bstr::ByteSlice;
-            ref_name
+
+            // First try as full hash
+            if let Some(full_hash) = ref_name
                 .as_bytes()
                 .as_bstr()
                 .to_str()
                 .ok()
                 .and_then(|s| gix::hash::ObjectId::from_hex(s.as_bytes()).ok())
-                .context("failed to parse reference or commit hash")?
+            {
+                full_hash
+            } else {
+                // Try as prefix (short hash) using gix's prefix lookup
+                let prefix = gix::hash::Prefix::from_hex(ref_name)
+                    .context("failed to parse commit hash prefix")?;
+
+                // Use the objects database to find by prefix
+                let maybe_oid = repo.objects
+                    .lookup_prefix(prefix, None)
+                    .context("failed to lookup object by prefix")?;
+
+                match maybe_oid {
+                    Some(oid) => oid.map_err(|_| anyhow::anyhow!("ambiguous prefix '{}'", ref_name))?,
+                    None => bail!("no object found with prefix '{}'", ref_name),
+                }
+            }
         }
     };
 
@@ -143,18 +161,37 @@ pub fn for_each_changed_file_between_commits(
     // Get HEAD commit
     let head_commit = repo.head_commit()?;
 
-    // Resolve the target commit
-    let target_object_id = match repo.find_reference(ref_name) {
+    // Resolve the target commit (supporting short hashes)
+    let target_object_id: gix::ObjectId = match repo.find_reference(ref_name) {
         Ok(r) => r.into_fully_peeled_id()?.detach(),
         Err(_) => {
+            // Try parsing as a full or partial commit hash
             use gix::bstr::ByteSlice;
-            ref_name
+
+            // First try as full hash
+            if let Some(full_hash) = ref_name
                 .as_bytes()
                 .as_bstr()
                 .to_str()
                 .ok()
                 .and_then(|s| gix::hash::ObjectId::from_hex(s.as_bytes()).ok())
-                .context("failed to parse reference or commit hash")?
+            {
+                full_hash
+            } else {
+                // Try as prefix (short hash) using gix's prefix lookup
+                let prefix = gix::hash::Prefix::from_hex(ref_name)
+                    .context("failed to parse commit hash prefix")?;
+
+                // Use the objects database to find by prefix
+                let maybe_oid = repo.objects
+                    .lookup_prefix(prefix, None)
+                    .context("failed to lookup object by prefix")?;
+
+                match maybe_oid {
+                    Some(oid) => oid.map_err(|_| anyhow::anyhow!("ambiguous prefix '{}'", ref_name))?,
+                    None => bail!("no object found with prefix '{}'", ref_name),
+                }
+            }
         }
     };
 

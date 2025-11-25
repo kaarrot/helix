@@ -566,16 +566,64 @@ impl<'t> OverlayHighlighter<'t> {
             HighlightEvent::Push => self.style,
         };
 
-        // Get the diff.plus highlight ID to apply REVERSED modifier for char diffs
+        // Get the diff.plus highlight ID to apply subtle background for char diffs
         let diff_plus_highlight = self.theme.find_highlight_exact("diff.plus");
 
         self.style = highlights.fold(base, |acc, highlight| {
             let mut style = self.theme.highlight(highlight);
 
-            // Apply REVERSED modifier to diff.plus highlights for better visibility
-            // This makes char-level diff highlighting use background color instead of foreground
+            // Apply contrast-aware background to diff.plus highlights
             if Some(highlight) == diff_plus_highlight {
-                style.add_modifier = style.add_modifier | helix_view::graphics::Modifier::REVERSED;
+                use helix_view::graphics::Color;
+
+                // Get the diff color from the theme
+                let diff_color = style.fg.unwrap_or(Color::Green);
+
+                // Get the actual background color from the theme
+                let bg_style = self.theme.get("ui.background");
+                let theme_bg = bg_style.bg.unwrap_or(Color::Black);
+
+                // Calculate a contrasting but subtle background based on theme background
+                let subtle_bg = match theme_bg {
+                    Color::Rgb(bg_r, bg_g, bg_b) => {
+                        // Calculate luminance to determine if theme is light or dark
+                        let luminance = (0.299 * bg_r as f32 + 0.587 * bg_g as f32 + 0.114 * bg_b as f32) / 255.0;
+
+                        // Extract diff color RGB or use default
+                        let (diff_r, diff_g, diff_b) = match diff_color {
+                            Color::Rgb(r, g, b) => (r, g, b),
+                            Color::Green => (100, 180, 100),
+                            Color::LightGreen => (144, 238, 144),
+                            Color::Yellow => (200, 200, 100),
+                            _ => (100, 180, 100),
+                        };
+
+                        if luminance < 0.5 {
+                            // Dark theme: blend diff color with reduced intensity for subtlety
+                            // Reduce blend to 20-25% mix for darker, more subtle highlighting
+                            Color::Rgb(
+                                bg_r.saturating_add((diff_r as i16 - bg_r as i16).max(0).min(30) as u8),
+                                bg_g.saturating_add((diff_g as i16 - bg_g as i16).max(0).min(45) as u8),
+                                bg_b.saturating_add((diff_b as i16 - bg_b as i16).max(0).min(30) as u8),
+                            )
+                        } else {
+                            // Light theme: darken slightly with diff color tint (10-15% mix)
+                            Color::Rgb(
+                                bg_r.saturating_sub(((bg_r as i16 - diff_r as i16).max(0).min(255) / 8) as u8),
+                                bg_g.saturating_sub(((bg_g as i16 - diff_g as i16).max(0).min(255) / 8) as u8),
+                                bg_b.saturating_sub(((bg_b as i16 - diff_b as i16).max(0).min(255) / 8) as u8),
+                            )
+                        }
+                    }
+                    Color::Black => Color::Rgb(30, 50, 30), // Darker green tint for black bg
+                    Color::White => Color::Rgb(230, 245, 230), // Light green tint for white bg
+                    _ => Color::Rgb(30, 50, 30), // Darker default for dark themes
+                };
+
+                style.bg = Some(subtle_bg);
+
+                // Clear foreground to preserve syntax highlighting
+                style.fg = None;
             }
 
             acc.patch(style)

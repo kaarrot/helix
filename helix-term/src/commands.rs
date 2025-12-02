@@ -6610,7 +6610,11 @@ fn shell_stream(cx: &mut compositor::Context, cmd: &str, behavior: &ShellBehavio
             .args(&shell[1..])
             .arg(&cmd)
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stderr(Stdio::piped())
+            // Set PYTHONUNBUFFERED to force Python to use unbuffered output.
+            // This makes Python programs stream output line-by-line instead of
+            // buffering until the internal buffer (typically 4-8KB) is full.
+            .env("PYTHONUNBUFFERED", "1");
 
         if input.is_some() || cfg!(windows) {
             process.stdin(Stdio::piped());

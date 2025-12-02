@@ -6528,7 +6528,7 @@ fn shell_stream(cx: &mut compositor::Context, cmd: &str, behavior: &ShellBehavio
         return;
     }
 
-    use tokio::io::{AsyncBufReadExt, BufReader};
+    use tokio::io::AsyncReadExt;
     use std::process::Stdio;
     use tokio::process::Command;
 
@@ -6635,11 +6635,14 @@ fn shell_stream(cx: &mut compositor::Context, cmd: &str, behavior: &ShellBehavio
             }
         }
 
-        let stdout = child.stdout.take().unwrap();
-        let stderr = child.stderr.take().unwrap();
+        let mut stdout = child.stdout.take().unwrap();
+        let mut stderr = child.stderr.take().unwrap();
 
-        let mut stdout_reader = BufReader::new(stdout).lines();
-        let mut stderr_reader = BufReader::new(stderr).lines();
+        // Use small buffers to read chunks as they become available,
+        // rather than waiting for newlines. This allows real-time streaming
+        // of output from commands that use printf or don't flush lines.
+        let mut stdout_buffer = vec![0u8; 1024];
+        let mut stderr_buffer = vec![0u8; 1024];
 
         let mut current_pos = from;
         let mut has_error = false;
@@ -6677,6 +6680,8 @@ fn shell_stream(cx: &mut compositor::Context, cmd: &str, behavior: &ShellBehavio
         }).await;
 
         let mut cancelled = false;
+        let mut stdout_closed = false;
+        let mut stderr_closed = false;
         loop {
             tokio::select! {
                 _ = &mut cancel_rx => {
@@ -6685,18 +6690,25 @@ fn shell_stream(cx: &mut compositor::Context, cmd: &str, behavior: &ShellBehavio
                     let _ = child.kill().await;
                     break;
                 }
-                line_result = stdout_reader.next_line() => {
-                    match line_result {
-                        Ok(Some(line)) => {
-                            let mut output = line;
-                            output.push('\n');
-                            let output = Tendril::from(output);
+                bytes_read = stdout.read(&mut stdout_buffer), if !stdout_closed => {
+                    match bytes_read {
+                        Ok(0) => {
+                            // EOF on stdout
+                            stdout_closed = true;
+                            if stderr_closed {
+                                break;
+                            }
+                        }
+                        Ok(n) => {
+                            // Convert bytes to string, handling invalid UTF-8
+                            let chunk = String::from_utf8_lossy(&stdout_buffer[..n]);
+                            let output = Tendril::from(chunk.as_ref());
                             let output_len = output.chars().count();
 
                             let pos = current_pos;
                             current_pos += output_len;
 
-                            // Dispatch callback to insert the line
+                            // Dispatch callback to insert the chunk
                             job::dispatch(move |editor, _compositor| {
                                 let Some(doc) = editor.document_mut(doc_id) else {
                                     return;
@@ -6712,7 +6724,6 @@ fn shell_stream(cx: &mut compositor::Context, cmd: &str, behavior: &ShellBehavio
                                 editor.ensure_cursor_in_view(view_id);
                             }).await;
                         }
-                        Ok(None) => break,
                         Err(e) => {
                             error_message = format!("Error reading stdout: {}", e);
                             has_error = true;
@@ -6720,18 +6731,25 @@ fn shell_stream(cx: &mut compositor::Context, cmd: &str, behavior: &ShellBehavio
                         }
                     }
                 }
-                line_result = stderr_reader.next_line() => {
-                    match line_result {
-                        Ok(Some(line)) => {
-                            let mut output = line;
-                            output.push('\n');
-                            let output = Tendril::from(output);
+                bytes_read = stderr.read(&mut stderr_buffer), if !stderr_closed => {
+                    match bytes_read {
+                        Ok(0) => {
+                            // EOF on stderr
+                            stderr_closed = true;
+                            if stdout_closed {
+                                break;
+                            }
+                        }
+                        Ok(n) => {
+                            // Convert bytes to string, handling invalid UTF-8
+                            let chunk = String::from_utf8_lossy(&stderr_buffer[..n]);
+                            let output = Tendril::from(chunk.as_ref());
                             let output_len = output.chars().count();
 
                             let pos = current_pos;
                             current_pos += output_len;
 
-                            // Also insert stderr output
+                            // Dispatch callback to insert the chunk
                             job::dispatch(move |editor, _compositor| {
                                 let Some(doc) = editor.document_mut(doc_id) else {
                                     return;
@@ -6746,7 +6764,6 @@ fn shell_stream(cx: &mut compositor::Context, cmd: &str, behavior: &ShellBehavio
                                 editor.ensure_cursor_in_view(view_id);
                             }).await;
                         }
-                        Ok(None) => {}
                         Err(e) => {
                             error_message = format!("Error reading stderr: {}", e);
                             has_error = true;

@@ -136,6 +136,7 @@ where
 {
     match element_id {
         helix_view::editor::StatusLineElement::Mode => render_mode,
+        helix_view::editor::StatusLineElement::DiffMergeIndicator => render_diff_merge_indicator,
         helix_view::editor::StatusLineElement::Spinner => render_lsp_spinner,
         helix_view::editor::StatusLineElement::FileBaseName => render_file_base_name,
         helix_view::editor::StatusLineElement::FileName => render_file_name,
@@ -193,6 +194,33 @@ where
         Style::default()
     };
     write(context, Span::styled(content, style));
+}
+
+fn render_diff_merge_indicator<'a, F>(context: &mut RenderContext<'a>, write: F)
+where
+    F: Fn(&mut RenderContext<'a>, Span<'a>) + Copy,
+{
+    let view_id = context.view.id;
+
+    // Check if we're in a diff view
+    if let Some(diff_state) = context.editor.diff_views.get(&view_id) {
+        let content = format!(" [DIFF: {}] ", diff_state.git_ref);
+        let style = context.editor.theme.get("ui.statusline.mode.diff");
+        write(context, Span::styled(content, style));
+        return;
+    }
+
+    // Check if we're in a merge view
+    if let Some(merge_state) = context.editor.merge_views.get(&view_id) {
+        let resolved = merge_state.resolved_count();
+        let total = merge_state.conflicts.len();
+        let content = format!(" [MERGE: {}/{}] ", resolved, total);
+        let style = context.editor.theme.get("ui.statusline.mode.merge");
+        write(context, Span::styled(content, style));
+        return;
+    }
+
+    // Not in diff or merge view, render nothing
 }
 
 // TODO think about handling multiple language servers

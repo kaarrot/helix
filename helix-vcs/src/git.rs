@@ -143,6 +143,75 @@ pub fn get_current_head_name(file: &Path) -> Result<Arc<ArcSwap<Box<str>>>> {
     Ok(Arc::new(ArcSwap::from_pointee(name.into_boxed_str())))
 }
 
+/// Get the OURS and THEIRS versions of a conflicted file during a merge.
+///
+/// Returns (ours_content, theirs_content) where:
+/// - ours_content: Stage 2 in git index (current branch/HEAD)
+/// - theirs_content: Stage 3 in git index (incoming branch being merged)
+pub fn get_merge_versions(file: &Path) -> Result<(Vec<u8>, Vec<u8>)> {
+    debug_assert!(!file.exists() || file.is_file());
+    debug_assert!(file.is_absolute());
+    let file = gix::path::realpath(file).context("resolve symlinks")?;
+
+    let repo_dir = get_repo_dir(&file)?;
+    let repo = open_repo(repo_dir)
+        .context("failed to open git repo")?
+        .to_thread_local();
+
+    let work_dir = repo
+        .workdir()
+        .ok_or_else(|| anyhow::anyhow!("working tree not found"))?;
+    let rela_path = file.strip_prefix(work_dir)?;
+    let rela_path = gix::path::try_into_bstr(rela_path)?;
+
+    // Access git index to get staged versions
+    let index = repo.index_or_load_from_head()?;
+
+    // Find stage 2 (OURS) and stage 3 (THEIRS) entries
+    let mut ours_oid = None;
+    let mut theirs_oid = None;
+
+    for entry in index.entries() {
+        if entry.path(&index) == rela_path.as_ref() {
+            let stage = entry.stage();
+            match stage {
+                gix::index::entry::Stage::Ours => ours_oid = Some(entry.id),
+                gix::index::entry::Stage::Theirs => theirs_oid = Some(entry.id),
+                _ => {}
+            }
+        }
+    }
+
+    let ours_oid = ours_oid.ok_or_else(|| {
+        anyhow::anyhow!("OURS version (stage 2) not found in index for conflicted file")
+    })?;
+    let theirs_oid = theirs_oid.ok_or_else(|| {
+        anyhow::anyhow!("THEIRS version (stage 3) not found in index for conflicted file")
+    })?;
+
+    // Read the blob contents
+    let ours_object = repo.find_object(ours_oid)?;
+    let theirs_object = repo.find_object(theirs_oid)?;
+
+    let ours_data = ours_object.detach().data;
+    let theirs_data = theirs_object.detach().data;
+
+    // Apply git filters (like crlf conversion) to both versions
+    let (mut pipeline, _) = repo.filter_pipeline(None)?;
+
+    let mut ours_worktree = pipeline.convert_to_worktree(&ours_data, rela_path.as_ref(), Delay::Forbid)?;
+    let mut ours_buf = Vec::with_capacity(ours_data.len());
+    ours_worktree.read_to_end(&mut ours_buf)?;
+
+    // Re-create pipeline for theirs to avoid borrow issues
+    let (mut pipeline2, _) = repo.filter_pipeline(None)?;
+    let mut theirs_worktree = pipeline2.convert_to_worktree(&theirs_data, rela_path.as_ref(), Delay::Forbid)?;
+    let mut theirs_buf = Vec::with_capacity(theirs_data.len());
+    theirs_worktree.read_to_end(&mut theirs_buf)?;
+
+    Ok((ours_buf, theirs_buf))
+}
+
 pub fn for_each_changed_file(cwd: &Path, f: impl Fn(Result<FileChange>) -> bool) -> Result<()> {
     status(&open_repo(cwd)?.to_thread_local(), f)
 }

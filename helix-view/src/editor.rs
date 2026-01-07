@@ -1,6 +1,7 @@
 use crate::{
     annotations::diagnostics::{DiagnosticFilter, InlineDiagnosticsConfig},
     clipboard::ClipboardProvider,
+    diff_view::DiffViewState,
     document::{
         DocumentOpenError, DocumentSavedEventFuture, DocumentSavedEventResult, Mode, SavePoint,
     },
@@ -9,6 +10,7 @@ use crate::{
     handlers::Handlers,
     info::Info,
     input::KeyEvent,
+    merge_view::MergeViewState,
     register::Registers,
     theme::{self, Theme},
     tree::{self, Tree},
@@ -39,7 +41,7 @@ use tokio::{
     time::{sleep, Duration, Instant, Sleep},
 };
 
-use anyhow::{anyhow, bail, Error};
+use anyhow::{anyhow, bail, Context as _, Error};
 
 pub use helix_core::diagnostic::Severity;
 use helix_core::{
@@ -623,6 +625,9 @@ pub enum StatusLineElement {
     /// The editor mode (Normal, Insert, Visual/Selection)
     Mode,
 
+    /// Diff/merge view indicator
+    DiffMergeIndicator,
+
     /// The LSP activity spinner
     Spinner,
 
@@ -1173,6 +1178,11 @@ pub struct Editor {
     pub debug_adapters: dap::registry::Registry,
     pub breakpoints: HashMap<PathBuf, Vec<Breakpoint>>,
 
+    /// Active side-by-side diff view sessions, keyed by view ID
+    pub diff_views: HashMap<ViewId, DiffViewState>,
+    /// Active 3-way merge sessions, keyed by view ID
+    pub merge_views: HashMap<ViewId, MergeViewState>,
+
     pub syn_loader: Arc<ArcSwap<syntax::Loader>>,
     pub theme_loader: Arc<theme::Loader>,
     /// last_theme is used for theme previews. We store the current theme here,
@@ -1317,6 +1327,8 @@ impl Editor {
             diff_providers: DiffProviderRegistry::default(),
             debug_adapters: dap::registry::Registry::new(),
             breakpoints: HashMap::new(),
+            diff_views: HashMap::new(),
+            merge_views: HashMap::new(),
             syn_loader,
             theme_loader,
             last_theme: None,
@@ -2357,6 +2369,298 @@ impl Editor {
 
     pub fn get_last_cwd(&mut self) -> Option<&Path> {
         self.last_cwd.as_deref()
+    }
+
+    /// Open a side-by-side diff view for the given file.
+    ///
+    /// Creates a vertical split with:
+    /// - Left pane: Read-only git revision (base)
+    /// - Right pane: Editable working copy
+    pub fn open_diff_view(&mut self, path: &Path, git_ref: &str) -> Result<(), Error> {
+        use crate::diff_view::DiffViewState;
+
+        let path = helix_stdx::path::canonicalize(path);
+
+        // 1. Open or get existing working document
+        let working_doc_id = if let Some(id) = self.document_id_by_path(&path) {
+            id
+        } else {
+            // Open the file if not already open
+            self.open(&path, Action::Load)?
+        };
+
+        // 2. Fetch git base content
+        let base_content = helix_vcs::git::get_diff_base_from_ref(&path, git_ref)
+            .map_err(|e| anyhow::anyhow!("Failed to fetch git revision: {}", e))?;
+
+        // 3. Create virtual base document
+        let base_doc = Document::from_git_revision(
+            base_content,
+            &path,
+            git_ref,
+            self.config.clone(),
+            self.syn_loader.clone(),
+        )?;
+        let base_doc_id = self.new_document(base_doc);
+
+        // 4. Link documents
+        if let Some(working_doc) = self.documents.get_mut(&working_doc_id) {
+            working_doc.linked_diff_doc = Some(base_doc_id);
+            working_doc.char_diff_enabled = true;
+        }
+        if let Some(base_doc) = self.documents.get_mut(&base_doc_id) {
+            base_doc.linked_diff_doc = Some(working_doc_id);
+        }
+
+        // 5. Create split layout: base (left) | working (right)
+        // First, switch to base document
+        self.switch(base_doc_id, Action::Replace);
+        let base_view_id = self.tree.focus;
+
+        // Then create vertical split for working document
+        self.switch(working_doc_id, Action::VerticalSplit);
+        let working_view_id = self.tree.focus;
+
+        // 6. Register diff state for both views
+        let diff_state = DiffViewState::new(
+            base_doc_id,
+            working_doc_id,
+            base_view_id,
+            working_view_id,
+            git_ref.to_string(),
+        );
+
+        self.diff_views.insert(base_view_id, diff_state.clone());
+        self.diff_views.insert(working_view_id, diff_state);
+
+        Ok(())
+    }
+
+    /// Close a diff view and clean up associated state.
+    pub fn close_diff_view(&mut self, view_id: ViewId) -> bool {
+        if let Some(diff_state) = self.diff_views.remove(&view_id) {
+            // Remove from both view entries
+            self.diff_views.remove(&diff_state.base_view_id);
+            self.diff_views.remove(&diff_state.working_view_id);
+
+            // Clear linked doc references
+            if let Some(base_doc) = self.documents.get_mut(&diff_state.base_doc_id) {
+                base_doc.linked_diff_doc = None;
+            }
+            if let Some(working_doc) = self.documents.get_mut(&diff_state.working_doc_id) {
+                working_doc.linked_diff_doc = None;
+                working_doc.char_diff_enabled = false;
+            }
+
+            // Close the virtual base document
+            let _ = self.close_document(diff_state.base_doc_id, true);
+
+            // Close the base view - check if it exists first
+            if self.tree.contains(diff_state.base_view_id) {
+                self.close(diff_state.base_view_id);
+            }
+
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Synchronize scroll position to linked diff views.
+    pub fn sync_scroll_to_linked_views(&mut self, source_view_id: ViewId) {
+        // Check if this view is part of a 2-way diff session
+        if let Some(diff_state) = self.diff_views.get(&source_view_id).cloned() {
+            if !diff_state.sync_scroll {
+                return;
+            }
+
+            // Determine which is the source and target
+            let (target_view_id, target_doc_id, source_doc_id) = if source_view_id == diff_state.base_view_id {
+                (diff_state.working_view_id, diff_state.working_doc_id, diff_state.base_doc_id)
+            } else {
+                (diff_state.base_view_id, diff_state.base_doc_id, diff_state.working_doc_id)
+            };
+
+            // Get source scroll position
+            if let Some(source_doc) = self.documents.get(&source_doc_id) {
+                let source_offset = source_doc.view_offset(source_view_id);
+
+                // Set target scroll position
+                // For now, use simple line-based alignment
+                // In the future, we can use DiffHandle hunks for smarter alignment
+                if let Some(target_doc) = self.documents.get_mut(&target_doc_id) {
+                    target_doc.set_view_offset(target_view_id, source_offset);
+                }
+            }
+            return;
+        }
+
+        // Check if this view is part of a 3-way merge session
+        if let Some(merge_state) = self.merge_views.get(&source_view_id).cloned() {
+            if !merge_state.sync_scroll {
+                return;
+            }
+
+            // Only sync between OURS and THEIRS panes (not RESULT)
+            let (target_view_id, target_doc_id, source_doc_id) =
+                if source_view_id == merge_state.ours_view_id {
+                    (merge_state.theirs_view_id, merge_state.theirs_doc_id, merge_state.ours_doc_id)
+                } else if source_view_id == merge_state.theirs_view_id {
+                    (merge_state.ours_view_id, merge_state.ours_doc_id, merge_state.theirs_doc_id)
+                } else {
+                    // RESULT pane - don't sync
+                    return;
+                };
+
+            // Get source scroll position and apply to target
+            if let Some(source_doc) = self.documents.get(&source_doc_id) {
+                let source_offset = source_doc.view_offset(source_view_id);
+
+                if let Some(target_doc) = self.documents.get_mut(&target_doc_id) {
+                    target_doc.set_view_offset(target_view_id, source_offset);
+                }
+            }
+        }
+    }
+
+    /// Open a 3-way merge view for resolving conflicts.
+    ///
+    /// Creates a 3-pane layout:
+    /// - Top-left: OURS version (read-only)
+    /// - Top-right: THEIRS version (read-only)
+    /// - Bottom: Merge result (editable)
+    pub fn open_merge_view(&mut self, path: &Path) -> Result<(), Error> {
+        use crate::merge_view::{parse_conflicts, extract_conflict_versions, MergeViewState};
+
+        let path = helix_stdx::path::canonicalize(path);
+
+        // 1. Read the conflicted file
+        let result_doc = Document::open(
+            &path,
+            None,
+            true,
+            self.config.clone(),
+            self.syn_loader.clone(),
+        )?;
+
+        // 2. Parse conflict markers
+        let conflicts = parse_conflicts(result_doc.text());
+        if conflicts.is_empty() {
+            bail!("No conflict markers found in file");
+        }
+
+        // 3. Fetch OURS and THEIRS versions from git index
+        let (ours_content, theirs_content) = helix_vcs::git::get_merge_versions(&path)
+            .context("Failed to fetch merge versions from git")?;
+
+        // Alternatively, extract from conflict markers if git fails
+        let (ours_text, theirs_text) = if ours_content.is_empty() || theirs_content.is_empty() {
+            extract_conflict_versions(result_doc.text(), &conflicts)
+        } else {
+            (
+                String::from_utf8_lossy(&ours_content).to_string(),
+                String::from_utf8_lossy(&theirs_content).to_string(),
+            )
+        };
+
+        // 4. Create virtual documents for OURS and THEIRS
+        // Save bytes for diff setup (needed after the text is consumed)
+        let ours_bytes = ours_text.as_bytes().to_vec();
+        let theirs_bytes = theirs_text.as_bytes().to_vec();
+
+        let ours_doc = Document::from_git_revision(
+            ours_text.into_bytes(),
+            &path,
+            "HEAD",
+            self.config.clone(),
+            self.syn_loader.clone(),
+        )?;
+        let ours_doc_id = self.new_document(ours_doc);
+
+        let theirs_doc = Document::from_git_revision(
+            theirs_text.into_bytes(),
+            &path,
+            "incoming",
+            self.config.clone(),
+            self.syn_loader.clone(),
+        )?;
+        let theirs_doc_id = self.new_document(theirs_doc);
+
+        // 5. Create result document (editable conflicted file)
+        let result_doc_id = self.new_document(result_doc);
+
+        // 5b. Set up diff highlighting for OURS vs THEIRS
+        // OURS shows diffs compared to THEIRS and vice versa
+        if let Some(ours_doc) = self.documents.get_mut(&ours_doc_id) {
+            ours_doc.set_diff_base(theirs_bytes.clone());
+            ours_doc.char_diff_enabled = true;
+        }
+        if let Some(theirs_doc) = self.documents.get_mut(&theirs_doc_id) {
+            theirs_doc.set_diff_base(ours_bytes);
+            theirs_doc.char_diff_enabled = true;
+        }
+
+        // 6. Create 3-pane layout
+        // First, create the RESULT view at bottom
+        self.switch(result_doc_id, Action::Replace);
+        let result_view_id = self.tree.focus;
+
+        // Split horizontally to create top section
+        self.switch(ours_doc_id, Action::HorizontalSplit);
+        let ours_view_id = self.tree.focus;
+
+        // Split vertically within top section for OURS | THEIRS
+        self.switch(theirs_doc_id, Action::VerticalSplit);
+        let theirs_view_id = self.tree.focus;
+
+        // 7. Register merge state
+        let merge_state = MergeViewState::new(
+            ours_doc_id,
+            theirs_doc_id,
+            result_doc_id,
+            ours_view_id,
+            theirs_view_id,
+            result_view_id,
+            conflicts,
+            path.to_path_buf(),
+        );
+
+        self.merge_views.insert(ours_view_id, merge_state.clone());
+        self.merge_views.insert(theirs_view_id, merge_state.clone());
+        self.merge_views.insert(result_view_id, merge_state);
+
+        // Focus on the RESULT pane (the editable conflict buffer)
+        self.tree.focus = result_view_id;
+
+        Ok(())
+    }
+
+    /// Close a merge view and clean up associated state.
+    pub fn close_merge_view(&mut self, view_id: ViewId) -> bool {
+        if let Some(merge_state) = self.merge_views.remove(&view_id) {
+            // Remove from all view entries
+            self.merge_views.remove(&merge_state.ours_view_id);
+            self.merge_views.remove(&merge_state.theirs_view_id);
+            self.merge_views.remove(&merge_state.result_view_id);
+
+            // Close virtual documents for OURS and THEIRS
+            let _ = self.close_document(merge_state.ours_doc_id, true);
+            let _ = self.close_document(merge_state.theirs_doc_id, true);
+
+            // Close OURS and THEIRS views - check if they exist first
+            // (closing one might remove the other from the tree)
+            if self.tree.contains(merge_state.ours_view_id) {
+                self.close(merge_state.ours_view_id);
+            }
+            if self.tree.contains(merge_state.theirs_view_id) {
+                self.close(merge_state.theirs_view_id);
+            }
+            // Keep result view open
+
+            true
+        } else {
+            false
+        }
     }
 }
 

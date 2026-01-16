@@ -238,6 +238,14 @@ impl<T, D> Column<T, D> {
 type DynQueryCallback<T, D> =
     fn(&str, &mut Editor, Arc<D>, &Injector<T, D>) -> BoxFuture<'static, anyhow::Result<()>>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PickerSortMode {
+    /// Normal fuzzy match score ranking (Nucleo's default)
+    Score,
+    /// Sort by file modification time (most recent first)
+    Modified,
+}
+
 pub struct Picker<T: 'static + Send + Sync, D: 'static> {
     columns: Arc<[Column<T, D>]>,
     primary_column: usize,
@@ -269,6 +277,10 @@ pub struct Picker<T: 'static + Send + Sync, D: 'static> {
     /// An event handler for syntax highlighting the currently previewed file.
     preview_highlight_handler: Sender<Arc<Path>>,
     dynamic_query_handler: Option<Sender<DynamicQueryChange>>,
+    /// Current sort mode for the picker
+    pub sort_mode: PickerSortMode,
+    /// Cache of file modification times for timestamp sorting (thread-safe for background population)
+    pub mtime_cache: std::sync::Arc<std::sync::Mutex<HashMap<std::path::PathBuf, std::time::SystemTime>>>,
 }
 
 impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
@@ -394,6 +406,8 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             file_fn: None,
             preview_highlight_handler: PreviewHighlightHandler::<T, D>::default().spawn(),
             dynamic_query_handler: None,
+            sort_mode: PickerSortMode::Score,  // Default to normal fuzzy scoring
+            mtime_cache: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -522,6 +536,16 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
 
     pub fn toggle_preview(&mut self) {
         self.show_preview = !self.show_preview;
+    }
+
+    /// Toggle between timestamp-based and fuzzy-score-based sorting
+    pub fn toggle_sort_mode(&mut self) {
+        self.sort_mode = match self.sort_mode {
+            PickerSortMode::Score => PickerSortMode::Modified,
+            PickerSortMode::Modified => PickerSortMode::Score,
+        };
+        // Reset cursor to top when changing sort mode so preview updates correctly
+        self.cursor = 0;
     }
 
     fn prompt_handle_event(&mut self, event: &Event, cx: &mut Context) -> EventResult {
@@ -708,10 +732,16 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
 
         // -- Render the input bar:
 
+        let has_mtime_cache = self.mtime_cache.lock().map(|c| !c.is_empty()).unwrap_or(false);
         let count = format!(
-            "{}{}/{}",
+            "{}{}{}/{}",
             if status.running || self.matcher.active_injectors() > 0 {
                 "(running) "
+            } else {
+                ""
+            },
+            if self.sort_mode == PickerSortMode::Modified && has_mtime_cache {
+                "[mtime] "
             } else {
                 ""
             },
@@ -758,7 +788,33 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             matcher.config.set_match_paths()
         }
 
-        let options = snapshot.matched_items(offset..end).map(|item| {
+        // Collect matched items into a Vec for potential re-sorting
+        let mut items: Vec<_> = snapshot.matched_items(offset..end).collect();
+
+        // Apply timestamp sort if in Modified mode and mtime cache is available
+        if self.sort_mode == PickerSortMode::Modified {
+            if let Ok(cache) = self.mtime_cache.lock() {
+                if !cache.is_empty() {
+                    use std::any::Any;
+                    items.sort_by_cached_key(|item| {
+                        // Try to extract PathBuf from item.data
+                        // This is safe because we only populate mtime_cache for file pickers
+                        if let Some(path) = (item.data as &dyn Any).downcast_ref::<std::path::PathBuf>() {
+                            std::cmp::Reverse(
+                                cache
+                                    .get(path)
+                                    .copied()
+                                    .unwrap_or(std::time::UNIX_EPOCH)
+                            )
+                        } else {
+                            std::cmp::Reverse(std::time::UNIX_EPOCH)
+                        }
+                    });
+                }
+            }
+        }
+
+        let options = items.into_iter().map(|item| {
             let mut widths = self.widths.iter_mut();
             let mut matcher_index = 0;
 
@@ -1142,6 +1198,9 @@ impl<I: 'static + Send + Sync, D: 'static + Send + Sync> Component for Picker<I,
             }
             ctrl!('t') => {
                 self.toggle_preview();
+            }
+            ctrl!('o') => {
+                self.toggle_sort_mode();
             }
             _ => {
                 self.prompt_handle_event(event, ctx);

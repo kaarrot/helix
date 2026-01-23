@@ -156,8 +156,6 @@ pub struct Document {
 
     path: Option<PathBuf>,
     relative_path: OnceCell<Option<PathBuf>>,
-    /// Custom name for scratch buffers (when path is None)
-    scratch_buffer_name: Option<String>,
     encoding: &'static encoding::Encoding,
     has_bom: bool,
 
@@ -760,7 +758,6 @@ impl Document {
             syn_loader,
             previous_diagnostic_id: None,
             pull_diagnostic_controller: TaskController::new(),
-            scratch_buffer_name: None,
         }
     }
 

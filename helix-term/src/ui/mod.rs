@@ -282,8 +282,20 @@ pub fn file_picker(editor: &Editor, root: PathBuf) -> FilePicker {
     let injector = picker.injector();
     let timeout = std::time::Instant::now() + std::time::Duration::from_millis(30);
 
+    // Clone the mtime cache Arc for background thread
+    let mtime_cache = picker.mtime_cache.clone();
+
     let mut hit_timeout = false;
     for file in &mut files {
+        // Cache mtime as we inject files (on main thread, within timeout)
+        if let Ok(metadata) = file.metadata() {
+            if let Ok(mtime) = metadata.modified() {
+                if let Ok(mut cache) = mtime_cache.lock() {
+                    cache.insert(file.clone(), mtime);
+                }
+            }
+        }
+
         if injector.push(file).is_err() {
             break;
         }
@@ -292,15 +304,27 @@ pub fn file_picker(editor: &Editor, root: PathBuf) -> FilePicker {
             break;
         }
     }
+
+    // Continue in background if needed (restores lazy loading)
     if hit_timeout {
         std::thread::spawn(move || {
             for file in files {
+                // Cache mtime in background thread
+                if let Ok(metadata) = file.metadata() {
+                    if let Ok(mtime) = metadata.modified() {
+                        if let Ok(mut cache) = mtime_cache.lock() {
+                            cache.insert(file.clone(), mtime);
+                        }
+                    }
+                }
+
                 if injector.push(file).is_err() {
                     break;
                 }
             }
         });
     }
+
     picker
 }
 

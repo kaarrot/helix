@@ -571,6 +571,49 @@ fn new_file(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> an
     Ok(())
 }
 
+fn copy_path_to_clipboard(
+    cx: &mut compositor::Context,
+    args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+
+    let doc = doc!(cx.editor);
+
+    // Determine which path to copy based on the argument
+    let use_absolute = args.first().map(|s| s == "absolute").unwrap_or(false);
+
+    let path_str = if use_absolute {
+        // Use absolute path
+        if let Some(path) = doc.path() {
+            path.to_string_lossy().to_string()
+        } else {
+            return Err(anyhow::anyhow!("No file path available (scratch buffer)"));
+        }
+    } else {
+        // Use relative path (default)
+        if let Some(path) = doc.relative_path() {
+            path.to_string_lossy().to_string()
+        } else if let Some(path) = doc.path() {
+            path.to_string_lossy().to_string()
+        } else {
+            return Err(anyhow::anyhow!("No file path available (scratch buffer)"));
+        }
+    };
+
+    // Write to system clipboard (register '+')
+    match cx.editor.registers.write('+', vec![path_str.clone()]) {
+        Ok(_) => {
+            cx.editor
+                .set_status(format!("Copied path to clipboard: {}", path_str));
+            Ok(())
+        }
+        Err(err) => Err(anyhow::anyhow!("Failed to copy to clipboard: {}", err)),
+    }
+}
+
 fn format(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> anyhow::Result<()> {
     if event != PromptEvent::Validate {
         return Ok(());
@@ -1472,6 +1515,14 @@ fn reload_all(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> 
 
     for (doc_id, view_ids) in docs_view_ids {
         let doc = doc_mut!(cx.editor, &doc_id);
+
+        // Skip scratch buffers (documents without a file path)
+        // Also skip buffers that haven't been saved to disk yet
+        match doc.path() {
+            None => continue, // Skip scratch buffers
+            Some(path) if !path.exists() => continue, // Skip unsaved files
+            Some(_) => {} // File exists, proceed with reload
+        }
 
         // Every doc is guaranteed to have at least 1 view at this point.
         let view = view_mut!(cx.editor, view_ids[0]);
@@ -2451,6 +2502,82 @@ fn insert_output(
     Ok(())
 }
 
+fn insert_stream_output(
+    cx: &mut compositor::Context,
+    args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+
+    // Check if a stream is already running
+    let process_info = {
+        let processes = STREAM_PROCESSES.lock().unwrap();
+        processes.as_ref().map(|p| {
+            (p.stdin_tx.clone(), p.buffer_name.clone(), p.doc_id, p.view_id)
+        })
+    };
+
+    // If stream is running and args provided, send input to it
+    if let Some((stdin_tx, buffer_name, doc_id, view_id)) = process_info {
+        if !args.is_empty() {
+            let input = args.join(" ");
+            send_stream_input(stdin_tx, input, doc_id, view_id, &buffer_name, cx);
+            return Ok(());
+        } else {
+            // No args - show prompt for input
+            show_stream_input_prompt(cx, stdin_tx, doc_id, view_id, buffer_name);
+            return Ok(());
+        }
+    }
+
+    // No stream running - start a new stream
+    // If no args, show prompt with history
+    if args.is_empty() {
+        show_new_stream_prompt(cx);
+        return Ok(());
+    }
+
+    // If current buffer is file-backed, try to switch to last stream buffer
+    {
+        let (_, doc) = current!(cx.editor);
+        if doc.path().is_some() {
+            // Current buffer is file-backed, check for last stream buffer
+            let last_doc_id = { LAST_STREAM_DOC_ID.lock().unwrap().clone() };
+            if let Some(doc_id) = last_doc_id {
+                // Check if that document still exists
+                if cx.editor.document(doc_id).is_some() {
+                    cx.editor.switch(doc_id, Action::Replace);
+                }
+            }
+        }
+    }
+
+    // Move cursor to end of buffer before running command
+    {
+        let (view, doc) = current!(cx.editor);
+        let end = doc.text().len_chars();
+        doc.set_selection(view.id, Selection::point(end));
+    }
+
+    shell_stream(cx, &args.join(" "), &ShellBehavior::Insert);
+    Ok(())
+}
+
+fn cancel_stream(
+    cx: &mut compositor::Context,
+    _args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+
+    cancel_stream_command(cx);
+    Ok(())
+}
+
 fn pipe_to(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow::Result<()> {
     pipe_impl(cx, args, event, &ShellBehavior::Ignore)
 }
@@ -3228,6 +3355,17 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         },
     },
     TypableCommand {
+        name: "copy-path",
+        aliases: &["cp"],
+        doc: "Copy the current file path to the system clipboard. Use ':copy-path absolute' for absolute path, or no argument for relative path.",
+        fun: copy_path_to_clipboard,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(1)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
         name: "format",
         aliases: &["fmt"],
         doc: "Format the file using an external formatter or language server.",
@@ -3933,6 +4071,29 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         fun: insert_output,
         completer: SHELL_COMPLETER,
         signature: SHELL_SIGNATURE,
+    },
+    TypableCommand {
+        name: "insert-stream-output",
+        aliases: &["\\"],
+        doc: "Run shell command, streaming output in real-time. With no args, shows prompt with history.",
+        fun: insert_stream_output,
+        completer: SHELL_COMPLETER,
+        signature: Signature {
+            positionals: (0, Some(2)),  // Allow 0 args for history prompt
+            raw_after: Some(1),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "cancel-stream",
+        aliases: &["\\\\"],
+        doc: "Cancel the currently running stream process.",
+        fun: cancel_stream,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
+            ..Signature::DEFAULT
+        },
     },
     TypableCommand {
         name: "append-output",

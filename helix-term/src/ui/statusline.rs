@@ -59,10 +59,11 @@ pub fn render(context: &mut RenderContext, viewport: Rect, surface: &mut Surface
 
     surface.set_style(viewport.with_height(1), base_style);
 
-    // Left side of the status line.
+    // Build all parts first before rendering
 
     let config = context.editor.config();
 
+    // Left side of the status line.
     for element_id in &config.statusline.left {
         let render = get_render_function(*element_id);
         (render)(context, |context, span| {
@@ -70,21 +71,25 @@ pub fn render(context: &mut RenderContext, viewport: Rect, surface: &mut Surface
         });
     }
 
-    surface.set_spans(
-        viewport.x,
-        viewport.y,
-        &context.parts.left,
-        context.parts.left.width() as u16,
-    );
-
     // Right side of the status line.
-
     for element_id in &config.statusline.right {
         let render = get_render_function(*element_id);
         (render)(context, |context, span| {
             append(&mut context.parts.right, span, base_style)
         })
     }
+
+    // Calculate available width for the left section, accounting for right section
+    let right_reserved_width = context.parts.right.width() as u16;
+    let left_max_width = viewport.width.saturating_sub(right_reserved_width + 1);
+
+    // Use set_spans_truncated to show the end of long paths with ellipsis at the beginning
+    surface.set_spans_truncated(
+        viewport.x,
+        viewport.y,
+        &context.parts.left,
+        left_max_width,
+    );
 
     surface.set_spans(
         viewport.x

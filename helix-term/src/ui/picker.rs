@@ -238,6 +238,14 @@ impl<T, D> Column<T, D> {
 type DynQueryCallback<T, D> =
     fn(&str, &mut Editor, Arc<D>, &Injector<T, D>) -> BoxFuture<'static, anyhow::Result<()>>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PickerSortMode {
+    /// Normal fuzzy match score ranking (Nucleo's default)
+    Score,
+    /// Sort by file modification time (most recent first)
+    Modified,
+}
+
 pub struct Picker<T: 'static + Send + Sync, D: 'static> {
     columns: Arc<[Column<T, D>]>,
     primary_column: usize,
@@ -269,6 +277,12 @@ pub struct Picker<T: 'static + Send + Sync, D: 'static> {
     /// An event handler for syntax highlighting the currently previewed file.
     preview_highlight_handler: Sender<Arc<Path>>,
     dynamic_query_handler: Option<Sender<DynamicQueryChange>>,
+    /// Current sort mode for the picker
+    pub sort_mode: PickerSortMode,
+    /// Cache of file modification times for timestamp sorting (thread-safe for background population)
+    pub mtime_cache: std::sync::Arc<std::sync::Mutex<HashMap<std::path::PathBuf, std::time::SystemTime>>>,
+    /// Mapping from display cursor position to nucleo index (when sorted)
+    pub sorted_indices: Vec<u32>,
 }
 
 impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
@@ -394,6 +408,9 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             file_fn: None,
             preview_highlight_handler: PreviewHighlightHandler::<T, D>::default().spawn(),
             dynamic_query_handler: None,
+            sort_mode: PickerSortMode::Score,  // Default to normal fuzzy scoring
+            mtime_cache: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sorted_indices: Vec::new(),
         }
     }
 
@@ -499,10 +516,35 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
     }
 
     pub fn selection(&self) -> Option<&T> {
-        self.matcher
-            .snapshot()
-            .get_matched_item(self.cursor)
-            .map(|item| item.data)
+        let snapshot = self.matcher.snapshot();
+
+        // If we're in timestamp sort mode and have a sorted index mapping, use it
+        if self.sort_mode == PickerSortMode::Modified && !self.sorted_indices.is_empty() {
+            // The sorted_indices are relative to the current page offset
+            // We stored indices as (nucleo_idx - offset), so cursor position in page
+            // directly indexes into sorted_indices
+            // Note: This only works while we're on the same page that was rendered
+            // If cursor moves to a new page, sorted_indices will be rebuilt during next render
+            let cursor_in_page = (self.cursor as usize) % self.sorted_indices.len().max(1);
+            let nucleo_idx_relative = *self.sorted_indices.get(cursor_in_page)?;
+
+            // Calculate page offset (same logic as render_picker)
+            // We need to figure out how many rows per page - but we don't have area here
+            // For now, use a simple approach: if cursor is within sorted_indices length,
+            // the mapping should work. Otherwise fall back to unsorted.
+            if cursor_in_page < self.sorted_indices.len() {
+                // Calculate actual offset by looking at cursor position
+                let offset = self.cursor - (cursor_in_page as u32);
+                let nucleo_idx = nucleo_idx_relative + offset;
+                snapshot.get_matched_item(nucleo_idx).map(|item| item.data)
+            } else {
+                // Cursor moved to a different page, use unsorted until next render
+                snapshot.get_matched_item(self.cursor).map(|item| item.data)
+            }
+        } else {
+            // Normal fuzzy-score sorting: use cursor directly
+            snapshot.get_matched_item(self.cursor).map(|item| item.data)
+        }
     }
 
     fn primary_query(&self) -> Arc<str> {
@@ -522,6 +564,16 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
 
     pub fn toggle_preview(&mut self) {
         self.show_preview = !self.show_preview;
+    }
+
+    /// Toggle between timestamp-based and fuzzy-score-based sorting
+    pub fn toggle_sort_mode(&mut self) {
+        self.sort_mode = match self.sort_mode {
+            PickerSortMode::Score => PickerSortMode::Modified,
+            PickerSortMode::Modified => PickerSortMode::Score,
+        };
+        // Reset cursor to top when changing sort mode so preview updates correctly
+        self.cursor = 0;
     }
 
     fn prompt_handle_event(&mut self, event: &Event, cx: &mut Context) -> EventResult {
@@ -708,10 +760,16 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
 
         // -- Render the input bar:
 
+        let has_mtime_cache = self.mtime_cache.lock().map(|c| !c.is_empty()).unwrap_or(false);
         let count = format!(
-            "{}{}/{}",
+            "{}{}{}/{}",
             if status.running || self.matcher.active_injectors() > 0 {
                 "(running) "
+            } else {
+                ""
+            },
+            if self.sort_mode == PickerSortMode::Modified && has_mtime_cache {
+                "[mtime] "
             } else {
                 ""
             },
@@ -758,7 +816,52 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             matcher.config.set_match_paths()
         }
 
-        let options = snapshot.matched_items(offset..end).map(|item| {
+        // Collect matched items with their original indices for potential re-sorting
+        let mut items_with_idx: Vec<_> = snapshot
+            .matched_items(offset..end)
+            .enumerate()
+            .map(|(idx, item)| (offset + idx as u32, item))
+            .collect();
+
+        // Apply timestamp sort if in Modified mode and mtime cache is available
+        if self.sort_mode == PickerSortMode::Modified {
+            if let Ok(cache) = self.mtime_cache.lock() {
+                if !cache.is_empty() {
+                    use std::any::Any;
+                    items_with_idx.sort_by_cached_key(|(_, item)| {
+                        // Try to extract PathBuf from item.data
+                        // This is safe because we only populate mtime_cache for file pickers
+                        if let Some(path) = (item.data as &dyn Any).downcast_ref::<std::path::PathBuf>() {
+                            std::cmp::Reverse(
+                                cache
+                                    .get(path)
+                                    .copied()
+                                    .unwrap_or(std::time::UNIX_EPOCH)
+                            )
+                        } else {
+                            std::cmp::Reverse(std::time::UNIX_EPOCH)
+                        }
+                    });
+                }
+            }
+        }
+
+        // Extract sorted indices for selection mapping (relative to cursor page)
+        // Store in self for selection() to use
+        if self.sort_mode == PickerSortMode::Modified {
+            self.sorted_indices = items_with_idx
+                .iter()
+                .map(|(idx, _)| *idx - offset)
+                .collect();
+        } else {
+            // Clear sorted indices when not in Modified mode
+            self.sorted_indices.clear();
+        }
+
+        // Extract just the items for rendering
+        let items: Vec<_> = items_with_idx.into_iter().map(|(_, item)| item).collect();
+
+        let options = items.into_iter().map(|item| {
             let mut widths = self.widths.iter_mut();
             let mut matcher_index = 0;
 
@@ -1142,6 +1245,9 @@ impl<I: 'static + Send + Sync, D: 'static + Send + Sync> Component for Picker<I,
             }
             ctrl!('t') => {
                 self.toggle_preview();
+            }
+            ctrl!('o') => {
+                self.toggle_sort_mode();
             }
             _ => {
                 self.prompt_handle_event(event, ctx);

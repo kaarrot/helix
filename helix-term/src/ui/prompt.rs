@@ -42,6 +42,7 @@ pub struct Prompt {
     selection: Option<usize>,
     history_register: Option<char>,
     history_pos: Option<usize>,
+    history_prefix: Option<String>,
     completion_fn: CompletionFn,
     callback_fn: CallbackFn,
     pub doc_fn: DocFn,
@@ -98,6 +99,7 @@ impl Prompt {
             selection: None,
             history_register,
             history_pos: None,
+            history_prefix: None,
             completion_fn: Box::new(completion_fn),
             callback_fn: Box::new(callback_fn),
             doc_fn: Box::new(|_| None),
@@ -266,12 +268,18 @@ impl Prompt {
             self.cursor = pos;
         }
         self.recalculate_completion(cx.editor);
+        // Reset history prefix when user types
+        self.history_prefix = None;
+        self.history_pos = None;
     }
 
     pub fn insert_str(&mut self, s: &str, editor: &Editor) {
         self.line.insert_str(self.cursor, s);
         self.cursor += s.len();
         self.recalculate_completion(editor);
+        // Reset history prefix when user edits
+        self.history_prefix = None;
+        self.history_pos = None;
     }
 
     pub fn move_cursor(&mut self, movement: Movement) {
@@ -293,6 +301,9 @@ impl Prompt {
         self.cursor = pos;
 
         self.recalculate_completion(editor);
+        // Reset history prefix when user edits
+        self.history_prefix = None;
+        self.history_pos = None;
     }
 
     pub fn delete_char_forwards(&mut self, editor: &Editor) {
@@ -300,6 +311,9 @@ impl Prompt {
         self.line.replace_range(self.cursor..pos, "");
 
         self.recalculate_completion(editor);
+        // Reset history prefix when user edits
+        self.history_prefix = None;
+        self.history_pos = None;
     }
 
     pub fn delete_word_backwards(&mut self, editor: &Editor) {
@@ -308,6 +322,9 @@ impl Prompt {
         self.cursor = pos;
 
         self.recalculate_completion(editor);
+        // Reset history prefix when user edits
+        self.history_prefix = None;
+        self.history_pos = None;
     }
 
     pub fn delete_word_forwards(&mut self, editor: &Editor) {
@@ -315,6 +332,9 @@ impl Prompt {
         self.line.replace_range(self.cursor..pos, "");
 
         self.recalculate_completion(editor);
+        // Reset history prefix when user edits
+        self.history_prefix = None;
+        self.history_pos = None;
     }
 
     pub fn kill_to_start_of_line(&mut self, editor: &Editor) {
@@ -323,6 +343,9 @@ impl Prompt {
         self.cursor = pos;
 
         self.recalculate_completion(editor);
+        // Reset history prefix when user edits
+        self.history_prefix = None;
+        self.history_pos = None;
     }
 
     pub fn kill_to_end_of_line(&mut self, editor: &Editor) {
@@ -330,12 +353,18 @@ impl Prompt {
         self.line.replace_range(self.cursor..pos, "");
 
         self.recalculate_completion(editor);
+        // Reset history prefix when user edits
+        self.history_prefix = None;
+        self.history_pos = None;
     }
 
     pub fn clear(&mut self, editor: &Editor) {
         self.line.clear();
         self.cursor = 0;
         self.recalculate_completion(editor);
+        // Reset history prefix when user edits
+        self.history_prefix = None;
+        self.history_pos = None;
     }
 
     pub fn change_history(
@@ -365,6 +394,48 @@ impl Prompt {
         // Appease the borrow checker.
         drop(values);
 
+        self.history_pos = Some(index);
+
+        self.move_end();
+        (self.callback_fn)(cx, &self.line, PromptEvent::Update);
+        self.recalculate_completion(cx.editor);
+    }
+
+    pub fn change_history_with_prefix(
+        &mut self,
+        cx: &mut Context,
+        register: char,
+        direction: CompletionDirection,
+    ) {
+        (self.callback_fn)(cx, &self.line, PromptEvent::Abort);
+        let values = match cx.editor.registers.read(register, cx.editor) {
+            Some(values) if values.len() > 0 => values.rev(),
+            _ => return,
+        };
+
+        // Filter history by prefix
+        let prefix = self.history_prefix.as_ref().map(|s| s.as_str()).unwrap_or("");
+        let filtered: Vec<String> = values
+            .filter(|entry| entry.starts_with(prefix))
+            .map(|s| s.to_string())
+            .collect();
+
+        if filtered.is_empty() {
+            return;
+        }
+
+        let end = filtered.len().saturating_sub(1);
+
+        let index = match direction {
+            CompletionDirection::Forward => self.history_pos.map_or(0, |i| i + 1),
+            CompletionDirection::Backward => self
+                .history_pos
+                .unwrap_or_else(|| filtered.len())
+                .saturating_sub(1),
+        }
+        .min(end);
+
+        self.line = filtered[index].clone();
         self.history_pos = Some(index);
 
         self.move_end();
@@ -702,12 +773,20 @@ impl Component for Prompt {
             }
             ctrl!('p') | key!(Up) => {
                 if let Some(register) = self.history_register {
-                    self.change_history(cx, register, CompletionDirection::Backward);
+                    // Capture prefix on first Up/Down press
+                    if self.history_prefix.is_none() {
+                        self.history_prefix = Some(self.line.clone());
+                    }
+                    self.change_history_with_prefix(cx, register, CompletionDirection::Backward);
                 }
             }
             ctrl!('n') | key!(Down) => {
                 if let Some(register) = self.history_register {
-                    self.change_history(cx, register, CompletionDirection::Forward);
+                    // Capture prefix on first Up/Down press
+                    if self.history_prefix.is_none() {
+                        self.history_prefix = Some(self.line.clone());
+                    }
+                    self.change_history_with_prefix(cx, register, CompletionDirection::Forward);
                 }
             }
             key!(Tab) => {

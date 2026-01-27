@@ -2155,7 +2155,11 @@ impl Editor {
         let config = self.config();
         let view = self.tree.get(id);
         let doc = doc_mut!(self, &view.doc);
-        view.ensure_cursor_in_view(doc, config.scrolloff)
+        view.ensure_cursor_in_view(doc, config.scrolloff);
+
+        // Sync scroll to linked diff/merge views
+        log::info!("ensure_cursor_in_view: calling sync for view {:?}", id);
+        self.sync_scroll_to_linked_views(id);
     }
 
     #[inline]
@@ -2618,6 +2622,9 @@ impl Editor {
 
     /// Synchronize scroll position to linked diff views.
     pub fn sync_scroll_to_linked_views(&mut self, source_view_id: ViewId) {
+        log::info!("sync_scroll_to_linked_views called for view {:?}", source_view_id);
+        log::info!("  merge_views has {} entries", self.merge_views.len());
+
         // Check if this view is part of a 2-way diff session
         if let Some(diff_state) = self.diff_views.get(&source_view_id).cloned() {
             if !diff_state.sync_scroll {
@@ -2647,9 +2654,15 @@ impl Editor {
 
         // Check if this view is part of a 3-way merge session
         if let Some(merge_state) = self.merge_views.get(&source_view_id).cloned() {
+            log::info!("  FOUND merge view state! source={:?}, ours={:?}, theirs={:?}, sync={}",
+                source_view_id, merge_state.ours_view_id, merge_state.theirs_view_id, merge_state.sync_scroll);
+
             if !merge_state.sync_scroll {
+                log::info!("  Sync scroll is DISABLED, returning");
                 return;
             }
+
+            log::info!("  Sync scroll is ENABLED, proceeding...");
 
             // Only sync between OURS and THEIRS panes (not RESULT)
             let (target_view_id, target_doc_id, source_doc_id) =
@@ -2665,11 +2678,21 @@ impl Editor {
             // Get source scroll position and apply to target
             if let Some(source_doc) = self.documents.get(&source_doc_id) {
                 let source_offset = source_doc.view_offset(source_view_id);
+                log::info!("  Syncing from view {:?} to view {:?}", source_view_id, target_view_id);
+                log::info!("  Source offset: anchor={}, vert={}, horiz={}",
+                    source_offset.anchor, source_offset.vertical_offset, source_offset.horizontal_offset);
 
                 if let Some(target_doc) = self.documents.get_mut(&target_doc_id) {
                     target_doc.set_view_offset(target_view_id, source_offset);
+                    log::info!("  ✓ Successfully synced scroll position!");
+                } else {
+                    log::warn!("  ✗ Target document not found!");
                 }
+            } else {
+                log::warn!("  ✗ Source document not found!");
             }
+        } else {
+            log::info!("  No merge view state found for view {:?}", source_view_id);
         }
     }
 

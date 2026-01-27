@@ -212,9 +212,15 @@ impl View {
             .iter()
             .map(|gutter| gutter.width(self, doc) as u16)
             .sum();
+
+        log::debug!("gutter_offset: view={:?}, total_width={}, view.area.width={}, gutters.layout.len()={}",
+            self.id, total_width, self.area.width, self.gutters.layout.len());
+
         if total_width < self.area.width {
             total_width
         } else {
+            log::warn!("Gutter overflow! total_width={} >= view.area.width={}, gutters disabled for view {:?}",
+                total_width, self.area.width, self.id);
             0
         }
     }

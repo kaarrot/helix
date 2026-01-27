@@ -3440,7 +3440,7 @@ fn changed_file_picker(cx: &mut Context) {
         }),
     ];
 
-    let picker = Picker::new(
+    let mut picker = Picker::new(
         columns,
         1, // path
         [],
@@ -3457,6 +3457,9 @@ fn changed_file_picker(cx: &mut Context) {
             let target_ref_for_callback = target_ref.clone();
             move |cx, meta: &FileChange, action| {
                 use helix_vcs::FileChange;
+
+                // Remember selection for next time
+                cx.editor.last_changed_file_selection = Some(meta.path().to_path_buf());
 
                 match meta {
                     FileChange::Modified { path } | FileChange::Renamed { to_path: path, .. } => {
@@ -3492,6 +3495,12 @@ fn changed_file_picker(cx: &mut Context) {
         },
     )
     .with_preview(|_editor, meta| Some((meta.path().into(), None)));
+
+    // Restore previous selection if available
+    let last_selection = cx.editor.last_changed_file_selection.clone();
+    if let Some(last_path) = last_selection {
+        picker = picker.with_pre_select(move |item: &FileChange| item.path() == last_path);
+    }
 
     // Get injector to populate picker asynchronously
     let injector = picker.injector();

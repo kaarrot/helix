@@ -283,6 +283,9 @@ pub struct Picker<T: 'static + Send + Sync, D: 'static> {
     pub mtime_cache: std::sync::Arc<std::sync::Mutex<HashMap<std::path::PathBuf, std::time::SystemTime>>>,
     /// Mapping from display cursor position to nucleo index (when sorted)
     pub sorted_indices: Vec<u32>,
+    /// One-shot predicate to pre-select a matching item once items are loaded.
+    /// Cleared after first successful match.
+    pre_select_fn: Option<Box<dyn Fn(&T) -> bool + Send>>,
 }
 
 impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
@@ -411,7 +414,13 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             sort_mode: PickerSortMode::Score,  // Default to normal fuzzy scoring
             mtime_cache: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             sorted_indices: Vec::new(),
+            pre_select_fn: None,
         }
+    }
+
+    pub fn with_pre_select(mut self, f: impl Fn(&T) -> bool + Send + 'static) -> Self {
+        self.pre_select_fn = Some(Box::new(f));
+        self
     }
 
     pub fn injector(&self) -> Injector<T, D> {
@@ -740,6 +749,19 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             self.cursor = self
                 .cursor
                 .min(snapshot.matched_item_count().saturating_sub(1))
+        }
+
+        // One-shot pre-select: scan matched items for a match, then clear
+        if self.pre_select_fn.is_some() && snapshot.matched_item_count() > 0 {
+            let pred = self.pre_select_fn.take().unwrap();
+            for idx in 0..snapshot.matched_item_count() {
+                if let Some(item) = snapshot.get_matched_item(idx) {
+                    if pred(item.data) {
+                        self.cursor = idx;
+                        break;
+                    }
+                }
+            }
         }
 
         let text_style = cx.editor.theme.get("ui.text");

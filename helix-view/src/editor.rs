@@ -1224,6 +1224,8 @@ pub struct Editor {
     pub merge_views: HashMap<ViewId, MergeViewState>,
     /// Editor-wide diff range for comparing two arbitrary commits
     pub diff_range: Option<DiffRange>,
+    /// Last selected file path in the changed file picker (for restoring selection)
+    pub last_changed_file_selection: Option<PathBuf>,
 
     pub syn_loader: Arc<ArcSwap<syntax::Loader>>,
     pub theme_loader: Arc<theme::Loader>,
@@ -1372,6 +1374,7 @@ impl Editor {
             diff_views: HashMap::new(),
             merge_views: HashMap::new(),
             diff_range: None,
+            last_changed_file_selection: None,
             syn_loader,
             theme_loader,
             last_theme: None,

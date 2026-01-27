@@ -2500,7 +2500,7 @@ impl Editor {
 
     /// Open a diff view between two arbitrary refs or ref vs working tree
     /// - If target_ref is None: compare base_ref vs working tree (editable)
-    /// - If target_ref is Some: compare two commits (both read-only)
+    /// - If target_ref is Some: compare base_ref vs target_ref (both read-only)
     pub fn open_diff_view_range(
         &mut self,
         path: &Path,
@@ -2512,9 +2512,8 @@ impl Editor {
         let path = helix_stdx::path::canonicalize(path);
 
         match target_ref {
-            // Compare base_ref vs working tree
+            // Compare base_ref vs working tree (editable right pane)
             None => {
-                // Just use the existing open_diff_view implementation
                 self.open_diff_view(&path, base_ref)
             }
             // Compare two commits

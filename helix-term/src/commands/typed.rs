@@ -3076,6 +3076,7 @@ fn diff_files(
                 ];
 
                 let base_ref_for_callback = base_ref.clone();
+                let target_ref_for_callback = target_ref.clone();
                 let picker = ui::Picker::new(
                     columns,
                     1, // path column
@@ -3086,30 +3087,17 @@ fn diff_files(
                         style_deleted: deleted,
                         style_renamed: renamed,
                     },
-                    move |cx, meta: &FileChange, action| {
+                    move |cx, meta: &FileChange, _action| {
                         let path_to_open = meta.path();
-                        if let Err(e) = cx.editor.open(path_to_open, action) {
-                            let err = if let Some(err) = e.source() {
-                                format!("{}", err)
-                            } else {
-                                format!("unable to open \"{}\"", path_to_open.display())
-                            };
-                            cx.editor.set_error(err);
-                            return;
-                        }
 
-                        // Set the diff base for the opened file
-                        let (_view, doc) = current!(cx.editor);
-                        match doc.set_diff_base_from_ref(base_ref_for_callback.clone()) {
-                            Ok(()) => {
-                                // Always enable char diff highlighting
-                                doc.char_diff_enabled = true;
-                                cx.editor.clear_idle_timer();
-                            }
-                            Err(err) => {
-                                cx.editor
-                                    .set_error(format!("Failed to set diff base: {}", err));
-                            }
+                        let result = cx.editor.open_diff_view_range(
+                            path_to_open,
+                            &base_ref_for_callback,
+                            target_ref_for_callback.as_deref(),
+                        );
+
+                        if let Err(err) = result {
+                            cx.editor.set_error(format!("Failed to open diff view: {}", err));
                         }
                     },
                 )

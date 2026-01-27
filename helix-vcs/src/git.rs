@@ -180,8 +180,21 @@ pub fn get_merge_versions(file: &Path) -> Result<(Vec<u8>, Vec<u8>)> {
 }
 
 /// Resolve a git reference or commit hash to a Commit object
-/// Supports: branch names, tags, full commit hashes, short hashes
+/// Supports: branch names, tags, full commit hashes, short hashes, and ^ (parent) suffix
 fn resolve_commit<'a>(repo: &'a Repository, ref_name: &str) -> Result<Commit<'a>> {
+    // Handle ^ (parent) suffix: e.g. "abc123^" means parent of abc123
+    if let Some(base) = ref_name.strip_suffix('^') {
+        let commit = resolve_commit(repo, base)?;
+        let parent_id = commit
+            .parent_ids()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("commit {} has no parent (root commit)", commit.id))?;
+        return repo
+            .find_object(parent_id)?
+            .try_into_commit()
+            .context(format!("parent of '{}' is not a commit", base));
+    }
+
     // First try as a reference (branch, tag, etc.)
     if let Ok(reference) = repo.find_reference(ref_name) {
         let object_id = reference.into_fully_peeled_id()?.detach();
@@ -241,7 +254,7 @@ pub fn for_each_changed_file_between_refs(
     let repo = open_repo(cwd)?.to_thread_local();
 
     match target_ref {
-        // Compare base_ref appropriately based on context
+        // Compare base_ref vs working tree (all changes since base_ref)
         None => {
             let base_commit = resolve_commit(&repo, base_ref)?;
             let head_commit = repo.head_commit()?;
@@ -251,24 +264,21 @@ pub fn for_each_changed_file_between_refs(
                 return status(&repo, f);
             }
 
-            // If base_ref is not HEAD, user wants to see what that commit changed
-            // So we compare it against its parent commit, not against HEAD
-            let parent_id = base_commit.parent_ids().next()
-                .ok_or_else(|| anyhow::anyhow!("commit {} has no parent (root commit)", base_commit.id))?;
-            let parent_commit = repo.find_object(parent_id)?
-                .try_into_commit()
-                .map_err(|e| anyhow::anyhow!("failed to convert parent to commit: {}", e))?;
-
             let work_dir = repo.workdir()
                 .ok_or_else(|| anyhow::anyhow!("working tree not found"))?
                 .to_path_buf();
 
-            // Diff parent → commit (showing what this commit changed)
-            let parent_tree = parent_commit.tree()?;
-            let base_tree = base_commit.tree()?;
+            // Collect paths already reported from the tree diff so we don't
+            // duplicate them when we also run status() below.
+            let mut seen = std::collections::HashSet::new();
 
-            parent_tree.changes()?.for_each_to_obtain_tree(
-                &base_tree,
+            // 1. Diff base_ref tree → HEAD tree (committed changes since base_ref)
+            let base_tree = base_commit.tree()?;
+            let head_tree = head_commit.tree()?;
+            let mut cancelled = false;
+
+            base_tree.changes()?.for_each_to_obtain_tree(
+                &head_tree,
                 |change| -> Result<_, std::convert::Infallible> {
                     use gix::object::tree::diff::Change;
 
@@ -308,7 +318,9 @@ pub fn for_each_changed_file_between_refs(
                     };
 
                     if let Some(change_item) = file_change {
+                        seen.insert(change_item.path().to_path_buf());
                         if !f(Ok(change_item)) {
+                            cancelled = true;
                             return Ok(gix::object::tree::diff::Action::Cancel);
                         }
                     }
@@ -316,6 +328,19 @@ pub fn for_each_changed_file_between_refs(
                     Ok(gix::object::tree::diff::Action::Continue)
                 },
             )?;
+
+            if cancelled {
+                return Ok(());
+            }
+
+            // 2. Also include working tree changes (unstaged/untracked)
+            //    that weren't already covered by the tree diff
+            status(&repo, |change| {
+                match &change {
+                    Ok(fc) if seen.contains(fc.path()) => true, // skip, already reported
+                    _ => f(change),
+                }
+            })?;
 
             return Ok(())
         }

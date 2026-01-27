@@ -192,7 +192,7 @@ fn symlink_to_git_repo() {
 // ============================================================================
 
 #[test]
-fn for_each_changed_file_single_commit() {
+fn for_each_changed_file_base_to_working_tree() {
     let repo = empty_git_repo();
 
     // Commit 1: Add file1.txt
@@ -202,6 +202,7 @@ fn for_each_changed_file_single_commit() {
         .unwrap();
     exec_git_cmd("add file1.txt", repo.path());
     exec_git_cmd("commit -m first", repo.path());
+    let commit1_hash = exec_git_cmd_output("rev-parse HEAD", repo.path());
 
     // Commit 2: Modify file1.txt, add file2.txt
     File::create(repo.path().join("file1.txt"))
@@ -214,10 +215,8 @@ fn for_each_changed_file_single_commit() {
         .unwrap();
     exec_git_cmd("add .", repo.path());
     exec_git_cmd("commit -m second", repo.path());
-    let commit2_hash = exec_git_cmd_output("rev-parse HEAD", repo.path());
 
-    // Create another commit so that commit2 is NOT HEAD
-    // This is important because the function has a fast path for HEAD
+    // Commit 3: Add file3.txt (this is HEAD)
     File::create(repo.path().join("file3.txt"))
         .unwrap()
         .write_all(b"content3")
@@ -225,16 +224,67 @@ fn for_each_changed_file_single_commit() {
     exec_git_cmd("add file3.txt", repo.path());
     exec_git_cmd("commit -m third", repo.path());
 
-    // Test: diff-commit commit2 (should show file1 modified, file2 added)
+    // Test: diff-commit commit1 (should show ALL changes from commit1 to working tree)
+    // Committed changes: file1 modified, file2 added, file3 added
     let changes = RefCell::new(Vec::new());
-    git::for_each_changed_file_between_refs(repo.path(), &commit2_hash, None, |change| {
+    git::for_each_changed_file_between_refs(repo.path(), &commit1_hash, None, |change| {
         changes.borrow_mut().push(change.unwrap());
         true
     })
     .unwrap();
 
     let changes = changes.into_inner();
-    assert_eq!(changes.len(), 2);
+    assert_eq!(changes.len(), 3);
+    assert!(changes.iter().any(|c| matches!(c,
+        FileChange::Modified { path } if path.ends_with("file1.txt")
+    )));
+    assert!(changes.iter().any(|c| matches!(c,
+        FileChange::Modified { path } if path.ends_with("file2.txt")
+    )));
+    assert!(changes.iter().any(|c| matches!(c,
+        FileChange::Modified { path } if path.ends_with("file3.txt")
+    )));
+}
+
+#[test]
+fn for_each_changed_file_includes_working_tree() {
+    let repo = empty_git_repo();
+
+    // Commit 1: Add file1.txt
+    File::create(repo.path().join("file1.txt"))
+        .unwrap()
+        .write_all(b"content1")
+        .unwrap();
+    exec_git_cmd("add file1.txt", repo.path());
+    exec_git_cmd("commit -m first", repo.path());
+    let commit1_hash = exec_git_cmd_output("rev-parse HEAD", repo.path());
+
+    // Commit 2: Add file2.txt (this is HEAD)
+    File::create(repo.path().join("file2.txt"))
+        .unwrap()
+        .write_all(b"content2")
+        .unwrap();
+    exec_git_cmd("add file2.txt", repo.path());
+    exec_git_cmd("commit -m second", repo.path());
+
+    // Modify file1.txt in working tree (not committed)
+    File::create(repo.path().join("file1.txt"))
+        .unwrap()
+        .write_all(b"working tree change")
+        .unwrap();
+
+    // Test: diff-commit commit1 should include both committed and working tree changes
+    let changes = RefCell::new(Vec::new());
+    git::for_each_changed_file_between_refs(repo.path(), &commit1_hash, None, |change| {
+        changes.borrow_mut().push(change.unwrap());
+        true
+    })
+    .unwrap();
+
+    let changes = changes.into_inner();
+    // file1.txt changed in tree diff (commit1 → HEAD) AND in working tree,
+    // but should only appear once due to dedup
+    // file2.txt added in commit2
     assert!(changes.iter().any(|c| matches!(c,
         FileChange::Modified { path } if path.ends_with("file1.txt")
     )));
@@ -322,7 +372,7 @@ fn for_each_changed_file_short_hash() {
     exec_git_cmd("add file3.txt", repo.path());
     exec_git_cmd("commit -m third", repo.path());
 
-    // Test: short hash should work
+    // Test: short hash should work; shows all changes from commit2 to working tree
     let changes = RefCell::new(Vec::new());
     git::for_each_changed_file_between_refs(repo.path(), short_hash, None, |change| {
         changes.borrow_mut().push(change.unwrap());
@@ -331,10 +381,80 @@ fn for_each_changed_file_short_hash() {
     .unwrap();
 
     let changes = changes.into_inner();
+    // commit2 → HEAD: file3.txt was added
     assert_eq!(changes.len(), 1);
     assert!(changes.iter().any(|c| matches!(c,
-        FileChange::Modified { path } if path.ends_with("file2.txt")
+        FileChange::Modified { path } if path.ends_with("file3.txt")
     )));
+}
+
+#[test]
+fn for_each_changed_file_parent_ref_suffix() {
+    let repo = empty_git_repo();
+
+    // Commit 1: file1.txt
+    File::create(repo.path().join("file1.txt"))
+        .unwrap()
+        .write_all(b"v1")
+        .unwrap();
+    exec_git_cmd("add file1.txt", repo.path());
+    exec_git_cmd("commit -m c1", repo.path());
+    let hash1 = exec_git_cmd_output("rev-parse HEAD", repo.path());
+
+    // Commit 2: modify file1.txt, add file2.txt
+    File::create(repo.path().join("file1.txt"))
+        .unwrap()
+        .write_all(b"v2")
+        .unwrap();
+    File::create(repo.path().join("file2.txt"))
+        .unwrap()
+        .write_all(b"new")
+        .unwrap();
+    exec_git_cmd("add .", repo.path());
+    exec_git_cmd("commit -m c2", repo.path());
+    let hash2 = exec_git_cmd_output("rev-parse HEAD", repo.path());
+
+    // Create a third commit so hash2 is not HEAD
+    File::create(repo.path().join("file3.txt"))
+        .unwrap()
+        .write_all(b"filler")
+        .unwrap();
+    exec_git_cmd("add file3.txt", repo.path());
+    exec_git_cmd("commit -m c3", repo.path());
+
+    // Test: using HASH^ to refer to parent - diff hash1..hash2 should equal diff hash2^..hash2
+    let changes_explicit = RefCell::new(Vec::new());
+    git::for_each_changed_file_between_refs(
+        repo.path(), &hash1, Some(&hash2), |change| {
+            changes_explicit.borrow_mut().push(change.unwrap());
+            true
+        },
+    ).unwrap();
+
+    let changes_caret = RefCell::new(Vec::new());
+    let hash2_parent = format!("{}^", hash2);
+    git::for_each_changed_file_between_refs(
+        repo.path(), &hash2_parent, Some(&hash2), |change| {
+            changes_caret.borrow_mut().push(change.unwrap());
+            true
+        },
+    ).unwrap();
+
+    let explicit = changes_explicit.into_inner();
+    let caret = changes_caret.into_inner();
+    assert_eq!(explicit.len(), caret.len());
+    assert_eq!(explicit.len(), 2);
+
+    // Also test get_diff_base_from_ref with ^ suffix
+    let base_from_hash1 = git::get_diff_base_from_ref(
+        &repo.path().join("file1.txt"),
+        &hash1,
+    ).unwrap();
+    let base_from_hash2_parent = git::get_diff_base_from_ref(
+        &repo.path().join("file1.txt"),
+        &hash2_parent,
+    ).unwrap();
+    assert_eq!(base_from_hash1, base_from_hash2_parent);
 }
 
 #[test]
@@ -352,6 +472,44 @@ fn for_each_changed_file_deleted() {
         .unwrap();
     exec_git_cmd("add .", repo.path());
     exec_git_cmd("commit -m first", repo.path());
+    let commit1_hash = exec_git_cmd_output("rev-parse HEAD", repo.path());
+
+    // Commit 2 (HEAD): Delete one file
+    std::fs::remove_file(repo.path().join("delete.txt")).unwrap();
+    exec_git_cmd("add .", repo.path());
+    exec_git_cmd("commit -m second", repo.path());
+
+    // Test: diff from commit1 to working tree should show delete.txt as deleted
+    let changes = RefCell::new(Vec::new());
+    git::for_each_changed_file_between_refs(repo.path(), &commit1_hash, None, |change| {
+        changes.borrow_mut().push(change.unwrap());
+        true
+    })
+    .unwrap();
+
+    let changes = changes.into_inner();
+    assert_eq!(changes.len(), 1);
+    assert!(changes.iter().any(|c| matches!(c,
+        FileChange::Deleted { path } if path.ends_with("delete.txt")
+    )));
+}
+
+#[test]
+fn for_each_changed_file_deleted_in_range() {
+    let repo = empty_git_repo();
+
+    // Commit 1: Add files
+    File::create(repo.path().join("keep.txt"))
+        .unwrap()
+        .write_all(b"keep")
+        .unwrap();
+    File::create(repo.path().join("delete.txt"))
+        .unwrap()
+        .write_all(b"delete")
+        .unwrap();
+    exec_git_cmd("add .", repo.path());
+    exec_git_cmd("commit -m first", repo.path());
+    let commit1_hash = exec_git_cmd_output("rev-parse HEAD", repo.path());
 
     // Commit 2: Delete one file
     std::fs::remove_file(repo.path().join("delete.txt")).unwrap();
@@ -359,21 +517,14 @@ fn for_each_changed_file_deleted() {
     exec_git_cmd("commit -m second", repo.path());
     let commit2_hash = exec_git_cmd_output("rev-parse HEAD", repo.path());
 
-    // Create a third commit so commit2 is not HEAD
-    File::create(repo.path().join("another.txt"))
-        .unwrap()
-        .write_all(b"another")
-        .unwrap();
-    exec_git_cmd("add another.txt", repo.path());
-    exec_git_cmd("commit -m third", repo.path());
-
-    // Test: should show delete.txt as deleted
+    // Test: explicit range commit1..commit2 should show delete.txt as deleted
     let changes = RefCell::new(Vec::new());
-    git::for_each_changed_file_between_refs(repo.path(), &commit2_hash, None, |change| {
-        changes.borrow_mut().push(change.unwrap());
-        true
-    })
-    .unwrap();
+    git::for_each_changed_file_between_refs(
+        repo.path(), &commit1_hash, Some(&commit2_hash), |change| {
+            changes.borrow_mut().push(change.unwrap());
+            true
+        },
+    ).unwrap();
 
     let changes = changes.into_inner();
     assert_eq!(changes.len(), 1);
@@ -434,8 +585,9 @@ fn for_each_changed_file_multiple_file_types() {
         .unwrap();
     exec_git_cmd("add .", repo.path());
     exec_git_cmd("commit -m first", repo.path());
+    let commit1_hash = exec_git_cmd_output("rev-parse HEAD", repo.path());
 
-    // Commit 2: Modify one, delete one, add one
+    // Commit 2 (HEAD): Modify one, delete one, add one
     File::create(repo.path().join("modify.txt"))
         .unwrap()
         .write_all(b"modified")
@@ -447,19 +599,10 @@ fn for_each_changed_file_multiple_file_types() {
         .unwrap();
     exec_git_cmd("add .", repo.path());
     exec_git_cmd("commit -m second", repo.path());
-    let commit2_hash = exec_git_cmd_output("rev-parse HEAD", repo.path());
 
-    // Create a third commit so commit2 is not HEAD
-    File::create(repo.path().join("yet_another.txt"))
-        .unwrap()
-        .write_all(b"yet another")
-        .unwrap();
-    exec_git_cmd("add yet_another.txt", repo.path());
-    exec_git_cmd("commit -m third", repo.path());
-
-    // Test: should show all changes
+    // Test: diff from commit1 to working tree shows all changes
     let changes = RefCell::new(Vec::new());
-    git::for_each_changed_file_between_refs(repo.path(), &commit2_hash, None, |change| {
+    git::for_each_changed_file_between_refs(repo.path(), &commit1_hash, None, |change| {
         changes.borrow_mut().push(change.unwrap());
         true
     })
@@ -479,10 +622,10 @@ fn for_each_changed_file_multiple_file_types() {
 }
 
 #[test]
-fn for_each_changed_file_root_commit_error() {
+fn for_each_changed_file_from_root_commit() {
     let repo = empty_git_repo();
 
-    // Create only one commit (root commit)
+    // Create root commit
     File::create(repo.path().join("file1.txt"))
         .unwrap()
         .write_all(b"initial")
@@ -491,7 +634,7 @@ fn for_each_changed_file_root_commit_error() {
     exec_git_cmd("commit -m initial", repo.path());
     let commit_hash = exec_git_cmd_output("rev-parse HEAD", repo.path());
 
-    // Create a second commit so the root commit is not HEAD
+    // Create a second commit (HEAD) so the root commit is not HEAD
     File::create(repo.path().join("file2.txt"))
         .unwrap()
         .write_all(b"second")
@@ -499,17 +642,24 @@ fn for_each_changed_file_root_commit_error() {
     exec_git_cmd("add file2.txt", repo.path());
     exec_git_cmd("commit -m second", repo.path());
 
-    // Test: trying to diff root commit should fail (no parent)
-    let result = git::for_each_changed_file_between_refs(
+    // Test: diff from root commit to working tree should show file2.txt
+    let changes = RefCell::new(Vec::new());
+    git::for_each_changed_file_between_refs(
         repo.path(),
         &commit_hash,
         None,
-        |_change| true,
-    );
+        |change| {
+            changes.borrow_mut().push(change.unwrap());
+            true
+        },
+    )
+    .unwrap();
 
-    assert!(result.is_err());
-    let err_msg = result.unwrap_err().to_string();
-    assert!(err_msg.contains("no parent") || err_msg.contains("root commit"));
+    let changes = changes.into_inner();
+    assert_eq!(changes.len(), 1);
+    assert!(changes.iter().any(|c| matches!(c,
+        FileChange::Modified { path } if path.ends_with("file2.txt")
+    )));
 }
 
 // ============================================================================

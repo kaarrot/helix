@@ -229,7 +229,8 @@ pub fn for_each_changed_file(cwd: &Path, f: impl Fn(Result<FileChange>) -> bool)
 }
 
 /// Iterate over changed files between two references
-/// - If target_ref is None: compare base_ref vs working tree
+/// - If target_ref is None and base_ref is HEAD: compare HEAD vs working tree
+/// - If target_ref is None and base_ref is not HEAD: compare base_ref vs its parent (show what that commit changed)
 /// - If target_ref is Some: compare base_ref vs target_ref (two commits)
 pub fn for_each_changed_file_between_refs(
     cwd: &Path,
@@ -240,16 +241,83 @@ pub fn for_each_changed_file_between_refs(
     let repo = open_repo(cwd)?.to_thread_local();
 
     match target_ref {
-        // Compare base_ref vs working tree
+        // Compare base_ref appropriately based on context
         None => {
-            // Note: For now, we just use status() which compares against HEAD
-            // In the future, we could enhance this to diff against base_ref
-            // by using the base_commit's tree instead of the working tree index
-            let _base_commit = resolve_commit(&repo, base_ref)?;
+            let base_commit = resolve_commit(&repo, base_ref)?;
+            let head_commit = repo.head_commit()?;
 
-            // Use status to get working tree changes
-            // Note: This will show all uncommitted changes in the working tree
-            status(&repo, f)
+            // Fast path: if base_ref is HEAD, just use status for efficiency
+            if base_commit.id == head_commit.id {
+                return status(&repo, f);
+            }
+
+            // If base_ref is not HEAD, user wants to see what that commit changed
+            // So we compare it against its parent commit, not against HEAD
+            let parent_id = base_commit.parent_ids().next()
+                .ok_or_else(|| anyhow::anyhow!("commit {} has no parent (root commit)", base_commit.id))?;
+            let parent_commit = repo.find_object(parent_id)?
+                .try_into_commit()
+                .map_err(|e| anyhow::anyhow!("failed to convert parent to commit: {}", e))?;
+
+            let work_dir = repo.workdir()
+                .ok_or_else(|| anyhow::anyhow!("working tree not found"))?
+                .to_path_buf();
+
+            // Diff parent → commit (showing what this commit changed)
+            let parent_tree = parent_commit.tree()?;
+            let base_tree = base_commit.tree()?;
+
+            parent_tree.changes()?.for_each_to_obtain_tree(
+                &base_tree,
+                |change| -> Result<_, std::convert::Infallible> {
+                    use gix::object::tree::diff::Change;
+
+                    let file_change = match change {
+                        Change::Addition { entry_mode, .. } => {
+                            if entry_mode.is_blob() {
+                                let path = work_dir.join(gix::path::from_bstr(change.location()));
+                                Some(FileChange::Modified { path })
+                            } else {
+                                None
+                            }
+                        }
+                        Change::Deletion { entry_mode, .. } => {
+                            if entry_mode.is_blob() {
+                                let path = work_dir.join(gix::path::from_bstr(change.location()));
+                                Some(FileChange::Deleted { path })
+                            } else {
+                                None
+                            }
+                        }
+                        Change::Modification { entry_mode, .. } => {
+                            if entry_mode.is_blob() {
+                                let path = work_dir.join(gix::path::from_bstr(change.location()));
+                                Some(FileChange::Modified { path })
+                            } else {
+                                None
+                            }
+                        }
+                        Change::Rewrite { entry_mode, .. } => {
+                            if entry_mode.is_blob() {
+                                let path = work_dir.join(gix::path::from_bstr(change.location()));
+                                Some(FileChange::Modified { path })
+                            } else {
+                                None
+                            }
+                        }
+                    };
+
+                    if let Some(change_item) = file_change {
+                        if !f(Ok(change_item)) {
+                            return Ok(gix::object::tree::diff::Action::Cancel);
+                        }
+                    }
+
+                    Ok(gix::object::tree::diff::Action::Continue)
+                },
+            )?;
+
+            return Ok(())
         }
         // Compare two commits
         Some(target) => {

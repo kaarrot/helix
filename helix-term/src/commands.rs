@@ -3391,27 +3391,6 @@ fn changed_file_picker(cx: &mut Context) {
         return;
     }
 
-    // Get the current file path if we're in a diff view
-    let current_file_path = {
-        let (view, _) = current!(cx.editor);
-        let view_id = view.id;
-
-        cx.editor.diff_views.get(&view_id)
-            .and_then(|diff_state| {
-                // Get the working document path from the diff view
-                cx.editor.documents.get(&diff_state.working_doc_id)
-                    .and_then(|doc| doc.path().map(|p| p.clone()))
-            })
-            .or_else(|| {
-                // Fallback: check merge view
-                cx.editor.merge_views.get(&view_id)
-                    .and_then(|merge_state| {
-                        cx.editor.documents.get(&merge_state.result_doc_id)
-                            .and_then(|doc| doc.path().map(|p| p.clone()))
-                    })
-            })
-    };
-
     // Get diff range from editor state or default to HEAD vs working tree
     let diff_range = cx.editor.diff_range.clone().unwrap_or_else(|| DiffRange {
         base_ref: "HEAD".to_string(),
@@ -3514,74 +3493,26 @@ fn changed_file_picker(cx: &mut Context) {
     )
     .with_preview(|_editor, meta| Some((meta.path().into(), None)));
 
-    // Collect changed files to find current file index
-    let changed_files_arc = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    {
+    // Get injector to populate picker asynchronously
+    let injector = picker.injector();
+
+    // Spawn background thread to populate the picker with changed files
+    std::thread::spawn(move || {
         use helix_vcs::git;
-        let files_clone = changed_files_arc.clone();
         let _ = git::for_each_changed_file_between_refs(
             &cwd,
             &base_ref,
             target_ref.as_deref(),
             move |change| {
-                if let Ok(file_change) = change {
-                    if let Ok(mut files) = files_clone.lock() {
-                        files.push(file_change);
-                    }
+                match change {
+                    Ok(change) => injector.push(change).is_ok(),
+                    Err(_err) => true,
                 }
-                true
             },
         );
-    }
+    });
 
-    // Find the index of the current file in the list and inject files
-    let initial_cursor = {
-        let changed_files = changed_files_arc.lock().unwrap();
-        let cursor = if let Some(ref current_path) = current_file_path {
-            changed_files.iter()
-                .position(|change| {
-                    let change_path = change.path();
-                    change_path == current_path
-                })
-                .unwrap_or(0) as u32
-        } else {
-            0
-        };
-
-        // Apply initial cursor position before getting injector
-        let picker = picker.with_initial_cursor(cursor);
-
-        // Now inject the collected files into the picker
-        let injector = picker.injector();
-        for file_change in changed_files.iter() {
-            // FileChange doesn't implement Clone, so we need to reconstruct it
-            // Actually, we can't copy FileChange, so let's use a different approach
-            let _ = injector.push(match file_change {
-                helix_vcs::FileChange::Untracked { path } => {
-                    helix_vcs::FileChange::Untracked { path: path.clone() }
-                }
-                helix_vcs::FileChange::Modified { path } => {
-                    helix_vcs::FileChange::Modified { path: path.clone() }
-                }
-                helix_vcs::FileChange::Conflict { path } => {
-                    helix_vcs::FileChange::Conflict { path: path.clone() }
-                }
-                helix_vcs::FileChange::Deleted { path } => {
-                    helix_vcs::FileChange::Deleted { path: path.clone() }
-                }
-                helix_vcs::FileChange::Renamed { from_path, to_path } => {
-                    helix_vcs::FileChange::Renamed {
-                        from_path: from_path.clone(),
-                        to_path: to_path.clone(),
-                    }
-                }
-            });
-        }
-
-        picker
-    };
-
-    cx.push_layer(Box::new(overlaid(initial_cursor)));
+    cx.push_layer(Box::new(overlaid(picker)));
 }
 
 pub fn command_palette(cx: &mut Context) {

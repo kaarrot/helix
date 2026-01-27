@@ -3391,6 +3391,27 @@ fn changed_file_picker(cx: &mut Context) {
         return;
     }
 
+    // Get the current file path if we're in a diff view
+    let current_file_path = {
+        let (view, _) = current!(cx.editor);
+        let view_id = view.id;
+
+        cx.editor.diff_views.get(&view_id)
+            .and_then(|diff_state| {
+                // Get the working document path from the diff view
+                cx.editor.documents.get(&diff_state.working_doc_id)
+                    .and_then(|doc| doc.path().map(|p| p.clone()))
+            })
+            .or_else(|| {
+                // Fallback: check merge view
+                cx.editor.merge_views.get(&view_id)
+                    .and_then(|merge_state| {
+                        cx.editor.documents.get(&merge_state.result_doc_id)
+                            .and_then(|doc| doc.path().map(|p| p.clone()))
+                    })
+            })
+    };
+
     // Get diff range from editor state or default to HEAD vs working tree
     let diff_range = cx.editor.diff_range.clone().unwrap_or_else(|| DiffRange {
         base_ref: "HEAD".to_string(),
@@ -3440,7 +3461,7 @@ fn changed_file_picker(cx: &mut Context) {
         }),
     ];
 
-    let mut picker = Picker::new(
+    let picker = Picker::new(
         columns,
         1, // path
         [],
@@ -3496,16 +3517,13 @@ fn changed_file_picker(cx: &mut Context) {
     )
     .with_preview(|_editor, meta| Some((meta.path().into(), None)));
 
-    // Restore previous selection if available
-    let last_selection = cx.editor.last_changed_file_selection.clone();
-    if let Some(last_path) = last_selection {
-        picker = picker.with_pre_select(move |item: &FileChange| item.path() == last_path);
-    }
+    let picker = picker.with_pre_select(move |file_change: &FileChange| {
+        current_file_path
+            .as_ref()
+            .map_or(false, |p| file_change.path() == p)
+    });
 
-    // Get injector to populate picker asynchronously
     let injector = picker.injector();
-
-    // Spawn background thread to populate the picker with changed files
     std::thread::spawn(move || {
         use helix_vcs::git;
         let _ = git::for_each_changed_file_between_refs(
@@ -3513,9 +3531,10 @@ fn changed_file_picker(cx: &mut Context) {
             &base_ref,
             target_ref.as_deref(),
             move |change| {
-                match change {
-                    Ok(change) => injector.push(change).is_ok(),
-                    Err(_err) => true,
+                if let Ok(fc) = change {
+                    injector.push(fc).is_ok()
+                } else {
+                    true
                 }
             },
         );

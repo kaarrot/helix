@@ -2,6 +2,7 @@ use crate::handlers::completion::LspCompletionItem;
 use crate::ui::{menu, Markdown, Menu, Popup, PromptEvent};
 use crate::{
     compositor::{Component, Context, Event, EventResult},
+    key,
     handlers::completion::{
         trigger_auto_completion, CompletionItem, CompletionResponse, ResolveHandler,
     },
@@ -124,6 +125,8 @@ pub struct Completion {
     filter: String,
     // TODO: move to helix-view/central handler struct in the future
     resolve_handler: ResolveHandler,
+    /// Whether auto-select is enabled (also enables space commit)
+    auto_select: bool,
 }
 
 impl Completion {
@@ -132,6 +135,7 @@ impl Completion {
     pub fn new(editor: &Editor, items: Vec<CompletionItem>, trigger_offset: usize) -> Self {
         let preview_completion_insert = editor.config().preview_completion_insert;
         let replace_mode = editor.config().completion_replace;
+        let auto_select = editor.config().completion_auto_select;
 
         let dir_style = editor.theme.get("ui.text.directory");
 
@@ -290,9 +294,14 @@ impl Completion {
             }
         });
 
-        let popup = Popup::new(Self::ID, menu)
+        let mut popup = Popup::new(Self::ID, menu)
             .with_scrollbar(false)
             .ignore_escape_key(true);
+
+        // Enable auto-select first item if configured
+        if auto_select {
+            popup.contents_mut().set_auto_select_first(true);
+        }
 
         let (view, doc) = current_ref!(editor);
         let text = doc.text().slice(..);
@@ -312,6 +321,7 @@ impl Completion {
             // and avoid allocation during matching
             filter: String::from(fragment),
             resolve_handler: ResolveHandler::new(),
+            auto_select,
         };
 
         // need to recompute immediately in case start_offset != trigger_offset
@@ -459,6 +469,26 @@ impl Completion {
 
 impl Component for Completion {
     fn handle_event(&mut self, event: &Event, cx: &mut Context) -> EventResult {
+        // Handle space as a commit character when auto-select is enabled
+        if self.auto_select {
+            if let Event::Key(key) = event {
+                if *key == key!(' ') && self.popup.contents().selection().is_some() {
+                    // Space with selected item - validate completion first
+                    let result = self.popup.handle_event(&Event::Key(key!(Enter)), cx);
+
+                    // Manually insert space after completion is applied
+                    let (view, doc) = current!(cx.editor);
+                    let text = doc.text();
+                    let selection = doc.selection(view.id).clone();
+                    let transaction = Transaction::insert(text, &selection, " ".into());
+                    doc.apply(&transaction, view.id);
+
+                    // Return result from Enter (which closes menu and applies completion)
+                    return result;
+                }
+            }
+        }
+
         self.popup.handle_event(event, cx)
     }
 

@@ -1422,10 +1422,16 @@ impl Component for EditorView {
                                     {
                                         consumed = true;
                                         Some(callback)
-                                    } else if let EventResult::Consumed(callback) =
-                                        completion.handle_event(&Event::Key(key!(Enter)), &mut cx)
-                                    {
-                                        Some(callback)
+                                    } else if should_auto_complete_on_char(key) {
+                                        // Auto-complete on trigger characters (punctuation, whitespace)
+                                        // but not on regular word characters (allows continued typing/filtering)
+                                        if let EventResult::Consumed(callback) =
+                                            completion.handle_event(&Event::Key(key!(Enter)), &mut cx)
+                                        {
+                                            Some(callback)
+                                        } else {
+                                            None
+                                        }
                                     } else {
                                         None
                                     }
@@ -1637,6 +1643,22 @@ impl Component for EditorView {
             }
             cursor => cursor,
         }
+    }
+}
+
+/// Check if a key press should trigger auto-completion.
+/// Returns true for punctuation/whitespace (trigger characters),
+/// false for word characters (allows continued typing to filter).
+fn should_auto_complete_on_char(key: KeyEvent) -> bool {
+    use helix_view::keyboard::KeyCode;
+
+    match key.code {
+        KeyCode::Char(c) => {
+            // Don't auto-complete on word characters (alphanumeric + underscore)
+            // This allows continued typing to filter completions
+            !c.is_alphanumeric() && c != '_'
+        }
+        _ => false,
     }
 }
 

@@ -2225,6 +2225,47 @@ fn toggle_option(
     Ok(())
 }
 
+/// Toggle completion auto-select mode (also enables/disables space commits).
+fn toggle_completion_mode(
+    cx: &mut compositor::Context,
+    _args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+
+    let mut config = serde_json::json!(&cx.editor.config().deref());
+
+    // Toggle completion-auto-select (note: kebab-case for JSON keys)
+    let auto_select = config
+        .pointer("/completion-auto-select")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let new_value = !auto_select;
+
+    if let Some(v) = config.pointer_mut("/completion-auto-select") {
+        *v = serde_json::Value::Bool(new_value);
+    }
+
+    let status = if new_value {
+        "Completion: auto-select enabled (space commits)"
+    } else {
+        "Completion: auto-select disabled"
+    };
+
+    let config = serde_json::from_value(config)
+        .map_err(|err| anyhow::anyhow!("Failed to parse config: {err}"))?;
+
+    cx.editor
+        .config_events
+        .0
+        .send(ConfigEvent::Update(config))?;
+    cx.editor.set_status(status);
+    Ok(())
+}
+
 /// Change the language of the current buffer at runtime.
 fn language(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow::Result<()> {
     if event != PromptEvent::Validate {
@@ -3556,6 +3597,17 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         signature: Signature {
             positionals: (1, None),
             raw_after: Some(1),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "toggle-completion-mode",
+        aliases: &["tcm"],
+        doc: "Toggle completion mode between spell-checker friendly (auto-select + space commits) and default.",
+        fun: toggle_completion_mode,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
             ..Signature::DEFAULT
         },
     },

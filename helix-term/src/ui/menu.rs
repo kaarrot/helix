@@ -35,6 +35,8 @@ pub struct Menu<T: Item> {
     size: (u16, u16),
     viewport: (u16, u16),
     recalculate: bool,
+    /// Whether to automatically select the first item
+    auto_select_first: bool,
 }
 
 impl<T: Item> Menu<T> {
@@ -47,7 +49,7 @@ impl<T: Item> Menu<T> {
         editor_data: <T as Item>::Data,
         callback_fn: impl Fn(&mut Editor, Option<&T>, MenuEvent) + 'static,
     ) -> Self {
-        let matches = (0..options.len() as u32).map(|i| (i, 0)).collect();
+        let matches: Vec<(u32, u32)> = (0..options.len() as u32).map(|i| (i, 0)).collect();
         Self {
             options,
             editor_data,
@@ -59,11 +61,24 @@ impl<T: Item> Menu<T> {
             size: (0, 0),
             viewport: (0, 0),
             recalculate: true,
+            auto_select_first: false,
+        }
+    }
+
+    /// Enable or disable auto-selection of the first item
+    pub fn set_auto_select_first(&mut self, auto_select: bool) {
+        self.auto_select_first = auto_select;
+        if auto_select && self.cursor.is_none() && !self.matches.is_empty() {
+            self.cursor = Some(0);
         }
     }
 
     pub fn reset_cursor(&mut self) {
-        self.cursor = None;
+        self.cursor = if self.auto_select_first && !self.matches.is_empty() {
+            Some(0)
+        } else {
+            None
+        };
         self.scroll = 0;
         self.recalculate = true;
     }
@@ -82,6 +97,9 @@ impl<T: Item> Menu<T> {
             self.recalculate = true;
             if let Some(cursor) = &mut self.cursor {
                 *cursor = (*cursor).min(self.matches.len() - 1)
+            } else if self.auto_select_first {
+                // Auto-select first item if nothing is selected and auto_select is enabled
+                self.cursor = Some(0);
             }
         }
     }
@@ -373,5 +391,118 @@ impl<T: Item + 'static> Component for Menu<T> {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Minimal Item implementation for testing
+    #[derive(Clone, Debug, PartialEq)]
+    struct TestItem(String);
+
+    impl Item for TestItem {
+        type Data = ();
+
+        fn format(&self, _data: &Self::Data) -> Row<'_> {
+            Row::new(vec![Cell::from(self.0.as_str())])
+        }
+    }
+
+    fn dummy_callback(_editor: &mut Editor, _item: Option<&TestItem>, _event: MenuEvent) {}
+
+    #[test]
+    fn test_menu_auto_select_disabled_by_default() {
+        let items = vec![
+            TestItem("item1".to_string()),
+            TestItem("item2".to_string()),
+        ];
+        let menu = Menu::new(items, (), dummy_callback);
+
+        // Auto-select should be disabled by default
+        assert!(!menu.auto_select_first);
+        // Cursor should be None
+        assert_eq!(menu.cursor, None);
+    }
+
+    #[test]
+    fn test_menu_set_auto_select() {
+        let items = vec![
+            TestItem("item1".to_string()),
+            TestItem("item2".to_string()),
+        ];
+        let mut menu = Menu::new(items, (), dummy_callback);
+
+        // Enable auto-select
+        menu.set_auto_select_first(true);
+
+        assert!(menu.auto_select_first);
+        // Should auto-select first item
+        assert_eq!(menu.cursor, Some(0));
+    }
+
+    #[test]
+    fn test_reset_cursor_with_auto_select() {
+        let items = vec![
+            TestItem("item1".to_string()),
+            TestItem("item2".to_string()),
+        ];
+        let mut menu = Menu::new(items, (), dummy_callback);
+
+        menu.set_auto_select_first(true);
+        menu.cursor = Some(1); // Move to second item
+
+        menu.reset_cursor();
+
+        // Should reset to first item when auto_select is true
+        assert_eq!(menu.cursor, Some(0));
+    }
+
+    #[test]
+    fn test_reset_cursor_without_auto_select() {
+        let items = vec![
+            TestItem("item1".to_string()),
+            TestItem("item2".to_string()),
+        ];
+        let mut menu = Menu::new(items, (), dummy_callback);
+
+        menu.cursor = Some(1);
+        menu.reset_cursor();
+
+        // Should reset to None when auto_select is false
+        assert_eq!(menu.cursor, None);
+    }
+
+    #[test]
+    fn test_ensure_cursor_in_bounds_with_auto_select() {
+        let items = vec![
+            TestItem("item1".to_string()),
+            TestItem("item2".to_string()),
+        ];
+        let mut menu = Menu::new(items, (), dummy_callback);
+
+        menu.set_auto_select_first(true);
+        menu.cursor = None;
+
+        menu.ensure_cursor_in_bounds();
+
+        // Should auto-select first item
+        assert_eq!(menu.cursor, Some(0));
+    }
+
+    #[test]
+    fn test_ensure_cursor_in_bounds_without_auto_select() {
+        let items = vec![
+            TestItem("item1".to_string()),
+            TestItem("item2".to_string()),
+        ];
+        let mut menu = Menu::new(items, (), dummy_callback);
+
+        menu.cursor = None;
+        menu.ensure_cursor_in_bounds();
+
+        // Should remain None
+        assert_eq!(menu.cursor, None);
     }
 }

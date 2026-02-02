@@ -355,6 +355,9 @@ pub struct Config {
     /// Whether to instruct the LSP to replace the entire word when applying a completion
     /// or to only insert new text
     pub completion_replace: bool,
+    /// Whether to auto-select the first completion item when the menu appears.
+    /// When enabled, space will also commit the selected completion. Defaults to false.
+    pub completion_auto_select: bool,
     /// `true` if helix should automatically add a line comment token if you're currently in a comment
     /// and press `enter`.
     pub continue_comments: bool,
@@ -1101,6 +1104,7 @@ impl Default for Config {
             },
             text_width: 80,
             completion_replace: false,
+            completion_auto_select: false,
             continue_comments: true,
             workspace_lsp_roots: Vec::new(),
             default_line_ending: LineEndingConfig::default(),

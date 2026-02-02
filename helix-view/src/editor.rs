@@ -1971,6 +1971,18 @@ impl Editor {
     }
 
     pub fn close(&mut self, id: ViewId) {
+        // Clean up diff/merge view state if this view is part of one
+        // Remove the paired view from the maps so navigation doesn't try to sync with a closed view
+        if let Some(diff_state) = self.diff_views.get(&id).cloned() {
+            self.diff_views.remove(&diff_state.base_view_id);
+            self.diff_views.remove(&diff_state.working_view_id);
+        }
+        if let Some(merge_state) = self.merge_views.get(&id).cloned() {
+            self.merge_views.remove(&merge_state.ours_view_id);
+            self.merge_views.remove(&merge_state.theirs_view_id);
+            self.merge_views.remove(&merge_state.result_view_id);
+        }
+
         // Remove selections for the closed view on all documents.
         for doc in self.documents_mut() {
             doc.remove_view(id);

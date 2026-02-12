@@ -242,8 +242,7 @@ pub fn for_each_changed_file(cwd: &Path, f: impl Fn(Result<FileChange>) -> bool)
 }
 
 /// Iterate over changed files between two references
-/// - If target_ref is None and base_ref is HEAD: compare HEAD vs working tree
-/// - If target_ref is None and base_ref is not HEAD: compare base_ref vs its parent (show what that commit changed)
+/// - If target_ref is None: compare base_ref vs working tree
 /// - If target_ref is Some: compare base_ref vs target_ref (two commits)
 pub fn for_each_changed_file_between_refs(
     cwd: &Path,

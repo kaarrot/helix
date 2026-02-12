@@ -3410,6 +3410,19 @@ fn changed_file_picker(cx: &mut Context) {
                             .and_then(|doc| doc.path().map(|p| p.clone()))
                     })
             })
+            .or_else(|| {
+                // Fallback 1: check if current document has a linked diff doc (single view diff)
+                let doc = doc!(cx.editor);
+                if doc.linked_diff_doc.is_some() {
+                    doc.path().map(|p| p.clone())
+                } else {
+                    None
+                }
+            })
+            .or_else(|| {
+                // Fallback 2: last selection from this picker
+                cx.editor.last_changed_file_selection.clone()
+            })
     };
 
     // Get diff range from editor state or default to HEAD vs working tree

@@ -375,6 +375,9 @@ pub struct Config {
     /// Search configuration.
     #[serde(default)]
     pub search: SearchConfig,
+    /// Diff configuration.
+    #[serde(default)]
+    pub diff: DiffConfig,
     pub lsp: LspConfig,
     pub terminal: Option<TerminalConfig>,
     /// Column numbers at which to draw the rulers. Defaults to `[]`, meaning no rulers.
@@ -507,6 +510,19 @@ pub fn get_terminal_provider() -> Option<TerminalConfig> {
     }
 
     None
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", default, deny_unknown_fields)]
+pub struct DiffConfig {
+    /// Show diff changes in a split view. Defaults to false.
+    pub split_view: bool,
+}
+
+impl Default for DiffConfig {
+    fn default() -> Self {
+        Self { split_view: false }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1093,6 +1109,7 @@ impl Default for Config {
             true_color: false,
             undercurl: false,
             search: SearchConfig::default(),
+            diff: DiffConfig::default(),
             lsp: LspConfig::default(),
             terminal: get_terminal_provider(),
             rulers: Vec::new(),
@@ -2476,36 +2493,41 @@ impl Editor {
             base_doc.linked_diff_doc = Some(working_doc_id);
         }
 
-        // 5. Create split layout: base (left) | working (right)
-        // Close all non-focused views first to ensure clean 2-split layout
-        let views_to_close: Vec<ViewId> = self
-            .tree
-            .views()
-            .filter_map(|(v, focus)| if !focus { Some(v.id) } else { None })
-            .collect();
-        for view_id in views_to_close {
-            self.close(view_id);
+        if self.config().diff.split_view {
+            // 5. Create split layout: base (left) | working (right)
+            // Close all non-focused views first to ensure clean 2-split layout
+            let views_to_close: Vec<ViewId> = self
+                .tree
+                .views()
+                .filter_map(|(v, focus)| if !focus { Some(v.id) } else { None })
+                .collect();
+            for view_id in views_to_close {
+                self.close(view_id);
+            }
+
+            // First, switch to base document
+            self.switch(base_doc_id, Action::Replace);
+            let base_view_id = self.tree.focus;
+
+            // Then create vertical split for working document
+            self.switch(working_doc_id, Action::VerticalSplit);
+            let working_view_id = self.tree.focus;
+
+            // 6. Register diff state for both views
+            let diff_state = DiffViewState::new(
+                base_doc_id,
+                working_doc_id,
+                base_view_id,
+                working_view_id,
+                git_ref.to_string(),
+            );
+
+            self.diff_views.insert(base_view_id, diff_state.clone());
+            self.diff_views.insert(working_view_id, diff_state);
+        } else {
+            // Just open the working document, diffs are enabled on it.
+            self.switch(working_doc_id, Action::Replace);
         }
-
-        // First, switch to base document
-        self.switch(base_doc_id, Action::Replace);
-        let base_view_id = self.tree.focus;
-
-        // Then create vertical split for working document
-        self.switch(working_doc_id, Action::VerticalSplit);
-        let working_view_id = self.tree.focus;
-
-        // 6. Register diff state for both views
-        let diff_state = DiffViewState::new(
-            base_doc_id,
-            working_doc_id,
-            base_view_id,
-            working_view_id,
-            git_ref.to_string(),
-        );
-
-        self.diff_views.insert(base_view_id, diff_state.clone());
-        self.diff_views.insert(working_view_id, diff_state);
 
         Ok(())
     }
@@ -2569,35 +2591,40 @@ impl Editor {
                     target_doc.set_diff_base(base_content);
                 }
 
-                // 6. Create split layout: base (left) | target (right)
-                // Close all non-focused views first to ensure clean 2-split layout
-                let views_to_close: Vec<ViewId> = self
-                    .tree
-                    .views()
-                    .filter_map(|(v, focus)| if !focus { Some(v.id) } else { None })
-                    .collect();
-                for view_id in views_to_close {
-                    self.close(view_id);
+                if self.config().diff.split_view {
+                    // 6. Create split layout: base (left) | target (right)
+                    // Close all non-focused views first to ensure clean 2-split layout
+                    let views_to_close: Vec<ViewId> = self
+                        .tree
+                        .views()
+                        .filter_map(|(v, focus)| if !focus { Some(v.id) } else { None })
+                        .collect();
+                    for view_id in views_to_close {
+                        self.close(view_id);
+                    }
+
+                    self.switch(base_doc_id, Action::Replace);
+                    let base_view_id = self.tree.focus;
+
+                    self.switch(target_doc_id, Action::VerticalSplit);
+                    let target_view_id = self.tree.focus;
+
+                    // 7. Register diff state for both views
+                    let display_string = format!("{}..{}", base_ref, target);
+                    let diff_state = DiffViewState::new(
+                        base_doc_id,
+                        target_doc_id,
+                        base_view_id,
+                        target_view_id,
+                        display_string,
+                    );
+
+                    self.diff_views.insert(base_view_id, diff_state.clone());
+                    self.diff_views.insert(target_view_id, diff_state);
+                } else {
+                    // Just open the target document, diffs are enabled on it.
+                    self.switch(target_doc_id, Action::Replace);
                 }
-
-                self.switch(base_doc_id, Action::Replace);
-                let base_view_id = self.tree.focus;
-
-                self.switch(target_doc_id, Action::VerticalSplit);
-                let target_view_id = self.tree.focus;
-
-                // 7. Register diff state for both views
-                let display_string = format!("{}..{}", base_ref, target);
-                let diff_state = DiffViewState::new(
-                    base_doc_id,
-                    target_doc_id,
-                    base_view_id,
-                    target_view_id,
-                    display_string,
-                );
-
-                self.diff_views.insert(base_view_id, diff_state.clone());
-                self.diff_views.insert(target_view_id, diff_state);
 
                 Ok(())
             }

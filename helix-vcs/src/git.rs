@@ -1,5 +1,5 @@
 use anyhow::{bail, Context, Result};
-use arc_swap::ArcSwap;
+use arc_swap::ArcSwap
 use gix::filter::plumbing::driver::apply::Delay;
 use std::io::Read;
 use std::path::Path;

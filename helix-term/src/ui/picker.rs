@@ -21,8 +21,8 @@ use thiserror::Error;
 use tokio::sync::mpsc::Sender;
 use tui::{
     buffer::Buffer as Surface,
-    layout::Constraint,
-    text::{Span, Spans},
+    layout::{Constraint, Direction as LayoutDirection, Layout},
+    text::{Span, Spans, Text},
     widgets::{Block, BorderType, Cell, Row, Table},
 };
 
@@ -42,7 +42,8 @@ use std::{
 use crate::ui::{Prompt, PromptEvent};
 use helix_core::{
     char_idx_at_visual_offset, fuzzy::MATCHER, movement::Direction,
-    text_annotations::TextAnnotations, unicode::segmentation::UnicodeSegmentation, Position,
+    text_annotations::TextAnnotations, unicode::segmentation::UnicodeSegmentation,
+    unicode::width::UnicodeWidthStr, Position,
 };
 use helix_view::{
     editor::Action,
@@ -196,6 +197,7 @@ pub struct Column<T, D> {
     /// global search) is not used for filtering twice.
     filter: bool,
     hidden: bool,
+    wraps: bool,
 }
 
 impl<T, D> Column<T, D> {
@@ -205,6 +207,7 @@ impl<T, D> Column<T, D> {
             format,
             filter: true,
             hidden: false,
+            wraps: false,
         }
     }
 
@@ -217,11 +220,17 @@ impl<T, D> Column<T, D> {
             format,
             filter: false,
             hidden: true,
+            wraps: false,
         }
     }
 
     pub fn without_filtering(mut self) -> Self {
         self.filter = false;
+        self
+    }
+
+    pub fn wrap(mut self) -> Self {
+        self.wraps = true;
         self
     }
 
@@ -371,7 +380,13 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
 
         let widths = columns
             .iter()
-            .map(|column| Constraint::Length(column.name.chars().count() as u16))
+            .map(|column| {
+                if column.wraps {
+                    Constraint::Min(0)
+                } else {
+                    Constraint::Length(column.name.chars().count() as u16)
+                }
+            })
             .collect();
 
         let query = PickerQuery::new(columns.iter().map(|col| &col.name).cloned(), default_column);
@@ -763,6 +778,27 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
         // -- Render the contents:
         // subtract area of prompt from top
         let inner = inner.clip_top(2);
+
+        // Calculate actual widths that Table will use to split columns
+        let highlight_symbol_width = 3; // " > "
+        let table_area_width = inner.width.saturating_sub(highlight_symbol_width);
+        let mut constraints = Vec::with_capacity(self.widths.len() * 2);
+        for w in &self.widths {
+            constraints.push(*w);
+            constraints.push(Constraint::Length(1)); // spacing
+        }
+        if !constraints.is_empty() {
+            constraints.pop();
+        }
+        let actual_widths: Vec<u16> = Layout::default()
+            .direction(LayoutDirection::Horizontal)
+            .constraints(constraints)
+            .split(Rect::new(0, 0, table_area_width, 1))
+            .into_iter()
+            .step_by(2)
+            .map(|r| r.width)
+            .collect();
+
         let rows = inner.height.saturating_sub(self.header_height()) as u32;
         let offset = self.cursor - (self.cursor % std::cmp::max(1, rows));
         let cursor = self.cursor.saturating_sub(offset);
@@ -779,17 +815,19 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
         let options = snapshot.matched_items(offset..end).map(|item| {
             let mut widths = self.widths.iter_mut();
             let mut matcher_index = 0;
+            let mut row_height = 1;
 
-            Row::new(self.columns.iter().map(|column| {
+            let cells = self.columns.iter().enumerate().map(|(i, column)| {
                 if column.hidden {
                     return Cell::default();
                 }
 
-                let Some(Constraint::Length(max_width)) = widths.next() else {
-                    unreachable!();
-                };
+                let current_width_constraint = widths.next().unwrap();
                 let mut cell = column.format(item.data, &self.editor_data);
-                let width = if column.filter {
+                let actual_width = actual_widths[i];
+
+                let mut width = 0;
+                if column.filter {
                     snapshot.pattern().column_pattern(matcher_index).indices(
                         item.matcher_columns[matcher_index].slice(..),
                         &mut matcher,
@@ -799,58 +837,86 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
                     indices.dedup();
                     let mut indices = indices.drain(..);
                     let mut next_highlight_idx = indices.next().unwrap_or(u32::MAX);
-                    let mut span_list = Vec::new();
-                    let mut current_span = String::new();
+
+                    let mut lines = Vec::new();
+                    let mut current_line_spans = Vec::new();
+                    let mut current_line_width = 0;
+
+                    let mut current_span_content = String::new();
                     let mut current_style = Style::default();
                     let mut grapheme_idx = 0u32;
-                    let mut width = 0;
 
-                    let spans: &[Span] =
-                        cell.content.lines.first().map_or(&[], |it| it.0.as_slice());
-                    for span in spans {
-                        // this looks like a bug on first glance, we are iterating
-                        // graphemes but treating them as char indices. The reason that
-                        // this is correct is that nucleo will only ever consider the first char
-                        // of a grapheme (and discard the rest of the grapheme) so the indices
-                        // returned by nucleo are essentially grapheme indecies
-                        for grapheme in span.content.graphemes(true) {
-                            let style = if grapheme_idx == next_highlight_idx {
-                                next_highlight_idx = indices.next().unwrap_or(u32::MAX);
-                                span.style.patch(highlight_style)
-                            } else {
-                                span.style
-                            };
-                            if style != current_style {
-                                if !current_span.is_empty() {
-                                    span_list.push(Span::styled(current_span, current_style))
+                    for line in &cell.content.lines {
+                        for span in &line.0 {
+                            width += span.width();
+                            for grapheme in span.content.graphemes(true) {
+                                let g_width = grapheme.width() as u16;
+
+                                if column.wraps && actual_width > 0 && current_line_width + g_width > actual_width && current_line_width > 0 {
+                                    if !current_span_content.is_empty() {
+                                        current_line_spans.push(Span::styled(std::mem::take(&mut current_span_content), current_style));
+                                    }
+                                    lines.push(Spans::from(std::mem::take(&mut current_line_spans)));
+                                    current_line_width = 0;
                                 }
-                                current_span = String::new();
-                                current_style = style;
+
+                                let style = if grapheme_idx == next_highlight_idx {
+                                    next_highlight_idx = indices.next().unwrap_or(u32::MAX);
+                                    span.style.patch(highlight_style)
+                                } else {
+                                    span.style
+                                };
+
+                                if style != current_style {
+                                    if !current_span_content.is_empty() {
+                                        current_line_spans.push(Span::styled(std::mem::take(&mut current_span_content), current_style));
+                                    }
+                                    current_style = style;
+                                }
+
+                                current_span_content.push_str(grapheme);
+                                current_line_width += g_width;
+                                grapheme_idx += 1;
                             }
-                            current_span.push_str(grapheme);
-                            grapheme_idx += 1;
                         }
-                        width += span.width();
+                        if !current_span_content.is_empty() {
+                            current_line_spans.push(Span::styled(std::mem::take(&mut current_span_content), current_style));
+                        }
+                        lines.push(Spans::from(std::mem::take(&mut current_line_spans)));
+                        current_line_width = 0;
                     }
 
-                    span_list.push(Span::styled(current_span, current_style));
-                    cell = Cell::from(Spans::from(span_list));
+                    cell = Cell::from(Text::from(lines));
                     matcher_index += 1;
-                    width
                 } else {
-                    cell.content
+                    let text_width = cell.content
                         .lines
                         .first()
                         .map(|line| line.width())
-                        .unwrap_or_default()
+                        .unwrap_or_default();
+                    width = text_width;
+
+                    if column.wraps && text_width as u16 > actual_width {
+                        let text = String::from(&cell.content);
+                        let wrapped = helix_core::wrap::reflow_hard_wrap(&text, actual_width as usize);
+                        cell = Cell::from(wrapped.to_string());
+                    }
                 };
 
-                if width as u16 > *max_width {
-                    *max_width = width as u16;
+                if !column.wraps {
+                    if let Constraint::Length(max_width) = current_width_constraint {
+                        if width as u16 > *max_width {
+                            *max_width = width as u16;
+                        }
+                    }
                 }
 
+                row_height = row_height.max(cell.content.lines.len() as u16);
+
                 cell
-            }))
+            }).collect::<Vec<_>>();
+
+            Row::new(cells).height(row_height)
         });
 
         let mut table = Table::new(options)

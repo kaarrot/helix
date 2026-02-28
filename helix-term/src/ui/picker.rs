@@ -58,7 +58,7 @@ pub const ID: &str = "picker";
 
 pub const MIN_AREA_WIDTH_FOR_PREVIEW: u16 = 72;
 pub const MIN_AREA_WIDTH_FOR_SIDE_BY_SIDE: u16 = 100;
-pub const MIN_AREA_HEIGHT_FOR_VERTICAL_PREVIEW: u16 = 20;
+pub const MIN_AREA_HEIGHT_FOR_VERTICAL_PREVIEW: u16 = 15;
 /// Biggest file size to preview in bytes
 pub const MAX_FILE_SIZE_FOR_PREVIEW: u64 = 10 * 1024 * 1024;
 
@@ -1038,6 +1038,7 @@ impl<I: 'static + Send + Sync, D: 'static + Send + Sync> Component for Picker<I,
         let render_preview = self.should_render_preview(area);
 
         if !render_preview {
+            self.completion_height = area.height.saturating_sub(4 + self.header_height());
             self.render_picker(area, surface, cx);
             return;
         }
@@ -1045,6 +1046,7 @@ impl<I: 'static + Send + Sync, D: 'static + Send + Sync> Component for Picker<I,
         if self.is_vertical(area) {
             let picker_height = area.height / 2;
             let picker_area = area.with_height(picker_height);
+            self.completion_height = picker_area.height.saturating_sub(4 + self.header_height());
             self.render_picker(picker_area, surface, cx);
 
             let preview_area = area.clip_top(picker_height);
@@ -1052,8 +1054,8 @@ impl<I: 'static + Send + Sync, D: 'static + Send + Sync> Component for Picker<I,
         } else {
             let picker_width = area.width / 2;
             let picker_area = area.with_width(picker_width);
+            self.completion_height = picker_area.height.saturating_sub(4 + self.header_height());
             self.render_picker(picker_area, surface, cx);
-
             let preview_area = area.clip_left(picker_width);
             self.render_preview(preview_area, surface, cx);
         }

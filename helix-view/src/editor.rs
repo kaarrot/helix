@@ -1174,8 +1174,9 @@ pub struct DiffRange {
 }
 
 impl DiffRange {
-    /// Parse a diff range string like "main..feature" or "main"
+    /// Parse a diff range string like "main..feature", "main", or "main!"
     /// - "main..feature" -> base: "main", target: Some("feature")
+    /// - "main!" -> base: "main^", target: Some("main") (shorthand for changes in "main")
     /// - "main" -> base: "main", target: None (working tree)
     pub fn parse(range_str: &str) -> Result<Self, Error> {
         if let Some((base, target)) = range_str.split_once("..") {
@@ -1185,6 +1186,14 @@ impl DiffRange {
             Ok(DiffRange {
                 base_ref: base.to_string(),
                 target_ref: Some(target.to_string()),
+            })
+        } else if let Some(base) = range_str.strip_suffix('!') {
+            if base.is_empty() {
+                bail!("Invalid diff range: '!' suffix must follow a reference");
+            }
+            Ok(DiffRange {
+                base_ref: format!("{}^", base),
+                target_ref: Some(base.to_string()),
             })
         } else {
             if range_str.is_empty() {

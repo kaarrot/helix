@@ -271,7 +271,8 @@ fn diag_picker(
         }),
         ui::PickerColumn::new("message", |item: &PickerDiagnostic, _| {
             item.diag.message.as_str().into()
-        }),
+        })
+        .wrap(),
     ];
     let mut primary_column = 3; // message
 
@@ -288,7 +289,8 @@ fn diag_picker(
                 } else {
                     Default::default()
                 }
-            }),
+            })
+            .wrap(),
         );
         primary_column += 1;
     }

@@ -26,6 +26,8 @@ pub struct DiffViewState {
     pub sync_scroll: bool,
     /// Git reference being compared against (e.g., "HEAD", "main", commit hash)
     pub git_ref: String,
+    /// Override for the global split_view config
+    pub split_view: Option<bool>,
 }
 
 impl DiffViewState {
@@ -44,6 +46,7 @@ impl DiffViewState {
             working_view_id,
             sync_scroll: true,
             git_ref,
+            split_view: None,
         }
     }
 

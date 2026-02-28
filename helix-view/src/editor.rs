@@ -2464,7 +2464,12 @@ impl Editor {
     /// Creates a vertical split with:
     /// - Left pane: Read-only git revision (base)
     /// - Right pane: Editable working copy
-    pub fn open_diff_view(&mut self, path: &Path, git_ref: &str) -> Result<(), Error> {
+    pub fn open_diff_view(
+        &mut self,
+        path: &Path,
+        git_ref: &str,
+        split_view_override: Option<bool>,
+    ) -> Result<(), Error> {
         use crate::diff_view::DiffViewState;
 
         let path = helix_stdx::path::canonicalize(path);
@@ -2502,7 +2507,9 @@ impl Editor {
             base_doc.linked_diff_doc = Some(working_doc_id);
         }
 
-        if self.config().diff.split_view {
+        let split_view = split_view_override.unwrap_or_else(|| self.config().diff.split_view);
+
+        if split_view {
             // 5. Create split layout: base (left) | working (right)
             // Close all non-focused views first to ensure clean 2-split layout
             let views_to_close: Vec<ViewId> = self
@@ -2523,19 +2530,32 @@ impl Editor {
             let working_view_id = self.tree.focus;
 
             // 6. Register diff state for both views
-            let diff_state = DiffViewState::new(
+            let mut diff_state = DiffViewState::new(
                 base_doc_id,
                 working_doc_id,
                 base_view_id,
                 working_view_id,
                 git_ref.to_string(),
             );
+            diff_state.split_view = split_view_override;
 
             self.diff_views.insert(base_view_id, diff_state.clone());
             self.diff_views.insert(working_view_id, diff_state);
         } else {
             // Just open the working document, diffs are enabled on it.
             self.switch(working_doc_id, Action::Replace);
+            let working_view_id = self.tree.focus;
+
+            // Still register diff state so we can toggle back to split view
+            let mut diff_state = DiffViewState::new(
+                base_doc_id,
+                working_doc_id,
+                working_view_id, // no separate base view in single mode
+                working_view_id,
+                git_ref.to_string(),
+            );
+            diff_state.split_view = split_view_override;
+            self.diff_views.insert(working_view_id, diff_state);
         }
 
         Ok(())
@@ -2549,6 +2569,7 @@ impl Editor {
         path: &Path,
         base_ref: &str,
         target_ref: Option<&str>,
+        split_view_override: Option<bool>,
     ) -> Result<(), Error> {
         use crate::diff_view::DiffViewState;
 
@@ -2557,7 +2578,7 @@ impl Editor {
         match target_ref {
             // Compare base_ref vs working tree (editable right pane)
             None => {
-                self.open_diff_view(&path, base_ref)
+                self.open_diff_view(&path, base_ref, split_view_override)
             }
             // Compare two commits
             Some(target) => {
@@ -2600,7 +2621,9 @@ impl Editor {
                     target_doc.set_diff_base(base_content);
                 }
 
-                if self.config().diff.split_view {
+                let split_view = split_view_override.unwrap_or_else(|| self.config().diff.split_view);
+
+                if split_view {
                     // 6. Create split layout: base (left) | target (right)
                     // Close all non-focused views first to ensure clean 2-split layout
                     let views_to_close: Vec<ViewId> = self
@@ -2620,19 +2643,32 @@ impl Editor {
 
                     // 7. Register diff state for both views
                     let display_string = format!("{}..{}", base_ref, target);
-                    let diff_state = DiffViewState::new(
+                    let mut diff_state = DiffViewState::new(
                         base_doc_id,
                         target_doc_id,
                         base_view_id,
                         target_view_id,
                         display_string,
                     );
+                    diff_state.split_view = split_view_override;
 
                     self.diff_views.insert(base_view_id, diff_state.clone());
                     self.diff_views.insert(target_view_id, diff_state);
                 } else {
                     // Just open the target document, diffs are enabled on it.
                     self.switch(target_doc_id, Action::Replace);
+                    let target_view_id = self.tree.focus;
+
+                    let display_string = format!("{}..{}", base_ref, target);
+                    let mut diff_state = DiffViewState::new(
+                        base_doc_id,
+                        target_doc_id,
+                        target_view_id,
+                        target_view_id,
+                        display_string,
+                    );
+                    diff_state.split_view = split_view_override;
+                    self.diff_views.insert(target_view_id, diff_state);
                 }
 
                 Ok(())
@@ -2659,8 +2695,8 @@ impl Editor {
             // Close the virtual base document
             let _ = self.close_document(diff_state.base_doc_id, true);
 
-            // Close the base view - check if it exists first
-            if self.tree.contains(diff_state.base_view_id) {
+            // Close the base view - check if it exists first and is NOT the working view
+            if diff_state.base_view_id != diff_state.working_view_id && self.tree.contains(diff_state.base_view_id) {
                 self.close(diff_state.base_view_id);
             }
 

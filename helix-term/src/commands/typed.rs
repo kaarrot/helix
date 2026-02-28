@@ -3094,6 +3094,7 @@ fn diff_files(
                             path_to_open,
                             &base_ref_for_callback,
                             target_ref_for_callback.as_deref(),
+                            None,
                         );
 
                         if let Err(err) = result {
@@ -3134,6 +3135,27 @@ fn diff_files(
     };
 
     cx.jobs.callback(callback);
+    Ok(())
+}
+
+fn diff_toggle_split_view(
+    cx: &mut compositor::Context,
+    _args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+
+    let mut cx = crate::commands::Context {
+        editor: cx.editor,
+        jobs: cx.jobs,
+        register: None,
+        count: None,
+        callback: Vec::new(),
+        on_next_key_callback: None,
+    };
+    crate::commands::diff_toggle_split_view(&mut cx);
     Ok(())
 }
 
@@ -4200,6 +4222,17 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         completer: CommandCompleter::none(),
         signature: Signature {
             positionals: (0, None),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "diff-toggle-split-view",
+        aliases: &["dtsv"],
+        doc: "Toggle between side-by-side and single-view diffs.",
+        fun: diff_toggle_split_view,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
             ..Signature::DEFAULT
         },
     },

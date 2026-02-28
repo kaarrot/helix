@@ -613,6 +613,8 @@ impl MappableCommand {
         merge_next_conflict, "Jump to next merge conflict",
         merge_prev_conflict, "Jump to previous merge conflict",
         merge_finish, "Save and stage resolved file (git add)",
+        diff_toggle_split_view, "Toggle between side-by-side and single-view diffs",
+        diff_reset, "Reset the diff base to HEAD (default behavior)",
         select_register, "Select register",
         insert_register, "Insert register",
         copy_between_registers, "Copy between two registers",
@@ -3502,6 +3504,7 @@ fn changed_file_picker(cx: &mut Context) {
                             path,
                             &base_ref_for_callback,
                             target_ref_for_callback.as_deref(),
+                            None,
                         ) {
                             cx.editor.set_error(format!("Failed to open diff view: {}", e));
                         }
@@ -6039,6 +6042,81 @@ fn diff_toggle_sync_scroll(cx: &mut Context) {
     }
 
     cx.editor.set_error("Not in a diff or merge view");
+}
+
+fn diff_toggle_split_view(cx: &mut Context) {
+    let (view, doc) = current!(cx.editor);
+    let view_id = view.id;
+    let _doc_id = doc.id();
+
+    // 1. Check if we are in a diff view
+    let diff_state = cx.editor.diff_views.get(&view_id).cloned();
+
+    let Some(diff_state) = diff_state else {
+        cx.editor.set_error("Not in a diff view");
+        return;
+    };
+
+    // 2. Determine the path and refs to reopen
+    // We need the working document path and the git_ref
+    let working_doc = match cx.editor.documents.get(&diff_state.working_doc_id) {
+        Some(doc) => doc,
+        None => {
+            cx.editor.set_error("Working document not found");
+            return;
+        }
+    };
+
+    let path = match working_doc.path() {
+        Some(path) => path.clone(),
+        None => {
+            cx.editor.set_error("Document has no path");
+            return;
+        }
+    };
+
+    let git_ref = diff_state.git_ref.clone();
+
+    // 3. Determine the new split state
+    // If current state has an override, toggle it.
+    // If not, toggle the global config value.
+    let current_split = diff_state
+        .split_view
+        .unwrap_or_else(|| cx.editor.config().diff.split_view);
+    let new_split = !current_split;
+
+    // 4. Close the current diff view
+    cx.editor.close_diff_view(view_id);
+
+    // 5. Reopen with the new split state
+    // We use the same base_ref from the state
+    // Determine if it was a range diff (base..target) or single ref diff
+    if let Some((base, target)) = git_ref.split_once("..") {
+        if let Err(e) = cx.editor.open_diff_view_range(
+            &path,
+            base,
+            Some(target),
+            Some(new_split),
+        ) {
+            cx.editor.set_error(format!("Failed to reopen diff view: {}", e));
+        }
+    } else {
+        if let Err(e) = cx.editor.open_diff_view(
+            &path,
+            &git_ref,
+            Some(new_split),
+        ) {
+            cx.editor.set_error(format!("Failed to reopen diff view: {}", e));
+        }
+    }
+
+    let status = if new_split { "side-by-side" } else { "single" };
+    cx.editor.set_status(format!("Diff layout set to {}", status));
+}
+
+fn diff_reset(cx: &mut Context) {
+    cx.editor.diff_range = None;
+    cx.editor.set_status("Diff range reset");
 }
 
 fn close_diff_or_merge_view(cx: &mut Context) {

@@ -245,6 +245,8 @@ pub fn default() -> HashMap<Mode, KeyTrie> {
                 "n" => merge_next_conflict,
                 "p" => merge_prev_conflict,
                 "s" => diff_toggle_sync_scroll,
+                "v" => diff_toggle_split_view,
+                "r" => diff_reset,
                 "q" => close_diff_or_merge_view,
                 "a" => merge_finish,
             },

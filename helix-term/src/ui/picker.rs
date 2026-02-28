@@ -57,6 +57,8 @@ use self::handlers::{DynamicQueryChange, DynamicQueryHandler, PreviewHighlightHa
 pub const ID: &str = "picker";
 
 pub const MIN_AREA_WIDTH_FOR_PREVIEW: u16 = 72;
+pub const MIN_AREA_WIDTH_FOR_SIDE_BY_SIDE: u16 = 100;
+pub const MIN_AREA_HEIGHT_FOR_VERTICAL_PREVIEW: u16 = 20;
 /// Biggest file size to preview in bytes
 pub const MAX_FILE_SIZE_FOR_PREVIEW: u64 = 10 * 1024 * 1024;
 
@@ -517,6 +519,22 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             1
         } else {
             0
+        }
+    }
+
+    pub fn is_vertical(&self, area: Rect) -> bool {
+        area.height > area.width || area.width < MIN_AREA_WIDTH_FOR_SIDE_BY_SIDE
+    }
+
+    fn should_render_preview(&self, area: Rect) -> bool {
+        if !self.show_preview || self.file_fn.is_none() {
+            return false;
+        }
+
+        if self.is_vertical(area) {
+            area.height > MIN_AREA_HEIGHT_FOR_VERTICAL_PREVIEW
+        } else {
+            area.width > MIN_AREA_WIDTH_FOR_PREVIEW
         }
     }
 
@@ -1017,19 +1035,25 @@ impl<I: 'static + Send + Sync, D: 'static + Send + Sync> Component for Picker<I,
         // |         | |         |
         // +---------+ +---------+
 
-        let render_preview =
-            self.show_preview && self.file_fn.is_some() && area.width > MIN_AREA_WIDTH_FOR_PREVIEW;
+        let render_preview = self.should_render_preview(area);
 
-        let picker_width = if render_preview {
-            area.width / 2
+        if !render_preview {
+            self.render_picker(area, surface, cx);
+            return;
+        }
+
+        if self.is_vertical(area) {
+            let picker_height = area.height / 2;
+            let picker_area = area.with_height(picker_height);
+            self.render_picker(picker_area, surface, cx);
+
+            let preview_area = area.clip_top(picker_height);
+            self.render_preview(preview_area, surface, cx);
         } else {
-            area.width
-        };
+            let picker_width = area.width / 2;
+            let picker_area = area.with_width(picker_width);
+            self.render_picker(picker_area, surface, cx);
 
-        let picker_area = area.with_width(picker_width);
-        self.render_picker(picker_area, surface, cx);
-
-        if render_preview {
             let preview_area = area.clip_left(picker_width);
             self.render_preview(preview_area, surface, cx);
         }
@@ -1152,26 +1176,34 @@ impl<I: 'static + Send + Sync, D: 'static + Send + Sync> Component for Picker<I,
     }
 
     fn cursor(&self, area: Rect, editor: &Editor) -> (Option<Position>, CursorKind) {
-        let block = Block::bordered();
-        // calculate the inner area inside the box
-        let inner = block.inner(area);
-
         // prompt area
-        let render_preview =
-            self.show_preview && self.file_fn.is_some() && area.width > MIN_AREA_WIDTH_FOR_PREVIEW;
+        let render_preview = self.should_render_preview(area);
 
-        let picker_width = if render_preview {
-            area.width / 2
+        let picker_area = if render_preview {
+            if self.is_vertical(area) {
+                area.with_height(area.height / 2)
+            } else {
+                area.with_width(area.width / 2)
+            }
         } else {
-            area.width
+            area
         };
-        let area = inner.clip_left(1).with_height(1).with_width(picker_width);
+
+        let block = Block::bordered();
+        let inner = block.inner(picker_area);
+        let area = inner.clip_left(1).with_height(1);
 
         self.prompt.cursor(area, editor)
     }
 
     fn required_size(&mut self, (width, height): (u16, u16)) -> Option<(u16, u16)> {
-        self.completion_height = height.saturating_sub(4 + self.header_height());
+        let area = Rect::new(0, 0, width, height);
+        let picker_height = if self.should_render_preview(area) && self.is_vertical(area) {
+            height / 2
+        } else {
+            height
+        };
+        self.completion_height = picker_height.saturating_sub(4 + self.header_height());
         Some((width, height))
     }
 

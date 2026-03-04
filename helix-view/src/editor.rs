@@ -2706,6 +2706,113 @@ impl Editor {
         }
     }
 
+    fn map_line_before_to_after(source_line: usize, diff_handle: &helix_vcs::DiffHandle) -> usize {
+        let diff = diff_handle.load();
+        let source_line = source_line as i64;
+        let mut cumulative_delta: i64 = 0;
+
+        for hunk_idx in 0..diff.len() {
+            let hunk = diff.nth_hunk(hunk_idx);
+            let source_start = hunk.before.start as i64;
+            let source_end = hunk.before.end as i64;
+            let target_start = hunk.after.start as i64;
+            let target_end = hunk.after.end as i64;
+
+            if source_line < source_start {
+                return source_line.saturating_add(cumulative_delta).max(0) as usize;
+            }
+
+            if source_line < source_end {
+                let source_len = source_end.saturating_sub(source_start);
+                let target_len = target_end.saturating_sub(target_start);
+
+                if source_len == 0 {
+                    return target_start.max(0) as usize;
+                }
+
+                let offset_in_hunk = source_line.saturating_sub(source_start);
+                let mapped_line = if target_len == 0 {
+                    target_start
+                } else {
+                    target_start + offset_in_hunk.min(target_len - 1)
+                };
+                return mapped_line.max(0) as usize;
+            }
+
+            cumulative_delta += (target_end - target_start) - (source_end - source_start);
+        }
+
+        source_line.saturating_add(cumulative_delta).max(0) as usize
+    }
+
+    fn map_view_offset_using_diff(
+        source_doc: &Document,
+        target_doc: &Document,
+        source_offset: crate::view::ViewPosition,
+        diff_handle: &helix_vcs::DiffHandle,
+        source_is_after: bool,
+    ) -> crate::view::ViewPosition {
+        let source_anchor_line = source_doc.text().char_to_line(source_offset.anchor);
+
+        // Mapping is implemented for before->after. For after->before we invert
+        // a cloned handle so hunks are exposed in the opposite direction.
+        let mapped_line = if source_is_after {
+            let mut inverted = diff_handle.clone();
+            inverted.invert();
+            Self::map_line_before_to_after(source_anchor_line, &inverted)
+        } else {
+            Self::map_line_before_to_after(source_anchor_line, diff_handle)
+        };
+
+        let target_line = mapped_line.min(target_doc.text().len_lines().saturating_sub(1));
+        crate::view::ViewPosition {
+            anchor: target_doc.text().line_to_char(target_line),
+            vertical_offset: source_offset.vertical_offset,
+            horizontal_offset: source_offset.horizontal_offset,
+        }
+    }
+
+    fn map_view_offset_by_line(
+        source_doc: &Document,
+        target_doc: &Document,
+        source_offset: crate::view::ViewPosition,
+    ) -> crate::view::ViewPosition {
+        let source_anchor_line = source_doc.text().char_to_line(source_offset.anchor);
+        let target_line = source_anchor_line.min(target_doc.text().len_lines().saturating_sub(1));
+
+        crate::view::ViewPosition {
+            anchor: target_doc.text().line_to_char(target_line),
+            vertical_offset: source_offset.vertical_offset,
+            horizontal_offset: source_offset.horizontal_offset,
+        }
+    }
+
+    pub fn map_line_between_documents(
+        &self,
+        source_doc_id: DocumentId,
+        target_doc_id: DocumentId,
+        source_line: usize,
+    ) -> usize {
+        let Some(source_doc) = self.documents.get(&source_doc_id) else {
+            return source_line;
+        };
+        let Some(target_doc) = self.documents.get(&target_doc_id) else {
+            return source_line;
+        };
+
+        let mapped_line = if let Some(source_diff) = source_doc.diff_handle() {
+            let mut inverted = source_diff.clone();
+            inverted.invert();
+            Self::map_line_before_to_after(source_line, &inverted)
+        } else if let Some(target_diff) = target_doc.diff_handle() {
+            Self::map_line_before_to_after(source_line, target_diff)
+        } else {
+            source_line
+        };
+
+        mapped_line.min(target_doc.text().len_lines().saturating_sub(1))
+    }
+
     /// Synchronize scroll position to linked diff views.
     pub fn sync_scroll_to_linked_views(&mut self, source_view_id: ViewId) {
         log::info!("sync_scroll_to_linked_views called for view {:?}", source_view_id);
@@ -2733,8 +2840,11 @@ impl Editor {
                 return;
             }
 
-            // Get source scroll position
-            if let Some(source_doc) = self.documents.get(&source_doc_id) {
+            // Get source scroll position and map to target with hunk-aware alignment.
+            let mapped_offset = {
+                let Some(source_doc) = self.documents.get(&source_doc_id) else {
+                    return;
+                };
                 let Some(source_offset) = source_doc.get_view_offset(source_view_id) else {
                     log::warn!(
                         "Skipping 2-way diff scroll sync: source view {:?} has no initialized view data",
@@ -2742,13 +2852,35 @@ impl Editor {
                     );
                     return;
                 };
+                let Some(target_doc) = self.documents.get(&target_doc_id) else {
+                    return;
+                };
 
-                // Set target scroll position
-                // For now, use simple line-based alignment
-                // In the future, we can use DiffHandle hunks for smarter alignment
-                if let Some(target_doc) = self.documents.get_mut(&target_doc_id) {
-                    target_doc.set_view_offset(target_view_id, source_offset);
+                if let Some(source_diff) = source_doc.diff_handle() {
+                    // source is "after" for its own diff handle
+                    Self::map_view_offset_using_diff(
+                        source_doc,
+                        target_doc,
+                        source_offset,
+                        source_diff,
+                        true,
+                    )
+                } else if let Some(target_diff) = target_doc.diff_handle() {
+                    // source is "before" when using target's diff handle
+                    Self::map_view_offset_using_diff(
+                        source_doc,
+                        target_doc,
+                        source_offset,
+                        target_diff,
+                        false,
+                    )
+                } else {
+                    Self::map_view_offset_by_line(source_doc, target_doc, source_offset)
                 }
+            };
+
+            if let Some(target_doc) = self.documents.get_mut(&target_doc_id) {
+                target_doc.set_view_offset(target_view_id, mapped_offset);
             }
             return;
         }
@@ -2785,8 +2917,12 @@ impl Editor {
                 return;
             }
 
-            // Get source scroll position and apply to target
-            if let Some(source_doc) = self.documents.get(&source_doc_id) {
+            // Get source scroll position and map to target with hunk-aware alignment.
+            let mapped_offset = {
+                let Some(source_doc) = self.documents.get(&source_doc_id) else {
+                    log::warn!("  ✗ Source document not found!");
+                    return;
+                };
                 let Some(source_offset) = source_doc.get_view_offset(source_view_id) else {
                     log::warn!(
                         "Skipping 3-way merge scroll sync: source view {:?} has no initialized view data",
@@ -2794,18 +2930,44 @@ impl Editor {
                     );
                     return;
                 };
-                log::info!("  Syncing from view {:?} to view {:?}", source_view_id, target_view_id);
-                log::info!("  Source offset: anchor={}, vert={}, horiz={}",
-                    source_offset.anchor, source_offset.vertical_offset, source_offset.horizontal_offset);
-
-                if let Some(target_doc) = self.documents.get_mut(&target_doc_id) {
-                    target_doc.set_view_offset(target_view_id, source_offset);
-                    log::info!("  ✓ Successfully synced scroll position!");
-                } else {
+                let Some(target_doc) = self.documents.get(&target_doc_id) else {
                     log::warn!("  ✗ Target document not found!");
+                    return;
+                };
+                log::info!("  Syncing from view {:?} to view {:?}", source_view_id, target_view_id);
+                log::info!(
+                    "  Source offset: anchor={}, vert={}, horiz={}",
+                    source_offset.anchor,
+                    source_offset.vertical_offset,
+                    source_offset.horizontal_offset
+                );
+
+                if let Some(source_diff) = source_doc.diff_handle() {
+                    Self::map_view_offset_using_diff(
+                        source_doc,
+                        target_doc,
+                        source_offset,
+                        source_diff,
+                        true,
+                    )
+                } else if let Some(target_diff) = target_doc.diff_handle() {
+                    Self::map_view_offset_using_diff(
+                        source_doc,
+                        target_doc,
+                        source_offset,
+                        target_diff,
+                        false,
+                    )
+                } else {
+                    Self::map_view_offset_by_line(source_doc, target_doc, source_offset)
                 }
+            };
+
+            if let Some(target_doc) = self.documents.get_mut(&target_doc_id) {
+                target_doc.set_view_offset(target_view_id, mapped_offset);
+                log::info!("  ✓ Successfully synced scroll position!");
             } else {
-                log::warn!("  ✗ Source document not found!");
+                log::warn!("  ✗ Target document not found!");
             }
         } else {
             log::info!("  No merge view state found for view {:?}", source_view_id);

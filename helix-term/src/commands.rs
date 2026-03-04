@@ -4271,16 +4271,18 @@ fn goto_next_change_impl(cx: &mut Context, direction: Direction) {
         };
 
         // Get current cursor line in source pane
-        let cursor_line = {
+        let (source_doc_id, cursor_line) = {
             let (view, doc) = current!(cx.editor);
             let text = doc.text().slice(..);
-            doc.selection(view.id).primary().cursor_line(text)
+            (doc.id(), doc.selection(view.id).primary().cursor_line(text))
         };
 
         // Set selection and align the other pane
         {
             let other_doc = doc_mut!(cx.editor, &other_doc_id);
-            let line = cursor_line.min(other_doc.text().len_lines().saturating_sub(1));
+            let line = cx
+                .editor
+                .map_line_between_documents(source_doc_id, other_doc_id, cursor_line);
             let pos = other_doc.text().line_to_char(line);
             let selection = helix_core::Selection::point(pos);
             other_doc.set_selection(other_view_id, selection);
@@ -4311,16 +4313,18 @@ fn goto_next_change_impl(cx: &mut Context, direction: Direction) {
         };
 
         // Get current cursor line in source pane
-        let cursor_line = {
+        let (source_doc_id, cursor_line) = {
             let (view, doc) = current!(cx.editor);
             let text = doc.text().slice(..);
-            doc.selection(view.id).primary().cursor_line(text)
+            (doc.id(), doc.selection(view.id).primary().cursor_line(text))
         };
 
         // Set selection and align the other pane
         {
             let other_doc = doc_mut!(cx.editor, &other_doc_id);
-            let line = cursor_line.min(other_doc.text().len_lines().saturating_sub(1));
+            let line = cx
+                .editor
+                .map_line_between_documents(source_doc_id, other_doc_id, cursor_line);
             let pos = other_doc.text().line_to_char(line);
             let selection = helix_core::Selection::point(pos);
             other_doc.set_selection(other_view_id, selection);

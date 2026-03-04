@@ -4292,9 +4292,8 @@ fn goto_next_change_impl(cx: &mut Context, direction: Direction) {
             other_doc.set_selection(other_view_id, selection);
         }
 
-        // Recompute viewport state like manual `C-w w` without changing active pane.
-        cx.editor.focus_next();
-        cx.editor.focus_prev();
+        // Update the view offset for the new cursor position and sync linked views.
+        cx.editor.ensure_cursor_in_view(view_id);
 
         return;
     }
@@ -4330,9 +4329,8 @@ fn goto_next_change_impl(cx: &mut Context, direction: Direction) {
             other_doc.set_selection(other_view_id, selection);
         }
 
-        // Recompute viewport state like manual `C-w w` without changing active pane.
-        cx.editor.focus_next();
-        cx.editor.focus_prev();
+        // Update the view offset for the new cursor position and sync linked views.
+        cx.editor.ensure_cursor_in_view(view_id);
 
     }
 }

@@ -140,7 +140,7 @@ impl EditorView {
         }
 
         Self::doc_diagnostics_highlights_into(doc, theme, &mut overlays);
-        Self::doc_char_diff_highlights_into(doc, theme, &mut overlays);
+        Self::doc_char_diff_highlights_into(doc, view, theme, &mut overlays);
 
         if is_focused {
             if let Some(tabstops) = Self::tabstop_highlights(doc, theme) {
@@ -464,6 +464,7 @@ impl EditorView {
     /// Get highlight spans for character-level diffs
     pub fn doc_char_diff_highlights_into(
         doc: &Document,
+        view: &View,
         theme: &Theme,
         overlay_highlights: &mut Vec<OverlayHighlights>,
     ) {
@@ -480,6 +481,11 @@ impl EditorView {
         let diff = diff_handle.load();
         let doc_text = doc.text();
         let diff_base = diff.diff_base();
+        let cursor_line = doc
+            .selection(view.id)
+            .primary()
+            .cursor_line(doc_text.slice(..)) as u32;
+        let active_hunk_idx = diff.hunk_at(cursor_line, true);
 
         // Use green-ish highlights on the newer side and red-ish highlights on
         // the older side so removed text in the old revision remains visible.
@@ -491,6 +497,15 @@ impl EditorView {
         let Some(change_highlight) = theme.find_highlight_exact(highlight_scope) else {
             return;
         };
+        // Prefer a stronger active-hunk background than cursorline so the
+        // current diff block is clearly visible.
+        let line_highlight = theme
+            .find_highlight_exact("ui.diff.active")
+            .or_else(|| theme.find_highlight_exact("ui.selection.primary"))
+            .or_else(|| theme.find_highlight_exact("ui.selection"))
+            .or_else(|| theme.find_highlight_exact("ui.cursorline.primary"))
+            .or_else(|| theme.find_highlight_exact("ui.cursorline"))
+            .unwrap_or(change_highlight);
 
         let mut line_ranges = Vec::new();
         let mut char_ranges = Vec::new();
@@ -500,6 +515,10 @@ impl EditorView {
         for hunk_idx in 0..hunk_count {
             let hunk = diff.nth_hunk(hunk_idx);
             if hunk == helix_vcs::Hunk::NONE {
+                continue;
+            }
+            let is_active_hunk = active_hunk_idx.is_some_and(|idx| idx == hunk_idx);
+            if !is_active_hunk {
                 continue;
             }
 
@@ -582,7 +601,7 @@ impl EditorView {
 
         if !line_ranges.is_empty() {
             overlay_highlights.push(OverlayHighlights::Homogeneous {
-                highlight: change_highlight,
+                highlight: line_highlight,
                 ranges: line_ranges,
             });
         }

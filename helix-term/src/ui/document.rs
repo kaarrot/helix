@@ -651,8 +651,8 @@ impl<'t> OverlayHighlighter<'t> {
 
                 style.bg = Some(subtle_bg);
 
-                // Clear foreground to preserve syntax highlighting
-                style.fg = None;
+                // Keep foreground so inserted/removed characters remain visibly
+                // green/red on top of the subtle hunk background.
             }
 
             acc.patch(style)

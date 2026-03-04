@@ -2721,7 +2721,10 @@ impl Editor {
         }
     }
 
-    fn map_line_before_to_after(source_line: usize, diff_handle: &helix_vcs::DiffHandle) -> usize {
+    fn map_line_before_to_after_with_hunk(
+        source_line: usize,
+        diff_handle: &helix_vcs::DiffHandle,
+    ) -> (usize, Option<(usize, usize)>) {
         let diff = diff_handle.load();
         let source_line = source_line as i64;
         let mut cumulative_delta: i64 = 0;
@@ -2734,7 +2737,10 @@ impl Editor {
             let target_end = hunk.after.end as i64;
 
             if source_line < source_start {
-                return source_line.saturating_add(cumulative_delta).max(0) as usize;
+                return (
+                    source_line.saturating_add(cumulative_delta).max(0) as usize,
+                    None,
+                );
             }
 
             if source_line < source_end {
@@ -2742,7 +2748,10 @@ impl Editor {
                 let target_len = target_end.saturating_sub(target_start);
 
                 if source_len == 0 {
-                    return target_start.max(0) as usize;
+                    return (
+                        target_start.max(0) as usize,
+                        Some((source_start.max(0) as usize, target_start.max(0) as usize)),
+                    );
                 }
 
                 let offset_in_hunk = source_line.saturating_sub(source_start);
@@ -2751,13 +2760,23 @@ impl Editor {
                 } else {
                     target_start + offset_in_hunk.min(target_len - 1)
                 };
-                return mapped_line.max(0) as usize;
+                return (
+                    mapped_line.max(0) as usize,
+                    Some((source_start.max(0) as usize, target_start.max(0) as usize)),
+                );
             }
 
             cumulative_delta += (target_end - target_start) - (source_end - source_start);
         }
 
-        source_line.saturating_add(cumulative_delta).max(0) as usize
+        (
+            source_line.saturating_add(cumulative_delta).max(0) as usize,
+            None,
+        )
+    }
+
+    fn map_line_before_to_after(source_line: usize, diff_handle: &helix_vcs::DiffHandle) -> usize {
+        Self::map_line_before_to_after_with_hunk(source_line, diff_handle).0
     }
 
     fn map_view_offset_using_diff(
@@ -2771,15 +2790,23 @@ impl Editor {
 
         // Mapping is implemented for before->after. For after->before we invert
         // a cloned handle so hunks are exposed in the opposite direction.
-        let mapped_line = if source_is_after {
+        let (mapped_line, hunk_starts) = if source_is_after {
             let mut inverted = diff_handle.clone();
             inverted.invert();
-            Self::map_line_before_to_after(source_anchor_line, &inverted)
+            Self::map_line_before_to_after_with_hunk(source_anchor_line, &inverted)
         } else {
-            Self::map_line_before_to_after(source_anchor_line, diff_handle)
+            Self::map_line_before_to_after_with_hunk(source_anchor_line, diff_handle)
         };
 
-        let target_line = mapped_line.min(target_doc.text().len_lines().saturating_sub(1));
+        // If the source anchor is inside a hunk, preserve the relative position
+        // of the hunk start in the viewport to keep panes visually aligned.
+        let target_line = if let Some((source_hunk_start, target_hunk_start)) = hunk_starts {
+            let source_to_hunk = source_hunk_start as i64 - source_anchor_line as i64;
+            (target_hunk_start as i64 - source_to_hunk).max(0) as usize
+        } else {
+            mapped_line
+        }
+        .min(target_doc.text().len_lines().saturating_sub(1));
         crate::view::ViewPosition {
             anchor: target_doc.text().line_to_char(target_line),
             vertical_offset: source_offset.vertical_offset,

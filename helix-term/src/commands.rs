@@ -4250,7 +4250,9 @@ fn goto_next_change_impl(cx: &mut Context, direction: Direction) {
 
                 Range::new(range.anchor, head)
             } else {
-                new_range.with_direction(direction)
+                // In normal mode, jump to the hunk start without selecting
+                // the entire hunk, so diff text remains readable.
+                Range::point(new_range.from())
             }
         });
 
@@ -4270,34 +4272,30 @@ fn goto_next_change_impl(cx: &mut Context, direction: Direction) {
             (diff_state.base_view_id, diff_state.base_doc_id)
         };
 
-        // Get current cursor line in source pane
+        // Get current cursor line in source pane.
         let (source_doc_id, cursor_line) = {
             let (view, doc) = current!(cx.editor);
             let text = doc.text().slice(..);
-            (doc.id(), doc.selection(view.id).primary().cursor_line(text))
+            let cursor_line = doc.selection(view.id).primary().cursor_line(text);
+            (doc.id(), cursor_line)
         };
+        let mapped_line = cx
+            .editor
+            .map_line_between_documents(source_doc_id, other_doc_id, cursor_line);
 
-        // Set selection and align the other pane
+        // Set selection in the other pane; viewport alignment is then handled
+        // by the focus toggle below (same behavior as manual `C-w w`).
         {
             let other_doc = doc_mut!(cx.editor, &other_doc_id);
-            let line = cx
-                .editor
-                .map_line_between_documents(source_doc_id, other_doc_id, cursor_line);
-            let pos = other_doc.text().line_to_char(line);
+            let pos = other_doc.text().line_to_char(mapped_line);
             let selection = helix_core::Selection::point(pos);
             other_doc.set_selection(other_view_id, selection);
         }
-        {
-            let other_doc = doc_mut!(cx.editor, &other_doc_id);
-            let other_view = view_mut!(cx.editor, other_view_id);
-            align_view(other_doc, other_view, Align::Top);
-        }
 
-        // Also align current view to top
-        {
-            let (view, doc) = current!(cx.editor);
-            align_view(doc, view, Align::Top);
-        }
+        // Recompute viewport state like manual `C-w w` without changing active pane.
+        cx.editor.focus_next();
+        cx.editor.focus_prev();
+
         return;
     }
 
@@ -4312,34 +4310,30 @@ fn goto_next_change_impl(cx: &mut Context, direction: Direction) {
             return; // In RESULT pane, don't sync
         };
 
-        // Get current cursor line in source pane
+        // Get current cursor line in source pane.
         let (source_doc_id, cursor_line) = {
             let (view, doc) = current!(cx.editor);
             let text = doc.text().slice(..);
-            (doc.id(), doc.selection(view.id).primary().cursor_line(text))
+            let cursor_line = doc.selection(view.id).primary().cursor_line(text);
+            (doc.id(), cursor_line)
         };
+        let mapped_line = cx
+            .editor
+            .map_line_between_documents(source_doc_id, other_doc_id, cursor_line);
 
-        // Set selection and align the other pane
+        // Set selection in the other pane; viewport alignment is then handled
+        // by the focus toggle below (same behavior as manual `C-w w`).
         {
             let other_doc = doc_mut!(cx.editor, &other_doc_id);
-            let line = cx
-                .editor
-                .map_line_between_documents(source_doc_id, other_doc_id, cursor_line);
-            let pos = other_doc.text().line_to_char(line);
+            let pos = other_doc.text().line_to_char(mapped_line);
             let selection = helix_core::Selection::point(pos);
             other_doc.set_selection(other_view_id, selection);
         }
-        {
-            let other_doc = doc_mut!(cx.editor, &other_doc_id);
-            let other_view = view_mut!(cx.editor, other_view_id);
-            align_view(other_doc, other_view, Align::Top);
-        }
 
-        // Also align current view to top
-        {
-            let (view, doc) = current!(cx.editor);
-            align_view(doc, view, Align::Top);
-        }
+        // Recompute viewport state like manual `C-w w` without changing active pane.
+        cx.editor.focus_next();
+        cx.editor.focus_prev();
+
     }
 }
 

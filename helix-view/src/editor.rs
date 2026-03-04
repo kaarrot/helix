@@ -2724,9 +2724,24 @@ impl Editor {
                 (diff_state.base_view_id, diff_state.base_doc_id, diff_state.working_doc_id)
             };
 
+            if !self.tree.contains(source_view_id) || !self.tree.contains(target_view_id) {
+                log::info!(
+                    "Skipping 2-way diff scroll sync: source/target view not visible (source={:?}, target={:?})",
+                    source_view_id,
+                    target_view_id
+                );
+                return;
+            }
+
             // Get source scroll position
             if let Some(source_doc) = self.documents.get(&source_doc_id) {
-                let source_offset = source_doc.view_offset(source_view_id);
+                let Some(source_offset) = source_doc.get_view_offset(source_view_id) else {
+                    log::warn!(
+                        "Skipping 2-way diff scroll sync: source view {:?} has no initialized view data",
+                        source_view_id
+                    );
+                    return;
+                };
 
                 // Set target scroll position
                 // For now, use simple line-based alignment
@@ -2761,9 +2776,24 @@ impl Editor {
                     return;
                 };
 
+            if !self.tree.contains(source_view_id) || !self.tree.contains(target_view_id) {
+                log::info!(
+                    "Skipping 3-way merge scroll sync: source/target view not visible (source={:?}, target={:?})",
+                    source_view_id,
+                    target_view_id
+                );
+                return;
+            }
+
             // Get source scroll position and apply to target
             if let Some(source_doc) = self.documents.get(&source_doc_id) {
-                let source_offset = source_doc.view_offset(source_view_id);
+                let Some(source_offset) = source_doc.get_view_offset(source_view_id) else {
+                    log::warn!(
+                        "Skipping 3-way merge scroll sync: source view {:?} has no initialized view data",
+                        source_view_id
+                    );
+                    return;
+                };
                 log::info!("  Syncing from view {:?} to view {:?}", source_view_id, target_view_id);
                 log::info!("  Source offset: anchor={}, vert={}, horiz={}",
                     source_offset.anchor, source_offset.vertical_offset, source_offset.horizontal_offset);

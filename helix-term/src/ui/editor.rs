@@ -91,7 +91,8 @@ impl EditorView {
 
         let view_offset = doc.view_offset(view.id);
 
-        let text_annotations = view.text_annotations(doc, Some(theme));
+        let mut text_annotations = view.text_annotations(doc, Some(theme));
+        view.apply_diff_alignment(doc, &mut text_annotations, &editor.diff_views, &editor.documents);
         let mut decorations = DecorationManager::default();
 
         if is_focused && config.cursorline {

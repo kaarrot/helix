@@ -527,8 +527,7 @@ impl View {
         documents: &'a std::collections::BTreeMap<DocumentId, Document>,
     ) {
         if let Some(diff_state) = diff_views.get(&self.id) {
-            let is_base = diff_state.is_base_view(self.id);
-            let other_doc_id = if is_base {
+            let other_doc_id = if diff_state.is_base_view(self.id) {
                 diff_state.working_doc_id
             } else {
                 diff_state.base_doc_id
@@ -537,12 +536,10 @@ impl View {
             if let (Some(diff_handle), Some(other_doc)) =
                 (doc.diff_handle(), documents.get(&other_doc_id))
             {
-                if let Some(other_diff_handle) = other_doc.diff_handle() {
+                if other_doc.diff_handle().is_some() {
                     text_annotations.add_line_annotation(Box::new(
                         crate::annotations::diff::DiffAlignment::new(
                             diff_handle.clone(),
-                            other_diff_handle.clone(),
-                            is_base,
                         ),
                     ));
                 }

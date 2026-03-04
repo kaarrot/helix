@@ -92,7 +92,14 @@ impl EditorView {
         let view_offset = doc.view_offset(view.id);
 
         let mut text_annotations = view.text_annotations(doc, Some(theme));
-        view.apply_diff_alignment(doc, &mut text_annotations, &editor.diff_views, &editor.documents);
+        // Prototype: inject virtual spacer lines in side-by-side diff panes to
+        // keep corresponding hunks visually aligned (VSCode-style UX check).
+        view.apply_diff_alignment(
+            doc,
+            &mut text_annotations,
+            &editor.diff_views,
+            &editor.documents,
+        );
         let mut decorations = DecorationManager::default();
 
         if is_focused && config.cursorline {
@@ -482,6 +489,9 @@ impl EditorView {
         let diff = diff_handle.load();
         let doc_text = doc.text();
         let diff_base = diff.diff_base();
+        let view_offset = doc.view_offset(view.id);
+        let visible_start_line = doc_text.char_to_line(view_offset.anchor);
+        let visible_end_line = view.estimate_last_doc_line(doc).saturating_add(1);
         let cursor_line = doc
             .selection(view.id)
             .primary()
@@ -519,28 +529,30 @@ impl EditorView {
                 continue;
             }
             let is_active_hunk = active_hunk_idx.is_some_and(|idx| idx == hunk_idx);
-            if !is_active_hunk {
-                continue;
-            }
 
             // Process each line in the hunk
             let start_line = hunk.after.start as usize;
             let end_line = hunk.after.end as usize;
+            let start_line = start_line.max(visible_start_line);
+            let end_line = end_line.min(visible_end_line);
+            if start_line >= end_line {
+                continue;
+            }
 
             for line_idx in start_line..end_line {
                 if line_idx >= doc_text.len_lines() {
                     break;
                 }
 
-                // Add a whole-line background range so hunk blocks remain visually
-                // connected even when line-by-line char ranges are sparse.
                 let line_start_char = doc_text.line_to_char(line_idx);
                 let line_end_char = if line_idx + 1 < doc_text.len_lines() {
                     doc_text.line_to_char(line_idx + 1)
                 } else {
                     doc_text.len_chars()
                 };
-                if line_end_char > line_start_char {
+
+                // Add subtle whole-line background only for active hunk.
+                if is_active_hunk && line_end_char > line_start_char {
                     line_ranges.push(line_start_char..line_end_char);
                 }
 

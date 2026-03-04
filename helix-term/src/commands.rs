@@ -4199,7 +4199,12 @@ fn goto_first_change_impl(cx: &mut Context, reverse: bool) {
         if hunk != Hunk::NONE {
             let range = hunk_range(hunk, doc.text().slice(..));
             push_jump(view, doc);
-            doc.set_selection(view.id, Selection::single(range.anchor, range.head));
+            let selection = if editor.mode == Mode::Select {
+                Selection::single(range.anchor, range.head)
+            } else {
+                Selection::point(range.from())
+            };
+            doc.set_selection(view.id, selection);
         }
     }
 }
@@ -4241,19 +4246,9 @@ fn goto_next_change_impl(cx: &mut Context, direction: Direction) {
             };
             let hunk = diff.nth_hunk(hunk_idx);
             let new_range = hunk_range(hunk, doc_text);
-            if editor.mode == Mode::Select {
-                let head = if new_range.head < range.anchor {
-                    new_range.anchor
-                } else {
-                    new_range.head
-                };
-
-                Range::new(range.anchor, head)
-            } else {
-                // In normal mode, jump to the hunk start without selecting
-                // the entire hunk, so diff text remains readable.
-                Range::point(new_range.from())
-            }
+            // Keep hunk navigation non-selecting in all modes to avoid
+            // carrying over selection state while diff browsing.
+            Range::point(new_range.from())
         });
 
         push_jump(view, doc);

@@ -76,6 +76,7 @@ use std::{
     error::Error,
     fmt,
     future::Future,
+    fs,
     io::Read,
     num::NonZeroUsize,
 };
@@ -107,6 +108,11 @@ struct StreamProcess {
 
 static STREAM_PROCESSES: Lazy<Arc<Mutex<Option<StreamProcess>>>> =
     Lazy::new(|| Arc::new(Mutex::new(None)));
+static STREAM_INPUT_HISTORY_LOADED: Lazy<Mutex<bool>> = Lazy::new(|| Mutex::new(false));
+
+const STREAM_INPUT_HISTORY_REGISTER: char = '>';
+const STREAM_INPUT_HISTORY_FILE: &str = "stream-input-history";
+const STREAM_INPUT_HISTORY_MAX_ENTRIES: usize = 200;
 
 pub type OnKeyCallback = Box<dyn FnOnce(&mut Context, KeyEvent)>;
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
@@ -6511,6 +6517,100 @@ fn send_stream_input(
     cx.editor.set_status(format!("Input sent to '{}'", buffer_name));
 }
 
+fn stream_input_history_path() -> PathBuf {
+    helix_loader::config_dir().join(STREAM_INPUT_HISTORY_FILE)
+}
+
+fn load_stream_input_history(editor: &mut Editor) {
+    let mut loaded = STREAM_INPUT_HISTORY_LOADED.lock().unwrap();
+    if *loaded {
+        return;
+    }
+
+    let path = stream_input_history_path();
+    let contents = match fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            *loaded = true;
+            return;
+        }
+        Err(err) => {
+            log::warn!(
+                "Failed to read stream input history file '{}': {}",
+                path.display(),
+                err
+            );
+            *loaded = true;
+            return;
+        }
+    };
+
+    // Ensure we don't duplicate entries if history gets loaded again for any reason.
+    editor.registers.remove(STREAM_INPUT_HISTORY_REGISTER);
+
+    let mut entries: Vec<&str> = contents.lines().filter(|line| !line.is_empty()).collect();
+    if entries.len() > STREAM_INPUT_HISTORY_MAX_ENTRIES {
+        let keep_from = entries.len() - STREAM_INPUT_HISTORY_MAX_ENTRIES;
+        entries = entries.split_off(keep_from);
+    }
+
+    for value in entries {
+        if let Err(err) = editor
+            .registers
+            .push(STREAM_INPUT_HISTORY_REGISTER, value.to_string())
+        {
+            log::warn!("Failed to load stream input history entry: {}", err);
+            break;
+        }
+    }
+
+    *loaded = true;
+}
+
+fn save_stream_input_history(editor: &Editor) {
+    let Some(values) = editor
+        .registers
+        .read(STREAM_INPUT_HISTORY_REGISTER, editor)
+    else {
+        return;
+    };
+
+    let mut entries: Vec<String> = values
+        .take(STREAM_INPUT_HISTORY_MAX_ENTRIES)
+        .map(|s| s.into_owned())
+        .collect();
+
+    if entries.is_empty() {
+        return;
+    }
+
+    // Register history is newest-first; store oldest-first for append-like readability.
+    entries.reverse();
+
+    let mut contents = entries.join("\n");
+    contents.push('\n');
+
+    let path = stream_input_history_path();
+    if let Some(parent) = path.parent() {
+        if let Err(err) = fs::create_dir_all(parent) {
+            log::warn!(
+                "Failed to create stream history directory '{}': {}",
+                parent.display(),
+                err
+            );
+            return;
+        }
+    }
+
+    if let Err(err) = fs::write(&path, contents) {
+        log::warn!(
+            "Failed to write stream input history file '{}': {}",
+            path.display(),
+            err
+        );
+    }
+}
+
 /// Show prompt to capture stream input
 fn show_stream_input_prompt(
     cx: &mut compositor::Context,
@@ -6521,10 +6621,11 @@ fn show_stream_input_prompt(
 ) {
     let callback = Box::pin(async move {
         let call: job::Callback = Callback::EditorCompositor(Box::new(
-            move |_editor: &mut Editor, compositor: &mut Compositor| {
+            move |editor: &mut Editor, compositor: &mut Compositor| {
+                load_stream_input_history(editor);
                 let prompt = Prompt::new(
                     "Stream input: ".into(),
-                    Some(':'),
+                    Some(STREAM_INPUT_HISTORY_REGISTER),
                     |_editor, _input| Vec::new(),  // No completion
                     move |cx, input, event| {
                         if event != PromptEvent::Validate {
@@ -6534,6 +6635,8 @@ fn show_stream_input_prompt(
                         if input.trim().is_empty() {
                             return;
                         }
+
+                        save_stream_input_history(cx.editor);
 
                         send_stream_input(
                             stdin_tx.clone(),

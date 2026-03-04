@@ -1,4 +1,5 @@
 use std::fmt::Write;
+use std::fs;
 use std::io::BufReader;
 use std::ops::{self, Deref};
 
@@ -3658,7 +3659,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "insert-stream-output",
-        aliases: &["\\"],
+        aliases: &["\\", ":"],
         doc: "Run shell command, streaming output in real-time. When stream is running, send input to it.",
         fun: insert_stream_output,
         completer: SHELL_COMPLETER,
@@ -3808,6 +3809,100 @@ pub static TYPABLE_COMMAND_MAP: Lazy<HashMap<&'static str, &'static TypableComma
             .collect()
     });
 
+static COMMAND_HISTORY_LOADED: Lazy<Mutex<bool>> = Lazy::new(|| Mutex::new(false));
+const COMMAND_HISTORY_REGISTER: char = ':';
+const COMMAND_HISTORY_FILE: &str = "command-history";
+const COMMAND_HISTORY_MAX_ENTRIES: usize = 500;
+
+fn command_history_path() -> PathBuf {
+    helix_loader::config_dir().join(COMMAND_HISTORY_FILE)
+}
+
+fn load_command_history(editor: &mut Editor) {
+    let mut loaded = COMMAND_HISTORY_LOADED.lock().unwrap();
+    if *loaded {
+        return;
+    }
+
+    let path = command_history_path();
+    let contents = match fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            *loaded = true;
+            return;
+        }
+        Err(err) => {
+            log::warn!(
+                "Failed to read command history file '{}': {}",
+                path.display(),
+                err
+            );
+            *loaded = true;
+            return;
+        }
+    };
+
+    editor.registers.remove(COMMAND_HISTORY_REGISTER);
+
+    let mut entries: Vec<&str> = contents.lines().filter(|line| !line.is_empty()).collect();
+    if entries.len() > COMMAND_HISTORY_MAX_ENTRIES {
+        let keep_from = entries.len() - COMMAND_HISTORY_MAX_ENTRIES;
+        entries = entries.split_off(keep_from);
+    }
+
+    for value in entries {
+        if let Err(err) = editor
+            .registers
+            .push(COMMAND_HISTORY_REGISTER, value.to_string())
+        {
+            log::warn!("Failed to load command history entry: {}", err);
+            break;
+        }
+    }
+
+    *loaded = true;
+}
+
+fn save_command_history(editor: &Editor) {
+    let Some(values) = editor.registers.read(COMMAND_HISTORY_REGISTER, editor) else {
+        return;
+    };
+
+    let mut entries: Vec<String> = values
+        .take(COMMAND_HISTORY_MAX_ENTRIES)
+        .map(|s| s.into_owned())
+        .collect();
+
+    if entries.is_empty() {
+        return;
+    }
+
+    entries.reverse();
+
+    let mut contents = entries.join("\n");
+    contents.push('\n');
+
+    let path = command_history_path();
+    if let Some(parent) = path.parent() {
+        if let Err(err) = fs::create_dir_all(parent) {
+            log::warn!(
+                "Failed to create command history directory '{}': {}",
+                parent.display(),
+                err
+            );
+            return;
+        }
+    }
+
+    if let Err(err) = fs::write(&path, contents) {
+        log::warn!(
+            "Failed to write command history file '{}': {}",
+            path.display(),
+            err
+        );
+    }
+}
+
 fn execute_command_line(
     cx: &mut compositor::Context,
     input: &str,
@@ -3852,13 +3947,18 @@ pub(super) fn execute_command(
 
 #[allow(clippy::unnecessary_unwrap)]
 pub(super) fn command_mode(cx: &mut Context) {
+    load_command_history(cx.editor);
+
     let mut prompt = Prompt::new(
         ":".into(),
-        Some(':'),
+        Some(COMMAND_HISTORY_REGISTER),
         complete_command_line,
         move |cx: &mut compositor::Context, input: &str, event: PromptEvent| {
             if let Err(err) = execute_command_line(cx, input, event) {
                 cx.editor.set_error(err.to_string());
+            }
+            if event == PromptEvent::Validate {
+                save_command_history(cx.editor);
             }
         },
     );

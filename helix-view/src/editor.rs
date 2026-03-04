@@ -2459,6 +2459,24 @@ impl Editor {
         self.last_cwd.as_deref()
     }
 
+    fn get_diff_content_or_empty(path: &Path, git_ref: &str) -> Result<Vec<u8>, Error> {
+        match helix_vcs::git::get_diff_base_from_ref(path, git_ref) {
+            Ok(content) => Ok(content),
+            Err(err) => {
+                // If file does not exist in this revision (added/removed between refs),
+                // treat that side as empty so side-by-side diff can still open.
+                let is_missing_in_ref = err
+                    .chain()
+                    .any(|cause| cause.to_string().contains("file is untracked"));
+                if is_missing_in_ref {
+                    Ok(Vec::new())
+                } else {
+                    Err(err.into())
+                }
+            }
+        }
+    }
+
     /// Open a side-by-side diff view for the given file.
     ///
     /// Creates a vertical split with:
@@ -2483,7 +2501,7 @@ impl Editor {
         };
 
         // 2. Fetch git base content
-        let base_content = helix_vcs::git::get_diff_base_from_ref(&path, git_ref)
+        let base_content = Self::get_diff_content_or_empty(&path, git_ref)
             .map_err(|e| anyhow::anyhow!("Failed to fetch git revision: {}", e))?;
 
         // 3. Create virtual base document
@@ -2592,11 +2610,11 @@ impl Editor {
             // Compare two commits
             Some(target) => {
                 // 1. Fetch base content from base_ref
-                let base_content = helix_vcs::git::get_diff_base_from_ref(&path, base_ref)
+                let base_content = Self::get_diff_content_or_empty(&path, base_ref)
                     .map_err(|e| anyhow::anyhow!("Failed to fetch base revision '{}': {}", base_ref, e))?;
 
                 // 2. Fetch target content from target_ref
-                let target_content = helix_vcs::git::get_diff_base_from_ref(&path, target)
+                let target_content = Self::get_diff_content_or_empty(&path, target)
                     .map_err(|e| anyhow::anyhow!("Failed to fetch target revision '{}': {}", target, e))?;
                 let target_content_for_diff = target_content.clone();
 

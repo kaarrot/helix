@@ -201,6 +201,8 @@ pub struct Document {
 
     /// Toggle for character-level diff highlighting
     pub char_diff_enabled: bool,
+    /// If true, char/hunk diff overlays use the "minus" (removed) style.
+    pub char_diff_minus_side: bool,
 
     /// The git reference (branch, tag, or commit hash) to use as diff base
     /// If None, uses HEAD (default behavior)
@@ -746,6 +748,7 @@ impl Document {
             config,
             version_control_head: None,
             char_diff_enabled: false,
+            char_diff_minus_side: false,
             diff_base_ref: None,
             focused_at: std::time::Instant::now(),
             readonly: false,

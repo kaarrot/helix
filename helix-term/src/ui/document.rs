@@ -566,18 +566,21 @@ impl<'t> OverlayHighlighter<'t> {
             HighlightEvent::Push => self.style,
         };
 
-        // Get the diff.plus highlight ID to apply subtle background for char diffs
+        // Get diff highlight IDs to apply subtle background for char/hunk diffs.
         let diff_plus_highlight = self.theme.find_highlight_exact("diff.plus");
+        let diff_minus_highlight = self.theme.find_highlight_exact("diff.minus");
 
         self.style = highlights.fold(base, |acc, highlight| {
             let mut style = self.theme.highlight(highlight);
 
-            // Apply contrast-aware background to diff.plus highlights
-            if Some(highlight) == diff_plus_highlight {
+            // Apply contrast-aware background to diff highlights.
+            let is_plus = Some(highlight) == diff_plus_highlight;
+            let is_minus = Some(highlight) == diff_minus_highlight;
+            if is_plus || is_minus {
                 use helix_view::graphics::Color;
 
                 // Get the diff color from the theme
-                let diff_color = style.fg.unwrap_or(Color::Green);
+                let diff_color = style.fg.unwrap_or(if is_minus { Color::Red } else { Color::Green });
 
                 // Get the actual background color from the theme
                 let bg_style = self.theme.get("ui.background");
@@ -594,8 +597,16 @@ impl<'t> OverlayHighlighter<'t> {
                             Color::Rgb(r, g, b) => (r, g, b),
                             Color::Green => (100, 180, 100),
                             Color::LightGreen => (144, 238, 144),
+                            Color::Red => (200, 95, 95),
+                            Color::LightRed => (240, 128, 128),
                             Color::Yellow => (200, 200, 100),
-                            _ => (100, 180, 100),
+                            _ => {
+                                if is_minus {
+                                    (200, 95, 95)
+                                } else {
+                                    (100, 180, 100)
+                                }
+                            }
                         };
 
                         if luminance < 0.5 {
@@ -615,9 +626,27 @@ impl<'t> OverlayHighlighter<'t> {
                             )
                         }
                     }
-                    Color::Black => Color::Rgb(30, 50, 30), // Darker green tint for black bg
-                    Color::White => Color::Rgb(230, 245, 230), // Light green tint for white bg
-                    _ => Color::Rgb(30, 50, 30), // Darker default for dark themes
+                    Color::Black => {
+                        if is_minus {
+                            Color::Rgb(55, 30, 30)
+                        } else {
+                            Color::Rgb(30, 50, 30)
+                        }
+                    }
+                    Color::White => {
+                        if is_minus {
+                            Color::Rgb(248, 232, 232)
+                        } else {
+                            Color::Rgb(230, 245, 230)
+                        }
+                    }
+                    _ => {
+                        if is_minus {
+                            Color::Rgb(55, 30, 30)
+                        } else {
+                            Color::Rgb(30, 50, 30)
+                        }
+                    }
                 };
 
                 style.bg = Some(subtle_bg);

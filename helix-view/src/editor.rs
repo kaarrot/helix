@@ -2497,14 +2497,23 @@ impl Editor {
         let base_doc_id = self.new_document(base_doc);
 
         // 4. Link documents and set up diff handle for hunk navigation
+        let mut working_content: Option<Vec<u8>> = None;
         if let Some(working_doc) = self.documents.get_mut(&working_doc_id) {
             working_doc.linked_diff_doc = Some(base_doc_id);
             working_doc.char_diff_enabled = true;
+            working_doc.char_diff_minus_side = false;
             // Set up diff handle for hunk navigation ([g and ]g)
-            working_doc.set_diff_base(base_content);
+            working_doc.set_diff_base(base_content.clone());
+            let text: String = working_doc.text().slice(..).chunks().collect();
+            working_content = Some(text.into_bytes());
         }
         if let Some(base_doc) = self.documents.get_mut(&base_doc_id) {
             base_doc.linked_diff_doc = Some(working_doc_id);
+            if let Some(content) = &working_content {
+                base_doc.set_diff_base(content.clone());
+                base_doc.char_diff_enabled = true;
+                base_doc.char_diff_minus_side = true;
+            }
         }
 
         let split_view = split_view_override.unwrap_or_else(|| self.config().diff.split_view);
@@ -2589,6 +2598,7 @@ impl Editor {
                 // 2. Fetch target content from target_ref
                 let target_content = helix_vcs::git::get_diff_base_from_ref(&path, target)
                     .map_err(|e| anyhow::anyhow!("Failed to fetch target revision '{}': {}", target, e))?;
+                let target_content_for_diff = target_content.clone();
 
                 // 3. Create virtual base document (read-only)
                 let base_doc = Document::from_git_revision(
@@ -2613,12 +2623,16 @@ impl Editor {
                 // 5. Link documents and set up diff handle for hunk navigation
                 if let Some(base_doc) = self.documents.get_mut(&base_doc_id) {
                     base_doc.linked_diff_doc = Some(target_doc_id);
+                    base_doc.char_diff_enabled = true;
+                    base_doc.char_diff_minus_side = true;
+                    base_doc.set_diff_base(target_content_for_diff);
                 }
                 if let Some(target_doc) = self.documents.get_mut(&target_doc_id) {
                     target_doc.linked_diff_doc = Some(base_doc_id);
                     target_doc.char_diff_enabled = true;
+                    target_doc.char_diff_minus_side = false;
                     // Set up diff handle for hunk navigation ([g and ]g)
-                    target_doc.set_diff_base(base_content);
+                    target_doc.set_diff_base(base_content.clone());
                 }
 
                 let split_view = split_view_override.unwrap_or_else(|| self.config().diff.split_view);
@@ -2690,6 +2704,7 @@ impl Editor {
             if let Some(working_doc) = self.documents.get_mut(&diff_state.working_doc_id) {
                 working_doc.linked_diff_doc = None;
                 working_doc.char_diff_enabled = false;
+                working_doc.char_diff_minus_side = false;
             }
 
             // Close the virtual base document
@@ -3045,10 +3060,12 @@ impl Editor {
         if let Some(ours_doc) = self.documents.get_mut(&ours_doc_id) {
             ours_doc.set_diff_base(theirs_bytes.clone());
             ours_doc.char_diff_enabled = true;
+            ours_doc.char_diff_minus_side = true;
         }
         if let Some(theirs_doc) = self.documents.get_mut(&theirs_doc_id) {
             theirs_doc.set_diff_base(ours_bytes);
             theirs_doc.char_diff_enabled = true;
+            theirs_doc.char_diff_minus_side = false;
         }
 
         // 6. Create 3-pane layout

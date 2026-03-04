@@ -481,13 +481,19 @@ impl EditorView {
         let doc_text = doc.text();
         let diff_base = diff.diff_base();
 
-        // Get theme highlights for character-level changes
-        // Use diff.plus scope and add REVERSED modifier for better visibility
-        let Some(add_highlight) = theme.find_highlight_exact("diff.plus") else {
+        // Use green-ish highlights on the newer side and red-ish highlights on
+        // the older side so removed text in the old revision remains visible.
+        let highlight_scope = if doc.char_diff_minus_side {
+            "diff.minus"
+        } else {
+            "diff.plus"
+        };
+        let Some(change_highlight) = theme.find_highlight_exact(highlight_scope) else {
             return;
         };
 
-        let mut add_ranges = Vec::new();
+        let mut line_ranges = Vec::new();
+        let mut char_ranges = Vec::new();
 
         // Iterate through all hunks
         let hunk_count = diff.len();
@@ -506,10 +512,21 @@ impl EditorView {
                     break;
                 }
 
+                // Add a whole-line background range so hunk blocks remain visually
+                // connected even when line-by-line char ranges are sparse.
+                let line_start_char = doc_text.line_to_char(line_idx);
+                let line_end_char = if line_idx + 1 < doc_text.len_lines() {
+                    doc_text.line_to_char(line_idx + 1)
+                } else {
+                    doc_text.len_chars()
+                };
+                if line_end_char > line_start_char {
+                    line_ranges.push(line_start_char..line_end_char);
+                }
+
                 // Get the line from the current document
                 let doc_line = doc_text.line(line_idx);
                 let doc_line_str = doc_line.to_string();
-                let line_start_char = doc_text.line_to_char(line_idx);
 
                 // Calculate corresponding line in diff_base
                 let line_offset_in_hunk = line_idx - hunk.after.start as usize;
@@ -519,7 +536,7 @@ impl EditorView {
                 if hunk.is_pure_insertion() {
                     if !doc_line_str.trim().is_empty() {
                         let char_count = doc_line_str.chars().count();
-                        add_ranges.push(line_start_char..line_start_char + char_count);
+                        char_ranges.push(line_start_char..line_start_char + char_count);
                     }
                     continue;
                 }
@@ -552,7 +569,7 @@ impl EditorView {
                         similar::ChangeTag::Insert => {
                             let start = line_start_char + doc_idx;
                             let end = start + char_count;
-                            add_ranges.push(start..end);
+                            char_ranges.push(start..end);
                             doc_idx += char_count;
                         }
                         similar::ChangeTag::Delete => {
@@ -563,10 +580,17 @@ impl EditorView {
             }
         }
 
-        if !add_ranges.is_empty() {
+        if !line_ranges.is_empty() {
             overlay_highlights.push(OverlayHighlights::Homogeneous {
-                highlight: add_highlight,
-                ranges: add_ranges,
+                highlight: change_highlight,
+                ranges: line_ranges,
+            });
+        }
+
+        if !char_ranges.is_empty() {
+            overlay_highlights.push(OverlayHighlights::Homogeneous {
+                highlight: change_highlight,
+                ranges: char_ranges,
             });
         }
     }

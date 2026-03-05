@@ -1250,6 +1250,8 @@ pub struct Editor {
     pub merge_views: HashMap<ViewId, MergeViewState>,
     /// Editor-wide diff range for comparing two arbitrary commits
     pub diff_range: Option<DiffRange>,
+    /// Session-scoped override for split/single diff layout toggled from commands.
+    pub diff_session_split_view_override: Option<bool>,
     /// Last selected file path in the changed file picker (for restoring selection)
     pub last_changed_file_selection: Option<PathBuf>,
 
@@ -1400,6 +1402,7 @@ impl Editor {
             diff_views: HashMap::new(),
             merge_views: HashMap::new(),
             diff_range: None,
+            diff_session_split_view_override: None,
             last_changed_file_selection: None,
             syn_loader,
             theme_loader,
@@ -2477,6 +2480,12 @@ impl Editor {
         }
     }
 
+    fn non_virtual_document_id_by_path(&self, path: &Path) -> Option<DocumentId> {
+        self.documents.iter().find_map(|(id, doc)| {
+            (!doc.is_virtual_base && doc.path().is_some_and(|p| p == path)).then_some(*id)
+        })
+    }
+
     /// Open a side-by-side diff view for the given file.
     ///
     /// Creates a vertical split with:
@@ -2488,39 +2497,61 @@ impl Editor {
         git_ref: &str,
         split_view_override: Option<bool>,
     ) -> Result<(), Error> {
+        self.open_diff_view_with_paths(path, path, git_ref, split_view_override)
+    }
+
+    /// Open a side-by-side diff where the base and working paths may differ
+    /// (used for renamed files).
+    pub fn open_diff_view_with_paths(
+        &mut self,
+        base_path: &Path,
+        working_path: &Path,
+        git_ref: &str,
+        split_view_override: Option<bool>,
+    ) -> Result<(), Error> {
         use crate::diff_view::DiffViewState;
 
-        let path = helix_stdx::path::canonicalize(path);
+        let base_path = helix_stdx::path::canonicalize(base_path);
+        let working_path = helix_stdx::path::canonicalize(working_path);
 
-        // 1. Open or get existing working document
-        let working_doc_id = if let Some(id) = self.document_id_by_path(&path) {
+        // If the focused view is already part of a diff/merge session, close
+        // that session first so old virtual panes/docs don't leak into the
+        // next diff open.
+        let focused_view = self.tree.focus;
+        if self.diff_views.contains_key(&focused_view) {
+            self.close_diff_view(focused_view);
+        }
+        if self.merge_views.contains_key(&focused_view) {
+            self.close_merge_view(focused_view);
+        }
+
+        // 1. Open or get existing working document (ignore virtual base docs).
+        let working_doc_id = if let Some(id) = self.non_virtual_document_id_by_path(&working_path) {
             id
         } else {
-            // Open the file if not already open
-            self.open(&path, Action::Load)?
+            self.open(&working_path, Action::Load)?
         };
 
-        // 2. Fetch git base content
-        let base_content = Self::get_diff_content_or_empty(&path, git_ref)
+        // 2. Fetch git base content (from base_path at git_ref).
+        let base_content = Self::get_diff_content_or_empty(&base_path, git_ref)
             .map_err(|e| anyhow::anyhow!("Failed to fetch git revision: {}", e))?;
 
-        // 3. Create virtual base document
+        // 3. Create virtual base document.
         let base_doc = Document::from_git_revision(
             base_content.clone(),
-            &path,
+            &base_path,
             git_ref,
             self.config.clone(),
             self.syn_loader.clone(),
         )?;
         let base_doc_id = self.new_document(base_doc);
 
-        // 4. Link documents and set up diff handle for hunk navigation
+        // 4. Link documents and set up diff handles for hunk navigation.
         let mut working_content: Option<Vec<u8>> = None;
         if let Some(working_doc) = self.documents.get_mut(&working_doc_id) {
             working_doc.linked_diff_doc = Some(base_doc_id);
             working_doc.char_diff_enabled = true;
             working_doc.char_diff_minus_side = false;
-            // Set up diff handle for hunk navigation ([g and ]g)
             working_doc.set_diff_base(base_content.clone());
             let text: String = working_doc.text().slice(..).chunks().collect();
             working_content = Some(text.into_bytes());
@@ -2534,11 +2565,11 @@ impl Editor {
             }
         }
 
+        let split_view_override = split_view_override.or(self.diff_session_split_view_override);
         let split_view = split_view_override.unwrap_or_else(|| self.config().diff.split_view);
 
         if split_view {
             // 5. Create split layout: base (left) | working (right)
-            // Close all non-focused views first to ensure clean 2-split layout
             let views_to_close: Vec<ViewId> = self
                 .tree
                 .views()
@@ -2548,15 +2579,12 @@ impl Editor {
                 self.close(view_id);
             }
 
-            // First, switch to base document
             self.switch(base_doc_id, Action::Replace);
             let base_view_id = self.tree.focus;
 
-            // Then create vertical split for working document
             self.switch(working_doc_id, Action::VerticalSplit);
             let working_view_id = self.tree.focus;
 
-            // 6. Register diff state for both views
             let mut diff_state = DiffViewState::new(
                 base_doc_id,
                 working_doc_id,
@@ -2569,15 +2597,13 @@ impl Editor {
             self.diff_views.insert(base_view_id, diff_state.clone());
             self.diff_views.insert(working_view_id, diff_state);
         } else {
-            // Just open the working document, diffs are enabled on it.
             self.switch(working_doc_id, Action::Replace);
             let working_view_id = self.tree.focus;
 
-            // Still register diff state so we can toggle back to split view
             let mut diff_state = DiffViewState::new(
                 base_doc_id,
                 working_doc_id,
-                working_view_id, // no separate base view in single mode
+                working_view_id,
                 working_view_id,
                 git_ref.to_string(),
             );
@@ -2588,9 +2614,9 @@ impl Editor {
         Ok(())
     }
 
-    /// Open a diff view between two arbitrary refs or ref vs working tree
-    /// - If target_ref is None: compare base_ref vs working tree (editable)
-    /// - If target_ref is Some: compare base_ref vs target_ref (both read-only)
+    /// Open a diff view between two arbitrary refs or ref vs working tree.
+    /// - If target_ref is None: compare base_ref vs working tree
+    /// - If target_ref is Some: compare base_ref vs target_ref
     pub fn open_diff_view_range(
         &mut self,
         path: &Path,
@@ -2598,47 +2624,73 @@ impl Editor {
         target_ref: Option<&str>,
         split_view_override: Option<bool>,
     ) -> Result<(), Error> {
+        self.open_diff_view_range_with_paths(path, path, base_ref, target_ref, split_view_override)
+    }
+
+    /// Open a diff view between two refs with potentially different file paths
+    /// on each side (used for renamed files).
+    pub fn open_diff_view_range_with_paths(
+        &mut self,
+        base_path: &Path,
+        target_path: &Path,
+        base_ref: &str,
+        target_ref: Option<&str>,
+        split_view_override: Option<bool>,
+    ) -> Result<(), Error> {
         use crate::diff_view::DiffViewState;
 
-        let path = helix_stdx::path::canonicalize(path);
+        let base_path = helix_stdx::path::canonicalize(base_path);
+        let target_path = helix_stdx::path::canonicalize(target_path);
+
+        // Same cleanup for the commit-to-commit path, which doesn't always
+        // route through open_diff_view_with_paths().
+        let focused_view = self.tree.focus;
+        if self.diff_views.contains_key(&focused_view) {
+            self.close_diff_view(focused_view);
+        }
+        if self.merge_views.contains_key(&focused_view) {
+            self.close_merge_view(focused_view);
+        }
+
+        let split_view_override = split_view_override.or(self.diff_session_split_view_override);
 
         match target_ref {
-            // Compare base_ref vs working tree (editable right pane)
-            None => {
-                self.open_diff_view(&path, base_ref, split_view_override)
-            }
-            // Compare two commits
+            None => self.open_diff_view_with_paths(
+                &base_path,
+                &target_path,
+                base_ref,
+                split_view_override,
+            ),
             Some(target) => {
-                // 1. Fetch base content from base_ref
-                let base_content = Self::get_diff_content_or_empty(&path, base_ref)
-                    .map_err(|e| anyhow::anyhow!("Failed to fetch base revision '{}': {}", base_ref, e))?;
+                let base_content =
+                    Self::get_diff_content_or_empty(&base_path, base_ref).map_err(|e| {
+                        anyhow::anyhow!("Failed to fetch base revision '{}': {}", base_ref, e)
+                    })?;
 
-                // 2. Fetch target content from target_ref
-                let target_content = Self::get_diff_content_or_empty(&path, target)
-                    .map_err(|e| anyhow::anyhow!("Failed to fetch target revision '{}': {}", target, e))?;
+                let target_content = Self::get_diff_content_or_empty(&target_path, target)
+                    .map_err(|e| {
+                        anyhow::anyhow!("Failed to fetch target revision '{}': {}", target, e)
+                    })?;
                 let target_content_for_diff = target_content.clone();
 
-                // 3. Create virtual base document (read-only)
                 let base_doc = Document::from_git_revision(
                     base_content.clone(),
-                    &path,
+                    &base_path,
                     base_ref,
                     self.config.clone(),
                     self.syn_loader.clone(),
                 )?;
                 let base_doc_id = self.new_document(base_doc);
 
-                // 4. Create virtual target document (read-only)
                 let target_doc = Document::from_git_revision(
                     target_content,
-                    &path,
+                    &target_path,
                     target,
                     self.config.clone(),
                     self.syn_loader.clone(),
                 )?;
                 let target_doc_id = self.new_document(target_doc);
 
-                // 5. Link documents and set up diff handle for hunk navigation
                 if let Some(base_doc) = self.documents.get_mut(&base_doc_id) {
                     base_doc.linked_diff_doc = Some(target_doc_id);
                     base_doc.char_diff_enabled = true;
@@ -2649,15 +2701,13 @@ impl Editor {
                     target_doc.linked_diff_doc = Some(base_doc_id);
                     target_doc.char_diff_enabled = true;
                     target_doc.char_diff_minus_side = false;
-                    // Set up diff handle for hunk navigation ([g and ]g)
                     target_doc.set_diff_base(base_content.clone());
                 }
 
-                let split_view = split_view_override.unwrap_or_else(|| self.config().diff.split_view);
+                let split_view =
+                    split_view_override.unwrap_or_else(|| self.config().diff.split_view);
 
                 if split_view {
-                    // 6. Create split layout: base (left) | target (right)
-                    // Close all non-focused views first to ensure clean 2-split layout
                     let views_to_close: Vec<ViewId> = self
                         .tree
                         .views()
@@ -2673,7 +2723,6 @@ impl Editor {
                     self.switch(target_doc_id, Action::VerticalSplit);
                     let target_view_id = self.tree.focus;
 
-                    // 7. Register diff state for both views
                     let display_string = format!("{}..{}", base_ref, target);
                     let mut diff_state = DiffViewState::new(
                         base_doc_id,
@@ -2687,7 +2736,6 @@ impl Editor {
                     self.diff_views.insert(base_view_id, diff_state.clone());
                     self.diff_views.insert(target_view_id, diff_state);
                 } else {
-                    // Just open the target document, diffs are enabled on it.
                     self.switch(target_doc_id, Action::Replace);
                     let target_view_id = self.tree.focus;
 
@@ -2729,7 +2777,9 @@ impl Editor {
             let _ = self.close_document(diff_state.base_doc_id, true);
 
             // Close the base view - check if it exists first and is NOT the working view
-            if diff_state.base_view_id != diff_state.working_view_id && self.tree.contains(diff_state.base_view_id) {
+            if diff_state.base_view_id != diff_state.working_view_id
+                && self.tree.contains(diff_state.base_view_id)
+            {
                 self.close(diff_state.base_view_id);
             }
 
@@ -2753,6 +2803,18 @@ impl Editor {
             let source_end = hunk.before.end as i64;
             let target_start = hunk.after.start as i64;
             let target_end = hunk.after.end as i64;
+            let source_len = source_end.saturating_sub(source_start);
+            let target_len = target_end.saturating_sub(target_start);
+
+            // Insertion boundary in source (`before` is empty). Treat this as a
+            // hunk anchor for viewport alignment while still mapping line-wise
+            // to the semantic line after the inserted block.
+            if source_len == 0 && source_line == source_start {
+                return (
+                    target_start.saturating_add(target_len).max(0) as usize,
+                    Some((source_start.max(0) as usize, target_start.max(0) as usize)),
+                );
+            }
 
             if source_line < source_start {
                 return (
@@ -2762,16 +2824,6 @@ impl Editor {
             }
 
             if source_line < source_end {
-                let source_len = source_end.saturating_sub(source_start);
-                let target_len = target_end.saturating_sub(target_start);
-
-                if source_len == 0 {
-                    return (
-                        target_start.max(0) as usize,
-                        Some((source_start.max(0) as usize, target_start.max(0) as usize)),
-                    );
-                }
-
                 let offset_in_hunk = source_line.saturating_sub(source_start);
                 let mapped_line = if target_len == 0 {
                     target_start
@@ -2875,7 +2927,10 @@ impl Editor {
 
     /// Synchronize scroll position to linked diff views.
     pub fn sync_scroll_to_linked_views(&mut self, source_view_id: ViewId) {
-        log::info!("sync_scroll_to_linked_views called for view {:?}", source_view_id);
+        log::info!(
+            "sync_scroll_to_linked_views called for view {:?}",
+            source_view_id
+        );
         log::info!("  merge_views has {} entries", self.merge_views.len());
 
         // Check if this view is part of a 2-way diff session
@@ -2885,11 +2940,20 @@ impl Editor {
             }
 
             // Determine which is the source and target
-            let (target_view_id, target_doc_id, source_doc_id) = if source_view_id == diff_state.base_view_id {
-                (diff_state.working_view_id, diff_state.working_doc_id, diff_state.base_doc_id)
-            } else {
-                (diff_state.base_view_id, diff_state.base_doc_id, diff_state.working_doc_id)
-            };
+            let (target_view_id, target_doc_id, source_doc_id) =
+                if source_view_id == diff_state.base_view_id {
+                    (
+                        diff_state.working_view_id,
+                        diff_state.working_doc_id,
+                        diff_state.base_doc_id,
+                    )
+                } else {
+                    (
+                        diff_state.base_view_id,
+                        diff_state.base_doc_id,
+                        diff_state.working_doc_id,
+                    )
+                };
 
             if !self.tree.contains(source_view_id) || !self.tree.contains(target_view_id) {
                 log::info!(
@@ -2947,8 +3011,13 @@ impl Editor {
 
         // Check if this view is part of a 3-way merge session
         if let Some(merge_state) = self.merge_views.get(&source_view_id).cloned() {
-            log::info!("  FOUND merge view state! source={:?}, ours={:?}, theirs={:?}, sync={}",
-                source_view_id, merge_state.ours_view_id, merge_state.theirs_view_id, merge_state.sync_scroll);
+            log::info!(
+                "  FOUND merge view state! source={:?}, ours={:?}, theirs={:?}, sync={}",
+                source_view_id,
+                merge_state.ours_view_id,
+                merge_state.theirs_view_id,
+                merge_state.sync_scroll
+            );
 
             if !merge_state.sync_scroll {
                 log::info!("  Sync scroll is DISABLED, returning");
@@ -2960,9 +3029,17 @@ impl Editor {
             // Only sync between OURS and THEIRS panes (not RESULT)
             let (target_view_id, target_doc_id, source_doc_id) =
                 if source_view_id == merge_state.ours_view_id {
-                    (merge_state.theirs_view_id, merge_state.theirs_doc_id, merge_state.ours_doc_id)
+                    (
+                        merge_state.theirs_view_id,
+                        merge_state.theirs_doc_id,
+                        merge_state.ours_doc_id,
+                    )
                 } else if source_view_id == merge_state.theirs_view_id {
-                    (merge_state.ours_view_id, merge_state.ours_doc_id, merge_state.theirs_doc_id)
+                    (
+                        merge_state.ours_view_id,
+                        merge_state.ours_doc_id,
+                        merge_state.theirs_doc_id,
+                    )
                 } else {
                     // RESULT pane - don't sync
                     return;
@@ -2994,7 +3071,11 @@ impl Editor {
                     log::warn!("  ✗ Target document not found!");
                     return;
                 };
-                log::info!("  Syncing from view {:?} to view {:?}", source_view_id, target_view_id);
+                log::info!(
+                    "  Syncing from view {:?} to view {:?}",
+                    source_view_id,
+                    target_view_id
+                );
                 log::info!(
                     "  Source offset: anchor={}, vert={}, horiz={}",
                     source_offset.anchor,
@@ -3041,7 +3122,7 @@ impl Editor {
     /// - Top-right: THEIRS version (read-only)
     /// - Bottom: Merge result (editable)
     pub fn open_merge_view(&mut self, path: &Path) -> Result<(), Error> {
-        use crate::merge_view::{parse_conflicts, extract_conflict_versions, MergeViewState};
+        use crate::merge_view::{extract_conflict_versions, parse_conflicts, MergeViewState};
 
         let path = helix_stdx::path::canonicalize(path);
 

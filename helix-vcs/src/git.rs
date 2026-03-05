@@ -2,7 +2,7 @@ use anyhow::{bail, Context, Result};
 use arc_swap::ArcSwap;
 use gix::filter::plumbing::driver::apply::Delay;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use gix::bstr::ByteSlice;
@@ -27,10 +27,21 @@ fn get_repo_dir(file: &Path) -> Result<&Path> {
     file.parent().context("file has no parent directory")
 }
 
+fn resolve_file_path(file: &Path) -> Result<PathBuf> {
+    if file.exists() {
+        gix::path::realpath(file).context("resolve symlinks")
+    } else {
+        let parent = get_repo_dir(file)?;
+        let parent = gix::path::realpath(parent).context("resolve symlinks for parent")?;
+        let file_name = file.file_name().context("file has no file name")?;
+        Ok(parent.join(file_name))
+    }
+}
+
 pub fn get_diff_base(file: &Path) -> Result<Vec<u8>> {
     debug_assert!(!file.exists() || file.is_file());
     debug_assert!(file.is_absolute());
-    let file = gix::path::realpath(file).context("resolve symlinks")?;
+    let file = resolve_file_path(file)?;
 
     // TODO cache repository lookup
 
@@ -62,7 +73,7 @@ pub fn get_diff_base(file: &Path) -> Result<Vec<u8>> {
 pub fn get_diff_base_from_ref(file: &Path, ref_name: &str) -> Result<Vec<u8>> {
     debug_assert!(!file.exists() || file.is_file());
     debug_assert!(file.is_absolute());
-    let file = gix::path::realpath(file).context("resolve symlinks")?;
+    let file = resolve_file_path(file)?;
 
     let repo_dir = get_repo_dir(&file)?;
     let repo = open_repo(repo_dir)
@@ -93,7 +104,7 @@ pub fn get_diff_base_from_ref(file: &Path, ref_name: &str) -> Result<Vec<u8>> {
 pub fn get_current_head_name(file: &Path) -> Result<Arc<ArcSwap<Box<str>>>> {
     debug_assert!(!file.exists() || file.is_file());
     debug_assert!(file.is_absolute());
-    let file = gix::path::realpath(file).context("resolve symlinks")?;
+    let file = resolve_file_path(file)?;
 
     let repo_dir = get_repo_dir(&file)?;
     let repo = open_repo(repo_dir)
@@ -118,7 +129,7 @@ pub fn get_current_head_name(file: &Path) -> Result<Arc<ArcSwap<Box<str>>>> {
 pub fn get_merge_versions(file: &Path) -> Result<(Vec<u8>, Vec<u8>)> {
     debug_assert!(!file.exists() || file.is_file());
     debug_assert!(file.is_absolute());
-    let file = gix::path::realpath(file).context("resolve symlinks")?;
+    let file = resolve_file_path(file)?;
 
     let repo_dir = get_repo_dir(&file)?;
     let repo = open_repo(repo_dir)
@@ -166,13 +177,15 @@ pub fn get_merge_versions(file: &Path) -> Result<(Vec<u8>, Vec<u8>)> {
     // Apply git filters (like crlf conversion) to both versions
     let (mut pipeline, _) = repo.filter_pipeline(None)?;
 
-    let mut ours_worktree = pipeline.convert_to_worktree(&ours_data, rela_path.as_ref(), Delay::Forbid)?;
+    let mut ours_worktree =
+        pipeline.convert_to_worktree(&ours_data, rela_path.as_ref(), Delay::Forbid)?;
     let mut ours_buf = Vec::with_capacity(ours_data.len());
     ours_worktree.read_to_end(&mut ours_buf)?;
 
     // Re-create pipeline for theirs to avoid borrow issues
     let (mut pipeline2, _) = repo.filter_pipeline(None)?;
-    let mut theirs_worktree = pipeline2.convert_to_worktree(&theirs_data, rela_path.as_ref(), Delay::Forbid)?;
+    let mut theirs_worktree =
+        pipeline2.convert_to_worktree(&theirs_data, rela_path.as_ref(), Delay::Forbid)?;
     let mut theirs_buf = Vec::with_capacity(theirs_data.len());
     theirs_worktree.read_to_end(&mut theirs_buf)?;
 
@@ -198,16 +211,21 @@ fn resolve_commit<'a>(repo: &'a Repository, ref_name: &str) -> Result<Commit<'a>
     // First try as a reference (branch, tag, etc.)
     if let Ok(reference) = repo.find_reference(ref_name) {
         let object_id = reference.into_fully_peeled_id()?.detach();
-        return repo.find_object(object_id)?.try_into_commit()
+        return repo
+            .find_object(object_id)?
+            .try_into_commit()
             .context(format!("'{}' is not a commit", ref_name));
     }
 
     // Not a reference, try as a commit hash (full or partial)
     // Use gix's prefix resolution which handles both short and full hashes
-    let prefix = gix::hash::Prefix::from_hex(ref_name)
-        .context(format!("'{}' is not a valid reference or commit hash", ref_name))?;
+    let prefix = gix::hash::Prefix::from_hex(ref_name).context(format!(
+        "'{}' is not a valid reference or commit hash",
+        ref_name
+    ))?;
 
-    let maybe_oid = repo.objects
+    let maybe_oid = repo
+        .objects
         .lookup_prefix(prefix, None)
         .context("failed to lookup object by hash")?;
 
@@ -217,7 +235,8 @@ fn resolve_commit<'a>(repo: &'a Repository, ref_name: &str) -> Result<Commit<'a>
                 "ambiguous hash prefix '{}' matches multiple objects. \
                 Try using at least 12 characters of the commit hash. \
                 Get the full hash with: git log --oneline --all | grep {}",
-                ref_name, ref_name
+                ref_name,
+                ref_name
             )
         })?,
         None => bail!("no commit found with hash '{}'", ref_name),
@@ -233,7 +252,8 @@ fn resolve_commit<'a>(repo: &'a Repository, ref_name: &str) -> Result<Commit<'a>
         );
     }
 
-    object.try_into_commit()
+    object
+        .try_into_commit()
         .context(format!("'{}' is not a commit", ref_name))
 }
 
@@ -263,7 +283,8 @@ pub fn for_each_changed_file_between_refs(
                 return status(&repo, f);
             }
 
-            let work_dir = repo.workdir()
+            let work_dir = repo
+                .workdir()
                 .ok_or_else(|| anyhow::anyhow!("working tree not found"))?
                 .to_path_buf();
 
@@ -341,7 +362,7 @@ pub fn for_each_changed_file_between_refs(
                 }
             })?;
 
-            return Ok(())
+            return Ok(());
         }
         // Compare two commits
         Some(target) => {

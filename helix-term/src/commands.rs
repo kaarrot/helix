@@ -3319,7 +3319,10 @@ fn jumplist_picker(cx: &mut Context) {
         JumpMeta {
             id: doc_id,
             path: doc.and_then(|d| d.path().cloned()),
-            display_name: doc.map_or_else(|| SCRATCH_BUFFER_NAME.to_string(), |d| d.display_name().to_string()),
+            display_name: doc.map_or_else(
+                || SCRATCH_BUFFER_NAME.to_string(),
+                |d| d.display_name().to_string(),
+            ),
             selection,
             text,
             is_current: view.doc == doc_id,
@@ -3393,24 +3396,41 @@ fn changed_file_picker(cx: &mut Context) {
         return;
     }
 
+    // If we're starting from a normal buffer, treat this as a new diff session
+    // and reset any layout override from previous sessions.
+    let in_active_diff_session = {
+        let (view, doc) = current!(cx.editor);
+        cx.editor.diff_views.contains_key(&view.id)
+            || cx.editor.merge_views.contains_key(&view.id)
+            || doc.linked_diff_doc.is_some()
+    };
+    if !in_active_diff_session {
+        cx.editor.diff_session_split_view_override = None;
+    }
+
     // Get the current file path if we're in a diff view
     let current_file_path = {
         let (view, _) = current!(cx.editor);
         let view_id = view.id;
 
-        cx.editor.diff_views.get(&view_id)
+        cx.editor
+            .diff_views
+            .get(&view_id)
             .and_then(|diff_state| {
                 // Get the working document path from the diff view
-                cx.editor.documents.get(&diff_state.working_doc_id)
+                cx.editor
+                    .documents
+                    .get(&diff_state.working_doc_id)
                     .and_then(|doc| doc.path().map(|p| p.clone()))
             })
             .or_else(|| {
                 // Fallback: check merge view
-                cx.editor.merge_views.get(&view_id)
-                    .and_then(|merge_state| {
-                        cx.editor.documents.get(&merge_state.result_doc_id)
-                            .and_then(|doc| doc.path().map(|p| p.clone()))
-                    })
+                cx.editor.merge_views.get(&view_id).and_then(|merge_state| {
+                    cx.editor
+                        .documents
+                        .get(&merge_state.result_doc_id)
+                        .and_then(|doc| doc.path().map(|p| p.clone()))
+                })
             })
             .or_else(|| {
                 // Fallback 1: check if current document has a linked diff doc (single view diff)
@@ -3437,7 +3457,8 @@ fn changed_file_picker(cx: &mut Context) {
     let target_ref = diff_range.target_ref.clone();
 
     // Show user what range we're using
-    cx.editor.set_status(format!("Loading changes for: {}", diff_range.display()));
+    cx.editor
+        .set_status(format!("Loading changes for: {}", diff_range.display()));
 
     let added = cx.editor.theme.get("diff.plus");
     let modified = cx.editor.theme.get("diff.delta");
@@ -3498,21 +3519,36 @@ fn changed_file_picker(cx: &mut Context) {
                 cx.editor.last_changed_file_selection = Some(meta.path().to_path_buf());
 
                 match meta {
-                    FileChange::Modified { path } | FileChange::Renamed { to_path: path, .. } => {
+                    FileChange::Modified { path } => {
                         // Open side-by-side diff view for modified files using the active diff range
                         if let Err(e) = cx.editor.open_diff_view_range(
                             path,
                             &base_ref_for_callback,
                             target_ref_for_callback.as_deref(),
-                            None,
+                            cx.editor.diff_session_split_view_override,
                         ) {
-                            cx.editor.set_error(format!("Failed to open diff view: {}", e));
+                            cx.editor
+                                .set_error(format!("Failed to open diff view: {}", e));
+                        }
+                    }
+                    FileChange::Renamed { from_path, to_path } => {
+                        // Preserve old/new paths so renamed files show both sides correctly.
+                        if let Err(e) = cx.editor.open_diff_view_range_with_paths(
+                            from_path,
+                            to_path,
+                            &base_ref_for_callback,
+                            target_ref_for_callback.as_deref(),
+                            cx.editor.diff_session_split_view_override,
+                        ) {
+                            cx.editor
+                                .set_error(format!("Failed to open diff view: {}", e));
                         }
                     }
                     FileChange::Conflict { path } => {
                         // Open 3-way merge view for conflicted files
                         if let Err(e) = cx.editor.open_merge_view(path) {
-                            cx.editor.set_error(format!("Failed to open merge view: {}", e));
+                            cx.editor
+                                .set_error(format!("Failed to open merge view: {}", e));
                         }
                     }
                     _ => {
@@ -4258,6 +4294,7 @@ fn goto_next_change_impl(cx: &mut Context, direction: Direction) {
 
     // Sync the other pane in diff/merge view
     let view_id = view!(cx.editor).id;
+    let scrolloff = cx.editor.config().scrolloff;
 
     // Check for 2-way diff view first
     if let Some(diff_state) = cx.editor.diff_views.get(&view_id).cloned() {
@@ -4267,28 +4304,68 @@ fn goto_next_change_impl(cx: &mut Context, direction: Direction) {
             (diff_state.base_view_id, diff_state.base_doc_id)
         };
 
-        // Get current cursor line in source pane.
-        let (source_doc_id, cursor_line) = {
+        // Get current cursor line and hunk index in source pane.
+        let (source_doc_id, cursor_line, source_hunk_idx) = {
             let (view, doc) = current!(cx.editor);
             let text = doc.text().slice(..);
             let cursor_line = doc.selection(view.id).primary().cursor_line(text);
-            (doc.id(), cursor_line)
+            let source_hunk_idx = doc.diff_handle().and_then(|diff_handle| {
+                let diff = diff_handle.load();
+                diff.hunk_at(cursor_line as u32, true)
+            });
+            (doc.id(), cursor_line, source_hunk_idx)
         };
-        let mapped_line = cx
-            .editor
-            .map_line_between_documents(source_doc_id, other_doc_id, cursor_line);
 
-        // Set selection in the other pane; viewport alignment is then handled
-        // by the focus toggle below (same behavior as manual `C-w w`).
+        // Single-buffer diff mode: no paired pane to align.
+        if other_view_id == view_id || other_doc_id == source_doc_id {
+            cx.editor.ensure_cursor_in_view(view_id);
+            return;
+        }
+
+        let mapped_line =
+            cx.editor
+                .map_line_between_documents(source_doc_id, other_doc_id, cursor_line);
+
+        let target_line = {
+            let Some(other_doc) = cx.editor.documents.get(&other_doc_id) else {
+                cx.editor.ensure_cursor_in_view(view_id);
+                return;
+            };
+
+            let mut target_line = mapped_line.min(other_doc.text().len_lines().saturating_sub(1));
+
+            if let Some(target_diff_handle) = other_doc.diff_handle() {
+                let target_diff = target_diff_handle.load();
+                let target_hunk_idx = source_hunk_idx
+                    .filter(|&idx| idx < target_diff.len())
+                    .or_else(|| target_diff.hunk_at(mapped_line as u32, true));
+
+                if let Some(idx) = target_hunk_idx {
+                    let target_hunk = target_diff.nth_hunk(idx);
+                    target_line = target_hunk.after.start as usize;
+                }
+            }
+
+            target_line.min(other_doc.text().len_lines().saturating_sub(1))
+        };
+
         {
             let other_doc = doc_mut!(cx.editor, &other_doc_id);
-            let pos = other_doc.text().line_to_char(mapped_line);
+            let pos = other_doc.text().line_to_char(target_line);
             let selection = helix_core::Selection::point(pos);
             other_doc.set_selection(other_view_id, selection);
         }
 
-        // Update the view offset for the new cursor position and sync linked views.
-        cx.editor.ensure_cursor_in_view(view_id);
+        {
+            let (view, doc) = current!(cx.editor);
+            align_view(doc, view, Align::Top);
+        }
+        {
+            let other_doc = doc_mut!(cx.editor, &other_doc_id);
+            let other_view = view_mut!(cx.editor, other_view_id);
+            align_view(other_doc, other_view, Align::Top);
+            other_view.ensure_cursor_in_view(other_doc, scrolloff);
+        }
 
         return;
     }
@@ -4304,29 +4381,62 @@ fn goto_next_change_impl(cx: &mut Context, direction: Direction) {
             return; // In RESULT pane, don't sync
         };
 
-        // Get current cursor line in source pane.
-        let (source_doc_id, cursor_line) = {
+        // Get current cursor line and hunk index in source pane.
+        let (source_doc_id, cursor_line, source_hunk_idx) = {
             let (view, doc) = current!(cx.editor);
             let text = doc.text().slice(..);
             let cursor_line = doc.selection(view.id).primary().cursor_line(text);
-            (doc.id(), cursor_line)
+            let source_hunk_idx = doc.diff_handle().and_then(|diff_handle| {
+                let diff = diff_handle.load();
+                diff.hunk_at(cursor_line as u32, true)
+            });
+            (doc.id(), cursor_line, source_hunk_idx)
         };
-        let mapped_line = cx
-            .editor
-            .map_line_between_documents(source_doc_id, other_doc_id, cursor_line);
 
-        // Set selection in the other pane; viewport alignment is then handled
-        // by the focus toggle below (same behavior as manual `C-w w`).
+        let mapped_line =
+            cx.editor
+                .map_line_between_documents(source_doc_id, other_doc_id, cursor_line);
+
+        let target_line = {
+            let Some(other_doc) = cx.editor.documents.get(&other_doc_id) else {
+                cx.editor.ensure_cursor_in_view(view_id);
+                return;
+            };
+
+            let mut target_line = mapped_line.min(other_doc.text().len_lines().saturating_sub(1));
+
+            if let Some(target_diff_handle) = other_doc.diff_handle() {
+                let target_diff = target_diff_handle.load();
+                let target_hunk_idx = source_hunk_idx
+                    .filter(|&idx| idx < target_diff.len())
+                    .or_else(|| target_diff.hunk_at(mapped_line as u32, true));
+
+                if let Some(idx) = target_hunk_idx {
+                    let target_hunk = target_diff.nth_hunk(idx);
+                    target_line = target_hunk.after.start as usize;
+                }
+            }
+
+            target_line.min(other_doc.text().len_lines().saturating_sub(1))
+        };
+
         {
             let other_doc = doc_mut!(cx.editor, &other_doc_id);
-            let pos = other_doc.text().line_to_char(mapped_line);
+            let pos = other_doc.text().line_to_char(target_line);
             let selection = helix_core::Selection::point(pos);
             other_doc.set_selection(other_view_id, selection);
         }
 
-        // Update the view offset for the new cursor position and sync linked views.
-        cx.editor.ensure_cursor_in_view(view_id);
-
+        {
+            let (view, doc) = current!(cx.editor);
+            align_view(doc, view, Align::Top);
+        }
+        {
+            let other_doc = doc_mut!(cx.editor, &other_doc_id);
+            let other_view = view_mut!(cx.editor, other_view_id);
+            align_view(other_doc, other_view, Align::Top);
+            other_view.ensure_cursor_in_view(other_doc, scrolloff);
+        }
     }
 }
 
@@ -6009,26 +6119,44 @@ fn diff_toggle_sync_scroll(cx: &mut Context) {
     let view_id = view.id;
 
     // Check 2-way diff view first
-    if let Some(diff_state) = cx.editor.diff_views.get_mut(&view_id) {
-        diff_state.sync_scroll = !diff_state.sync_scroll;
-        let status = if diff_state.sync_scroll {
+    if let Some(diff_state) = cx.editor.diff_views.get(&view_id).cloned() {
+        let new_sync_scroll = !diff_state.sync_scroll;
+        for id in [diff_state.base_view_id, diff_state.working_view_id] {
+            if let Some(state) = cx.editor.diff_views.get_mut(&id) {
+                state.sync_scroll = new_sync_scroll;
+            }
+        }
+
+        let status = if new_sync_scroll {
             "enabled"
         } else {
             "disabled"
         };
-        cx.editor.set_status(format!("Synchronized scrolling {}", status));
+        cx.editor
+            .set_status(format!("Synchronized scrolling {}", status));
         return;
     }
 
     // Check 3-way merge view
-    if let Some(merge_state) = cx.editor.merge_views.get_mut(&view_id) {
-        merge_state.sync_scroll = !merge_state.sync_scroll;
-        let status = if merge_state.sync_scroll {
+    if let Some(merge_state) = cx.editor.merge_views.get(&view_id).cloned() {
+        let new_sync_scroll = !merge_state.sync_scroll;
+        for id in [
+            merge_state.ours_view_id,
+            merge_state.theirs_view_id,
+            merge_state.result_view_id,
+        ] {
+            if let Some(state) = cx.editor.merge_views.get_mut(&id) {
+                state.sync_scroll = new_sync_scroll;
+            }
+        }
+
+        let status = if new_sync_scroll {
             "enabled"
         } else {
             "disabled"
         };
-        cx.editor.set_status(format!("Synchronized scrolling {}", status));
+        cx.editor
+            .set_status(format!("Synchronized scrolling {}", status));
         return;
     }
 
@@ -6073,8 +6201,10 @@ fn diff_toggle_split_view(cx: &mut Context) {
     // If not, toggle the global config value.
     let current_split = diff_state
         .split_view
+        .or(cx.editor.diff_session_split_view_override)
         .unwrap_or_else(|| cx.editor.config().diff.split_view);
     let new_split = !current_split;
+    cx.editor.diff_session_split_view_override = Some(new_split);
 
     // 4. Close the current diff view
     cx.editor.close_diff_view(view_id);
@@ -6083,30 +6213,28 @@ fn diff_toggle_split_view(cx: &mut Context) {
     // We use the same base_ref from the state
     // Determine if it was a range diff (base..target) or single ref diff
     if let Some((base, target)) = git_ref.split_once("..") {
-        if let Err(e) = cx.editor.open_diff_view_range(
-            &path,
-            base,
-            Some(target),
-            Some(new_split),
-        ) {
-            cx.editor.set_error(format!("Failed to reopen diff view: {}", e));
+        if let Err(e) = cx
+            .editor
+            .open_diff_view_range(&path, base, Some(target), Some(new_split))
+        {
+            cx.editor
+                .set_error(format!("Failed to reopen diff view: {}", e));
         }
     } else {
-        if let Err(e) = cx.editor.open_diff_view(
-            &path,
-            &git_ref,
-            Some(new_split),
-        ) {
-            cx.editor.set_error(format!("Failed to reopen diff view: {}", e));
+        if let Err(e) = cx.editor.open_diff_view(&path, &git_ref, Some(new_split)) {
+            cx.editor
+                .set_error(format!("Failed to reopen diff view: {}", e));
         }
     }
 
     let status = if new_split { "side-by-side" } else { "single" };
-    cx.editor.set_status(format!("Diff layout set to {}", status));
+    cx.editor
+        .set_status(format!("Diff layout set to {}", status));
 }
 
 fn diff_reset(cx: &mut Context) {
     cx.editor.diff_range = None;
+    cx.editor.diff_session_split_view_override = None;
     cx.editor.set_status("Diff range reset");
 }
 
@@ -6170,7 +6298,10 @@ fn merge_finish(cx: &mut Context) {
     }
 
     // Save the result document first (queues async save)
-    if let Err(e) = cx.editor.save::<std::path::PathBuf>(result_doc_id, None, false) {
+    if let Err(e) = cx
+        .editor
+        .save::<std::path::PathBuf>(result_doc_id, None, false)
+    {
         cx.editor.set_error(format!("Failed to save: {}", e));
         return;
     }
@@ -6298,7 +6429,13 @@ fn merge_accept_ours(cx: &mut Context) {
         }
 
         // Now apply the new resolution - refetch conflict to get updated end_line
-        let conflict = cx.editor.merge_views.get(&view_id).unwrap().current_conflict().unwrap();
+        let conflict = cx
+            .editor
+            .merge_views
+            .get(&view_id)
+            .unwrap()
+            .current_conflict()
+            .unwrap();
         let resolved = conflict.ours_content.clone();
         // Ensure resolved content ends with newline (replacement range includes trailing newline)
         let resolved = if resolved.ends_with('\n') {
@@ -6412,7 +6549,13 @@ fn merge_accept_theirs(cx: &mut Context) {
         }
 
         // Now apply the new resolution - refetch conflict to get updated end_line
-        let conflict = cx.editor.merge_views.get(&view_id).unwrap().current_conflict().unwrap();
+        let conflict = cx
+            .editor
+            .merge_views
+            .get(&view_id)
+            .unwrap()
+            .current_conflict()
+            .unwrap();
         let resolved = conflict.theirs_content.clone();
         // Ensure resolved content ends with newline (replacement range includes trailing newline)
         let resolved = if resolved.ends_with('\n') {
@@ -6526,7 +6669,13 @@ fn merge_accept_both(cx: &mut Context) {
         }
 
         // Now apply the new resolution - refetch conflict to get updated end_line
-        let conflict = cx.editor.merge_views.get(&view_id).unwrap().current_conflict().unwrap();
+        let conflict = cx
+            .editor
+            .merge_views
+            .get(&view_id)
+            .unwrap()
+            .current_conflict()
+            .unwrap();
         let updated_end_line = conflict.end_line;
 
         // Get the resolved content (OURS followed by THEIRS)
@@ -6589,7 +6738,9 @@ fn merge_next_conflict(cx: &mut Context) {
         merge_state.current_conflict().map(|conflict| {
             // Estimate line in OURS/THEIRS: subtract marker lines from previous conflicts
             // Each conflict adds ~3 marker lines (<<<, ===, >>>), plus content lines
-            let marker_lines_before: usize = merge_state.conflicts.iter()
+            let marker_lines_before: usize = merge_state
+                .conflicts
+                .iter()
                 .take(current_idx)
                 .map(|c| {
                     // Count lines added by conflict markers: <<<, ===, >>> = 3 lines
@@ -6618,7 +6769,19 @@ fn merge_next_conflict(cx: &mut Context) {
         return;
     };
 
-    if let Some((current, total, start_line, estimated_line, result_doc_id, result_view_id, ours_doc_id, ours_view_id, theirs_doc_id, theirs_view_id)) = conflict_info {
+    if let Some((
+        current,
+        total,
+        start_line,
+        estimated_line,
+        result_doc_id,
+        result_view_id,
+        ours_doc_id,
+        ours_view_id,
+        theirs_doc_id,
+        theirs_view_id,
+    )) = conflict_info
+    {
         let msg = format!("Conflict {}/{} (line {})", current, total, start_line + 1);
         cx.editor.set_status(msg);
 
@@ -6675,7 +6838,9 @@ fn merge_prev_conflict(cx: &mut Context) {
         let current_idx = merge_state.current_conflict;
         merge_state.current_conflict().map(|conflict| {
             // Estimate line in OURS/THEIRS: subtract marker lines from previous conflicts
-            let marker_lines_before: usize = merge_state.conflicts.iter()
+            let marker_lines_before: usize = merge_state
+                .conflicts
+                .iter()
                 .take(current_idx)
                 .map(|c| 3 + c.theirs_content.lines().count())
                 .sum();
@@ -6699,7 +6864,19 @@ fn merge_prev_conflict(cx: &mut Context) {
         return;
     };
 
-    if let Some((current, total, start_line, estimated_line, result_doc_id, result_view_id, ours_doc_id, ours_view_id, theirs_doc_id, theirs_view_id)) = conflict_info {
+    if let Some((
+        current,
+        total,
+        start_line,
+        estimated_line,
+        result_doc_id,
+        result_view_id,
+        ours_doc_id,
+        ours_view_id,
+        theirs_doc_id,
+        theirs_view_id,
+    )) = conflict_info
+    {
         let msg = format!("Conflict {}/{} (line {})", current, total, start_line + 1);
         cx.editor.set_status(msg);
 
@@ -7240,8 +7417,7 @@ fn surround_delete(cx: &mut Context) {
     cx.editor.autoinfo = Some(Info::new("Delete surrounding pair of", &SURROUND_HELP_TEXT));
 }
 
-#[derive(Eq, PartialEq)]
-#[derive(Clone, Copy)]
+#[derive(Eq, PartialEq, Clone, Copy)]
 enum ShellBehavior {
     Replace,
     Ignore,
@@ -7461,7 +7637,8 @@ fn send_stream_input(
 ) {
     // Send to process stdin via channel
     if stdin_tx.send(input.clone()).is_err() {
-        cx.editor.set_error("Failed to send input - process may have exited");
+        cx.editor
+            .set_error("Failed to send input - process may have exited");
         return;
     }
 
@@ -7473,15 +7650,13 @@ fn send_stream_input(
         let echo = format!(">>> {}\n", input);
         let output = Tendril::from(echo);
 
-        let transaction = Transaction::change(
-            doc.text(),
-            [(pos, pos, Some(output))].into_iter()
-        );
+        let transaction = Transaction::change(doc.text(), [(pos, pos, Some(output))].into_iter());
         doc.apply(&transaction, view_id);
         cx.editor.ensure_cursor_in_view(view_id);
     }
 
-    cx.editor.set_status(format!("Input sent to '{}'", buffer_name));
+    cx.editor
+        .set_status(format!("Input sent to '{}'", buffer_name));
 }
 
 /// Show prompt to capture stream input
@@ -7497,8 +7672,8 @@ fn show_stream_input_prompt(
             move |_editor: &mut Editor, compositor: &mut Compositor| {
                 let prompt = Prompt::new(
                     "Stream input: ".into(),
-                    Some('\\'),  // Use \ register for stream command history
-                    |_editor, _input| Vec::new(),  // No completion
+                    Some('\\'), // Use \ register for stream command history
+                    |_editor, _input| Vec::new(), // No completion
                     move |cx, input, event| {
                         if event != PromptEvent::Validate {
                             return;
@@ -7533,8 +7708,8 @@ pub fn show_new_stream_prompt(cx: &mut compositor::Context) {
             move |_editor: &mut Editor, compositor: &mut Compositor| {
                 let prompt = Prompt::new(
                     "Stream command: ".into(),
-                    Some('\\'),  // Use \ register for stream command history
-                    |_editor, _input| Vec::new(),  // No completion
+                    Some('\\'), // Use \ register for stream command history
+                    |_editor, _input| Vec::new(), // No completion
                     move |cx, input, event| {
                         if event != PromptEvent::Validate {
                             return;
@@ -7581,9 +7756,13 @@ fn cancel_stream_command(cx: &mut compositor::Context) {
     if let Some(process) = processes.take() {
         // Send cancellation signal
         let _ = process.cancel_tx.send(());
-        cx.editor.set_status(format!("Stream cancelled (buffer: {})", process.buffer_name));
+        cx.editor.set_status(format!(
+            "Stream cancelled (buffer: {})",
+            process.buffer_name
+        ));
     } else {
-        cx.editor.set_error("No stream process is currently running");
+        cx.editor
+            .set_error("No stream process is currently running");
     }
 }
 
@@ -7603,7 +7782,11 @@ fn shell_stream(cx: &mut compositor::Context, cmd: &str, behavior: &ShellBehavio
             let call: job::Callback = Callback::EditorCompositor(Box::new(
                 move |_editor: &mut Editor, compositor: &mut Compositor| {
                     let prompt = Prompt::new(
-                        format!("A stream is running in '{}'. Cancel it? (y/n): ", buffer_name).into(),
+                        format!(
+                            "A stream is running in '{}'. Cancel it? (y/n): ",
+                            buffer_name
+                        )
+                        .into(),
                         None,
                         |_editor, _input| Vec::new(), // no completion
                         move |cx, input, event| {
@@ -7634,8 +7817,8 @@ fn shell_stream(cx: &mut compositor::Context, cmd: &str, behavior: &ShellBehavio
         return;
     }
 
-    use tokio::io::AsyncReadExt;
     use std::process::Stdio;
+    use tokio::io::AsyncReadExt;
     use tokio::process::Command;
 
     let pipe = match behavior {
@@ -7665,7 +7848,8 @@ fn shell_stream(cx: &mut compositor::Context, cmd: &str, behavior: &ShellBehavio
     let behavior_copy = *behavior;
 
     // Show status message that stream is starting
-    cx.editor.set_status(format!("Starting stream in '{}': {}", buffer_name, cmd));
+    cx.editor
+        .set_status(format!("Starting stream in '{}': {}", buffer_name, cmd));
 
     // Save command to persistent history (file) and register (in-session)
     save_stream_command(&cmd);
@@ -7674,7 +7858,10 @@ fn shell_stream(cx: &mut compositor::Context, cmd: &str, behavior: &ShellBehavio
     log::info!("shell_stream: Scheduling async callback for cmd: {}", cmd);
 
     cx.jobs.callback(async move {
-        log::info!("shell_stream async: Starting async execution for cmd: {}", cmd);
+        log::info!(
+            "shell_stream async: Starting async execution for cmd: {}",
+            cmd
+        );
         if shell.is_empty() {
             bail!("No shell set");
         }
@@ -7698,10 +7885,15 @@ fn shell_stream(cx: &mut compositor::Context, cmd: &str, behavior: &ShellBehavio
                 0
             };
             let _ = tx.send(from);
-        }).await;
+        })
+        .await;
 
         let from = rx.await.unwrap_or(0);
-        log::info!("shell_stream async: Insertion position for cmd '{}' is: {}", cmd, from);
+        log::info!(
+            "shell_stream async: Insertion position for cmd '{}' is: {}",
+            cmd,
+            from
+        );
 
         // Create a cancellation channel
         let (cancel_tx, mut cancel_rx) = oneshot::channel::<()>();
@@ -7720,9 +7912,15 @@ fn shell_stream(cx: &mut compositor::Context, cmd: &str, behavior: &ShellBehavio
         // Always pipe stdin to enable interactive input via :stream-input command
         process.stdin(Stdio::piped());
 
-        log::info!("shell_stream async: About to spawn process for cmd: {}", cmd);
+        log::info!(
+            "shell_stream async: About to spawn process for cmd: {}",
+            cmd
+        );
         let mut child = process.spawn()?;
-        log::info!("shell_stream async: Process spawned successfully for cmd: {}", cmd);
+        log::info!(
+            "shell_stream async: Process spawned successfully for cmd: {}",
+            cmd
+        );
 
         // Create channel for interactive input
         let (stdin_tx, mut stdin_rx) = mpsc::unbounded_channel::<String>();
@@ -7755,8 +7953,9 @@ fn shell_stream(cx: &mut compositor::Context, cmd: &str, behavior: &ShellBehavio
                 let _ = helix_view::document::to_writer(
                     &mut stdin_handle,
                     (encoding::UTF_8, false),
-                    &input
-                ).await;
+                    &input,
+                )
+                .await;
             }
 
             // Then listen for interactive input from :stream-input command
@@ -7797,10 +7996,8 @@ fn shell_stream(cx: &mut compositor::Context, cmd: &str, behavior: &ShellBehavio
                 return;
             };
 
-            let transaction = Transaction::change(
-                doc.text(),
-                [(from, from, Some(command_output))].into_iter()
-            );
+            let transaction =
+                Transaction::change(doc.text(), [(from, from, Some(command_output))].into_iter());
             doc.apply(&transaction, view_id);
 
             // If this is a scratch buffer (no path), set its name to the command
@@ -7815,7 +8012,8 @@ fn shell_stream(cx: &mut compositor::Context, cmd: &str, behavior: &ShellBehavio
             }
 
             editor.ensure_cursor_in_view(view_id);
-        }).await;
+        })
+        .await;
 
         let mut cancelled = false;
         let mut stdout_closed = false;
@@ -7943,10 +8141,7 @@ fn shell_stream(cx: &mut compositor::Context, cmd: &str, behavior: &ShellBehavio
             };
 
             let new_range = Range::new(current_pos, current_pos);
-            let selection = Selection::new(
-                SmallVec::from_buf([new_range]),
-                0
-            );
+            let selection = Selection::new(SmallVec::from_buf([new_range]), 0);
             doc.set_selection(view_id, selection);
 
             editor.ensure_cursor_in_view(view_id);

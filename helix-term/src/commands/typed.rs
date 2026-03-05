@@ -1519,9 +1519,9 @@ fn reload_all(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> 
         // Skip scratch buffers (documents without a file path)
         // Also skip buffers that haven't been saved to disk yet
         match doc.path() {
-            None => continue, // Skip scratch buffers
+            None => continue,                         // Skip scratch buffers
             Some(path) if !path.exists() => continue, // Skip unsaved files
-            Some(_) => {} // File exists, proceed with reload
+            Some(_) => {}                             // File exists, proceed with reload
         }
 
         // Every doc is guaranteed to have at least 1 view at this point.
@@ -2515,7 +2515,12 @@ fn insert_stream_output(
     let process_info = {
         let processes = STREAM_PROCESSES.lock().unwrap();
         processes.as_ref().map(|p| {
-            (p.stdin_tx.clone(), p.buffer_name.clone(), p.doc_id, p.view_id)
+            (
+                p.stdin_tx.clone(),
+                p.buffer_name.clone(),
+                p.doc_id,
+                p.view_id,
+            )
         })
     };
 
@@ -2949,11 +2954,7 @@ fn toggle_char_diff(
     Ok(())
 }
 
-fn diff_commit(
-    cx: &mut compositor::Context,
-    args: Args,
-    event: PromptEvent,
-) -> anyhow::Result<()> {
+fn diff_commit(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow::Result<()> {
     use helix_view::editor::DiffRange;
 
     if event != PromptEvent::Validate {
@@ -2966,36 +2967,31 @@ fn diff_commit(
         Ok(diff_range) => {
             let display = diff_range.display();
             cx.editor.diff_range = Some(diff_range);
-            cx.editor.set_status(format!("Diff range set to: {}", display));
+            cx.editor
+                .set_status(format!("Diff range set to: {}", display));
         }
         Err(err) => {
-            cx.editor.set_error(format!("Failed to parse diff range: {}", err));
+            cx.editor
+                .set_error(format!("Failed to parse diff range: {}", err));
         }
     }
 
     Ok(())
 }
 
-fn diff_reset(
-    cx: &mut compositor::Context,
-    _args: Args,
-    event: PromptEvent,
-) -> anyhow::Result<()> {
+fn diff_reset(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> anyhow::Result<()> {
     if event != PromptEvent::Validate {
         return Ok(());
     }
 
     cx.editor.diff_range = None;
+    cx.editor.diff_session_split_view_override = None;
     cx.editor.set_status("Diff range reset");
 
     Ok(())
 }
 
-fn diff_files(
-    cx: &mut compositor::Context,
-    args: Args,
-    event: PromptEvent,
-) -> anyhow::Result<()> {
+fn diff_files(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow::Result<()> {
     use helix_vcs::FileChange;
     use helix_view::editor::DiffRange;
     use helix_view::theme::Style;
@@ -3028,6 +3024,16 @@ fn diff_files(
         return Ok(());
     }
 
+    let in_active_diff_session = {
+        let (view, doc) = current!(cx.editor);
+        cx.editor.diff_views.contains_key(&view.id)
+            || cx.editor.merge_views.contains_key(&view.id)
+            || doc.linked_diff_doc.is_some()
+    };
+    if !in_active_diff_session {
+        cx.editor.diff_session_split_view_override = None;
+    }
+
     let modified = cx.editor.theme.get("diff.delta");
     let deleted = cx.editor.theme.get("diff.minus");
     let renamed = cx.editor.theme.get("diff.delta.moved");
@@ -3046,33 +3052,49 @@ fn diff_files(
         let call: job::Callback = job::Callback::EditorCompositor(Box::new(
             move |_editor: &mut Editor, compositor: &mut Compositor| {
                 let columns = [
-                    ui::PickerColumn::new("change", |change: &FileChange, data: &DiffFileChangeData| {
-                        match change {
-                            FileChange::Modified { .. } => Span::styled("~ modified", data.style_modified),
-                            FileChange::Deleted { .. } => Span::styled("- deleted", data.style_deleted),
-                            FileChange::Renamed { .. } => Span::styled("> renamed", data.style_renamed),
-                            _ => Span::raw("  changed"),
-                        }
-                        .into()
-                    }),
-                    ui::PickerColumn::new("path", |change: &FileChange, data: &DiffFileChangeData| {
-                        let display_path = |path: &PathBuf| {
-                            path.strip_prefix(&data.cwd)
-                                .unwrap_or(path)
-                                .display()
-                                .to_string()
-                        };
-                        match change {
-                            FileChange::Modified { path } => display_path(path),
-                            FileChange::Deleted { path } => display_path(path),
-                            FileChange::Renamed { from_path, to_path} => {
-                                format!("{} -> {}", display_path(from_path), display_path(to_path))
+                    ui::PickerColumn::new(
+                        "change",
+                        |change: &FileChange, data: &DiffFileChangeData| {
+                            match change {
+                                FileChange::Modified { .. } => {
+                                    Span::styled("~ modified", data.style_modified)
+                                }
+                                FileChange::Deleted { .. } => {
+                                    Span::styled("- deleted", data.style_deleted)
+                                }
+                                FileChange::Renamed { .. } => {
+                                    Span::styled("> renamed", data.style_renamed)
+                                }
+                                _ => Span::raw("  changed"),
                             }
-                            FileChange::Untracked { path } => display_path(path),
-                            FileChange::Conflict { path } => display_path(path),
-                        }
-                        .into()
-                    }),
+                            .into()
+                        },
+                    ),
+                    ui::PickerColumn::new(
+                        "path",
+                        |change: &FileChange, data: &DiffFileChangeData| {
+                            let display_path = |path: &PathBuf| {
+                                path.strip_prefix(&data.cwd)
+                                    .unwrap_or(path)
+                                    .display()
+                                    .to_string()
+                            };
+                            match change {
+                                FileChange::Modified { path } => display_path(path),
+                                FileChange::Deleted { path } => display_path(path),
+                                FileChange::Renamed { from_path, to_path } => {
+                                    format!(
+                                        "{} -> {}",
+                                        display_path(from_path),
+                                        display_path(to_path)
+                                    )
+                                }
+                                FileChange::Untracked { path } => display_path(path),
+                                FileChange::Conflict { path } => display_path(path),
+                            }
+                            .into()
+                        },
+                    ),
                 ];
 
                 let base_ref_for_callback = base_ref.clone();
@@ -3088,17 +3110,27 @@ fn diff_files(
                         style_renamed: renamed,
                     },
                     move |cx, meta: &FileChange, _action| {
-                        let path_to_open = meta.path();
-
-                        let result = cx.editor.open_diff_view_range(
-                            path_to_open,
-                            &base_ref_for_callback,
-                            target_ref_for_callback.as_deref(),
-                            None,
-                        );
+                        let result = match meta {
+                            FileChange::Renamed { from_path, to_path } => {
+                                cx.editor.open_diff_view_range_with_paths(
+                                    from_path,
+                                    to_path,
+                                    &base_ref_for_callback,
+                                    target_ref_for_callback.as_deref(),
+                                    cx.editor.diff_session_split_view_override,
+                                )
+                            }
+                            _ => cx.editor.open_diff_view_range(
+                                meta.path(),
+                                &base_ref_for_callback,
+                                target_ref_for_callback.as_deref(),
+                                cx.editor.diff_session_split_view_override,
+                            ),
+                        };
 
                         if let Err(err) = result {
-                            cx.editor.set_error(format!("Failed to open diff view: {}", err));
+                            cx.editor
+                                .set_error(format!("Failed to open diff view: {}", err));
                         }
                     },
                 )
@@ -3115,12 +3147,10 @@ fn diff_files(
                         &cwd,
                         &base_ref_for_thread,
                         target_ref_for_thread.as_deref(),
-                        move |change| {
-                            match change {
-                                Ok(change) => injector.push(change).is_ok(),
-                                Err(_err) => true,
-                            }
-                        }
+                        move |change| match change {
+                            Ok(change) => injector.push(change).is_ok(),
+                            Err(_err) => true,
+                        },
                     );
 
                     if let Err(err) = result {

@@ -862,16 +862,24 @@ pub fn split_on_matches(text: RopeSlice, selection: &Selection, regex: &rope::Re
         let sel_start = sel.from();
         let sel_end = sel.to();
         let mut start = sel_start;
+        let result_start = result.len();
 
         for mat in regex.find_iter(text.regex_input_at(sel_start..sel_end)) {
             // TODO: retain range direction
             let end = text.byte_to_char(mat.start());
-            result.push(Range::new(start, end));
+            if start < end {
+                result.push(Range::new(start, end));
+            }
             start = text.byte_to_char(mat.end());
         }
 
         if start < sel_end {
             result.push(Range::new(start, sel_end));
+        }
+
+        // Keep at least one range when the selection is fully consumed by matches.
+        if result.len() == result_start {
+            result.push(Range::point(sel_start));
         }
     }
 
@@ -1291,29 +1299,64 @@ mod test {
         assert_eq!(
             result.ranges(),
             &[
-                // TODO: rather than this behavior, maybe we want it
-                // to be based on which side is the anchor?
-                //
-                // We get a leading zero-width range when there's
-                // a leading match because ranges are inclusive on
-                // the left.  Imagine, for example, if the entire
-                // selection range were matched: you'd still want
-                // at least one range to remain after the split.
-                Range::new(0, 0),
                 Range::new(1, 5),
                 Range::new(6, 9),
                 Range::new(11, 13),
                 Range::new(16, 19),
-                // In contrast to the comment above, there is no
-                // _trailing_ zero-width range despite the trailing
-                // match, because ranges are exclusive on the right.
             ]
         );
 
         assert_eq!(
             result.fragments(text.slice(..)).collect::<Vec<_>>(),
-            &["", "abcd", "efg", "rs", "xyz"]
+            &["abcd", "efg", "rs", "xyz"]
         );
+    }
+
+    #[test]
+    fn test_split_on_matches_consecutive_delimiters_no_empty_ranges() {
+        let text = Rope::from("a||b");
+        let selection = Selection::new(smallvec![Range::new(0, 4)], 0);
+
+        let result = split_on_matches(
+            text.slice(..),
+            &selection,
+            &rope::Regex::new(r"\|").unwrap(),
+        );
+
+        assert_eq!(result.ranges(), &[Range::new(0, 1), Range::new(3, 4)]);
+        assert_eq!(
+            result.fragments(text.slice(..)).collect::<Vec<_>>(),
+            &["a", "b"]
+        );
+    }
+
+    #[test]
+    fn test_split_on_matches_only_matches_keeps_single_empty_range() {
+        let text = Rope::from("   ");
+        let selection = Selection::new(smallvec![Range::new(0, 3)], 0);
+
+        let result = split_on_matches(
+            text.slice(..),
+            &selection,
+            &rope::Regex::new(r"\s+").unwrap(),
+        );
+
+        assert_eq!(result.ranges(), &[Range::new(0, 0)]);
+        assert_eq!(result.fragments(text.slice(..)).collect::<Vec<_>>(), &[""]);
+    }
+
+    #[test]
+    fn test_split_on_matches_zero_width_selection_passthrough() {
+        let text = Rope::from("abc");
+        let selection = Selection::new(smallvec![Range::point(1)], 0);
+
+        let result = split_on_matches(
+            text.slice(..),
+            &selection,
+            &rope::Regex::new(r"b").unwrap(),
+        );
+
+        assert_eq!(result.ranges(), &[Range::point(1)]);
     }
 
     #[test]

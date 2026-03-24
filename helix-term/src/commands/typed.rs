@@ -2986,6 +2986,29 @@ fn diff_reset(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> 
 
     cx.editor.diff_range = None;
     cx.editor.diff_session_split_view_override = None;
+
+    // Collect (doc_id, path, diff_base) before mutating documents
+    let diff_bases: Vec<_> = cx
+        .editor
+        .documents
+        .iter()
+        .filter_map(|(id, doc)| {
+            let path = doc.path()?.to_path_buf();
+            let diff_base = cx.editor.diff_providers.get_diff_base(&path)?;
+            Some((*id, diff_base))
+        })
+        .collect();
+
+    // Reset diff base and disable character diff for all documents
+    for (_, doc) in cx.editor.documents.iter_mut() {
+        doc.char_diff_enabled = false;
+    }
+    for (id, diff_base) in diff_bases {
+        if let Some(doc) = cx.editor.documents.get_mut(&id) {
+            doc.set_diff_base(diff_base);
+        }
+    }
+
     cx.editor.set_status("Diff range reset");
 
     Ok(())

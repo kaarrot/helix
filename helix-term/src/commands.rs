@@ -615,6 +615,8 @@ impl MappableCommand {
         merge_finish, "Save and stage resolved file (git add)",
         diff_toggle_split_view, "Toggle between side-by-side and single-view diffs",
         diff_reset, "Reset the diff base to HEAD (default behavior)",
+        diff_commit_from_selection, "Set diff base from selected commit hash(es)",
+        diff_show_commit_from_selection, "Show changes introduced by selected commit",
         select_register, "Select register",
         insert_register, "Insert register",
         copy_between_registers, "Copy between two registers",
@@ -6236,6 +6238,124 @@ fn diff_reset(cx: &mut Context) {
     cx.editor.diff_range = None;
     cx.editor.diff_session_split_view_override = None;
     cx.editor.set_status("Diff range reset");
+}
+
+fn diff_commit_from_selection(cx: &mut Context) {
+    use helix_view::editor::DiffRange;
+
+    let (view, doc) = current!(cx.editor);
+    let text = doc.text().slice(..);
+    let selection = doc.selection(view.id);
+
+    // Get primary selection text
+    let range = selection.primary();
+    let selected_text = range.fragment(text).to_string();
+
+    if selected_text.trim().is_empty() {
+        cx.editor.set_error("No selection");
+        return;
+    }
+
+    // Split into lines to detect single vs multi-line selection
+    let lines: Vec<&str> = selected_text.lines().collect();
+
+    if lines.is_empty() {
+        cx.editor.set_error("No selection");
+        return;
+    }
+
+    if lines.len() == 1 {
+        // Single-line selection: working tree vs commit
+        let hash = extract_commit_hash(lines[0]);
+
+        if hash.is_empty() {
+            cx.editor.set_error("Invalid commit hash in selection");
+            return;
+        }
+
+        let diff_range = DiffRange {
+            base_ref: hash.clone(),
+            target_ref: None,
+        };
+        cx.editor.diff_range = Some(diff_range);
+        cx.editor.set_status(format!("Diff set: {} vs working tree", hash));
+    } else {
+        // Multi-line selection: compare two commits
+        let hash1 = extract_commit_hash(lines[0]);
+        let hash2 = extract_commit_hash(lines[lines.len() - 1]);
+
+        if hash1.is_empty() || hash2.is_empty() {
+            cx.editor.set_error("Invalid commit hash in selection");
+            return;
+        }
+
+        let diff_range = DiffRange {
+            base_ref: hash1.clone(),
+            target_ref: Some(hash2.clone()),
+        };
+        cx.editor.diff_range = Some(diff_range);
+        cx.editor.set_status(format!("Diff set: {}..{}", hash1, hash2));
+    }
+}
+
+fn diff_show_commit_from_selection(cx: &mut Context) {
+    use helix_view::editor::DiffRange;
+
+    let (view, doc) = current!(cx.editor);
+    let text = doc.text().slice(..);
+    let selection = doc.selection(view.id);
+
+    // Get primary selection text
+    let range = selection.primary();
+    let selected_text = range.fragment(text).to_string();
+
+    if selected_text.trim().is_empty() {
+        cx.editor.set_error("No selection");
+        return;
+    }
+
+    // Only support single-line selection
+    let lines: Vec<&str> = selected_text.lines().collect();
+
+    if lines.is_empty() {
+        cx.editor.set_error("No selection");
+        return;
+    }
+
+    if lines.len() > 1 {
+        cx.editor.set_error("Show commit changes requires a single commit selection");
+        return;
+    }
+
+    let hash = extract_commit_hash(lines[0]);
+
+    if hash.is_empty() {
+        cx.editor.set_error("Invalid commit hash in selection");
+        return;
+    }
+
+    // Create range showing commit vs its parent
+    let diff_range = DiffRange {
+        base_ref: format!("{}^", hash),
+        target_ref: Some(hash.clone()),
+    };
+    cx.editor.diff_range = Some(diff_range);
+    cx.editor.set_status(format!("Diff set: showing changes in {}", hash));
+}
+
+fn extract_commit_hash(input: &str) -> String {
+    // Take first token before whitespace
+    let token = input.split_whitespace().next().unwrap_or("");
+
+    // Validate it looks like a git hash (hex chars, 7-40 length)
+    if token.len() >= 7
+        && token.len() <= 40
+        && token.chars().all(|c| c.is_ascii_hexdigit())
+    {
+        token.to_string()
+    } else {
+        String::new()
+    }
 }
 
 fn close_diff_or_merge_view(cx: &mut Context) {

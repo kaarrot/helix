@@ -247,6 +247,8 @@ pub fn default() -> HashMap<Mode, KeyTrie> {
                 "s" => diff_toggle_sync_scroll,
                 "v" => diff_toggle_split_view,
                 "r" => diff_reset,
+                "c" => diff_commit_from_selection,
+                "C" => diff_show_commit_from_selection,
                 "q" => close_diff_or_merge_view,
                 "a" => merge_finish,
             },

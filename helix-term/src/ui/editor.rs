@@ -35,6 +35,98 @@ use std::{mem::take, num::NonZeroUsize, ops, rc::Rc};
 
 use tui::{buffer::Buffer as Surface, text::Span};
 
+/// Paints a tinted background on virtual spacer lines inserted by
+/// `DiffAlignment` in side-by-side diff views, making "no content here"
+/// regions visually distinct from real document lines.
+struct DiffSpacerDecoration {
+    /// (doc_line, num_spacer_rows) – sorted by doc_line for binary search.
+    spacer_rows: Vec<(usize, usize)>,
+    style: Style,
+}
+
+impl DiffSpacerDecoration {
+    fn new(diff_handle: &helix_vcs::DiffHandle, theme: &Theme) -> Self {
+        let diff = diff_handle.load();
+        let mut padding = std::collections::BTreeMap::<usize, usize>::new();
+        for i in 0..diff.len() {
+            let hunk = diff.nth_hunk(i);
+            let before_len = hunk.before.len() as usize;
+            let after_len = hunk.after.len() as usize;
+            if before_len > after_len {
+                let deficit = before_len - after_len;
+                let emit_after = hunk.after.start as usize;
+                let doc_line = emit_after.saturating_sub(1);
+                *padding.entry(doc_line).or_insert(0) += deficit;
+            }
+        }
+
+        let style = theme.try_get("ui.diff.spacer").unwrap_or_else(|| {
+            let bg_style = theme.get("ui.background");
+            match bg_style.bg {
+                Some(Color::Rgb(br, bg, bb)) => {
+                    let lum = 0.299 * br as f64 + 0.587 * bg as f64 + 0.114 * bb as f64;
+                    let (r, g, b) = if lum < 128.0 {
+                        // Dark theme: lighten slightly
+                        (
+                            (br as u16 + 15).min(255) as u8,
+                            (bg as u16 + 15).min(255) as u8,
+                            (bb as u16 + 15).min(255) as u8,
+                        )
+                    } else {
+                        // Light theme: darken slightly
+                        (
+                            br.saturating_sub(15),
+                            bg.saturating_sub(15),
+                            bb.saturating_sub(15),
+                        )
+                    };
+                    Style::default().bg(Color::Rgb(r, g, b))
+                }
+                _ => Style::default().bg(Color::Gray),
+            }
+        });
+
+        Self {
+            spacer_rows: padding.into_iter().collect(),
+            style,
+        }
+    }
+}
+
+impl Decoration for DiffSpacerDecoration {
+    fn render_virt_lines(
+        &mut self,
+        renderer: &mut TextRenderer,
+        pos: LinePos,
+        virt_off: Position,
+    ) -> Position {
+        let rows = self
+            .spacer_rows
+            .binary_search_by_key(&pos.doc_line, |(line, _)| *line)
+            .ok()
+            .map(|idx| self.spacer_rows[idx].1)
+            .unwrap_or(0);
+
+        if rows > 0 {
+            for i in 0..rows {
+                let y = pos.visual_line + virt_off.row as u16 + i as u16;
+                // Clip: after set_style transforms (clip_top + viewport.y), the
+                // absolute Y must stay within the viewport.
+                if y >= renderer.offset.row as u16 + renderer.viewport.height {
+                    break;
+                }
+                renderer.set_style(
+                    Rect::new(renderer.viewport.x, y, renderer.viewport.width, 1),
+                    self.style,
+                );
+            }
+            Position::new(rows, 0)
+        } else {
+            Position::default()
+        }
+    }
+}
+
 pub struct EditorView {
     pub keymaps: Keymaps,
     on_next_key: Option<(OnKeyCallback, OnKeyCallbackKind)>,
@@ -101,6 +193,15 @@ impl EditorView {
             &editor.documents,
         );
         let mut decorations = DecorationManager::default();
+
+        // Tint background of diff-alignment spacer (virtual) lines so the
+        // "no content on this side" regions are visually distinct.
+        if editor.diff_views.contains_key(&view.id) {
+            if let Some(diff_handle) = doc.diff_handle() {
+                decorations
+                    .add_decoration(DiffSpacerDecoration::new(diff_handle, theme));
+            }
+        }
 
         if is_focused && config.cursorline {
             decorations.add_decoration(Self::cursorline(doc, view, theme));

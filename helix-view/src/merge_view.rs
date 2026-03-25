@@ -280,6 +280,43 @@ impl ConflictBuilder {
     }
 }
 
+/// Compute the line ranges that each conflict occupies in the OURS and THEIRS
+/// documents.
+///
+/// The OURS/THEIRS docs replace each conflict marker block with only that
+/// side's content.  Non-conflict regions have identical line counts across all
+/// versions, so we can walk the RESULT structure and accumulate offsets.
+pub fn compute_conflict_line_ranges(conflicts: &mut [ConflictHunk]) {
+    let mut ours_line: usize = 0;
+    let mut theirs_line: usize = 0;
+    let mut last_result_end: usize = 0;
+
+    for conflict in conflicts.iter_mut() {
+        // Non-conflict lines between previous conflict end and this one
+        let prefix_lines = conflict.start_line.saturating_sub(last_result_end);
+        ours_line += prefix_lines;
+        theirs_line += prefix_lines;
+
+        let ours_count = if conflict.ours_content.is_empty() {
+            0
+        } else {
+            conflict.ours_content.lines().count()
+        };
+        let theirs_count = if conflict.theirs_content.is_empty() {
+            0
+        } else {
+            conflict.theirs_content.lines().count()
+        };
+
+        conflict.ours_lines = (ours_line, ours_line + ours_count);
+        conflict.theirs_lines = (theirs_line, theirs_line + theirs_count);
+
+        ours_line += ours_count;
+        theirs_line += theirs_count;
+        last_result_end = conflict.end_line + 1;
+    }
+}
+
 /// Parse conflict markers from file content.
 ///
 /// Supports both standard and diff3 conflict marker formats:
@@ -456,6 +493,59 @@ mod tests {
         assert!(theirs.contains("header"));
         assert!(theirs.contains("theirs"));
         assert!(theirs.contains("footer"));
+    }
+
+    #[test]
+    fn test_compute_conflict_line_ranges() {
+        // File:
+        //   0: header
+        //   1: <<<<<<< HEAD
+        //   2: our line 1
+        //   3: our line 2
+        //   4: =======
+        //   5: their line
+        //   6: >>>>>>> branch
+        //   7: middle
+        //   8: <<<<<<< HEAD
+        //   9: our2
+        //  10: =======
+        //  11: their2 a
+        //  12: their2 b
+        //  13: their2 c
+        //  14: >>>>>>> branch
+        //  15: footer
+        let text = Rope::from(
+            "header\n\
+             <<<<<<< HEAD\n\
+             our line 1\n\
+             our line 2\n\
+             =======\n\
+             their line\n\
+             >>>>>>> branch\n\
+             middle\n\
+             <<<<<<< HEAD\n\
+             our2\n\
+             =======\n\
+             their2 a\n\
+             their2 b\n\
+             their2 c\n\
+             >>>>>>> branch\n\
+             footer\n",
+        );
+
+        let mut conflicts = parse_conflicts(&text);
+        assert_eq!(conflicts.len(), 2);
+        compute_conflict_line_ranges(&mut conflicts);
+
+        // OURS doc:  header | our line 1 | our line 2 | middle | our2 | footer
+        //            line 0   line 1       line 2       line 3   line 4  line 5
+        assert_eq!(conflicts[0].ours_lines, (1, 3)); // lines 1..3
+        assert_eq!(conflicts[1].ours_lines, (4, 5)); // line 4
+
+        // THEIRS doc: header | their line | middle | their2 a | their2 b | their2 c | footer
+        //             line 0   line 1       line 2   line 3     line 4     line 5      line 6
+        assert_eq!(conflicts[0].theirs_lines, (1, 2)); // line 1
+        assert_eq!(conflicts[1].theirs_lines, (3, 6)); // lines 3..6
     }
 
     #[test]

@@ -6856,26 +6856,12 @@ fn merge_next_conflict(cx: &mut Context) {
 
         let current_idx = merge_state.current_conflict;
         merge_state.current_conflict().map(|conflict| {
-            // Estimate line in OURS/THEIRS: subtract marker lines from previous conflicts
-            // Each conflict adds ~3 marker lines (<<<, ===, >>>), plus content lines
-            let marker_lines_before: usize = merge_state
-                .conflicts
-                .iter()
-                .take(current_idx)
-                .map(|c| {
-                    // Count lines added by conflict markers: <<<, ===, >>> = 3 lines
-                    // Plus the THEIRS content lines that appear below === in RESULT
-                    // but don't exist in OURS (and vice versa for THEIRS doc)
-                    3 + c.theirs_content.lines().count()
-                })
-                .sum();
-            let estimated_line = conflict.start_line.saturating_sub(marker_lines_before);
-
             (
                 current_idx + 1,
                 merge_state.conflicts.len(),
                 conflict.start_line,
-                estimated_line,
+                conflict.ours_lines.0,
+                conflict.theirs_lines.0,
                 merge_state.result_doc_id,
                 merge_state.result_view_id,
                 merge_state.ours_doc_id,
@@ -6893,7 +6879,8 @@ fn merge_next_conflict(cx: &mut Context) {
         current,
         total,
         start_line,
-        estimated_line,
+        ours_target_line,
+        theirs_target_line,
         result_doc_id,
         result_view_id,
         ours_doc_id,
@@ -6918,10 +6905,11 @@ fn merge_next_conflict(cx: &mut Context) {
             align_view(result_doc, result_view, Align::Top);
         }
 
-        // Scroll OURS pane to the estimated conflict location and align
+        // Scroll OURS pane to the precomputed conflict location
         {
             let ours_doc = doc_mut!(cx.editor, &ours_doc_id);
-            let ours_line = estimated_line.min(ours_doc.text().len_lines().saturating_sub(1));
+            let ours_line =
+                ours_target_line.min(ours_doc.text().len_lines().saturating_sub(1));
             let ours_pos = ours_doc.text().line_to_char(ours_line);
             let ours_selection = helix_core::Selection::point(ours_pos);
             ours_doc.set_selection(ours_view_id, ours_selection);
@@ -6932,10 +6920,11 @@ fn merge_next_conflict(cx: &mut Context) {
             align_view(ours_doc, ours_view, Align::Top);
         }
 
-        // Scroll THEIRS pane to the estimated conflict location and align
+        // Scroll THEIRS pane to its own precomputed conflict location
         {
             let theirs_doc = doc_mut!(cx.editor, &theirs_doc_id);
-            let theirs_line = estimated_line.min(theirs_doc.text().len_lines().saturating_sub(1));
+            let theirs_line =
+                theirs_target_line.min(theirs_doc.text().len_lines().saturating_sub(1));
             let theirs_pos = theirs_doc.text().line_to_char(theirs_line);
             let theirs_selection = helix_core::Selection::point(theirs_pos);
             theirs_doc.set_selection(theirs_view_id, theirs_selection);
@@ -6957,20 +6946,12 @@ fn merge_prev_conflict(cx: &mut Context) {
 
         let current_idx = merge_state.current_conflict;
         merge_state.current_conflict().map(|conflict| {
-            // Estimate line in OURS/THEIRS: subtract marker lines from previous conflicts
-            let marker_lines_before: usize = merge_state
-                .conflicts
-                .iter()
-                .take(current_idx)
-                .map(|c| 3 + c.theirs_content.lines().count())
-                .sum();
-            let estimated_line = conflict.start_line.saturating_sub(marker_lines_before);
-
             (
                 current_idx + 1,
                 merge_state.conflicts.len(),
                 conflict.start_line,
-                estimated_line,
+                conflict.ours_lines.0,
+                conflict.theirs_lines.0,
                 merge_state.result_doc_id,
                 merge_state.result_view_id,
                 merge_state.ours_doc_id,
@@ -6988,7 +6969,8 @@ fn merge_prev_conflict(cx: &mut Context) {
         current,
         total,
         start_line,
-        estimated_line,
+        ours_target_line,
+        theirs_target_line,
         result_doc_id,
         result_view_id,
         ours_doc_id,
@@ -7013,10 +6995,11 @@ fn merge_prev_conflict(cx: &mut Context) {
             align_view(result_doc, result_view, Align::Top);
         }
 
-        // Scroll OURS pane to the estimated conflict location and align
+        // Scroll OURS pane to the precomputed conflict location
         {
             let ours_doc = doc_mut!(cx.editor, &ours_doc_id);
-            let ours_line = estimated_line.min(ours_doc.text().len_lines().saturating_sub(1));
+            let ours_line =
+                ours_target_line.min(ours_doc.text().len_lines().saturating_sub(1));
             let ours_pos = ours_doc.text().line_to_char(ours_line);
             let ours_selection = helix_core::Selection::point(ours_pos);
             ours_doc.set_selection(ours_view_id, ours_selection);
@@ -7027,10 +7010,11 @@ fn merge_prev_conflict(cx: &mut Context) {
             align_view(ours_doc, ours_view, Align::Top);
         }
 
-        // Scroll THEIRS pane to the estimated conflict location and align
+        // Scroll THEIRS pane to its own precomputed conflict location
         {
             let theirs_doc = doc_mut!(cx.editor, &theirs_doc_id);
-            let theirs_line = estimated_line.min(theirs_doc.text().len_lines().saturating_sub(1));
+            let theirs_line =
+                theirs_target_line.min(theirs_doc.text().len_lines().saturating_sub(1));
             let theirs_pos = theirs_doc.text().line_to_char(theirs_line);
             let theirs_selection = helix_core::Selection::point(theirs_pos);
             theirs_doc.set_selection(theirs_view_id, theirs_selection);

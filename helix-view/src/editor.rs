@@ -3122,7 +3122,10 @@ impl Editor {
     /// - Top-right: THEIRS version (read-only)
     /// - Bottom: Merge result (editable)
     pub fn open_merge_view(&mut self, path: &Path) -> Result<(), Error> {
-        use crate::merge_view::{extract_conflict_versions, parse_conflicts, MergeViewState};
+        use crate::merge_view::{
+            compute_conflict_line_ranges, extract_conflict_versions, parse_conflicts,
+            MergeViewState,
+        };
 
         let path = helix_stdx::path::canonicalize(path);
 
@@ -3135,11 +3138,12 @@ impl Editor {
             self.syn_loader.clone(),
         )?;
 
-        // 2. Parse conflict markers
-        let conflicts = parse_conflicts(result_doc.text());
+        // 2. Parse conflict markers and compute line ranges in OURS/THEIRS docs
+        let mut conflicts = parse_conflicts(result_doc.text());
         if conflicts.is_empty() {
             bail!("No conflict markers found in file");
         }
+        compute_conflict_line_ranges(&mut conflicts);
 
         // 3. Fetch OURS and THEIRS versions from git index
         let (ours_content, theirs_content) = helix_vcs::git::get_merge_versions(&path)

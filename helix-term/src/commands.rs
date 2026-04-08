@@ -6289,12 +6289,14 @@ fn diff_commit_from_selection(cx: &mut Context) {
             return;
         }
 
+        // In git log output, the first line is the newer commit and the last
+        // line is the older commit.  Diff should be OLD..NEW (base → target).
         let diff_range = DiffRange {
-            base_ref: hash1.clone(),
-            target_ref: Some(hash2.clone()),
+            base_ref: hash2.clone(),
+            target_ref: Some(hash1.clone()),
         };
         cx.editor.diff_range = Some(diff_range);
-        cx.editor.set_status(format!("Diff set: {}..{}", hash1, hash2));
+        cx.editor.set_status(format!("Diff set: {}..{}", hash2, hash1));
     }
 }
 

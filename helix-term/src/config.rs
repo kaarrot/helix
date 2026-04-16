@@ -14,6 +14,8 @@ pub struct Config {
     pub theme: Option<theme::Config>,
     pub keys: HashMap<Mode, KeyTrie>,
     pub editor: helix_view::editor::Config,
+    /// Non-fatal warnings produced while loading (e.g. unknown fields skipped).
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -30,8 +32,47 @@ impl Default for Config {
             theme: None,
             keys: keymap::default(),
             editor: helix_view::editor::Config::default(),
+            warnings: Vec::new(),
         }
     }
+}
+
+/// Try to deserialize editor config, stripping unknown fields one-by-one and
+/// collecting a warning for each one rather than failing the whole load.
+fn parse_editor_lenient(
+    val: toml::Value,
+) -> Result<(helix_view::editor::Config, Vec<String>), toml::de::Error> {
+    let mut val = val;
+    let mut warnings = Vec::new();
+    loop {
+        match val.clone().try_into::<helix_view::editor::Config>() {
+            Ok(config) => return Ok((config, warnings)),
+            Err(err) => {
+                // toml errors for unknown fields look like:
+                // "unknown field `foo`, expected one of ..."
+                let msg = err.to_string();
+                if let Some(field) = unknown_field_name(&msg) {
+                    warnings.push(format!(
+                        "Unknown editor config field ignored: `{field}`"
+                    ));
+                    if let toml::Value::Table(ref mut table) = val {
+                        table.remove(field);
+                    } else {
+                        return Err(err);
+                    }
+                } else {
+                    return Err(err);
+                }
+            }
+        }
+    }
+}
+
+fn unknown_field_name(err: &str) -> Option<&str> {
+    let prefix = "unknown field `";
+    let start = err.find(prefix)? + prefix.len();
+    let end = err[start..].find('`')? + start;
+    Some(&err[start..end])
 }
 
 #[derive(Debug)]
@@ -74,20 +115,22 @@ impl Config {
                     merge_keys(&mut keys, local_keys)
                 }
 
-                let editor = match (global.editor, local.editor) {
-                    (None, None) => helix_view::editor::Config::default(),
+                let (editor, warnings) = match (global.editor, local.editor) {
+                    (None, None) => (helix_view::editor::Config::default(), Vec::new()),
                     (None, Some(val)) | (Some(val), None) => {
-                        val.try_into().map_err(ConfigLoadError::BadConfig)?
+                        parse_editor_lenient(val).map_err(ConfigLoadError::BadConfig)?
                     }
-                    (Some(global), Some(local)) => merge_toml_values(global, local, 3)
-                        .try_into()
-                        .map_err(ConfigLoadError::BadConfig)?,
+                    (Some(global), Some(local)) => {
+                        parse_editor_lenient(merge_toml_values(global, local, 3))
+                            .map_err(ConfigLoadError::BadConfig)?
+                    }
                 };
 
                 Config {
                     theme: local.theme.or(global.theme),
                     keys,
                     editor,
+                    warnings,
                 }
             }
             // if any configs are invalid return that first
@@ -100,13 +143,17 @@ impl Config {
                 if let Some(keymap) = config.keys {
                     merge_keys(&mut keys, keymap);
                 }
+                let (editor, warnings) = config
+                    .editor
+                    .map_or_else(
+                        || Ok((helix_view::editor::Config::default(), Vec::new())),
+                        |val| parse_editor_lenient(val).map_err(ConfigLoadError::BadConfig),
+                    )?;
                 Config {
                     theme: config.theme,
                     keys,
-                    editor: config.editor.map_or_else(
-                        || Ok(helix_view::editor::Config::default()),
-                        |val| val.try_into().map_err(ConfigLoadError::BadConfig),
-                    )?,
+                    editor,
+                    warnings,
                 }
             }
 
@@ -183,5 +230,39 @@ mod tests {
         // From the Default trait
         let default_keys = Config::default().keys;
         assert_eq!(default_keys, keymap::default());
+    }
+
+    #[test]
+    fn cursorline_ignores_unknown_nested_fields_with_non_bool_values() {
+        use helix_view::document::Mode;
+
+        let config = Config::load_test(
+            r#"
+            [editor.cursorline]
+            normal = true
+            completion-display = "statusline"
+        "#,
+        );
+
+        assert!(config.editor.cursorline.from_mode(Mode::Normal));
+        assert!(!config.editor.cursorline.from_mode(Mode::Insert));
+        assert!(!config.editor.cursorline.from_mode(Mode::Select));
+    }
+
+    #[test]
+    fn statusline_ignores_unknown_elements() {
+        use helix_view::editor::StatusLineElement;
+
+        let config = Config::load_test(
+            r#"
+            [editor.statusline]
+            left = ["mode", "completion-suggestions", "file-name"]
+        "#,
+        );
+
+        assert_eq!(
+            config.editor.statusline.left,
+            vec![StatusLineElement::Mode, StatusLineElement::FileName]
+        );
     }
 }

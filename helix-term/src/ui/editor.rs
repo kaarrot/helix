@@ -94,7 +94,7 @@ impl EditorView {
         let text_annotations = view.text_annotations(doc, Some(theme));
         let mut decorations = DecorationManager::default();
 
-        if is_focused && config.cursorline {
+        if is_focused && config.cursorline.from_mode(editor.mode) {
             decorations.add_decoration(Self::cursorline(doc, view, theme));
         }
 

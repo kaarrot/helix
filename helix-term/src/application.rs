@@ -447,10 +447,22 @@ impl Application {
         };
 
         match refresh_config() {
-            Ok(_) => {
-                self.editor.set_status("Config refreshed");
+            Ok(()) => {
+                let warnings = &self.config.load().warnings;
+                for warning in warnings {
+                    warn!("Config warning: {warning}");
+                }
+                if warnings.is_empty() {
+                    self.editor.set_status("Config refreshed");
+                } else {
+                    self.editor.set_status(format!(
+                        "Config refreshed (warnings: {})",
+                        warnings.join("; ")
+                    ));
+                }
             }
             Err(err) => {
+                error!("{err}");
                 self.editor.set_error(err.to_string());
             }
         }

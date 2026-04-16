@@ -126,12 +126,22 @@ FLAGS:
     }
 
     let config = match Config::load_default() {
-        Ok(config) => config,
+        Ok(config) => {
+            for warning in &config.warnings {
+                log::warn!("Config warning: {warning}");
+                eprintln!("Config warning: {warning}");
+            }
+            config
+        }
         Err(ConfigLoadError::Error(err)) if err.kind() == std::io::ErrorKind::NotFound => {
             Config::default()
         }
-        Err(ConfigLoadError::Error(err)) => return Err(Error::new(err)),
+        Err(ConfigLoadError::Error(err)) => {
+            log::error!("Failed to load config: {err}");
+            return Err(Error::new(err));
+        }
         Err(ConfigLoadError::BadConfig(err)) => {
+            log::error!("Bad config: {err}");
             eprintln!("Bad config: {}", err);
             eprintln!("Press <ENTER> to continue with default config");
             use std::io::Read;

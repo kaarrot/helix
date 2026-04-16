@@ -355,6 +355,9 @@ pub struct Config {
     /// Whether to instruct the LSP to replace the entire word when applying a completion
     /// or to only insert new text
     pub completion_replace: bool,
+    /// Where completion suggestions are rendered: the vertical popup (default),
+    /// the statusline (via the `completion-suggestions` statusline element), or both.
+    pub completion_display: CompletionDisplay,
     /// `true` if helix should automatically add a line comment token if you're currently in a comment
     /// and press `enter`.
     pub continue_comments: bool,
@@ -688,6 +691,10 @@ pub enum StatusLineElement {
 
     /// The base of current working directory
     CurrentWorkingDirectory,
+
+    /// Horizontal list of the top in-flight completion suggestions
+    /// (only rendered in insert mode when a completion popup is active).
+    CompletionSuggestions,
 }
 
 // Cursor shape is read and used on every rendered frame and so needs
@@ -742,6 +749,20 @@ impl Default for CursorShapeConfig {
     fn default() -> Self {
         Self([CursorKind::Block; 3])
     }
+}
+
+/// Where to render completion suggestions.
+#[derive(Debug, Default, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CompletionDisplay {
+    /// Render the vertical popup next to the cursor (current behavior).
+    #[default]
+    Popup,
+    /// Render suggestions only inside the statusline (requires
+    /// `completion-suggestions` to be in the statusline layout).
+    Statusline,
+    /// Render both the popup and the statusline suggestions.
+    Both,
 }
 
 /// bufferline render modes
@@ -1101,6 +1122,7 @@ impl Default for Config {
             },
             text_width: 80,
             completion_replace: false,
+            completion_display: CompletionDisplay::default(),
             continue_comments: true,
             workspace_lsp_roots: Vec::new(),
             default_line_ending: LineEndingConfig::default(),

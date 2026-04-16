@@ -444,6 +444,13 @@ impl Completion {
         self.popup.contents().is_empty()
     }
 
+    /// Iterator over the currently-matched completion items, each paired with
+    /// a flag indicating whether the item is the selected (cursor) entry.
+    /// Used by the statusline's `completion-suggestions` element.
+    pub fn matched_items(&self) -> impl Iterator<Item = (&CompletionItem, bool)> + '_ {
+        self.popup.contents().matched_items()
+    }
+
     pub fn replace_item(
         &mut self,
         old_item: &impl PartialEq<CompletionItem>,

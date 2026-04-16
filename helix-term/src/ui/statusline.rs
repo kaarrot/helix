@@ -9,7 +9,7 @@ use helix_view::{
     Document, Editor, View,
 };
 
-use crate::ui::ProgressSpinners;
+use crate::ui::{Completion, ProgressSpinners};
 
 use helix_view::editor::StatusLineElement as StatusLineElementID;
 use tui::buffer::Buffer as Surface;
@@ -21,6 +21,7 @@ pub struct RenderContext<'a> {
     pub view: &'a View,
     pub focused: bool,
     pub spinners: &'a ProgressSpinners,
+    pub completion: Option<&'a Completion>,
     pub parts: RenderBuffer<'a>,
 }
 
@@ -31,6 +32,7 @@ impl<'a> RenderContext<'a> {
         view: &'a View,
         focused: bool,
         spinners: &'a ProgressSpinners,
+        completion: Option<&'a Completion>,
     ) -> Self {
         RenderContext {
             editor,
@@ -38,6 +40,7 @@ impl<'a> RenderContext<'a> {
             view,
             focused,
             spinners,
+            completion,
             parts: RenderBuffer::default(),
         }
     }
@@ -157,6 +160,9 @@ where
         helix_view::editor::StatusLineElement::VersionControl => render_version_control,
         helix_view::editor::StatusLineElement::Register => render_register,
         helix_view::editor::StatusLineElement::CurrentWorkingDirectory => render_cwd,
+        helix_view::editor::StatusLineElement::CompletionSuggestions => {
+            render_completion_suggestions
+        }
     }
 }
 
@@ -446,6 +452,9 @@ fn render_file_name<'a, F>(context: &mut RenderContext<'a>, write: F)
 where
     F: Fn(&mut RenderContext<'a>, Span<'a>) + Copy,
 {
+    if suggestions_taking_over(context) {
+        return;
+    }
     let title = {
         let rel_path = context.doc.relative_path();
         let path = rel_path
@@ -462,6 +471,9 @@ fn render_file_absolute_path<'a, F>(context: &mut RenderContext<'a>, write: F)
 where
     F: Fn(&mut RenderContext<'a>, Span<'a>) + Copy,
 {
+    if suggestions_taking_over(context) {
+        return;
+    }
     let title = {
         let path = context.doc.path();
         let path = path
@@ -503,6 +515,9 @@ fn render_file_base_name<'a, F>(context: &mut RenderContext<'a>, write: F)
 where
     F: Fn(&mut RenderContext<'a>, Span<'a>) + Copy,
 {
+    if suggestions_taking_over(context) {
+        return;
+    }
     let title = {
         let rel_path = context.doc.relative_path();
         let path = rel_path
@@ -582,4 +597,87 @@ where
         .to_string_lossy()
         .to_string();
     write(context, cwd.into())
+}
+
+/// True when completion suggestions are currently being rendered in the statusline
+/// and are therefore allowed to hide path elements to free up space.
+fn suggestions_taking_over(context: &RenderContext) -> bool {
+    use helix_view::editor::CompletionDisplay;
+    if context.editor.mode() != Mode::Insert {
+        return false;
+    }
+    let Some(completion) = context.completion else {
+        return false;
+    };
+    if completion.is_empty() {
+        return false;
+    }
+    if matches!(
+        context.editor.config().completion_display,
+        CompletionDisplay::Popup
+    ) {
+        return false;
+    }
+    let cfg = &context.editor.config().statusline;
+    cfg.left
+        .iter()
+        .chain(cfg.center.iter())
+        .chain(cfg.right.iter())
+        .any(|e| matches!(e, StatusLineElementID::CompletionSuggestions))
+}
+
+fn render_completion_suggestions<'a, F>(context: &mut RenderContext<'a>, write: F)
+where
+    F: Fn(&mut RenderContext<'a>, Span<'a>) + Copy,
+{
+    use crate::handlers::completion::{CompletionItem, LspCompletionItem};
+    use helix_core::CompletionItem as CoreCompletionItem;
+    use helix_view::editor::CompletionDisplay;
+
+    const MAX_ITEMS: usize = 5;
+    const MAX_LABEL_WIDTH: usize = 16;
+
+    if context.editor.mode() != Mode::Insert {
+        return;
+    }
+    if matches!(
+        context.editor.config().completion_display,
+        CompletionDisplay::Popup
+    ) {
+        return;
+    }
+    let Some(completion) = context.completion else {
+        return;
+    };
+
+    let unselected_style = context.editor.theme.get("ui.menu");
+    let selected_style = context.editor.theme.get("ui.menu.selected");
+
+    let mut wrote_any = false;
+    for (item, selected) in completion.matched_items().take(MAX_ITEMS) {
+        let label = match item {
+            CompletionItem::Lsp(LspCompletionItem { item, .. }) => item.label.as_str(),
+            CompletionItem::Other(CoreCompletionItem { label, .. }) => label.as_ref(),
+        };
+
+        let mut truncated = String::with_capacity(MAX_LABEL_WIDTH + 1);
+        for (i, ch) in label.chars().enumerate() {
+            if i >= MAX_LABEL_WIDTH {
+                truncated.push('…');
+                break;
+            }
+            truncated.push(ch);
+        }
+
+        if wrote_any {
+            write(context, Span::styled(" ", unselected_style));
+        }
+        let style = if selected {
+            selected_style
+        } else {
+            unselected_style
+        };
+        write(context, Span::styled(format!(" {truncated} "), style));
+        wrote_any = true;
+    }
 }

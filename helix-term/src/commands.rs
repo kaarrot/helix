@@ -46,7 +46,7 @@ use helix_core::{
 };
 use helix_view::{
     document::{FormatterError, Mode, SCRATCH_BUFFER_NAME},
-    editor::Action,
+    editor::{Action, DiffRange},
     expansion,
     info::Info,
     input::KeyEvent,
@@ -3326,6 +3326,23 @@ fn changed_file_picker(cx: &mut Context) {
         return;
     }
 
+    // Get the current file path for pre-selection in the picker
+    let current_file_path = {
+        let (_, doc) = current!(cx.editor);
+        doc.path().map(|p| p.to_path_buf())
+    };
+
+    // Get diff range from editor state or default to HEAD vs working tree
+    let diff_range = cx.editor.diff_range.clone().unwrap_or_else(|| DiffRange {
+        base_ref: "HEAD".to_string(),
+        target_ref: None,
+    });
+
+    let base_ref = diff_range.base_ref.clone();
+    let target_ref = diff_range.target_ref.clone();
+
+    cx.editor.set_status(format!("Loading changes for: {}", diff_range.display()));
+
     let added = cx.editor.theme.get("diff.plus");
     let modified = cx.editor.theme.get("diff.delta");
     let conflict = cx.editor.theme.get("diff.delta.conflict");
@@ -3376,6 +3393,7 @@ fn changed_file_picker(cx: &mut Context) {
             style_renamed: renamed,
         },
         |cx, meta: &FileChange, action| {
+            cx.editor.last_changed_file_selection = Some(meta.path().to_path_buf());
             let path_to_open = meta.path();
             if let Err(e) = cx.editor.open(path_to_open, action) {
                 let err = if let Some(err) = e.source() {
@@ -3388,18 +3406,27 @@ fn changed_file_picker(cx: &mut Context) {
         },
     )
     .with_preview(|_editor, meta| Some((meta.path().into(), None)));
-    let injector = picker.injector();
 
-    cx.editor
-        .diff_providers
-        .clone()
-        .for_each_changed_file(cwd, move |change| match change {
-            Ok(change) => injector.push(change).is_ok(),
-            Err(err) => {
-                status::report_blocking(err);
-                true
-            }
-        });
+    let picker = picker.with_pre_select(move |file_change: &FileChange| {
+        current_file_path
+            .as_ref()
+            .map_or(false, |p| file_change.path() == p)
+    });
+
+    let injector = picker.injector();
+    std::thread::spawn(move || {
+        use helix_vcs::git;
+        let _ = git::for_each_changed_file_between_refs(
+            &cwd,
+            &base_ref,
+            target_ref.as_deref(),
+            move |change| match change {
+                Ok(change) => injector.push(change).is_ok(),
+                Err(_) => true,
+            },
+        );
+    });
+
     cx.push_layer(Box::new(overlaid(picker)));
 }
 

@@ -1131,6 +1131,39 @@ impl Default for SearchConfig {
     }
 }
 
+/// Represents a diff range between two git references.
+#[derive(Debug, Clone)]
+pub struct DiffRange {
+    pub base_ref: String,
+    pub target_ref: Option<String>,
+}
+
+impl DiffRange {
+    /// Parse a diff range string.
+    /// - `"a..b"` → base `a`, target `Some(b)`
+    /// - `"a!"` → base `a^`, target `Some(a)` (changes introduced by commit a)
+    /// - `"a"` → base `a`, target `None` (a vs working tree)
+    pub fn parse(range_str: &str) -> anyhow::Result<Self> {
+        if let Some((base, target)) = range_str.split_once("..") {
+            anyhow::ensure!(!base.is_empty() && !target.is_empty(), "invalid range: both sides must be non-empty");
+            Ok(Self { base_ref: base.to_string(), target_ref: Some(target.to_string()) })
+        } else if let Some(base) = range_str.strip_suffix('!') {
+            anyhow::ensure!(!base.is_empty(), "invalid range: '!' must follow a reference");
+            Ok(Self { base_ref: format!("{}^", base), target_ref: Some(base.to_string()) })
+        } else {
+            anyhow::ensure!(!range_str.is_empty(), "invalid range: cannot be empty");
+            Ok(Self { base_ref: range_str.to_string(), target_ref: None })
+        }
+    }
+
+    pub fn display(&self) -> String {
+        match &self.target_ref {
+            Some(t) => format!("{}..{}", self.base_ref, t),
+            None => self.base_ref.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Breakpoint {
     pub id: Option<usize>,
@@ -1169,6 +1202,10 @@ pub struct Editor {
     pub language_servers: helix_lsp::Registry,
     pub diagnostics: Diagnostics,
     pub diff_providers: DiffProviderRegistry,
+    /// Current diff range used by space+g picker and diff-commit workflow.
+    pub diff_range: Option<DiffRange>,
+    /// Remembers the last file selected in the changed-file picker for pre-selection.
+    pub last_changed_file_selection: Option<PathBuf>,
 
     pub debug_adapters: dap::registry::Registry,
     pub breakpoints: HashMap<PathBuf, Vec<Breakpoint>>,
@@ -1315,6 +1352,8 @@ impl Editor {
             language_servers,
             diagnostics: Diagnostics::new(),
             diff_providers: DiffProviderRegistry::default(),
+            diff_range: None,
+            last_changed_file_selection: None,
             debug_adapters: dap::registry::Registry::new(),
             breakpoints: HashMap::new(),
             syn_loader,

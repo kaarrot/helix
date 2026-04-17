@@ -542,7 +542,13 @@ where
         .unwrap_or_default()
         .to_string();
 
-    write(context, head.into());
+    let display = if let Some(commit_ref) = context.doc.diff_base_ref() {
+        format!("{}@{}", head, commit_ref)
+    } else {
+        head
+    };
+
+    write(context, display.into());
 }
 
 fn render_register<'a, F>(context: &mut RenderContext<'a>, write: F)

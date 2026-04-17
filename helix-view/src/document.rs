@@ -198,11 +198,21 @@ pub struct Document {
 
     diff_handle: Option<DiffHandle>,
     version_control_head: Option<Arc<ArcSwap<Box<str>>>>,
+    diff_base_ref: Option<String>,
 
     // when document was used for most-recent-used buffer picker
     pub focused_at: std::time::Instant,
 
     pub readonly: bool,
+
+    /// True when this document holds a read-only git revision (virtual base doc).
+    pub is_virtual_base: bool,
+    /// Override the display name shown in the bufferline / statusline.
+    pub display_name_override: Option<String>,
+    /// Character-level diff highlighting enabled for this document.
+    pub char_diff_enabled: bool,
+    /// When true this doc is the "minus" (old/base) side; highlights use diff.minus scope.
+    pub char_diff_minus_side: bool,
 
     pub previous_diagnostic_id: Option<String>,
 
@@ -725,8 +735,13 @@ impl Document {
             diff_handle: None,
             config,
             version_control_head: None,
+            diff_base_ref: None,
             focused_at: std::time::Instant::now(),
             readonly: false,
+            is_virtual_base: false,
+            display_name_override: None,
+            char_diff_enabled: false,
+            char_diff_minus_side: false,
             jump_labels: HashMap::new(),
             color_swatches: None,
             color_swatch_controller: TaskController::new(),
@@ -1868,6 +1883,30 @@ impl Document {
         self.language_servers().any(|l| l.id() == id)
     }
 
+    /// Create a read-only virtual document from raw bytes fetched from a git revision.
+    pub fn from_git_revision(
+        content: Vec<u8>,
+        real_path: &Path,
+        git_ref: &str,
+        config: Arc<dyn DynAccess<Config>>,
+        syn_loader: Arc<ArcSwap<syntax::Loader>>,
+    ) -> anyhow::Result<Self> {
+        let (text, encoding, has_bom) = from_reader(&mut content.as_slice(), None)
+            .map_err(|e| anyhow::anyhow!("decode git revision content: {e}"))?;
+        let mut doc = Self::from(text, Some((encoding, has_bom)), config, syn_loader.clone());
+        doc.path = Some(real_path.to_path_buf());
+        doc.relative_path = OnceCell::new();
+        doc.is_virtual_base = true;
+        doc.readonly = true;
+        let filename = real_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown");
+        doc.display_name_override = Some(format!("{filename} @ {git_ref}"));
+        doc.detect_language(&syn_loader.load());
+        Ok(doc)
+    }
+
     pub fn diff_handle(&self) -> Option<&DiffHandle> {
         self.diff_handle.as_ref()
     }
@@ -1883,6 +1922,31 @@ impl Document {
         } else {
             self.diff_handle = None;
         }
+    }
+
+    /// Set the diff base to an arbitrary git ref (branch, tag, or commit hash).
+    pub fn set_diff_base_from_ref(&mut self, ref_name: String) -> anyhow::Result<()> {
+        if let Some(path) = self.path() {
+            let diff_base = helix_vcs::git::get_diff_base_from_ref(path, &ref_name)?;
+            self.set_diff_base(diff_base);
+            self.diff_base_ref = Some(ref_name);
+        }
+        Ok(())
+    }
+
+    /// Reset the diff base back to HEAD.
+    pub fn reset_diff_base(&mut self) -> anyhow::Result<()> {
+        if let Some(path) = self.path() {
+            let diff_base = helix_vcs::git::get_diff_base(path)?;
+            self.set_diff_base(diff_base);
+            self.diff_base_ref = None;
+        }
+        Ok(())
+    }
+
+    /// Return the git ref currently used as the diff base, if any custom ref is set.
+    pub fn diff_base_ref(&self) -> Option<&str> {
+        self.diff_base_ref.as_deref()
     }
 
     pub fn version_control_head(&self) -> Option<Arc<Box<str>>> {
@@ -2000,6 +2064,9 @@ impl Document {
     }
 
     pub fn display_name(&self) -> Cow<'_, str> {
+        if let Some(ref name) = self.display_name_override {
+            return Cow::Borrowed(name.as_str());
+        }
         self.relative_path()
             .map_or_else(|| SCRATCH_BUFFER_NAME.into(), |path| path.to_string_lossy())
     }

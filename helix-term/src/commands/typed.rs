@@ -2757,6 +2757,32 @@ pub const SHELL_COMPLETER: CommandCompleter = CommandCompleter::positional(&[
     completers::repeating_filenames,
 ]);
 
+fn toggle_char_diff(
+    cx: &mut compositor::Context,
+    _args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+
+    let (_view, doc) = current!(cx.editor);
+    doc.char_diff_enabled = !doc.char_diff_enabled;
+
+    let status = if doc.char_diff_enabled {
+        "Character-level diff highlighting enabled"
+    } else {
+        "Character-level diff highlighting disabled"
+    };
+
+    cx.editor.set_status(status);
+
+    // Force a redraw to apply the decoration
+    cx.editor.clear_idle_timer();
+
+    Ok(())
+}
+
 const WRITE_NO_FORMAT_FLAG: Flag = Flag {
     name: "no-format",
     doc: "skip auto-formatting",
@@ -3786,6 +3812,17 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         completer: CommandCompleter::none(),
         signature: Signature {
             positionals: (0, None),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "toggle-char-diff",
+        aliases: &["tcd"],
+        doc: "Toggle character-level diff highlighting for the current buffer.",
+        fun: toggle_char_diff,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
             ..Signature::DEFAULT
         },
     },

@@ -374,6 +374,8 @@ pub struct Config {
     #[serde(default)]
     pub search: SearchConfig,
     pub lsp: LspConfig,
+    #[serde(default)]
+    pub diff: DiffConfig,
     pub terminal: Option<TerminalConfig>,
     /// Column numbers at which to draw the rulers. Defaults to `[]`, meaning no rulers.
     pub rulers: Vec<u16>,
@@ -505,6 +507,19 @@ pub fn get_terminal_provider() -> Option<TerminalConfig> {
     }
 
     None
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", default, deny_unknown_fields)]
+pub struct DiffConfig {
+    /// Show diff in a side-by-side split view. Defaults to false.
+    pub split_view: bool,
+}
+
+impl Default for DiffConfig {
+    fn default() -> Self {
+        Self { split_view: false }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1089,6 +1104,7 @@ impl Default for Config {
             undercurl: false,
             search: SearchConfig::default(),
             lsp: LspConfig::default(),
+            diff: DiffConfig::default(),
             terminal: get_terminal_provider(),
             rulers: Vec::new(),
             whitespace: WhitespaceConfig::default(),
@@ -1206,6 +1222,10 @@ pub struct Editor {
     pub diff_range: Option<DiffRange>,
     /// Remembers the last file selected in the changed-file picker for pre-selection.
     pub last_changed_file_selection: Option<PathBuf>,
+    /// Active side-by-side diff sessions, keyed by ViewId (both panes registered).
+    pub diff_views: HashMap<ViewId, crate::diff_view::DiffViewState>,
+    /// Per-session split_view override (set by diff-commit, cleared on close).
+    pub diff_session_split_view_override: Option<bool>,
 
     pub debug_adapters: dap::registry::Registry,
     pub breakpoints: HashMap<PathBuf, Vec<Breakpoint>>,
@@ -1354,6 +1374,8 @@ impl Editor {
             diff_providers: DiffProviderRegistry::default(),
             diff_range: None,
             last_changed_file_selection: None,
+            diff_views: HashMap::new(),
+            diff_session_split_view_override: None,
             debug_adapters: dap::registry::Registry::new(),
             breakpoints: HashMap::new(),
             syn_loader,
@@ -1952,6 +1974,10 @@ impl Editor {
     }
 
     pub fn close(&mut self, id: ViewId) {
+        // Clean up any diff session that owns this view.
+        if self.diff_views.contains_key(&id) {
+            self.close_diff_view(id);
+        }
         // Remove selections for the closed view on all documents.
         for doc in self.documents_mut() {
             doc.remove_view(id);
@@ -2396,6 +2422,255 @@ impl Editor {
 
     pub fn get_last_cwd(&mut self) -> Option<&Path> {
         self.last_cwd.as_deref()
+    }
+
+    // -------------------------------------------------------------------------
+    // Split diff view
+    // -------------------------------------------------------------------------
+
+    fn get_diff_content_or_empty(path: &Path, git_ref: &str) -> Result<Vec<u8>, Error> {
+        match helix_vcs::git::get_diff_base_from_ref(path, git_ref) {
+            Ok(content) => Ok(content),
+            Err(err) => {
+                let is_missing = err
+                    .chain()
+                    .any(|e| e.to_string().contains("file is untracked"));
+                if is_missing {
+                    Ok(Vec::new())
+                } else {
+                    Err(err.into())
+                }
+            }
+        }
+    }
+
+    fn non_virtual_document_id_by_path(&self, path: &Path) -> Option<DocumentId> {
+        self.documents.iter().find_map(|(id, doc)| {
+            (!doc.is_virtual_base && doc.path().is_some_and(|p| p == path)).then_some(*id)
+        })
+    }
+
+    pub fn open_diff_view(
+        &mut self,
+        path: &Path,
+        git_ref: &str,
+        split_view_override: Option<bool>,
+    ) -> Result<(), Error> {
+        self.open_diff_view_with_paths(path, path, git_ref, split_view_override)
+    }
+
+    pub fn open_diff_view_with_paths(
+        &mut self,
+        base_path: &Path,
+        working_path: &Path,
+        git_ref: &str,
+        split_view_override: Option<bool>,
+    ) -> Result<(), Error> {
+        use crate::diff_view::DiffViewState;
+
+        let base_path = helix_stdx::path::canonicalize(base_path);
+        let working_path = helix_stdx::path::canonicalize(working_path);
+
+        let focused_view = self.tree.focus;
+        if self.diff_views.contains_key(&focused_view) {
+            self.close_diff_view(focused_view);
+        }
+
+        let working_doc_id = if let Some(id) = self.non_virtual_document_id_by_path(&working_path) {
+            id
+        } else {
+            self.open(&working_path, Action::Load)?
+        };
+
+        let base_content = Self::get_diff_content_or_empty(&base_path, git_ref)
+            .map_err(|e| anyhow::anyhow!("Failed to fetch git revision: {}", e))?;
+
+        let base_doc = Document::from_git_revision(
+            base_content.clone(),
+            &base_path,
+            git_ref,
+            self.config.clone(),
+            self.syn_loader.clone(),
+        )?;
+        let base_doc_id = self.new_document(base_doc);
+
+        let mut working_content: Option<Vec<u8>> = None;
+        if let Some(doc) = self.documents.get_mut(&working_doc_id) {
+            doc.linked_diff_doc = Some(base_doc_id);
+            doc.char_diff_enabled = true;
+            doc.char_diff_minus_side = false;
+            doc.set_diff_base(base_content.clone());
+            let text: String = doc.text().slice(..).chunks().collect();
+            working_content = Some(text.into_bytes());
+        }
+        if let Some(doc) = self.documents.get_mut(&base_doc_id) {
+            doc.linked_diff_doc = Some(working_doc_id);
+            if let Some(content) = &working_content {
+                doc.set_diff_base(content.clone());
+                doc.char_diff_enabled = true;
+                doc.char_diff_minus_side = true;
+            }
+        }
+
+        let split_view_override = split_view_override.or(self.diff_session_split_view_override);
+        let split_view = split_view_override.unwrap_or_else(|| self.config().diff.split_view);
+
+        if split_view {
+            let views_to_close: Vec<ViewId> = self
+                .tree
+                .views()
+                .filter_map(|(v, focus)| if !focus { Some(v.id) } else { None })
+                .collect();
+            for view_id in views_to_close {
+                self.close(view_id);
+            }
+            self.switch(base_doc_id, Action::Replace);
+            let base_view_id = self.tree.focus;
+            self.switch(working_doc_id, Action::VerticalSplit);
+            let working_view_id = self.tree.focus;
+            let diff_state = DiffViewState::new(
+                base_doc_id, working_doc_id, base_view_id, working_view_id,
+                git_ref.to_string(),
+            );
+            self.diff_views.insert(base_view_id, diff_state.clone());
+            self.diff_views.insert(working_view_id, diff_state);
+        } else {
+            self.switch(working_doc_id, Action::Replace);
+            let working_view_id = self.tree.focus;
+            let diff_state = DiffViewState::new(
+                base_doc_id, working_doc_id, working_view_id, working_view_id,
+                git_ref.to_string(),
+            );
+            self.diff_views.insert(working_view_id, diff_state);
+        }
+
+        Ok(())
+    }
+
+    pub fn open_diff_view_range(
+        &mut self,
+        path: &Path,
+        base_ref: &str,
+        target_ref: Option<&str>,
+        split_view_override: Option<bool>,
+    ) -> Result<(), Error> {
+        self.open_diff_view_range_with_paths(path, path, base_ref, target_ref, split_view_override)
+    }
+
+    pub fn open_diff_view_range_with_paths(
+        &mut self,
+        base_path: &Path,
+        target_path: &Path,
+        base_ref: &str,
+        target_ref: Option<&str>,
+        split_view_override: Option<bool>,
+    ) -> Result<(), Error> {
+        use crate::diff_view::DiffViewState;
+
+        let base_path = helix_stdx::path::canonicalize(base_path);
+        let target_path = helix_stdx::path::canonicalize(target_path);
+
+        let focused_view = self.tree.focus;
+        if self.diff_views.contains_key(&focused_view) {
+            self.close_diff_view(focused_view);
+        }
+
+        let split_view_override = split_view_override.or(self.diff_session_split_view_override);
+
+        match target_ref {
+            None => self.open_diff_view_with_paths(
+                &base_path, &target_path, base_ref, split_view_override,
+            ),
+            Some(target) => {
+                let base_content = Self::get_diff_content_or_empty(&base_path, base_ref)
+                    .map_err(|e| anyhow::anyhow!("Failed to fetch '{}': {}", base_ref, e))?;
+                let target_content = Self::get_diff_content_or_empty(&target_path, target)
+                    .map_err(|e| anyhow::anyhow!("Failed to fetch '{}': {}", target, e))?;
+                let target_content_for_diff = target_content.clone();
+
+                let base_doc = Document::from_git_revision(
+                    base_content.clone(), &base_path, base_ref,
+                    self.config.clone(), self.syn_loader.clone(),
+                )?;
+                let base_doc_id = self.new_document(base_doc);
+
+                let target_doc = Document::from_git_revision(
+                    target_content, &target_path, target,
+                    self.config.clone(), self.syn_loader.clone(),
+                )?;
+                let target_doc_id = self.new_document(target_doc);
+
+                if let Some(doc) = self.documents.get_mut(&base_doc_id) {
+                    doc.linked_diff_doc = Some(target_doc_id);
+                    doc.char_diff_enabled = true;
+                    doc.char_diff_minus_side = true;
+                    doc.set_diff_base(target_content_for_diff);
+                }
+                if let Some(doc) = self.documents.get_mut(&target_doc_id) {
+                    doc.linked_diff_doc = Some(base_doc_id);
+                    doc.char_diff_enabled = true;
+                    doc.char_diff_minus_side = false;
+                    doc.set_diff_base(base_content);
+                }
+
+                let split_view = split_view_override.unwrap_or_else(|| self.config().diff.split_view);
+                let display = format!("{}..{}", base_ref, target);
+
+                if split_view {
+                    let views_to_close: Vec<ViewId> = self
+                        .tree.views()
+                        .filter_map(|(v, focus)| if !focus { Some(v.id) } else { None })
+                        .collect();
+                    for view_id in views_to_close { self.close(view_id); }
+                    self.switch(base_doc_id, Action::Replace);
+                    let base_view_id = self.tree.focus;
+                    self.switch(target_doc_id, Action::VerticalSplit);
+                    let target_view_id = self.tree.focus;
+                    let diff_state = DiffViewState::new(
+                        base_doc_id, target_doc_id, base_view_id, target_view_id, display,
+                    );
+                    self.diff_views.insert(base_view_id, diff_state.clone());
+                    self.diff_views.insert(target_view_id, diff_state);
+                } else {
+                    self.switch(target_doc_id, Action::Replace);
+                    let target_view_id = self.tree.focus;
+                    let diff_state = DiffViewState::new(
+                        base_doc_id, target_doc_id, target_view_id, target_view_id, display,
+                    );
+                    self.diff_views.insert(target_view_id, diff_state);
+                }
+
+                Ok(())
+            }
+        }
+    }
+
+    pub fn close_diff_view(&mut self, view_id: ViewId) -> bool {
+        if let Some(diff_state) = self.diff_views.remove(&view_id) {
+            self.diff_views.remove(&diff_state.base_view_id);
+            self.diff_views.remove(&diff_state.working_view_id);
+
+            if let Some(doc) = self.documents.get_mut(&diff_state.base_doc_id) {
+                doc.linked_diff_doc = None;
+            }
+            if let Some(doc) = self.documents.get_mut(&diff_state.working_doc_id) {
+                doc.linked_diff_doc = None;
+                doc.char_diff_enabled = false;
+                doc.char_diff_minus_side = false;
+            }
+
+            let _ = self.close_document(diff_state.base_doc_id, true);
+
+            if diff_state.base_view_id != diff_state.working_view_id
+                && self.tree.contains(diff_state.base_view_id)
+            {
+                self.close(diff_state.base_view_id);
+            }
+
+            true
+        } else {
+            false
+        }
     }
 }
 

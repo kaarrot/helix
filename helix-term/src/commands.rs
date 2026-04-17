@@ -551,6 +551,9 @@ impl MappableCommand {
         vsplit_new, "Vertical right split scratch buffer",
         wclose, "Close window",
         wonly, "Close windows except current",
+        close_diff_or_merge_view, "Close diff or merge view",
+        diff_toggle_split_view, "Toggle synchronized scrolling in diff view",
+        diff_reset, "Reset diff base to HEAD",
         select_register, "Select register",
         insert_register, "Insert register",
         copy_between_registers, "Copy between two registers",
@@ -3392,16 +3395,17 @@ fn changed_file_picker(cx: &mut Context) {
             style_deleted: deleted,
             style_renamed: renamed,
         },
-        |cx, meta: &FileChange, action| {
-            cx.editor.last_changed_file_selection = Some(meta.path().to_path_buf());
-            let path_to_open = meta.path();
-            if let Err(e) = cx.editor.open(path_to_open, action) {
-                let err = if let Some(err) = e.source() {
-                    format!("{}", err)
-                } else {
-                    format!("unable to open \"{}\"", path_to_open.display())
-                };
-                cx.editor.set_error(err);
+        {
+            let base_ref_cb = base_ref.clone();
+            let target_ref_cb = target_ref.clone();
+            move |cx, meta: &FileChange, _action| {
+                cx.editor.last_changed_file_selection = Some(meta.path().to_path_buf());
+                let path = meta.path();
+                if let Err(e) = cx.editor.open_diff_view_range(
+                    path, &base_ref_cb, target_ref_cb.as_deref(), None,
+                ) {
+                    cx.editor.set_error(format!("Failed to open diff view: {e}"));
+                }
             }
         },
     )
@@ -5814,6 +5818,56 @@ fn select_register(cx: &mut Context) {
             cx.editor.selected_register = Some(ch);
         }
     })
+}
+
+// ---------------------------------------------------------------------------
+// Diff view commands
+// ---------------------------------------------------------------------------
+
+fn close_diff_or_merge_view(cx: &mut Context) {
+    let view_id = view!(cx.editor).id;
+    if !cx.editor.close_diff_view(view_id) {
+        cx.editor.set_error("Not in a diff view");
+    }
+}
+
+fn diff_toggle_split_view(cx: &mut Context) {
+    let view_id = view!(cx.editor).id;
+    let Some(diff_state) = cx.editor.diff_views.get(&view_id).cloned() else {
+        cx.editor.set_error("Not in a diff view");
+        return;
+    };
+    let new_val = !diff_state.sync_scroll;
+    for id in [diff_state.base_view_id, diff_state.working_view_id] {
+        if let Some(state) = cx.editor.diff_views.get_mut(&id) {
+            state.sync_scroll = new_val;
+        }
+    }
+    cx.editor.set_status(if new_val { "Sync scroll enabled" } else { "Sync scroll disabled" });
+}
+
+fn diff_reset(cx: &mut Context) {
+    let view_id = view!(cx.editor).id;
+    if cx.editor.diff_views.contains_key(&view_id) {
+        cx.editor.close_diff_view(view_id);
+    }
+    cx.editor.diff_range = None;
+    let diff_bases: Vec<_> = cx.editor.documents.iter()
+        .filter_map(|(id, doc)| {
+            let path = doc.path()?.to_path_buf();
+            let base = cx.editor.diff_providers.get_diff_base(&path)?;
+            Some((*id, base))
+        })
+        .collect();
+    for (_, doc) in cx.editor.documents.iter_mut() {
+        doc.char_diff_enabled = false;
+    }
+    for (id, base) in diff_bases {
+        if let Some(doc) = cx.editor.documents.get_mut(&id) {
+            doc.set_diff_base(base);
+        }
+    }
+    cx.editor.set_status("Diff reset to HEAD");
 }
 
 fn insert_register(cx: &mut Context) {

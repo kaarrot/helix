@@ -2978,18 +2978,9 @@ fn diff_files(
                         style_renamed: renamed,
                     },
                     move |cx, meta: &FileChange, _action| {
-                        let path_to_open = meta.path();
-
-                        // Open file then set diff base for char-diff highlighting
-                        if let Err(e) = cx.editor.open(path_to_open, Action::Replace) {
-                            cx.editor.set_error(format!("unable to open: {e}"));
-                            return;
-                        }
-                        let (_view, doc) = current!(cx.editor);
-                        if let Err(err) = doc.set_diff_base_from_ref(ref_name_for_callback.clone()) {
-                            cx.editor.set_error(format!("Failed to set diff base: {}", err));
-                        } else {
-                            doc.char_diff_enabled = true;
+                        let path = meta.path();
+                        if let Err(e) = cx.editor.open_diff_view(path, &ref_name_for_callback, None) {
+                            cx.editor.set_error(format!("Failed to open diff view: {e}"));
                         }
                     },
                 )

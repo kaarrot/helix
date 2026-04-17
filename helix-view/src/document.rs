@@ -213,6 +213,8 @@ pub struct Document {
     pub char_diff_enabled: bool,
     /// When true this doc is the "minus" (old/base) side; highlights use diff.minus scope.
     pub char_diff_minus_side: bool,
+    /// The paired document in a split diff session.
+    pub linked_diff_doc: Option<DocumentId>,
 
     pub previous_diagnostic_id: Option<String>,
 
@@ -742,6 +744,7 @@ impl Document {
             display_name_override: None,
             char_diff_enabled: false,
             char_diff_minus_side: false,
+            linked_diff_doc: None,
             jump_labels: HashMap::new(),
             color_swatches: None,
             color_swatch_controller: TaskController::new(),

@@ -686,15 +686,24 @@ impl View {
 
     /// Hook virtual-line alignment spacers into the text annotations for this
     /// view when it is part of a side-by-side diff session.
-    /// The actual DiffAlignment annotation is added in Layer 7 (alignment spacers).
     pub fn apply_diff_alignment<'a>(
         &self,
-        _doc: &'a Document,
-        _text_annotations: &mut helix_core::text_annotations::TextAnnotations<'a>,
-        _diff_views: &std::collections::HashMap<ViewId, crate::diff_view::DiffViewState>,
-        _documents: &'a std::collections::BTreeMap<DocumentId, Document>,
+        doc: &'a Document,
+        text_annotations: &mut helix_core::text_annotations::TextAnnotations<'a>,
+        diff_views: &std::collections::HashMap<ViewId, crate::diff_view::DiffViewState>,
+        documents: &'a std::collections::BTreeMap<DocumentId, Document>,
     ) {
-        // Populated in Layer 7 when DiffAlignment LineAnnotation is added.
+        let Some(diff_state) = diff_views.get(&self.id) else { return };
+        let other_doc_id = if diff_state.is_base_view(self.id) {
+            diff_state.working_doc_id
+        } else {
+            diff_state.base_doc_id
+        };
+        if let (Some(diff_handle), Some(_)) = (doc.diff_handle(), documents.get(&other_doc_id)) {
+            text_annotations.add_line_annotation(Box::new(
+                crate::annotations::diff::DiffAlignment::new(diff_handle.clone()),
+            ));
+        }
     }
 }
 

@@ -122,6 +122,54 @@ pub fn get_current_head_name(file: &Path) -> Result<Arc<ArcSwap<Box<str>>>> {
     Ok(Arc::new(ArcSwap::from_pointee(name.into_boxed_str())))
 }
 
+/// Fetch OURS (stage 2) and THEIRS (stage 3) versions of a conflicted file
+/// from the git index. Returns `(ours_bytes, theirs_bytes)`.
+pub fn get_merge_versions(file: &Path) -> Result<(Vec<u8>, Vec<u8>)> {
+    debug_assert!(file.is_absolute());
+    let file = resolve_file_path(file)?;
+
+    let repo_dir = get_repo_dir(&file)?;
+    let repo = open_repo(repo_dir)
+        .context("failed to open git repo")?
+        .to_thread_local();
+
+    let work_dir = repo.workdir().ok_or_else(|| anyhow::anyhow!("not a working tree"))?;
+    let rela_path = file.strip_prefix(work_dir)?;
+    let rela_path = gix::path::try_into_bstr(rela_path)?;
+
+    let index = repo.index_or_load_from_head()?;
+    let mut ours_oid = None;
+    let mut theirs_oid = None;
+
+    for entry in index.entries() {
+        if entry.path(&index) == rela_path.as_ref() {
+            match entry.stage() {
+                gix::index::entry::Stage::Ours   => ours_oid   = Some(entry.id),
+                gix::index::entry::Stage::Theirs => theirs_oid = Some(entry.id),
+                _ => {}
+            }
+        }
+    }
+
+    let ours_oid = ours_oid.ok_or_else(|| anyhow::anyhow!("OURS (stage 2) not in index — is there an active merge?"))?;
+    let theirs_oid = theirs_oid.ok_or_else(|| anyhow::anyhow!("THEIRS (stage 3) not in index"))?;
+
+    let (mut pipeline, _) = repo.filter_pipeline(None)?;
+
+    let ours_data = repo.find_object(ours_oid)?.detach().data;
+    let mut ours_out = pipeline.convert_to_worktree(&ours_data, rela_path.as_ref(), Delay::Forbid)?;
+    let mut ours_buf = Vec::with_capacity(ours_data.len());
+    ours_out.read_to_end(&mut ours_buf)?;
+
+    let (mut pipeline2, _) = repo.filter_pipeline(None)?;
+    let theirs_data = repo.find_object(theirs_oid)?.detach().data;
+    let mut theirs_out = pipeline2.convert_to_worktree(&theirs_data, rela_path.as_ref(), Delay::Forbid)?;
+    let mut theirs_buf = Vec::with_capacity(theirs_data.len());
+    theirs_out.read_to_end(&mut theirs_buf)?;
+
+    Ok((ours_buf, theirs_buf))
+}
+
 pub fn for_each_changed_file(cwd: &Path, f: impl Fn(Result<FileChange>) -> bool) -> Result<()> {
     status(&open_repo(cwd)?.to_thread_local(), f)
 }

@@ -2859,6 +2859,20 @@ fn diff_commit(
     Ok(())
 }
 
+fn open_merge_view(
+    cx: &mut compositor::Context,
+    _args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+    let path = doc!(cx.editor).path()
+        .map(|p| p.to_path_buf())
+        .context("Current buffer has no file path")?;
+    cx.editor.open_merge_view(&path).map_err(|e| anyhow::anyhow!("{e}"))
+}
+
 fn diff_reset(
     cx: &mut compositor::Context,
     _args: Args,
@@ -4098,6 +4112,17 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         completer: CommandCompleter::none(),
         signature: Signature {
             positionals: (1, Some(1)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "merge",
+        aliases: &["3way"],
+        doc: "Open a 3-way merge view for the current conflicted file.",
+        fun: open_merge_view,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
             ..Signature::DEFAULT
         },
     },

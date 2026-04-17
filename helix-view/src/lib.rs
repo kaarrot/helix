@@ -6,6 +6,7 @@ pub mod clipboard;
 pub mod diff_view;
 pub mod document;
 pub mod editor;
+pub mod merge_view;
 pub mod events;
 pub mod expansion;
 pub mod graphics;

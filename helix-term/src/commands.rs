@@ -554,6 +554,12 @@ impl MappableCommand {
         close_diff_or_merge_view, "Close diff or merge view",
         diff_toggle_split_view, "Toggle synchronized scrolling in diff view",
         diff_reset, "Reset diff base to HEAD",
+        merge_accept_ours, "Accept HEAD version for current conflict",
+        merge_accept_theirs, "Accept incoming version for current conflict",
+        merge_accept_both, "Accept both versions for current conflict",
+        merge_next_conflict, "Jump to next merge conflict",
+        merge_prev_conflict, "Jump to previous merge conflict",
+        merge_finish, "Save and stage the resolved file",
         select_register, "Select register",
         insert_register, "Insert register",
         copy_between_registers, "Copy between two registers",
@@ -5883,9 +5889,157 @@ fn select_register(cx: &mut Context) {
 
 fn close_diff_or_merge_view(cx: &mut Context) {
     let view_id = view!(cx.editor).id;
-    if !cx.editor.close_diff_view(view_id) {
-        cx.editor.set_error("Not in a diff view");
+    let closed = cx.editor.close_diff_view(view_id)
+        || cx.editor.close_merge_view(view_id);
+    if !closed {
+        cx.editor.set_error("Not in a diff or merge view");
     }
+}
+
+fn merge_accept_ours(cx: &mut Context) {
+    merge_accept_impl(cx, true);
+}
+
+fn merge_accept_theirs(cx: &mut Context) {
+    merge_accept_impl(cx, false);
+}
+
+fn merge_accept_both(cx: &mut Context) {
+    use helix_view::merge_view::{find_conflicts, extract_sides};
+    let (view, doc) = current!(cx.editor);
+    let cursor_line = doc.selection(view.id).primary().cursor_line(doc.text().slice(..));
+    let text = doc.text().clone();
+
+    let Some(region) = find_conflicts(&text).into_iter().find(|r| {
+        cursor_line >= r.start_line && cursor_line <= r.end_line
+    }) else {
+        cx.editor.set_status("No conflict at cursor");
+        return;
+    };
+
+    let Some((ours, _, theirs)) = extract_sides(&text, &region) else {
+        cx.editor.set_error("Malformed conflict markers");
+        return;
+    };
+    let combined = format!("{}{}", ours, theirs);
+    apply_conflict_resolution(cx, &region, combined);
+    cx.editor.set_status("Accepted both versions");
+}
+
+fn merge_accept_impl(cx: &mut Context, accept_ours: bool) {
+    use helix_view::merge_view::{find_conflicts, extract_sides};
+    let (view, doc) = current!(cx.editor);
+    let cursor_line = doc.selection(view.id).primary().cursor_line(doc.text().slice(..));
+    let text = doc.text().clone();
+
+    let Some(region) = find_conflicts(&text).into_iter().find(|r| {
+        cursor_line >= r.start_line && cursor_line <= r.end_line
+    }) else {
+        cx.editor.set_status("No conflict at cursor");
+        return;
+    };
+
+    let Some((ours, _, theirs)) = extract_sides(&text, &region) else {
+        cx.editor.set_error("Malformed conflict markers");
+        return;
+    };
+
+    let replacement = if accept_ours { ours } else { theirs };
+    let side = if accept_ours { "HEAD" } else { "incoming" };
+    apply_conflict_resolution(cx, &region, replacement);
+    cx.editor.set_status(format!("Accepted {} version", side));
+}
+
+fn apply_conflict_resolution(
+    cx: &mut Context,
+    region: &helix_view::merge_view::ConflictRegion,
+    replacement: String,
+) {
+    let (view, doc) = current!(cx.editor);
+    let text = doc.text();
+    let start_char = text.line_to_char(region.start_line);
+    let end_char = if region.end_line + 1 < text.len_lines() {
+        text.line_to_char(region.end_line + 1)
+    } else {
+        text.len_chars()
+    };
+    let view_id = view.id;
+    let transaction = helix_core::Transaction::change(
+        text,
+        std::iter::once((start_char, end_char, Some(replacement.into()))),
+    );
+    doc.apply(&transaction, view_id);
+}
+
+fn merge_next_conflict(cx: &mut Context) {
+    merge_jump_impl(cx, Direction::Forward);
+}
+
+fn merge_prev_conflict(cx: &mut Context) {
+    merge_jump_impl(cx, Direction::Backward);
+}
+
+fn merge_jump_impl(cx: &mut Context, direction: Direction) {
+    use helix_view::merge_view::find_conflicts;
+    let (view, doc) = current!(cx.editor);
+    let view_id = view.id;
+    let cursor_line = doc.selection(view_id).primary().cursor_line(doc.text().slice(..));
+    let text = doc.text().clone();
+    let conflicts = find_conflicts(&text);
+
+    if conflicts.is_empty() {
+        cx.editor.set_status("No conflicts remaining");
+        return;
+    }
+
+    let total = conflicts.len();
+    let target_start = match direction {
+        Direction::Forward => conflicts.iter().find(|r| r.start_line > cursor_line)
+            .or_else(|| conflicts.first())
+            .map(|r| r.start_line),
+        Direction::Backward => conflicts.iter().rev().find(|r| r.start_line < cursor_line)
+            .or_else(|| conflicts.last())
+            .map(|r| r.start_line),
+    };
+
+    if let Some(start_line) = target_start {
+        let pos = doc.text().line_to_char(start_line);
+        let (view, doc) = current!(cx.editor);
+        let view_id = view.id;
+        doc.set_selection(view_id, helix_core::Selection::point(pos));
+        cx.editor.ensure_cursor_in_view(view_id);
+
+        let current_idx = conflicts.iter().position(|r| r.start_line == start_line)
+            .map(|i| i + 1).unwrap_or(1);
+        cx.editor.set_status(format!("Conflict {}/{}", current_idx, total));
+    }
+}
+
+fn merge_finish(cx: &mut Context) {
+    use helix_view::merge_view::conflict_count;
+    let (view, doc) = current!(cx.editor);
+    let view_id = view.id;
+    let remaining = conflict_count(doc.text());
+
+    if remaining > 0 {
+        cx.editor.set_error(format!("{} conflict(s) still unresolved", remaining));
+        return;
+    }
+
+    let doc_id = doc.id();
+    let path = doc.path().map(|p| p.to_path_buf());
+
+    if let Err(e) = cx.editor.save::<PathBuf>(doc_id, None, false) {
+        cx.editor.set_error(format!("Failed to save: {e}"));
+        return;
+    }
+
+    // Stage with git add
+    if let Some(p) = path {
+        let _ = std::process::Command::new("git").args(["add", "--"]).arg(&p).status();
+    }
+
+    cx.editor.set_status("File saved and staged (git add)");
 }
 
 fn diff_toggle_split_view(cx: &mut Context) {

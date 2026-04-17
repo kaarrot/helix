@@ -236,9 +236,15 @@ pub fn default() -> HashMap<Mode, KeyTrie> {
             "g" => changed_file_picker,
             "a" => code_action,
             "'" => last_picker,
-            "m" => { "Diff"
-                "r" => diff_reset,
+            "m" => { "Merge/Diff"
+                "o" => merge_accept_ours,
+                "t" => merge_accept_theirs,
+                "b" => merge_accept_both,
+                "n" => merge_next_conflict,
+                "p" => merge_prev_conflict,
+                "f" => merge_finish,
                 "s" => diff_toggle_split_view,
+                "r" => diff_reset,
                 "q" => close_diff_or_merge_view,
             },
             "G" => { "Debug (experimental)" sticky=true

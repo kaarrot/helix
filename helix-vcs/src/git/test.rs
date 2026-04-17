@@ -1,13 +1,13 @@
-use std::{fs::File, io::Write, path::Path, process::Command};
+use std::{cell::RefCell, fs::File, io::Write, path::Path, process::Command};
 
 use tempfile::TempDir;
 
-use crate::git;
+use crate::{git, FileChange};
 
 fn exec_git_cmd(args: &str, git_dir: &Path) {
     let res = Command::new("git")
         .arg("-C")
-        .arg(git_dir) // execute the git command in this directory
+        .arg(git_dir)
         .args(args.split_whitespace())
         .env_remove("GIT_DIR")
         .env_remove("GIT_ASKPASS")
@@ -48,12 +48,44 @@ fn empty_git_repo() -> TempDir {
     tmp
 }
 
+fn exec_git_cmd_output(args: &str, git_dir: &Path) -> String {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(git_dir)
+        .args(args.split_whitespace())
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_ASKPASS")
+        .env_remove("SSH_ASKPASS")
+        .env("GIT_TERMINAL_PROMPT", "false")
+        .env("GIT_AUTHOR_DATE", "2000-01-01 00:00:00 +0000")
+        .env("GIT_AUTHOR_EMAIL", "author@example.com")
+        .env("GIT_AUTHOR_NAME", "author")
+        .env("GIT_COMMITTER_DATE", "2000-01-02 00:00:00 +0000")
+        .env("GIT_COMMITTER_EMAIL", "committer@example.com")
+        .env("GIT_COMMITTER_NAME", "committer")
+        .env("GIT_CONFIG_COUNT", "2")
+        .env("GIT_CONFIG_KEY_0", "commit.gpgsign")
+        .env("GIT_CONFIG_VALUE_0", "false")
+        .env("GIT_CONFIG_KEY_1", "init.defaultBranch")
+        .env("GIT_CONFIG_VALUE_1", "main")
+        .output()
+        .unwrap_or_else(|_| panic!("`git {args}` failed"));
+    if !output.status.success() {
+        println!("{}", String::from_utf8_lossy(&output.stdout));
+        eprintln!("{}", String::from_utf8_lossy(&output.stderr));
+        panic!("`git {args}` failed (see output above)")
+    }
+    String::from_utf8(output.stdout)
+        .expect("git output is not valid UTF-8")
+        .trim()
+        .to_string()
+}
+
 #[test]
 fn missing_file() {
     let temp_git = empty_git_repo();
     let file = temp_git.path().join("file.txt");
     File::create(&file).unwrap().write_all(b"foo").unwrap();
-
     assert!(git::get_diff_base(&file).is_err());
 }
 
@@ -75,13 +107,10 @@ fn modified_file() {
     File::create(&file).unwrap().write_all(contents).unwrap();
     create_commit(temp_git.path(), true);
     File::create(&file).unwrap().write_all(b"bar").unwrap();
-
     assert_eq!(git::get_diff_base(&file).unwrap(), Vec::from(contents));
 }
 
 /// Test that `get_file_head` does not return content for a directory.
-/// This is important to correctly cover cases where a directory is removed and replaced by a file.
-/// If the contents of the directory object were returned a diff between a path and the directory children would be produced.
 #[test]
 fn directory() {
     let temp_git = empty_git_repo();
@@ -90,21 +119,12 @@ fn directory() {
     let file = dir.join("file.txt");
     let contents = b"foo".as_slice();
     File::create(file).unwrap().write_all(contents).unwrap();
-
     create_commit(temp_git.path(), true);
-
     std::fs::remove_dir_all(&dir).unwrap();
     File::create(&dir).unwrap().write_all(b"bar").unwrap();
     assert!(git::get_diff_base(&dir).is_err());
 }
 
-/// Test that `get_diff_base` resolves symlinks so that the same diff base is
-/// used as the target file.
-///
-/// This is important to correctly cover cases where a symlink is removed and
-/// replaced by a file. If the contents of the symlink object were returned
-/// a diff between a literal file path and the actual file content would be
-/// produced (bad ui).
 #[cfg(any(unix, windows))]
 #[test]
 fn symlink() {
@@ -118,16 +138,12 @@ fn symlink() {
     let contents = Vec::from(b"foo");
     File::create(&file).unwrap().write_all(&contents).unwrap();
     let file_link = temp_git.path().join("file_link.txt");
-
     symlink("file.txt", &file_link).unwrap();
     create_commit(temp_git.path(), true);
-
     assert_eq!(git::get_diff_base(&file_link).unwrap(), contents);
     assert_eq!(git::get_diff_base(&file).unwrap(), contents);
 }
 
-/// Test that `get_diff_base` returns content when the file is a symlink to
-/// another file that is in a git repo, but the symlink itself is not.
 #[cfg(any(unix, windows))]
 #[test]
 fn symlink_to_git_repo() {
@@ -138,15 +154,299 @@ fn symlink_to_git_repo() {
 
     let temp_dir = tempfile::tempdir().expect("create temp dir");
     let temp_git = empty_git_repo();
-
     let file = temp_git.path().join("file.txt");
     let contents = Vec::from(b"foo");
     File::create(&file).unwrap().write_all(&contents).unwrap();
     create_commit(temp_git.path(), true);
-
     let file_link = temp_dir.path().join("file_link.txt");
     symlink(&file, &file_link).unwrap();
-
     assert_eq!(git::get_diff_base(&file_link).unwrap(), contents);
     assert_eq!(git::get_diff_base(&file).unwrap(), contents);
+}
+
+// ============================================================================
+// Tests for for_each_changed_file_between_refs()
+// ============================================================================
+
+#[test]
+fn for_each_changed_file_base_to_working_tree() {
+    let repo = empty_git_repo();
+
+    File::create(repo.path().join("file1.txt")).unwrap().write_all(b"content1").unwrap();
+    exec_git_cmd("add file1.txt", repo.path());
+    exec_git_cmd("commit -m first", repo.path());
+    let commit1_hash = exec_git_cmd_output("rev-parse HEAD", repo.path());
+
+    File::create(repo.path().join("file1.txt")).unwrap().write_all(b"content1 modified").unwrap();
+    File::create(repo.path().join("file2.txt")).unwrap().write_all(b"content2").unwrap();
+    exec_git_cmd("add .", repo.path());
+    exec_git_cmd("commit -m second", repo.path());
+
+    File::create(repo.path().join("file3.txt")).unwrap().write_all(b"content3").unwrap();
+    exec_git_cmd("add file3.txt", repo.path());
+    exec_git_cmd("commit -m third", repo.path());
+
+    let changes = RefCell::new(Vec::new());
+    git::for_each_changed_file_between_refs(repo.path(), &commit1_hash, None, |change| {
+        changes.borrow_mut().push(change.unwrap());
+        true
+    }).unwrap();
+
+    let changes = changes.into_inner();
+    assert_eq!(changes.len(), 3);
+    assert!(changes.iter().any(|c| matches!(c, FileChange::Modified { path } if path.ends_with("file1.txt"))));
+    assert!(changes.iter().any(|c| matches!(c, FileChange::Modified { path } if path.ends_with("file2.txt"))));
+    assert!(changes.iter().any(|c| matches!(c, FileChange::Modified { path } if path.ends_with("file3.txt"))));
+}
+
+#[test]
+fn for_each_changed_file_includes_working_tree() {
+    let repo = empty_git_repo();
+
+    File::create(repo.path().join("file1.txt")).unwrap().write_all(b"content1").unwrap();
+    exec_git_cmd("add file1.txt", repo.path());
+    exec_git_cmd("commit -m first", repo.path());
+    let commit1_hash = exec_git_cmd_output("rev-parse HEAD", repo.path());
+
+    File::create(repo.path().join("file2.txt")).unwrap().write_all(b"content2").unwrap();
+    exec_git_cmd("add file2.txt", repo.path());
+    exec_git_cmd("commit -m second", repo.path());
+
+    // Modify file1 in working tree only (not committed)
+    File::create(repo.path().join("file1.txt")).unwrap().write_all(b"working tree change").unwrap();
+
+    let changes = RefCell::new(Vec::new());
+    git::for_each_changed_file_between_refs(repo.path(), &commit1_hash, None, |change| {
+        changes.borrow_mut().push(change.unwrap());
+        true
+    }).unwrap();
+
+    let changes = changes.into_inner();
+    assert!(changes.iter().any(|c| matches!(c, FileChange::Modified { path } if path.ends_with("file1.txt"))));
+    assert!(changes.iter().any(|c| matches!(c, FileChange::Modified { path } if path.ends_with("file2.txt"))));
+}
+
+#[test]
+fn for_each_changed_file_commit_range() {
+    let repo = empty_git_repo();
+
+    File::create(repo.path().join("file1.txt")).unwrap().write_all(b"v1").unwrap();
+    exec_git_cmd("add file1.txt", repo.path());
+    exec_git_cmd("commit -m c1", repo.path());
+    let hash1 = exec_git_cmd_output("rev-parse HEAD", repo.path());
+
+    File::create(repo.path().join("file2.txt")).unwrap().write_all(b"v2").unwrap();
+    exec_git_cmd("add file2.txt", repo.path());
+    exec_git_cmd("commit -m c2", repo.path());
+
+    File::create(repo.path().join("file3.txt")).unwrap().write_all(b"v3").unwrap();
+    exec_git_cmd("add file3.txt", repo.path());
+    exec_git_cmd("commit -m c3", repo.path());
+    let hash3 = exec_git_cmd_output("rev-parse HEAD", repo.path());
+
+    let changes = RefCell::new(Vec::new());
+    git::for_each_changed_file_between_refs(repo.path(), &hash1, Some(&hash3), |change| {
+        changes.borrow_mut().push(change.unwrap());
+        true
+    }).unwrap();
+
+    let changes = changes.into_inner();
+    assert_eq!(changes.len(), 2);
+    assert!(changes.iter().any(|c| matches!(c, FileChange::Modified { path } if path.ends_with("file2.txt"))));
+    assert!(changes.iter().any(|c| matches!(c, FileChange::Modified { path } if path.ends_with("file3.txt"))));
+}
+
+#[test]
+fn for_each_changed_file_short_hash() {
+    let repo = empty_git_repo();
+
+    File::create(repo.path().join("file1.txt")).unwrap().write_all(b"content").unwrap();
+    exec_git_cmd("add file1.txt", repo.path());
+    exec_git_cmd("commit -m initial", repo.path());
+
+    File::create(repo.path().join("file2.txt")).unwrap().write_all(b"content2").unwrap();
+    exec_git_cmd("add file2.txt", repo.path());
+    exec_git_cmd("commit -m second", repo.path());
+    let full_hash = exec_git_cmd_output("rev-parse HEAD", repo.path());
+    let short_hash = &full_hash[..7];
+
+    File::create(repo.path().join("file3.txt")).unwrap().write_all(b"content3").unwrap();
+    exec_git_cmd("add file3.txt", repo.path());
+    exec_git_cmd("commit -m third", repo.path());
+
+    let changes = RefCell::new(Vec::new());
+    git::for_each_changed_file_between_refs(repo.path(), short_hash, None, |change| {
+        changes.borrow_mut().push(change.unwrap());
+        true
+    }).unwrap();
+
+    let changes = changes.into_inner();
+    assert_eq!(changes.len(), 1);
+    assert!(changes.iter().any(|c| matches!(c, FileChange::Modified { path } if path.ends_with("file3.txt"))));
+}
+
+#[test]
+fn for_each_changed_file_parent_ref_suffix() {
+    let repo = empty_git_repo();
+
+    File::create(repo.path().join("file1.txt")).unwrap().write_all(b"v1").unwrap();
+    exec_git_cmd("add file1.txt", repo.path());
+    exec_git_cmd("commit -m c1", repo.path());
+    let hash1 = exec_git_cmd_output("rev-parse HEAD", repo.path());
+
+    File::create(repo.path().join("file1.txt")).unwrap().write_all(b"v2").unwrap();
+    File::create(repo.path().join("file2.txt")).unwrap().write_all(b"new").unwrap();
+    exec_git_cmd("add .", repo.path());
+    exec_git_cmd("commit -m c2", repo.path());
+    let hash2 = exec_git_cmd_output("rev-parse HEAD", repo.path());
+
+    File::create(repo.path().join("file3.txt")).unwrap().write_all(b"filler").unwrap();
+    exec_git_cmd("add file3.txt", repo.path());
+    exec_git_cmd("commit -m c3", repo.path());
+
+    let changes_explicit = RefCell::new(Vec::new());
+    git::for_each_changed_file_between_refs(repo.path(), &hash1, Some(&hash2), |change| {
+        changes_explicit.borrow_mut().push(change.unwrap());
+        true
+    }).unwrap();
+
+    let hash2_parent = format!("{}^", hash2);
+    let changes_caret = RefCell::new(Vec::new());
+    git::for_each_changed_file_between_refs(repo.path(), &hash2_parent, Some(&hash2), |change| {
+        changes_caret.borrow_mut().push(change.unwrap());
+        true
+    }).unwrap();
+
+    assert_eq!(changes_explicit.into_inner().len(), 2);
+    assert_eq!(changes_caret.into_inner().len(), 2);
+
+    let base_from_hash1 = git::get_diff_base_from_ref(&repo.path().join("file1.txt"), &hash1).unwrap();
+    let base_from_parent = git::get_diff_base_from_ref(&repo.path().join("file1.txt"), &hash2_parent).unwrap();
+    assert_eq!(base_from_hash1, base_from_parent);
+}
+
+#[test]
+fn for_each_changed_file_deleted() {
+    let repo = empty_git_repo();
+
+    File::create(repo.path().join("keep.txt")).unwrap().write_all(b"keep").unwrap();
+    File::create(repo.path().join("delete.txt")).unwrap().write_all(b"delete").unwrap();
+    exec_git_cmd("add .", repo.path());
+    exec_git_cmd("commit -m first", repo.path());
+    let commit1_hash = exec_git_cmd_output("rev-parse HEAD", repo.path());
+
+    std::fs::remove_file(repo.path().join("delete.txt")).unwrap();
+    exec_git_cmd("add .", repo.path());
+    exec_git_cmd("commit -m second", repo.path());
+
+    let changes = RefCell::new(Vec::new());
+    git::for_each_changed_file_between_refs(repo.path(), &commit1_hash, None, |change| {
+        changes.borrow_mut().push(change.unwrap());
+        true
+    }).unwrap();
+
+    let changes = changes.into_inner();
+    assert_eq!(changes.len(), 1);
+    assert!(changes.iter().any(|c| matches!(c, FileChange::Deleted { path } if path.ends_with("delete.txt"))));
+}
+
+#[test]
+fn for_each_changed_file_deleted_in_range() {
+    let repo = empty_git_repo();
+
+    File::create(repo.path().join("keep.txt")).unwrap().write_all(b"keep").unwrap();
+    File::create(repo.path().join("delete.txt")).unwrap().write_all(b"delete").unwrap();
+    exec_git_cmd("add .", repo.path());
+    exec_git_cmd("commit -m first", repo.path());
+    let commit1_hash = exec_git_cmd_output("rev-parse HEAD", repo.path());
+
+    std::fs::remove_file(repo.path().join("delete.txt")).unwrap();
+    exec_git_cmd("add .", repo.path());
+    exec_git_cmd("commit -m second", repo.path());
+    let commit2_hash = exec_git_cmd_output("rev-parse HEAD", repo.path());
+
+    let changes = RefCell::new(Vec::new());
+    git::for_each_changed_file_between_refs(repo.path(), &commit1_hash, Some(&commit2_hash), |change| {
+        changes.borrow_mut().push(change.unwrap());
+        true
+    }).unwrap();
+
+    let changes = changes.into_inner();
+    assert_eq!(changes.len(), 1);
+    assert!(changes.iter().any(|c| matches!(c, FileChange::Deleted { path } if path.ends_with("delete.txt"))));
+}
+
+#[test]
+fn for_each_changed_file_head_vs_working_tree() {
+    let repo = empty_git_repo();
+
+    File::create(repo.path().join("file1.txt")).unwrap().write_all(b"committed").unwrap();
+    exec_git_cmd("add file1.txt", repo.path());
+    exec_git_cmd("commit -m initial", repo.path());
+
+    File::create(repo.path().join("file1.txt")).unwrap().write_all(b"modified in working tree").unwrap();
+
+    let changes = RefCell::new(Vec::new());
+    git::for_each_changed_file_between_refs(repo.path(), "HEAD", None, |change| {
+        changes.borrow_mut().push(change.unwrap());
+        true
+    }).unwrap();
+
+    let changes = changes.into_inner();
+    assert_eq!(changes.len(), 1);
+    assert!(changes.iter().any(|c| matches!(c, FileChange::Modified { path } if path.ends_with("file1.txt"))));
+}
+
+#[test]
+fn for_each_changed_file_multiple_file_types() {
+    let repo = empty_git_repo();
+
+    File::create(repo.path().join("existing.txt")).unwrap().write_all(b"existing").unwrap();
+    File::create(repo.path().join("modify.txt")).unwrap().write_all(b"will modify").unwrap();
+    File::create(repo.path().join("delete.txt")).unwrap().write_all(b"will delete").unwrap();
+    exec_git_cmd("add .", repo.path());
+    exec_git_cmd("commit -m first", repo.path());
+    let commit1_hash = exec_git_cmd_output("rev-parse HEAD", repo.path());
+
+    File::create(repo.path().join("modify.txt")).unwrap().write_all(b"modified").unwrap();
+    std::fs::remove_file(repo.path().join("delete.txt")).unwrap();
+    File::create(repo.path().join("new.txt")).unwrap().write_all(b"new file").unwrap();
+    exec_git_cmd("add .", repo.path());
+    exec_git_cmd("commit -m second", repo.path());
+
+    let changes = RefCell::new(Vec::new());
+    git::for_each_changed_file_between_refs(repo.path(), &commit1_hash, None, |change| {
+        changes.borrow_mut().push(change.unwrap());
+        true
+    }).unwrap();
+
+    let changes = changes.into_inner();
+    assert_eq!(changes.len(), 3);
+    assert!(changes.iter().any(|c| matches!(c, FileChange::Modified { path } if path.ends_with("modify.txt"))));
+    assert!(changes.iter().any(|c| matches!(c, FileChange::Deleted { path } if path.ends_with("delete.txt"))));
+    assert!(changes.iter().any(|c| matches!(c, FileChange::Modified { path } if path.ends_with("new.txt"))));
+}
+
+#[test]
+fn for_each_changed_file_from_root_commit() {
+    let repo = empty_git_repo();
+
+    File::create(repo.path().join("file1.txt")).unwrap().write_all(b"initial").unwrap();
+    exec_git_cmd("add file1.txt", repo.path());
+    exec_git_cmd("commit -m initial", repo.path());
+    let commit_hash = exec_git_cmd_output("rev-parse HEAD", repo.path());
+
+    File::create(repo.path().join("file2.txt")).unwrap().write_all(b"second").unwrap();
+    exec_git_cmd("add file2.txt", repo.path());
+    exec_git_cmd("commit -m second", repo.path());
+
+    let changes = RefCell::new(Vec::new());
+    git::for_each_changed_file_between_refs(repo.path(), &commit_hash, None, |change| {
+        changes.borrow_mut().push(change.unwrap());
+        true
+    }).unwrap();
+
+    let changes = changes.into_inner();
+    assert_eq!(changes.len(), 1);
+    assert!(changes.iter().any(|c| matches!(c, FileChange::Modified { path } if path.ends_with("file2.txt"))));
 }

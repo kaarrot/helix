@@ -4,3 +4,16 @@ helix-term/rustfmt.toml
 result
 runtime/grammars
 .DS_Store
+
+# Local dev artifacts
+kuba.md
+test_inline_diff.rs
+helix-course/
+helix-course-branch/
+helix-course-tech/
+runtime.7z
+hx_runtime
+helix.code-workspace
+config_with_error.toml
+.target-bench-nomold/
+.target-check/

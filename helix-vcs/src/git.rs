@@ -2,7 +2,7 @@ use anyhow::{bail, Context, Result};
 use arc_swap::ArcSwap;
 use gix::filter::plumbing::driver::apply::Delay;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use gix::bstr::ByteSlice;
@@ -27,10 +27,23 @@ fn get_repo_dir(file: &Path) -> Result<&Path> {
     file.parent().context("file has no parent directory")
 }
 
+/// Resolve a file path, handling the case where the file doesn't exist yet
+/// (e.g. a deleted file being diffed). Falls back to resolving the parent directory.
+fn resolve_file_path(file: &Path) -> Result<PathBuf> {
+    if file.exists() {
+        gix::path::realpath(file).context("resolve symlinks")
+    } else {
+        let parent = get_repo_dir(file)?;
+        let parent = gix::path::realpath(parent).context("resolve symlinks for parent")?;
+        let file_name = file.file_name().context("file has no file name")?;
+        Ok(parent.join(file_name))
+    }
+}
+
 pub fn get_diff_base(file: &Path) -> Result<Vec<u8>> {
     debug_assert!(!file.exists() || file.is_file());
     debug_assert!(file.is_absolute());
-    let file = gix::path::realpath(file).context("resolve symlinks")?;
+    let file = resolve_file_path(file)?;
 
     // TODO cache repository lookup
 
@@ -59,10 +72,40 @@ pub fn get_diff_base(file: &Path) -> Result<Vec<u8>> {
     }
 }
 
+pub fn get_diff_base_from_ref(file: &Path, ref_name: &str) -> Result<Vec<u8>> {
+    debug_assert!(!file.exists() || file.is_file());
+    debug_assert!(file.is_absolute());
+    let file = resolve_file_path(file)?;
+
+    let repo_dir = get_repo_dir(&file)?;
+    let repo = open_repo(repo_dir)
+        .context("failed to open git repo")?
+        .to_thread_local();
+
+    let commit = resolve_commit(&repo, ref_name)?;
+    let file_oid = find_file_in_commit(&repo, &commit, &file)?;
+
+    let file_object = repo.find_object(file_oid)?;
+    let data = file_object.detach().data;
+
+    if let Some(work_dir) = repo.workdir() {
+        let rela_path = file.strip_prefix(work_dir)?;
+        let rela_path = gix::path::try_into_bstr(rela_path)?;
+        let (mut pipeline, _) = repo.filter_pipeline(None)?;
+        let mut worktree_outcome =
+            pipeline.convert_to_worktree(&data, rela_path.as_ref(), Delay::Forbid)?;
+        let mut buf = Vec::with_capacity(data.len());
+        worktree_outcome.read_to_end(&mut buf)?;
+        Ok(buf)
+    } else {
+        Ok(data)
+    }
+}
+
 pub fn get_current_head_name(file: &Path) -> Result<Arc<ArcSwap<Box<str>>>> {
     debug_assert!(!file.exists() || file.is_file());
     debug_assert!(file.is_absolute());
-    let file = gix::path::realpath(file).context("resolve symlinks")?;
+    let file = resolve_file_path(file)?;
 
     let repo_dir = get_repo_dir(&file)?;
     let repo = open_repo(repo_dir)
@@ -81,6 +124,204 @@ pub fn get_current_head_name(file: &Path) -> Result<Arc<ArcSwap<Box<str>>>> {
 
 pub fn for_each_changed_file(cwd: &Path, f: impl Fn(Result<FileChange>) -> bool) -> Result<()> {
     status(&open_repo(cwd)?.to_thread_local(), f)
+}
+
+/// Iterate over changed files between a git ref and the working tree, or between two refs.
+///
+/// - `target_ref = None`: compare `base_ref` vs working tree (all changes since that ref)
+/// - `target_ref = Some(t)`: compare `base_ref` vs `t` (two-commit tree diff)
+pub fn for_each_changed_file_between_refs(
+    cwd: &Path,
+    base_ref: &str,
+    target_ref: Option<&str>,
+    f: impl Fn(Result<FileChange>) -> bool,
+) -> Result<()> {
+    let repo = open_repo(cwd)?.to_thread_local();
+
+    match target_ref {
+        None => {
+            let base_commit = resolve_commit(&repo, base_ref)?;
+            let head_commit = repo.head_commit()?;
+
+            if base_commit.id == head_commit.id {
+                return status(&repo, f);
+            }
+
+            let work_dir = repo
+                .workdir()
+                .ok_or_else(|| anyhow::anyhow!("working tree not found"))?
+                .to_path_buf();
+
+            let mut seen = std::collections::HashSet::new();
+            let base_tree = base_commit.tree()?;
+            let head_tree = head_commit.tree()?;
+            let mut cancelled = false;
+
+            base_tree.changes()?.for_each_to_obtain_tree(
+                &head_tree,
+                |change| -> Result<_, std::convert::Infallible> {
+                    use gix::object::tree::diff::Change;
+                    let file_change = match change {
+                        Change::Addition { entry_mode, .. } | Change::Modification { entry_mode, .. } | Change::Rewrite { entry_mode, .. } => {
+                            if entry_mode.is_blob() {
+                                Some(FileChange::Modified { path: work_dir.join(gix::path::from_bstr(change.location())) })
+                            } else { None }
+                        }
+                        Change::Deletion { entry_mode, .. } => {
+                            if entry_mode.is_blob() {
+                                Some(FileChange::Deleted { path: work_dir.join(gix::path::from_bstr(change.location())) })
+                            } else { None }
+                        }
+                    };
+                    if let Some(change_item) = file_change {
+                        seen.insert(change_item.path().to_path_buf());
+                        if !f(Ok(change_item)) {
+                            cancelled = true;
+                            return Ok(gix::object::tree::diff::Action::Cancel);
+                        }
+                    }
+                    Ok(gix::object::tree::diff::Action::Continue)
+                },
+            )?;
+
+            if !cancelled {
+                status(&repo, |change| match &change {
+                    Ok(fc) if seen.contains(fc.path()) => true,
+                    _ => f(change),
+                })?;
+            }
+        }
+        Some(target) => {
+            let base_commit = resolve_commit(&repo, base_ref)?;
+            let target_commit = resolve_commit(&repo, target)?;
+            let work_dir = repo
+                .workdir()
+                .ok_or_else(|| anyhow::anyhow!("working tree not found"))?
+                .to_path_buf();
+
+            let base_tree = base_commit.tree()?;
+            let target_tree = target_commit.tree()?;
+
+            base_tree.changes()?.for_each_to_obtain_tree(
+                &target_tree,
+                |change| -> Result<_, std::convert::Infallible> {
+                    use gix::object::tree::diff::Change;
+                    let file_change = match change {
+                        Change::Addition { entry_mode, .. } | Change::Modification { entry_mode, .. } | Change::Rewrite { entry_mode, .. } => {
+                            if entry_mode.is_blob() {
+                                Some(FileChange::Modified { path: work_dir.join(gix::path::from_bstr(change.location())) })
+                            } else { None }
+                        }
+                        Change::Deletion { entry_mode, .. } => {
+                            if entry_mode.is_blob() {
+                                Some(FileChange::Deleted { path: work_dir.join(gix::path::from_bstr(change.location())) })
+                            } else { None }
+                        }
+                    };
+                    if let Some(change_item) = file_change {
+                        if !f(Ok(change_item)) {
+                            return Ok(gix::object::tree::diff::Action::Cancel);
+                        }
+                    }
+                    Ok(gix::object::tree::diff::Action::Continue)
+                },
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Iterate over files changed between a specific commit and HEAD.
+pub fn for_each_changed_file_between_commits(
+    cwd: &Path,
+    ref_name: &str,
+    f: impl Fn(Result<FileChange>) -> bool,
+) -> Result<()> {
+    let repo = open_repo(cwd)?.to_thread_local();
+    let work_dir = repo
+        .workdir()
+        .ok_or_else(|| anyhow::anyhow!("working tree not found"))?
+        .to_path_buf();
+
+    let head_commit = repo.head_commit()?;
+    let target_commit = resolve_commit(&repo, ref_name)?;
+    let head_tree = head_commit.tree()?;
+    let target_tree = target_commit.tree()?;
+
+    target_tree.changes()?.for_each_to_obtain_tree(
+        &head_tree,
+        |change| -> Result<_, std::convert::Infallible> {
+            use gix::object::tree::diff::Change;
+            let file_change = match change {
+                Change::Addition { entry_mode, .. } | Change::Modification { entry_mode, .. } | Change::Rewrite { entry_mode, .. } => {
+                    if entry_mode.is_blob() {
+                        Some(FileChange::Modified { path: work_dir.join(gix::path::from_bstr(change.location())) })
+                    } else { None }
+                }
+                Change::Deletion { entry_mode, .. } => {
+                    if entry_mode.is_blob() {
+                        Some(FileChange::Deleted { path: work_dir.join(gix::path::from_bstr(change.location())) })
+                    } else { None }
+                }
+            };
+            if let Some(change_item) = file_change {
+                if !f(Ok(change_item)) {
+                    return Ok(gix::object::tree::diff::Action::Cancel);
+                }
+            }
+            Ok(gix::object::tree::diff::Action::Continue)
+        },
+    )?;
+
+    Ok(())
+}
+
+/// Resolve a git reference or commit hash (full or short, with optional `^` parent suffix).
+fn resolve_commit<'a>(repo: &'a Repository, ref_name: &str) -> Result<Commit<'a>> {
+    if let Some(base) = ref_name.strip_suffix('^') {
+        let commit = resolve_commit(repo, base)?;
+        let parent_id = commit
+            .parent_ids()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("commit {} has no parent (root commit)", commit.id))?;
+        return repo
+            .find_object(parent_id)?
+            .try_into_commit()
+            .context(format!("parent of '{}' is not a commit", base));
+    }
+
+    if let Ok(reference) = repo.find_reference(ref_name) {
+        let object_id = reference.into_fully_peeled_id()?.detach();
+        return repo
+            .find_object(object_id)?
+            .try_into_commit()
+            .context(format!("'{}' is not a commit", ref_name));
+    }
+
+    let prefix = gix::hash::Prefix::from_hex(ref_name).context(format!(
+        "'{}' is not a valid reference or commit hash",
+        ref_name
+    ))?;
+
+    let maybe_oid = repo
+        .objects
+        .lookup_prefix(prefix, None)
+        .context("failed to lookup object by hash")?;
+
+    let object_id = match maybe_oid {
+        Some(oid) => oid.map_err(|_| {
+            anyhow::anyhow!(
+                "ambiguous hash prefix '{}'; try using more characters",
+                ref_name
+            )
+        })?,
+        None => bail!("no commit found with hash '{}'", ref_name),
+    };
+
+    repo.find_object(object_id)?
+        .try_into_commit()
+        .context(format!("'{}' is not a commit", ref_name))
 }
 
 fn open_repo(path: &Path) -> Result<ThreadSafeRepository> {

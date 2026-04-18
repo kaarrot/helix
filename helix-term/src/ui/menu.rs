@@ -192,6 +192,10 @@ impl<T: Item> Menu<T> {
         self.matches.len()
     }
 
+    pub fn cursor(&self) -> Option<usize> {
+        self.cursor
+    }
+
     /// Iterator over the currently-matched items, paired with a `selected` flag
     /// indicating whether the item is the cursor selection.
     pub fn matched_items(&self) -> impl Iterator<Item = (&T, bool)> + '_ {

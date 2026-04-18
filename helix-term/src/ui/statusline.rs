@@ -560,6 +560,9 @@ fn render_version_control<'a, F>(context: &mut RenderContext<'a>, write: F)
 where
     F: Fn(&mut RenderContext<'a>, Span<'a>) + Copy,
 {
+    if suggestions_taking_over(context) {
+        return;
+    }
     let head = context
         .doc
         .version_control_head()
@@ -599,6 +602,9 @@ fn render_cwd<'a, F>(context: &mut RenderContext<'a>, write: F)
 where
     F: Fn(&mut RenderContext<'a>, Span<'a>) + Copy,
 {
+    if suggestions_taking_over(context) {
+        return;
+    }
     let cwd = helix_stdx::env::current_working_dir();
     let cwd = cwd
         .file_name()
@@ -662,8 +668,12 @@ where
     let unselected_style = context.editor.theme.get("ui.menu");
     let selected_style = context.editor.theme.get("ui.menu.selected");
 
+    let window_start = completion
+        .cursor()
+        .map_or(0, |c| c.saturating_sub(MAX_ITEMS - 1));
+
     let mut wrote_any = false;
-    for (item, selected) in completion.matched_items().take(MAX_ITEMS) {
+    for (item, selected) in completion.matched_items().skip(window_start).take(MAX_ITEMS) {
         let label = match item {
             CompletionItem::Lsp(LspCompletionItem { item, .. }) => item.label.as_str(),
             CompletionItem::Other(CoreCompletionItem { label, .. }) => label.as_ref(),

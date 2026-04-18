@@ -451,6 +451,10 @@ impl Completion {
         self.popup.contents().matched_items()
     }
 
+    pub fn cursor(&self) -> Option<usize> {
+        self.popup.contents().cursor()
+    }
+
     pub fn replace_item(
         &mut self,
         old_item: &impl PartialEq<CompletionItem>,

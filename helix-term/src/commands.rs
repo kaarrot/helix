@@ -3407,6 +3407,13 @@ fn changed_file_picker(cx: &mut Context) {
             move |cx, meta: &FileChange, _action| {
                 cx.editor.last_changed_file_selection = Some(meta.path().to_path_buf());
                 let path = meta.path();
+                // Conflict files open the 3-way merge view directly
+                if matches!(meta, FileChange::Conflict { .. }) {
+                    if let Err(e) = cx.editor.open_merge_view(path) {
+                        cx.editor.set_error(format!("Failed to open merge view: {e}"));
+                    }
+                    return;
+                }
                 if let Err(e) = cx.editor.open_diff_view_range(
                     path, &base_ref_cb, target_ref_cb.as_deref(), None,
                 ) {

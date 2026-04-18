@@ -375,6 +375,9 @@ fn render_position<'a, F>(context: &mut RenderContext<'a>, write: F)
 where
     F: Fn(&mut RenderContext<'a>, Span<'a>) + Copy,
 {
+    if suggestions_taking_over(context) {
+        return;
+    }
     let position = get_position(context);
     write(
         context,
@@ -386,6 +389,9 @@ fn render_total_line_numbers<'a, F>(context: &mut RenderContext<'a>, write: F)
 where
     F: Fn(&mut RenderContext<'a>, Span<'a>) + Copy,
 {
+    if suggestions_taking_over(context) {
+        return;
+    }
     let total_line_numbers = context.doc.text().len_lines();
 
     write(context, format!(" {} ", total_line_numbers).into());
@@ -395,6 +401,9 @@ fn render_position_percentage<'a, F>(context: &mut RenderContext<'a>, write: F)
 where
     F: Fn(&mut RenderContext<'a>, Span<'a>) + Copy,
 {
+    if suggestions_taking_over(context) {
+        return;
+    }
     let position = get_position(context);
     let maxrows = context.doc.text().len_lines();
     write(

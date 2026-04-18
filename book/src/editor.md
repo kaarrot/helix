@@ -180,9 +180,13 @@ left = ["mode", "spinner", "completion-suggestions", "file-name", "read-only-ind
 | `both` | ✓ | ✓ |
 
 While the statusline strip is active in insert mode it temporarily replaces the
-path elements (`file-name`, `file-absolute-path`, `file-base-name`) so that the
-full width is available for suggestions. The path reappears as soon as you leave
-insert mode or the completion popup closes.
+path elements (`file-name`, `file-absolute-path`, `file-base-name`) and the
+cursor-position elements (`position`, `position-percentage`, `total-line-numbers`)
+so that the full width is available for suggestions. The cursor row/column is
+still visible via the gutter, so hiding the position elements during completion
+avoids them being drawn on top of the suggestions on narrow terminals. The path
+and position reappear as soon as you leave insert mode or the completion popup
+closes.
 
 **Insert mode** — suggestions replace the file path, with the currently
 selected candidate highlighted:

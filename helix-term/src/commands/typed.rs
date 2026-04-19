@@ -1447,47 +1447,6 @@ fn reload(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> anyh
     Ok(())
 }
 
-fn diff_base(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow::Result<()> {
-    if event != PromptEvent::Validate {
-        return Ok(());
-    }
-
-    let scrolloff = cx.editor.config().scrolloff;
-    let (view, doc) = current!(cx.editor);
-
-    let commit_ref = if args.is_empty() {
-        // No args means reset to HEAD
-        None
-    } else {
-        Some(args.get(0).unwrap().to_string())
-    };
-
-    // Set or reset the diff base
-    let result = match commit_ref.clone() {
-        Some(ref_name) => doc.set_diff_base_from_ref(ref_name),
-        None => doc.reset_diff_base(),
-    };
-    if let Err(e) = result {
-        cx.editor.set_error(format!("failed to set diff base: {e}"));
-        return Ok(());
-    }
-
-    // Reload the document to refresh the diff with the new base
-    doc.reload(view, &cx.editor.diff_providers).map(|_| {
-        view.ensure_cursor_in_view(doc, scrolloff);
-    })?;
-
-    // Show status message
-    let msg = if let Some(ref commit) = commit_ref {
-        format!("Diff base set to: {}", commit)
-    } else {
-        "Diff base reset to HEAD".to_string()
-    };
-    cx.editor.set_status(msg);
-
-    Ok(())
-}
-
 fn reload_all(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> anyhow::Result<()> {
     if event != PromptEvent::Validate {
         return Ok(());
@@ -2798,224 +2757,6 @@ pub const SHELL_COMPLETER: CommandCompleter = CommandCompleter::positional(&[
     completers::repeating_filenames,
 ]);
 
-fn toggle_char_diff(
-    cx: &mut compositor::Context,
-    _args: Args,
-    event: PromptEvent,
-) -> anyhow::Result<()> {
-    if event != PromptEvent::Validate {
-        return Ok(());
-    }
-
-    let (_view, doc) = current!(cx.editor);
-    doc.char_diff_enabled = !doc.char_diff_enabled;
-
-    let status = if doc.char_diff_enabled {
-        "Character-level diff highlighting enabled"
-    } else {
-        "Character-level diff highlighting disabled"
-    };
-
-    cx.editor.set_status(status);
-
-    // Force a redraw to apply the decoration
-    cx.editor.clear_idle_timer();
-
-    Ok(())
-}
-
-fn diff_commit(
-    cx: &mut compositor::Context,
-    args: Args,
-    event: PromptEvent,
-) -> anyhow::Result<()> {
-    use helix_view::editor::DiffRange;
-
-    if event != PromptEvent::Validate {
-        return Ok(());
-    }
-
-    let range_str = args.first().context("missing git reference argument")?;
-
-    let diff_range = DiffRange::parse(range_str)
-        .with_context(|| format!("failed to parse diff range: {}", range_str))?;
-    let display = diff_range.display();
-    cx.editor.diff_range = Some(diff_range);
-    cx.editor
-        .set_status(format!("Diff range set to: {} — use space+g to browse files", display));
-
-    Ok(())
-}
-
-fn open_merge_view(
-    cx: &mut compositor::Context,
-    _args: Args,
-    event: PromptEvent,
-) -> anyhow::Result<()> {
-    if event != PromptEvent::Validate {
-        return Ok(());
-    }
-    let path = doc!(cx.editor).path()
-        .map(|p| p.to_path_buf())
-        .context("Current buffer has no file path")?;
-    cx.editor.open_merge_view(&path).map_err(|e| anyhow::anyhow!("{e}"))
-}
-
-fn diff_reset(
-    cx: &mut compositor::Context,
-    _args: Args,
-    event: PromptEvent,
-) -> anyhow::Result<()> {
-    if event != PromptEvent::Validate {
-        return Ok(());
-    }
-
-    cx.editor.diff_range = None;
-
-    // Collect HEAD diff bases for all documents before mutating
-    let diff_bases: Vec<_> = cx
-        .editor
-        .documents
-        .iter()
-        .filter_map(|(id, doc)| {
-            let path = doc.path()?.to_path_buf();
-            let diff_base = cx.editor.diff_providers.get_diff_base(&path)?;
-            Some((*id, diff_base))
-        })
-        .collect();
-
-    for (_, doc) in cx.editor.documents.iter_mut() {
-        doc.char_diff_enabled = false;
-    }
-    for (id, diff_base) in diff_bases {
-        if let Some(doc) = cx.editor.documents.get_mut(&id) {
-            doc.set_diff_base(diff_base);
-        }
-    }
-
-    cx.editor.set_status("Diff reset to HEAD");
-
-    Ok(())
-}
-
-fn diff_files(
-    cx: &mut compositor::Context,
-    args: Args,
-    event: PromptEvent,
-) -> anyhow::Result<()> {
-    use helix_vcs::FileChange;
-    use helix_view::theme::Style;
-    use std::path::PathBuf;
-
-    if event != PromptEvent::Validate {
-        return Ok(());
-    }
-
-    let ref_name = args.first().context("missing git reference argument")?;
-    let ref_name_owned = ref_name.to_string();
-
-    let cwd = helix_stdx::env::current_working_dir();
-    if !cwd.exists() {
-        cx.editor
-            .set_error("Current working directory does not exist");
-        return Ok(());
-    }
-
-    let modified = cx.editor.theme.get("diff.delta");
-    let deleted = cx.editor.theme.get("diff.minus");
-    let renamed = cx.editor.theme.get("diff.delta.moved");
-
-    let callback = async move {
-        use tui::text::Span;
-
-        #[derive(Clone)]
-        pub struct DiffFileChangeData {
-            cwd: PathBuf,
-            style_modified: Style,
-            style_deleted: Style,
-            style_renamed: Style,
-        }
-
-        let call: job::Callback = job::Callback::EditorCompositor(Box::new(
-            move |_editor: &mut Editor, compositor: &mut Compositor| {
-                let columns = [
-                    ui::PickerColumn::new("change", |change: &FileChange, data: &DiffFileChangeData| {
-                        match change {
-                            FileChange::Modified { .. } => Span::styled("~ modified", data.style_modified),
-                            FileChange::Deleted { .. } => Span::styled("- deleted", data.style_deleted),
-                            FileChange::Renamed { .. } => Span::styled("> renamed", data.style_renamed),
-                            _ => Span::raw("  changed"),
-                        }
-                        .into()
-                    }),
-                    ui::PickerColumn::new("path", |change: &FileChange, data: &DiffFileChangeData| {
-                        let display_path = |path: &PathBuf| {
-                            path.strip_prefix(&data.cwd)
-                                .unwrap_or(path)
-                                .display()
-                                .to_string()
-                        };
-                        match change {
-                            FileChange::Modified { path } => display_path(path),
-                            FileChange::Deleted { path } => display_path(path),
-                            FileChange::Renamed { from_path, to_path} => {
-                                format!("{} -> {}", display_path(from_path), display_path(to_path))
-                            }
-                            FileChange::Untracked { path } => display_path(path),
-                            FileChange::Conflict { path } => display_path(path),
-                        }
-                        .into()
-                    }),
-                ];
-
-                let ref_name_for_callback = ref_name_owned.clone();
-                let picker = ui::Picker::new(
-                    columns,
-                    1, // path column
-                    [],
-                    DiffFileChangeData {
-                        cwd: cwd.clone(),
-                        style_modified: modified,
-                        style_deleted: deleted,
-                        style_renamed: renamed,
-                    },
-                    move |cx, meta: &FileChange, _action| {
-                        let path = meta.path();
-                        if let Err(e) = cx.editor.open_diff_view(path, &ref_name_for_callback, None) {
-                            cx.editor.set_error(format!("Failed to open diff view: {e}"));
-                        }
-                    },
-                )
-                .with_preview(|_editor, meta| Some((meta.path().into(), None)));
-
-                let injector = picker.injector();
-                let ref_name_for_thread = ref_name_owned.clone();
-
-                // Spawn thread to populate the picker with changed files
-                std::thread::spawn(move || {
-                    use helix_vcs::git;
-                    let result = git::for_each_changed_file_between_commits(&cwd, &ref_name_for_thread, move |change| {
-                        match change {
-                            Ok(change) => injector.push(change).is_ok(),
-                            Err(_err) => true,
-                        }
-                    });
-
-                    if let Err(err) = result {
-                        log::error!("Failed to get diff files: {}", err);
-                    }
-                });
-
-                compositor.push(Box::new(overlaid(picker)));
-            },
-        ));
-        Ok(call)
-    };
-
-    cx.jobs.callback(callback);
-    Ok(())
-}
-
 const WRITE_NO_FORMAT_FLAG: Flag = Flag {
     name: "no-format",
     doc: "skip auto-formatting",
@@ -3608,7 +3349,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         name: "diff-base",
         aliases: &["db"],
         doc: "Set diff base to a specific commit (branch, tag, SHA, or HEAD~N). No arguments resets to HEAD.",
-        fun: diff_base,
+        fun: typed_diff::diff_base,
         completer: CommandCompleter::none(),
         signature: Signature {
             positionals: (0, Some(1)),
@@ -4063,7 +3804,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         name: "toggle-char-diff",
         aliases: &["tcd"],
         doc: "Toggle character-level diff highlighting for the current buffer.",
-        fun: toggle_char_diff,
+        fun: typed_diff::toggle_char_diff,
         completer: CommandCompleter::none(),
         signature: Signature {
             positionals: (0, Some(0)),
@@ -4074,7 +3815,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         name: "diff-commit",
         aliases: &["dc"],
         doc: "Set the diff range for the space+g changed-file picker. Accepts: REF (REF vs working tree), REF! (changes introduced by REF, i.e. REF^..REF), or REF1..REF2 (changes between two refs).",
-        fun: diff_commit,
+        fun: typed_diff::diff_commit,
         completer: CommandCompleter::none(),
         signature: Signature {
             positionals: (1, Some(1)),
@@ -4085,7 +3826,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         name: "diff-reset",
         aliases: &["dr"],
         doc: "Reset the diff base to HEAD (default behavior).",
-        fun: diff_reset,
+        fun: typed_diff::diff_reset_typed,
         completer: CommandCompleter::none(),
         signature: Signature {
             positionals: (0, Some(0)),
@@ -4096,7 +3837,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         name: "diff-files",
         aliases: &["df"],
         doc: "Show a picker with all files changed between current branch and specified commit.",
-        fun: diff_files,
+        fun: typed_diff::diff_files,
         completer: CommandCompleter::none(),
         signature: Signature {
             positionals: (1, Some(1)),
@@ -4107,7 +3848,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         name: "merge",
         aliases: &["3way"],
         doc: "Open a 3-way merge view for the current conflicted file.",
-        fun: open_merge_view,
+        fun: typed_diff::open_merge_view,
         completer: CommandCompleter::none(),
         signature: Signature {
             positionals: (0, Some(0)),

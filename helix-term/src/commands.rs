@@ -3,6 +3,7 @@ pub(crate) mod diff;
 pub(crate) mod lsp;
 pub(crate) mod syntax;
 pub(crate) mod typed;
+pub(crate) mod typed_diff;
 
 pub use dap::*;
 pub(crate) use diff::*;

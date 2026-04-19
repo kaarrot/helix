@@ -2829,32 +2829,20 @@ fn diff_commit(
     args: Args,
     event: PromptEvent,
 ) -> anyhow::Result<()> {
+    use helix_view::editor::DiffRange;
+
     if event != PromptEvent::Validate {
         return Ok(());
     }
 
-    let ref_name = args.first().context("missing git reference argument")?;
-    let ref_name_owned = ref_name.to_string();
+    let range_str = args.first().context("missing git reference argument")?;
 
-    let result = {
-        let (_view, doc) = current!(cx.editor);
-        doc.set_diff_base_from_ref(ref_name_owned.clone())
-    };
-
-    match result {
-        Ok(()) => {
-            // Always enable char diff highlighting
-            let (_view, doc) = current!(cx.editor);
-            doc.char_diff_enabled = true;
-
-            cx.editor
-                .set_status(format!("Diff base set to: {} (char diff enabled)", ref_name));
-            cx.editor.clear_idle_timer();
-        }
-        Err(err) => {
-            cx.editor.set_error(format!("Failed to set diff base: {}", err));
-        }
-    }
+    let diff_range = DiffRange::parse(range_str)
+        .with_context(|| format!("failed to parse diff range: {}", range_str))?;
+    let display = diff_range.display();
+    cx.editor.diff_range = Some(diff_range);
+    cx.editor
+        .set_status(format!("Diff range set to: {} — use space+g to browse files", display));
 
     Ok(())
 }
@@ -4085,7 +4073,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     TypableCommand {
         name: "diff-commit",
         aliases: &["dc"],
-        doc: "Set the diff base to a specific git reference (branch, tag, or commit hash).",
+        doc: "Set the diff range for the space+g changed-file picker. Accepts: REF (REF vs working tree), REF! (changes introduced by REF, i.e. REF^..REF), or REF1..REF2 (changes between two refs).",
         fun: diff_commit,
         completer: CommandCompleter::none(),
         signature: Signature {

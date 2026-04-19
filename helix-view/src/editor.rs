@@ -1190,6 +1190,10 @@ pub struct MergeViewState {
     pub theirs_view_id: ViewId,
     pub result_view_id: ViewId,
     pub sync_scroll: bool,
+    /// Tracks the last accept so a follow-up accept (e.g. ours → theirs)
+    /// replaces the inserted text instead of searching for markers that
+    /// no longer exist. Cleared on conflict navigation.
+    pub last_resolution: Option<crate::merge_view::LastResolution>,
 }
 
 impl MergeViewState {
@@ -2947,6 +2951,7 @@ impl Editor {
             ours_doc_id, theirs_doc_id, result_doc_id,
             ours_view_id, theirs_view_id, result_view_id,
             sync_scroll: true,
+            last_resolution: None,
         };
         self.merge_views.insert(ours_view_id, state.clone());
         self.merge_views.insert(theirs_view_id, state.clone());

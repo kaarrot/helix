@@ -5905,19 +5905,80 @@ fn close_diff_or_merge_view(cx: &mut Context) {
     }
 }
 
+#[derive(Copy, Clone)]
+enum AcceptSide { Ours, Theirs, Both }
+
+impl AcceptSide {
+    fn pick(self, ours: &str, theirs: &str, both: &str) -> String {
+        match self {
+            AcceptSide::Ours => ours.to_string(),
+            AcceptSide::Theirs => theirs.to_string(),
+            AcceptSide::Both => both.to_string(),
+        }
+    }
+    fn label(self) -> &'static str {
+        match self {
+            AcceptSide::Ours => "HEAD",
+            AcceptSide::Theirs => "incoming",
+            AcceptSide::Both => "both",
+        }
+    }
+}
+
 fn merge_accept_ours(cx: &mut Context) {
-    merge_accept_impl(cx, true);
+    merge_accept_impl(cx, AcceptSide::Ours);
 }
 
 fn merge_accept_theirs(cx: &mut Context) {
-    merge_accept_impl(cx, false);
+    merge_accept_impl(cx, AcceptSide::Theirs);
 }
 
 fn merge_accept_both(cx: &mut Context) {
-    use helix_view::merge_view::{find_conflicts, extract_sides};
-    let (view, doc) = current!(cx.editor);
-    let cursor_line = doc.selection(view.id).primary().cursor_line(doc.text().slice(..));
-    let text = doc.text().clone();
+    merge_accept_impl(cx, AcceptSide::Both);
+}
+
+fn merge_accept_impl(cx: &mut Context, side: AcceptSide) {
+    use helix_view::merge_view::{find_conflicts, extract_sides, LastResolution};
+
+    let view_id = view!(cx.editor).id;
+    let doc_id = doc!(cx.editor).id();
+
+    // 1. If we just resolved a conflict and the cursor is still inside the
+    //    inserted replacement, replace it again with the new side instead of
+    //    hunting for markers that no longer exist.
+    let prior = cx.editor.merge_views.get(&view_id)
+        .and_then(|s| s.last_resolution.clone());
+    if let Some(prior) = prior {
+        let (view, doc) = current!(cx.editor);
+        let cursor = doc.selection(view.id).primary().cursor(doc.text().slice(..));
+        if cursor >= prior.start_char && cursor <= prior.end_char {
+            let replacement = side.pick(&prior.ours, &prior.theirs, &prior.both);
+            let new_end = prior.start_char + replacement.chars().count();
+            let text = doc.text();
+            let tx = helix_core::Transaction::change(
+                text,
+                std::iter::once((prior.start_char, prior.end_char, Some(replacement.clone().into()))),
+            );
+            doc.apply(&tx, view_id);
+            let new_resolution = LastResolution {
+                start_char: prior.start_char,
+                end_char: new_end,
+                ours: prior.ours,
+                theirs: prior.theirs,
+                both: prior.both,
+            };
+            update_last_resolutions(&mut cx.editor.merge_views, doc_id, Some(new_resolution));
+            cx.editor.set_status(format!("Switched to {} version", side.label()));
+            return;
+        }
+    }
+
+    // 2. Otherwise find a real conflict at cursor and resolve it.
+    let text = doc!(cx.editor).text().clone();
+    let cursor_line = {
+        let (view, doc) = current_ref!(cx.editor);
+        doc.selection(view.id).primary().cursor_line(doc.text().slice(..))
+    };
 
     let Some(region) = find_conflicts(&text).into_iter().find(|r| {
         cursor_line >= r.start_line && cursor_line <= r.end_line
@@ -5930,40 +5991,9 @@ fn merge_accept_both(cx: &mut Context) {
         cx.editor.set_error("Malformed conflict markers");
         return;
     };
-    let combined = format!("{}{}", ours, theirs);
-    apply_conflict_resolution(cx, &region, combined);
-    cx.editor.set_status("Accepted both versions");
-}
+    let both = format!("{}{}", ours, theirs);
+    let replacement = side.pick(&ours, &theirs, &both);
 
-fn merge_accept_impl(cx: &mut Context, accept_ours: bool) {
-    use helix_view::merge_view::{find_conflicts, extract_sides};
-    let (view, doc) = current!(cx.editor);
-    let cursor_line = doc.selection(view.id).primary().cursor_line(doc.text().slice(..));
-    let text = doc.text().clone();
-
-    let Some(region) = find_conflicts(&text).into_iter().find(|r| {
-        cursor_line >= r.start_line && cursor_line <= r.end_line
-    }) else {
-        cx.editor.set_status("No conflict at cursor");
-        return;
-    };
-
-    let Some((ours, _, theirs)) = extract_sides(&text, &region) else {
-        cx.editor.set_error("Malformed conflict markers");
-        return;
-    };
-
-    let replacement = if accept_ours { ours } else { theirs };
-    let side = if accept_ours { "HEAD" } else { "incoming" };
-    apply_conflict_resolution(cx, &region, replacement);
-    cx.editor.set_status(format!("Accepted {} version", side));
-}
-
-fn apply_conflict_resolution(
-    cx: &mut Context,
-    region: &helix_view::merge_view::ConflictRegion,
-    replacement: String,
-) {
     let (view, doc) = current!(cx.editor);
     let text = doc.text();
     let start_char = text.line_to_char(region.start_line);
@@ -5972,12 +6002,35 @@ fn apply_conflict_resolution(
     } else {
         text.len_chars()
     };
-    let view_id = view.id;
-    let transaction = helix_core::Transaction::change(
+    let new_end = start_char + replacement.chars().count();
+    let tx = helix_core::Transaction::change(
         text,
-        std::iter::once((start_char, end_char, Some(replacement.into()))),
+        std::iter::once((start_char, end_char, Some(replacement.clone().into()))),
     );
-    doc.apply(&transaction, view_id);
+    doc.apply(&tx, view.id);
+    let new_resolution = LastResolution {
+        start_char,
+        end_char: new_end,
+        ours,
+        theirs,
+        both,
+    };
+    update_last_resolutions(&mut cx.editor.merge_views, doc_id, Some(new_resolution));
+    cx.editor.set_status(format!("Accepted {} version", side.label()));
+}
+
+/// Update `last_resolution` on every MergeViewState entry tied to the given
+/// result doc. Passing `None` clears the resolution (e.g. on conflict navigation).
+fn update_last_resolutions(
+    merge_views: &mut std::collections::HashMap<ViewId, helix_view::editor::MergeViewState>,
+    result_doc_id: DocumentId,
+    value: Option<helix_view::merge_view::LastResolution>,
+) {
+    for state in merge_views.values_mut() {
+        if state.result_doc_id == result_doc_id {
+            state.last_resolution = value.clone();
+        }
+    }
 }
 
 fn merge_next_conflict(cx: &mut Context) {
@@ -5992,9 +6045,13 @@ fn merge_jump_impl(cx: &mut Context, direction: Direction) {
     use helix_view::merge_view::find_conflicts;
     let (view, doc) = current!(cx.editor);
     let view_id = view.id;
+    let doc_id = doc.id();
     let cursor_line = doc.selection(view_id).primary().cursor_line(doc.text().slice(..));
     let text = doc.text().clone();
     let conflicts = find_conflicts(&text);
+
+    // Moving to a new conflict invalidates the switch-without-undo shortcut.
+    update_last_resolutions(&mut cx.editor.merge_views, doc_id, None);
 
     if conflicts.is_empty() {
         cx.editor.set_status("No conflicts remaining");

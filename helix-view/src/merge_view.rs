@@ -1,5 +1,18 @@
 use helix_core::Rope;
 
+/// Remembers the last conflict resolution so a follow-up accept replaces it
+/// instead of failing to find markers that no longer exist.
+#[derive(Debug, Clone)]
+pub struct LastResolution {
+    /// Absolute char offset where the replacement begins in the RESULT doc.
+    pub start_char: usize,
+    /// Absolute char offset where the replacement ends (exclusive).
+    pub end_char: usize,
+    pub ours: String,
+    pub theirs: String,
+    pub both: String,
+}
+
 /// Parse `<<<<<<<` / `=======` / `>>>>>>>` conflict markers from a rope
 /// and return the line ranges of each conflict block.
 pub struct ConflictRegion {

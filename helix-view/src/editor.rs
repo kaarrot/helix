@@ -1240,16 +1240,8 @@ pub struct Editor {
     pub language_servers: helix_lsp::Registry,
     pub diagnostics: Diagnostics,
     pub diff_providers: DiffProviderRegistry,
-    /// Current diff range used by space+g picker and diff-commit workflow.
-    pub diff_range: Option<DiffRange>,
-    /// Remembers the last file selected in the changed-file picker for pre-selection.
-    pub last_changed_file_selection: Option<PathBuf>,
-    /// Active side-by-side diff sessions, keyed by ViewId (both panes registered).
-    pub diff_views: HashMap<ViewId, crate::diff_view::DiffViewState>,
-    /// Per-session split_view override (set by diff-commit, cleared on close).
-    pub diff_session_split_view_override: Option<bool>,
-    /// Active 3-way merge sessions, keyed by ViewId (all three panes registered).
-    pub merge_views: HashMap<ViewId, MergeViewState>,
+    /// All diff/merge runtime state (range, active views, merge sessions, etc.).
+    pub diff: crate::diff_view::DiffSession,
 
     pub debug_adapters: dap::registry::Registry,
     pub breakpoints: HashMap<PathBuf, Vec<Breakpoint>>,
@@ -1396,11 +1388,7 @@ impl Editor {
             language_servers,
             diagnostics: Diagnostics::new(),
             diff_providers: DiffProviderRegistry::default(),
-            diff_range: None,
-            last_changed_file_selection: None,
-            diff_views: HashMap::new(),
-            diff_session_split_view_override: None,
-            merge_views: HashMap::new(),
+            diff: crate::diff_view::DiffSession::default(),
             debug_adapters: dap::registry::Registry::new(),
             breakpoints: HashMap::new(),
             syn_loader,
@@ -2000,10 +1988,10 @@ impl Editor {
 
     pub fn close(&mut self, id: ViewId) {
         // Clean up any diff/merge session that owns this view.
-        if self.diff_views.contains_key(&id) {
+        if self.diff.views.contains_key(&id) {
             self.close_diff_view(id);
         }
-        if self.merge_views.contains_key(&id) {
+        if self.diff.merge_views.contains_key(&id) {
             self.close_merge_view(id);
         }
         // Remove selections for the closed view on all documents.
@@ -2584,7 +2572,7 @@ impl Editor {
     }
 
     pub fn sync_scroll_to_linked_views(&mut self, source_view_id: ViewId) {
-        let Some(diff_state) = self.diff_views.get(&source_view_id).cloned() else {
+        let Some(diff_state) = self.diff.views.get(&source_view_id).cloned() else {
             return;
         };
         if !diff_state.sync_scroll {
@@ -2669,7 +2657,7 @@ impl Editor {
         let working_path = helix_stdx::path::canonicalize(working_path);
 
         let focused_view = self.tree.focus;
-        if self.diff_views.contains_key(&focused_view) {
+        if self.diff.views.contains_key(&focused_view) {
             self.close_diff_view(focused_view);
         }
 
@@ -2709,7 +2697,7 @@ impl Editor {
             }
         }
 
-        let split_view_override = split_view_override.or(self.diff_session_split_view_override);
+        let split_view_override = split_view_override.or(self.diff.split_view_override);
         let split_view = split_view_override.unwrap_or_else(|| self.config().diff.split_view);
 
         if split_view {
@@ -2732,8 +2720,8 @@ impl Editor {
                 base_path.clone(), working_path.clone(),
                 git_ref.to_string(), None,
             );
-            self.diff_views.insert(base_view_id, diff_state.clone());
-            self.diff_views.insert(working_view_id, diff_state);
+            self.diff.views.insert(base_view_id, diff_state.clone());
+            self.diff.views.insert(working_view_id, diff_state);
         } else {
             self.switch(working_doc_id, Action::Replace);
             let working_view_id = self.tree.focus;
@@ -2744,7 +2732,7 @@ impl Editor {
                 base_path.clone(), working_path.clone(),
                 git_ref.to_string(), None,
             );
-            self.diff_views.insert(working_view_id, diff_state);
+            self.diff.views.insert(working_view_id, diff_state);
         }
 
         Ok(())
@@ -2774,11 +2762,11 @@ impl Editor {
         let target_path = helix_stdx::path::canonicalize(target_path);
 
         let focused_view = self.tree.focus;
-        if self.diff_views.contains_key(&focused_view) {
+        if self.diff.views.contains_key(&focused_view) {
             self.close_diff_view(focused_view);
         }
 
-        let split_view_override = split_view_override.or(self.diff_session_split_view_override);
+        let split_view_override = split_view_override.or(self.diff.split_view_override);
 
         match target_ref {
             None => self.open_diff_view_with_paths(
@@ -2835,8 +2823,8 @@ impl Editor {
                         base_path.clone(), target_path.clone(),
                         base_ref.to_string(), Some(target.to_string()),
                     );
-                    self.diff_views.insert(base_view_id, diff_state.clone());
-                    self.diff_views.insert(target_view_id, diff_state);
+                    self.diff.views.insert(base_view_id, diff_state.clone());
+                    self.diff.views.insert(target_view_id, diff_state);
                 } else {
                     self.switch(target_doc_id, Action::Replace);
                     let target_view_id = self.tree.focus;
@@ -2846,7 +2834,7 @@ impl Editor {
                         base_path.clone(), target_path.clone(),
                         base_ref.to_string(), Some(target.to_string()),
                     );
-                    self.diff_views.insert(target_view_id, diff_state);
+                    self.diff.views.insert(target_view_id, diff_state);
                 }
 
                 Ok(())
@@ -2855,9 +2843,9 @@ impl Editor {
     }
 
     pub fn close_diff_view(&mut self, view_id: ViewId) -> bool {
-        if let Some(diff_state) = self.diff_views.remove(&view_id) {
-            self.diff_views.remove(&diff_state.base_view_id);
-            self.diff_views.remove(&diff_state.working_view_id);
+        if let Some(diff_state) = self.diff.views.remove(&view_id) {
+            self.diff.views.remove(&diff_state.base_view_id);
+            self.diff.views.remove(&diff_state.working_view_id);
 
             if let Some(doc) = self.documents.get_mut(&diff_state.base_doc_id) {
                 doc.linked_diff_doc = None;
@@ -2965,9 +2953,9 @@ impl Editor {
             sync_scroll: true,
             last_resolution: None,
         };
-        self.merge_views.insert(ours_view_id, state.clone());
-        self.merge_views.insert(theirs_view_id, state.clone());
-        self.merge_views.insert(result_view_id, state);
+        self.diff.merge_views.insert(ours_view_id, state.clone());
+        self.diff.merge_views.insert(theirs_view_id, state.clone());
+        self.diff.merge_views.insert(result_view_id, state);
 
         // Focus RESULT pane so the user starts editing conflicts immediately.
         self.tree.focus = result_view_id;
@@ -2976,10 +2964,10 @@ impl Editor {
     }
 
     pub fn close_merge_view(&mut self, view_id: ViewId) -> bool {
-        if let Some(state) = self.merge_views.remove(&view_id) {
-            self.merge_views.remove(&state.ours_view_id);
-            self.merge_views.remove(&state.theirs_view_id);
-            self.merge_views.remove(&state.result_view_id);
+        if let Some(state) = self.diff.merge_views.remove(&view_id) {
+            self.diff.merge_views.remove(&state.ours_view_id);
+            self.diff.merge_views.remove(&state.theirs_view_id);
+            self.diff.merge_views.remove(&state.result_view_id);
 
             let _ = self.close_document(state.ours_doc_id, true);
             let _ = self.close_document(state.theirs_doc_id, true);

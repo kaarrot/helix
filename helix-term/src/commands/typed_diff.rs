@@ -81,7 +81,7 @@ pub(crate) fn diff_commit(
     let diff_range = DiffRange::parse(range_str)
         .with_context(|| format!("failed to parse diff range: {}", range_str))?;
     let display = diff_range.display();
-    cx.editor.diff_range = Some(diff_range);
+    cx.editor.diff.range = Some(diff_range);
     cx.editor
         .set_status(format!("Diff range set to: {} — use space+g to browse files", display));
 
@@ -111,7 +111,7 @@ pub(crate) fn diff_reset_typed(
         return Ok(());
     }
 
-    cx.editor.diff_range = None;
+    cx.editor.diff.range = None;
 
     let diff_bases: Vec<_> = cx
         .editor

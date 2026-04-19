@@ -4019,7 +4019,7 @@ fn goto_next_change_impl(cx: &mut Context, direction: Direction) {
     let view_id = view!(cx.editor).id;
     let scrolloff = cx.editor.config().scrolloff;
 
-    if let Some(diff_state) = cx.editor.diff_views.get(&view_id).cloned() {
+    if let Some(diff_state) = cx.editor.diff.views.get(&view_id).cloned() {
         let (other_view_id, other_doc_id) = if view_id == diff_state.base_view_id {
             (diff_state.working_view_id, diff_state.working_doc_id)
         } else {

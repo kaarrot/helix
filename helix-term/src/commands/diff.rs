@@ -27,7 +27,7 @@ pub fn changed_file_picker(cx: &mut Context) {
     };
 
     // Get diff range from editor state or default to HEAD vs working tree
-    let diff_range = cx.editor.diff_range.clone().unwrap_or_else(|| DiffRange {
+    let diff_range = cx.editor.diff.range.clone().unwrap_or_else(|| DiffRange {
         base_ref: "HEAD".to_string(),
         target_ref: None,
     });
@@ -90,7 +90,7 @@ pub fn changed_file_picker(cx: &mut Context) {
             let base_ref_cb = base_ref.clone();
             let target_ref_cb = target_ref.clone();
             move |cx, meta: &FileChange, _action| {
-                cx.editor.last_changed_file_selection = Some(meta.path().to_path_buf());
+                cx.editor.diff.last_changed_file_selection = Some(meta.path().to_path_buf());
                 let path = meta.path();
                 // Conflict files open the 3-way merge view directly
                 if matches!(meta, FileChange::Conflict { .. }) {
@@ -182,7 +182,7 @@ fn merge_accept_impl(cx: &mut Context, side: AcceptSide) {
     // 1. If we just resolved a conflict and the cursor is still inside the
     //    inserted replacement, replace it again with the new side instead of
     //    hunting for markers that no longer exist.
-    let prior = cx.editor.merge_views.get(&view_id)
+    let prior = cx.editor.diff.merge_views.get(&view_id)
         .and_then(|s| s.last_resolution.clone());
     if let Some(prior) = prior {
         let (view, doc) = current!(cx.editor);
@@ -203,7 +203,7 @@ fn merge_accept_impl(cx: &mut Context, side: AcceptSide) {
                 theirs: prior.theirs,
                 both: prior.both,
             };
-            update_last_resolutions(&mut cx.editor.merge_views, doc_id, Some(new_resolution));
+            update_last_resolutions(&mut cx.editor.diff.merge_views, doc_id, Some(new_resolution));
             cx.editor.set_status(format!("Switched to {} version", side.label()));
             return;
         }
@@ -251,7 +251,7 @@ fn merge_accept_impl(cx: &mut Context, side: AcceptSide) {
         theirs,
         both,
     };
-    update_last_resolutions(&mut cx.editor.merge_views, doc_id, Some(new_resolution));
+    update_last_resolutions(&mut cx.editor.diff.merge_views, doc_id, Some(new_resolution));
     cx.editor.set_status(format!("Accepted {} version", side.label()));
 }
 
@@ -287,7 +287,7 @@ fn merge_jump_impl(cx: &mut Context, direction: Direction) {
     let conflicts = find_conflicts(&text);
 
     // Moving to a new conflict invalidates the switch-without-undo shortcut.
-    update_last_resolutions(&mut cx.editor.merge_views, doc_id, None);
+    update_last_resolutions(&mut cx.editor.diff.merge_views, doc_id, None);
 
     if conflicts.is_empty() {
         cx.editor.set_status("No conflicts remaining");
@@ -345,13 +345,13 @@ pub fn merge_finish(cx: &mut Context) {
 
 pub fn diff_toggle_sync_scroll(cx: &mut Context) {
     let view_id = view!(cx.editor).id;
-    let Some(diff_state) = cx.editor.diff_views.get(&view_id).cloned() else {
+    let Some(diff_state) = cx.editor.diff.views.get(&view_id).cloned() else {
         cx.editor.set_error("Not in a diff view");
         return;
     };
     let new_val = !diff_state.sync_scroll;
     for id in [diff_state.base_view_id, diff_state.working_view_id] {
-        if let Some(state) = cx.editor.diff_views.get_mut(&id) {
+        if let Some(state) = cx.editor.diff.views.get_mut(&id) {
             state.sync_scroll = new_val;
         }
     }
@@ -360,7 +360,7 @@ pub fn diff_toggle_sync_scroll(cx: &mut Context) {
 
 pub fn diff_toggle_split_view(cx: &mut Context) {
     let view_id = view!(cx.editor).id;
-    let Some(diff_state) = cx.editor.diff_views.get(&view_id).cloned() else {
+    let Some(diff_state) = cx.editor.diff.views.get(&view_id).cloned() else {
         cx.editor.set_error("Not in a diff view");
         return;
     };
@@ -377,7 +377,7 @@ pub fn diff_toggle_split_view(cx: &mut Context) {
         return;
     }
 
-    cx.editor.diff_session_split_view_override = Some(new_split);
+    cx.editor.diff.split_view_override = Some(new_split);
     cx.editor.close_diff_view(view_id);
 
     let result = cx.editor.open_diff_view_range_with_paths(
@@ -392,10 +392,10 @@ pub fn diff_toggle_split_view(cx: &mut Context) {
 
 pub fn diff_reset(cx: &mut Context) {
     let view_id = view!(cx.editor).id;
-    if cx.editor.diff_views.contains_key(&view_id) {
+    if cx.editor.diff.views.contains_key(&view_id) {
         cx.editor.close_diff_view(view_id);
     }
-    cx.editor.diff_range = None;
+    cx.editor.diff.range = None;
     let diff_bases: Vec<_> = cx.editor.documents.iter()
         .filter_map(|(id, doc)| {
             let path = doc.path()?.to_path_buf();
@@ -439,7 +439,7 @@ pub fn diff_commit_from_selection(cx: &mut Context) {
             return;
         };
         let hash = hash.to_string();
-        cx.editor.diff_range = Some(DiffRange { base_ref: hash.clone(), target_ref: None });
+        cx.editor.diff.range = Some(DiffRange { base_ref: hash.clone(), target_ref: None });
         cx.editor.set_status(format!("Diff set: {} vs working tree", hash));
     } else {
         // In git log output, the first line is the newer commit; diff goes OLD..NEW.
@@ -450,7 +450,7 @@ pub fn diff_commit_from_selection(cx: &mut Context) {
             return;
         };
         let (older, newer) = (older.to_string(), newer.to_string());
-        cx.editor.diff_range = Some(DiffRange {
+        cx.editor.diff.range = Some(DiffRange {
             base_ref: older.clone(),
             target_ref: Some(newer.clone()),
         });
@@ -473,7 +473,7 @@ pub fn diff_show_commit_from_selection(cx: &mut Context) {
         return;
     };
     let hash = hash.to_string();
-    cx.editor.diff_range = Some(DiffRange {
+    cx.editor.diff.range = Some(DiffRange {
         base_ref: format!("{}^", hash),
         target_ref: Some(hash.clone()),
     });

@@ -168,12 +168,12 @@ impl EditorView {
         view.apply_diff_alignment(
             doc,
             &mut text_annotations,
-            &editor.diff_views,
+            &editor.diff.views,
             &editor.documents,
         );
         let mut decorations = DecorationManager::default();
 
-        if editor.diff_views.contains_key(&view.id) {
+        if editor.diff.views.contains_key(&view.id) {
             if let Some(diff_handle) = doc.diff_handle() {
                 decorations.add_decoration(DiffSpacerDecoration::new(diff_handle, theme));
             }

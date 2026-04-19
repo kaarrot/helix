@@ -1,5 +1,15 @@
-use crate::{DocumentId, ViewId};
-use std::path::PathBuf;
+use crate::{editor::{DiffRange, MergeViewState}, DocumentId, ViewId};
+use std::{collections::HashMap, path::PathBuf};
+
+/// All diff/merge runtime state aggregated into one Editor field.
+#[derive(Debug, Default)]
+pub struct DiffSession {
+    pub views: HashMap<ViewId, DiffViewState>,
+    pub merge_views: HashMap<ViewId, MergeViewState>,
+    pub range: Option<DiffRange>,
+    pub split_view_override: Option<bool>,
+    pub last_changed_file_selection: Option<PathBuf>,
+}
 
 #[derive(Debug, Clone)]
 pub struct DiffViewState {

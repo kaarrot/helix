@@ -2728,6 +2728,9 @@ impl Editor {
             let diff_state = DiffViewState::new(
                 base_doc_id, working_doc_id, base_view_id, working_view_id,
                 git_ref.to_string(),
+            ).with_reopen(
+                base_path.clone(), working_path.clone(),
+                git_ref.to_string(), None,
             );
             self.diff_views.insert(base_view_id, diff_state.clone());
             self.diff_views.insert(working_view_id, diff_state);
@@ -2737,6 +2740,9 @@ impl Editor {
             let diff_state = DiffViewState::new(
                 base_doc_id, working_doc_id, working_view_id, working_view_id,
                 git_ref.to_string(),
+            ).with_reopen(
+                base_path.clone(), working_path.clone(),
+                git_ref.to_string(), None,
             );
             self.diff_views.insert(working_view_id, diff_state);
         }
@@ -2825,6 +2831,9 @@ impl Editor {
                     let target_view_id = self.tree.focus;
                     let diff_state = DiffViewState::new(
                         base_doc_id, target_doc_id, base_view_id, target_view_id, display,
+                    ).with_reopen(
+                        base_path.clone(), target_path.clone(),
+                        base_ref.to_string(), Some(target.to_string()),
                     );
                     self.diff_views.insert(base_view_id, diff_state.clone());
                     self.diff_views.insert(target_view_id, diff_state);
@@ -2833,6 +2842,9 @@ impl Editor {
                     let target_view_id = self.tree.focus;
                     let diff_state = DiffViewState::new(
                         base_doc_id, target_doc_id, target_view_id, target_view_id, display,
+                    ).with_reopen(
+                        base_path.clone(), target_path.clone(),
+                        base_ref.to_string(), Some(target.to_string()),
                     );
                     self.diff_views.insert(target_view_id, diff_state);
                 }

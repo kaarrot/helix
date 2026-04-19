@@ -1,4 +1,5 @@
 use crate::{DocumentId, ViewId};
+use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
 pub struct DiffViewState {
@@ -8,6 +9,11 @@ pub struct DiffViewState {
     pub working_view_id: ViewId,
     pub sync_scroll: bool,
     pub git_ref: String,
+    /// Reopen recipe: paths and refs so :diff-toggle-split can rebuild the view.
+    pub base_path: PathBuf,
+    pub working_path: PathBuf,
+    pub base_ref: String,
+    pub target_ref: Option<String>,
 }
 
 impl DiffViewState {
@@ -24,8 +30,26 @@ impl DiffViewState {
             base_view_id,
             working_view_id,
             sync_scroll: true,
-            git_ref,
+            git_ref: git_ref.clone(),
+            base_path: PathBuf::new(),
+            working_path: PathBuf::new(),
+            base_ref: git_ref,
+            target_ref: None,
         }
+    }
+
+    pub fn with_reopen(
+        mut self,
+        base_path: PathBuf,
+        working_path: PathBuf,
+        base_ref: String,
+        target_ref: Option<String>,
+    ) -> Self {
+        self.base_path = base_path;
+        self.working_path = working_path;
+        self.base_ref = base_ref;
+        self.target_ref = target_ref;
+        self
     }
 
     pub fn contains_view(&self, view_id: ViewId) -> bool {

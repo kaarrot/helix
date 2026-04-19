@@ -552,7 +552,8 @@ impl MappableCommand {
         wclose, "Close window",
         wonly, "Close windows except current",
         close_diff_or_merge_view, "Close diff or merge view",
-        diff_toggle_split_view, "Toggle synchronized scrolling in diff view",
+        diff_toggle_split_view, "Toggle between single-pane and side-by-side diff",
+        diff_toggle_sync_scroll, "Toggle synchronized scrolling in split diff",
         diff_reset, "Reset diff base to HEAD",
         diff_commit_from_selection, "Set diff range from selected commit hash(es)",
         diff_show_commit_from_selection, "Show changes introduced by selected commit",
@@ -6108,7 +6109,7 @@ fn merge_finish(cx: &mut Context) {
     cx.editor.set_status("File saved and staged (git add)");
 }
 
-fn diff_toggle_split_view(cx: &mut Context) {
+fn diff_toggle_sync_scroll(cx: &mut Context) {
     let view_id = view!(cx.editor).id;
     let Some(diff_state) = cx.editor.diff_views.get(&view_id).cloned() else {
         cx.editor.set_error("Not in a diff view");
@@ -6121,6 +6122,38 @@ fn diff_toggle_split_view(cx: &mut Context) {
         }
     }
     cx.editor.set_status(if new_val { "Sync scroll enabled" } else { "Sync scroll disabled" });
+}
+
+fn diff_toggle_split_view(cx: &mut Context) {
+    let view_id = view!(cx.editor).id;
+    let Some(diff_state) = cx.editor.diff_views.get(&view_id).cloned() else {
+        cx.editor.set_error("Not in a diff view");
+        return;
+    };
+    let was_split = diff_state.base_view_id != diff_state.working_view_id;
+    let new_split = !was_split;
+
+    let base_path = diff_state.base_path.clone();
+    let working_path = diff_state.working_path.clone();
+    let base_ref = diff_state.base_ref.clone();
+    let target_ref = diff_state.target_ref.clone();
+
+    if base_path.as_os_str().is_empty() || working_path.as_os_str().is_empty() {
+        cx.editor.set_error("Can't toggle: diff view missing reopen paths");
+        return;
+    }
+
+    cx.editor.diff_session_split_view_override = Some(new_split);
+    cx.editor.close_diff_view(view_id);
+
+    let result = cx.editor.open_diff_view_range_with_paths(
+        &base_path, &working_path, &base_ref, target_ref.as_deref(), Some(new_split),
+    );
+    if let Err(e) = result {
+        cx.editor.set_error(format!("Failed to toggle split view: {e}"));
+        return;
+    }
+    cx.editor.set_status(if new_split { "Split view on" } else { "Split view off" });
 }
 
 fn diff_reset(cx: &mut Context) {

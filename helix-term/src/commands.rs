@@ -554,6 +554,8 @@ impl MappableCommand {
         close_diff_or_merge_view, "Close diff or merge view",
         diff_toggle_split_view, "Toggle synchronized scrolling in diff view",
         diff_reset, "Reset diff base to HEAD",
+        diff_commit_from_selection, "Set diff range from selected commit hash(es)",
+        diff_show_commit_from_selection, "Show changes introduced by selected commit",
         merge_accept_ours, "Accept HEAD version for current conflict",
         merge_accept_theirs, "Accept incoming version for current conflict",
         merge_accept_both, "Accept both versions for current conflict",
@@ -6086,6 +6088,76 @@ fn diff_reset(cx: &mut Context) {
         }
     }
     cx.editor.set_status("Diff reset to HEAD");
+}
+
+/// Extract a leading git-hash-like token from a line of text.
+fn extract_commit_hash(line: &str) -> Option<&str> {
+    let token = line.split_whitespace().next()?;
+    let is_hash = (7..=40).contains(&token.len())
+        && token.chars().all(|c| c.is_ascii_hexdigit());
+    is_hash.then_some(token)
+}
+
+fn diff_commit_from_selection(cx: &mut Context) {
+    use helix_view::editor::DiffRange;
+
+    let (view, doc) = current_ref!(cx.editor);
+    let text = doc.text().slice(..);
+    let selected = doc.selection(view.id).primary().fragment(text).to_string();
+
+    let lines: Vec<&str> = selected.lines().filter(|l| !l.trim().is_empty()).collect();
+    if lines.is_empty() {
+        cx.editor.set_error("No selection");
+        return;
+    }
+
+    if lines.len() == 1 {
+        let Some(hash) = extract_commit_hash(lines[0]) else {
+            cx.editor.set_error("Invalid commit hash in selection");
+            return;
+        };
+        let hash = hash.to_string();
+        cx.editor.diff_range = Some(DiffRange { base_ref: hash.clone(), target_ref: None });
+        cx.editor.set_status(format!("Diff set: {} vs working tree", hash));
+    } else {
+        // In git log output, the first line is the newer commit; diff goes OLD..NEW.
+        let (Some(newer), Some(older)) =
+            (extract_commit_hash(lines[0]), extract_commit_hash(lines[lines.len() - 1]))
+        else {
+            cx.editor.set_error("Invalid commit hash in selection");
+            return;
+        };
+        let (older, newer) = (older.to_string(), newer.to_string());
+        cx.editor.diff_range = Some(DiffRange {
+            base_ref: older.clone(),
+            target_ref: Some(newer.clone()),
+        });
+        cx.editor.set_status(format!("Diff set: {}..{}", older, newer));
+    }
+}
+
+fn diff_show_commit_from_selection(cx: &mut Context) {
+    use helix_view::editor::DiffRange;
+
+    let (view, doc) = current_ref!(cx.editor);
+    let text = doc.text().slice(..);
+    let selected = doc.selection(view.id).primary().fragment(text).to_string();
+
+    let lines: Vec<&str> = selected.lines().filter(|l| !l.trim().is_empty()).collect();
+    if lines.len() != 1 {
+        cx.editor.set_error("Select exactly one commit line");
+        return;
+    }
+    let Some(hash) = extract_commit_hash(lines[0]) else {
+        cx.editor.set_error("Invalid commit hash in selection");
+        return;
+    };
+    let hash = hash.to_string();
+    cx.editor.diff_range = Some(DiffRange {
+        base_ref: format!("{}^", hash),
+        target_ref: Some(hash.clone()),
+    });
+    cx.editor.set_status(format!("Diff set: showing changes in {}", hash));
 }
 
 fn insert_register(cx: &mut Context) {

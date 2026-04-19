@@ -245,6 +245,8 @@ pub fn default() -> HashMap<Mode, KeyTrie> {
                 "f" => merge_finish,
                 "s" => diff_toggle_split_view,
                 "r" => diff_reset,
+                "c" => diff_commit_from_selection,
+                "C" => diff_show_commit_from_selection,
                 "q" => close_diff_or_merge_view,
             },
             "G" => { "Debug (experimental)" sticky=true

@@ -2700,8 +2700,15 @@ fn search_in_root(cx: &mut Context, search_root: PathBuf) {
 
 fn search_in_buffer(cx: &mut Context) {
     #[derive(Debug)]
+    enum BufferResultLocation {
+        Path(PathBuf),
+        Document(DocumentId),
+    }
+
+    #[derive(Debug)]
     struct LineResult {
-        path: PathBuf,
+        location: BufferResultLocation,
+        display_name: String,
         line_num: usize,
     }
 
@@ -2711,13 +2718,20 @@ fn search_in_buffer(cx: &mut Context) {
         number_style: Style,
         colon_style: Style,
         text: helix_core::Rope,
-        path: PathBuf,
+        location: BufferResultLocation,
+        display_name: String,
     }
 
     let (_, doc) = current_ref!(cx.editor);
-    let path = match doc.path().cloned() {
-        Some(p) => p,
-        None => PathBuf::from(helix_view::document::SCRATCH_BUFFER_NAME),
+    let (location, display_name) = match doc.path().cloned() {
+        Some(path) => (
+            BufferResultLocation::Path(path),
+            doc.display_name().into_owned(),
+        ),
+        None => (
+            BufferResultLocation::Document(doc.id()),
+            doc.display_name().into_owned(),
+        ),
     };
     let editor_config = cx.editor.config();
     let config = BufferSearchConfig {
@@ -2726,22 +2740,28 @@ fn search_in_buffer(cx: &mut Context) {
         number_style: cx.editor.theme.get("constant.numeric.integer"),
         colon_style: cx.editor.theme.get("punctuation"),
         text: doc.text().clone(),
-        path,
+        location,
+        display_name,
     };
 
     let columns = [
         PickerColumn::new("path", |item: &LineResult, config: &BufferSearchConfig| {
-            let path = helix_stdx::path::get_relative_path(&item.path);
-            let directories = path
-                .parent()
-                .filter(|p| !p.as_os_str().is_empty())
-                .map(|p| format!("{}{}", p.display(), std::path::MAIN_SEPARATOR))
-                .unwrap_or_default();
-            let filename = item
-                .path
-                .file_name()
-                .map(|f| f.to_string_lossy().into_owned())
-                .unwrap_or_default();
+            let (directories, filename) = match &item.location {
+                BufferResultLocation::Path(path) => {
+                    let path = helix_stdx::path::get_relative_path(path);
+                    let directories = path
+                        .parent()
+                        .filter(|p| !p.as_os_str().is_empty())
+                        .map(|p| format!("{}{}", p.display(), std::path::MAIN_SEPARATOR))
+                        .unwrap_or_default();
+                    let filename = path
+                        .file_name()
+                        .map(|f| f.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    (directories, filename)
+                }
+                BufferResultLocation::Document(_) => (String::new(), item.display_name.clone()),
+            };
             Cell::from(Spans::from(vec![
                 Span::styled(directories, config.directory_style),
                 Span::raw(filename),
@@ -2770,7 +2790,11 @@ fn search_in_buffer(cx: &mut Context) {
 
         let injector = injector.clone();
         let text = config.text.clone();
-        let path = config.path.clone();
+        let display_name = config.display_name.clone();
+        let location = match &config.location {
+            BufferResultLocation::Path(path) => BufferResultLocation::Path(path.clone()),
+            BufferResultLocation::Document(id) => BufferResultLocation::Document(*id),
+        };
         async move {
             let mut searcher = SearcherBuilder::new()
                 .binary_detection(BinaryDetection::quit(b'\x00'))
@@ -2778,7 +2802,13 @@ fn search_in_buffer(cx: &mut Context) {
             let sink = sinks::UTF8(|line_num, _| {
                 let stop = injector
                     .push(LineResult {
-                        path: path.clone(),
+                        location: match &location {
+                            BufferResultLocation::Path(path) => {
+                                BufferResultLocation::Path(path.clone())
+                            }
+                            BufferResultLocation::Document(id) => BufferResultLocation::Document(*id),
+                        },
+                        display_name: display_name.clone(),
                         line_num: line_num as usize - 1,
                     })
                     .is_err();
@@ -2799,15 +2829,27 @@ fn search_in_buffer(cx: &mut Context) {
         1,
         [],
         config,
-        move |cx, LineResult { path, line_num, .. }, action| {
-            let doc = match cx.editor.open(path, action) {
-                Ok(id) => doc_mut!(cx.editor, &id),
-                Err(e) => {
-                    cx.editor
-                        .set_error(format!("Failed to open file '{}': {}", path.display(), e));
-                    return;
+        move |cx, LineResult { location, line_num, .. }, action| {
+            let doc_id = match location {
+                BufferResultLocation::Path(path) => match cx.editor.open(path, action) {
+                    Ok(id) => id,
+                    Err(e) => {
+                        cx.editor
+                            .set_error(format!("Failed to open file '{}': {}", path.display(), e));
+                        return;
+                    }
+                },
+                BufferResultLocation::Document(id) => {
+                    if cx.editor.document(*id).is_none() {
+                        cx.editor
+                            .set_error("The buffer you selected is no longer available.");
+                        return;
+                    }
+                    cx.editor.switch(*id, action);
+                    *id
                 }
             };
+            let doc = doc_mut!(cx.editor, &doc_id);
             let line_num = *line_num;
             let view = view_mut!(cx.editor);
             let text = doc.text();
@@ -2825,8 +2867,12 @@ fn search_in_buffer(cx: &mut Context) {
             }
         },
     )
-    .with_preview(|_editor, LineResult { path, line_num, .. }| {
-        Some((path.as_path().into(), Some((*line_num, *line_num))))
+    .with_preview(|_editor, LineResult { location, line_num, .. }| {
+        let location = match location {
+            BufferResultLocation::Path(path) => path.as_path().into(),
+            BufferResultLocation::Document(id) => (*id).into(),
+        };
+        Some((location, Some((*line_num, *line_num))))
     })
     .with_history_register(Some(reg))
     .with_dynamic_query(get_lines, Some(275));

@@ -176,11 +176,18 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use helix_view::document::Mode;
 
     impl Config {
         fn load_test(config: &str) -> Config {
             Config::load(Ok(config.to_owned()), Err(ConfigLoadError::default())).unwrap()
         }
+    }
+
+    fn assert_cursorline_modes(config: &Config, normal: bool, insert: bool, select: bool) {
+        assert_eq!(config.editor.cursorline.from_mode(Mode::Normal), normal);
+        assert_eq!(config.editor.cursorline.from_mode(Mode::Insert), insert);
+        assert_eq!(config.editor.cursorline.from_mode(Mode::Select), select);
     }
 
     #[test]
@@ -233,9 +240,47 @@ mod tests {
     }
 
     #[test]
-    fn cursorline_ignores_unknown_nested_fields_with_non_bool_values() {
-        use helix_view::document::Mode;
+    fn cursorline_bool_true_applies_to_all_modes() {
+        let config = Config::load_test("editor.cursorline = true");
 
+        assert_cursorline_modes(&config, true, true, true);
+    }
+
+    #[test]
+    fn cursorline_bool_false_applies_to_all_modes() {
+        let config = Config::load_test("editor.cursorline = false");
+
+        assert_cursorline_modes(&config, false, false, false);
+    }
+
+    #[test]
+    fn cursorline_per_mode_defaults_unspecified_modes_to_false() {
+        let config = Config::load_test(
+            r#"
+            [editor.cursorline]
+            normal = true
+        "#,
+        );
+
+        assert_cursorline_modes(&config, true, false, false);
+    }
+
+    #[test]
+    fn cursorline_per_mode_preserves_each_mode_value() {
+        let config = Config::load_test(
+            r#"
+            [editor.cursorline]
+            normal = true
+            insert = false
+            select = true
+        "#,
+        );
+
+        assert_cursorline_modes(&config, true, false, true);
+    }
+
+    #[test]
+    fn cursorline_ignores_unknown_nested_fields_with_non_bool_values() {
         let config = Config::load_test(
             r#"
             [editor.cursorline]
@@ -244,9 +289,7 @@ mod tests {
         "#,
         );
 
-        assert!(config.editor.cursorline.from_mode(Mode::Normal));
-        assert!(!config.editor.cursorline.from_mode(Mode::Insert));
-        assert!(!config.editor.cursorline.from_mode(Mode::Select));
+        assert_cursorline_modes(&config, true, false, false);
     }
 
     #[test]

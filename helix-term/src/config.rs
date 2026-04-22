@@ -181,6 +181,10 @@ mod tests {
         fn load_test(config: &str) -> Config {
             Config::load(Ok(config.to_owned()), Err(ConfigLoadError::default())).unwrap()
         }
+
+        fn load_merged_test(global: &str, local: &str) -> Config {
+            Config::load(Ok(global.to_owned()), Ok(local.to_owned())).unwrap()
+        }
     }
 
     #[test]
@@ -230,6 +234,76 @@ mod tests {
         // From the Default trait
         let default_keys = Config::default().keys;
         assert_eq!(default_keys, keymap::default());
+    }
+
+    #[test]
+    fn editor_config_ignores_unknown_top_level_fields_and_records_warning() {
+        let config = Config::load_test(
+            r#"
+            [editor]
+            scrolloff = 13
+            mystery-setting = "ignored"
+        "#,
+        );
+
+        assert_eq!(config.editor.scrolloff, 13);
+        assert_eq!(
+            config.warnings,
+            vec!["Unknown editor config field ignored: `mystery-setting`".to_owned()]
+        );
+    }
+
+    #[test]
+    fn editor_config_merge_succeeds_with_unknown_top_level_field() {
+        let config = Config::load_merged_test(
+            r#"
+            [editor]
+            scrolloff = 7
+            mystery-setting = true
+        "#,
+            r#"
+            [editor]
+            scrolloff = 21
+        "#,
+        );
+
+        assert_eq!(config.editor.scrolloff, 21);
+        assert_eq!(
+            config.warnings,
+            vec!["Unknown editor config field ignored: `mystery-setting`".to_owned()]
+        );
+    }
+
+    #[test]
+    fn invalid_known_editor_field_still_fails_load() {
+        let err = Config::load(
+            Ok(r#"
+                [editor]
+                scrolloff = "not-a-number"
+            "#
+            .to_owned()),
+            Err(ConfigLoadError::default()),
+        )
+        .unwrap_err();
+
+        match err {
+            ConfigLoadError::BadConfig(err) => {
+                assert!(err.to_string().contains("invalid type"));
+            }
+            other => panic!("expected bad config error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clean_editor_config_has_no_warnings() {
+        let config = Config::load_test(
+            r#"
+            [editor]
+            scrolloff = 9
+        "#,
+        );
+
+        assert!(config.warnings.is_empty());
     }
 
     #[test]

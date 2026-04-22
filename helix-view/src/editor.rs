@@ -2555,3 +2555,115 @@ impl CursorCache {
         self.0.set(None)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_statusline_element, Config, StatusLineConfig, StatusLineElement};
+    use crate::document::Mode;
+
+    fn parse_editor_config(toml: &str) -> Config {
+        toml::from_str(toml).unwrap()
+    }
+
+    fn parse_statusline_config(toml: &str) -> StatusLineConfig {
+        toml::from_str(toml).unwrap()
+    }
+
+    #[test]
+    fn cursorline_true_enables_all_modes() {
+        let config = parse_editor_config("cursorline = true");
+
+        assert!(config.cursorline.from_mode(Mode::Normal));
+        assert!(config.cursorline.from_mode(Mode::Insert));
+        assert!(config.cursorline.from_mode(Mode::Select));
+    }
+
+    #[test]
+    fn cursorline_false_disables_all_modes() {
+        let config = parse_editor_config("cursorline = false");
+
+        assert!(!config.cursorline.from_mode(Mode::Normal));
+        assert!(!config.cursorline.from_mode(Mode::Insert));
+        assert!(!config.cursorline.from_mode(Mode::Select));
+    }
+
+    #[test]
+    fn cursorline_partial_table_defaults_unspecified_modes_to_false() {
+        let config = parse_editor_config(
+            r#"
+            [cursorline]
+            normal = true
+        "#,
+        );
+
+        assert!(config.cursorline.from_mode(Mode::Normal));
+        assert!(!config.cursorline.from_mode(Mode::Insert));
+        assert!(!config.cursorline.from_mode(Mode::Select));
+    }
+
+    #[test]
+    fn cursorline_ignores_unknown_keys_without_affecting_valid_modes() {
+        let config = parse_editor_config(
+            r#"
+            [cursorline]
+            normal = true
+            typo = "x"
+        "#,
+        );
+
+        assert!(config.cursorline.from_mode(Mode::Normal));
+        assert!(!config.cursorline.from_mode(Mode::Insert));
+        assert!(!config.cursorline.from_mode(Mode::Select));
+    }
+
+    #[test]
+    fn parse_statusline_element_handles_supported_and_unknown_values() {
+        assert_eq!(
+            parse_statusline_element("mode"),
+            Some(StatusLineElement::Mode)
+        );
+        assert_eq!(
+            parse_statusline_element("file-name"),
+            Some(StatusLineElement::FileName)
+        );
+        assert_eq!(parse_statusline_element("bogus"), None);
+    }
+
+    #[test]
+    fn statusline_config_preserves_known_elements() {
+        let config = parse_statusline_config(
+            r#"
+            left = ["mode", "file-name"]
+        "#,
+        );
+
+        assert_eq!(
+            config.left,
+            vec![StatusLineElement::Mode, StatusLineElement::FileName]
+        );
+    }
+
+    #[test]
+    fn statusline_config_filters_unknown_elements_in_all_sections() {
+        let config = parse_statusline_config(
+            r#"
+            left = ["mode", "bogus", "file-name"]
+            center = ["spinner", "bogus", "separator"]
+            right = ["bogus", "diagnostics", "position"]
+        "#,
+        );
+
+        assert_eq!(
+            config.left,
+            vec![StatusLineElement::Mode, StatusLineElement::FileName]
+        );
+        assert_eq!(
+            config.center,
+            vec![StatusLineElement::Spinner, StatusLineElement::Separator]
+        );
+        assert_eq!(
+            config.right,
+            vec![StatusLineElement::Diagnostics, StatusLineElement::Position]
+        );
+    }
+}

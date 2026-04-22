@@ -673,7 +673,11 @@ where
         .map_or(0, |c| c.saturating_sub(MAX_ITEMS - 1));
 
     let mut wrote_any = false;
-    for (item, selected) in completion.matched_items().skip(window_start).take(MAX_ITEMS) {
+    for (item, selected) in completion
+        .matched_items()
+        .skip(window_start)
+        .take(MAX_ITEMS)
+    {
         let label = match item {
             CompletionItem::Lsp(LspCompletionItem { item, .. }) => item.label.as_str(),
             CompletionItem::Other(CoreCompletionItem { label, .. }) => label.as_ref(),
@@ -698,5 +702,144 @@ where
         };
         write(context, Span::styled(format!(" {truncated} "), style));
         wrote_any = true;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{borrow::Cow, path::Path, sync::Arc};
+
+    use arc_swap::{access::Map, ArcSwap};
+    use helix_core::{completion::CompletionProvider, syntax, Selection, Transaction};
+    use helix_view::{
+        document::Mode,
+        editor::{Action, CompletionDisplay, StatusLineElement},
+        graphics::Rect,
+        theme, Editor,
+    };
+
+    use crate::{
+        config::Config as AppConfig,
+        handlers,
+        handlers::completion::CompletionItem,
+        ui::{Completion, ProgressSpinners},
+    };
+
+    use super::{render, RenderContext, Surface};
+
+    struct TestHarness {
+        _runtime: tokio::runtime::Runtime,
+        app_config: Arc<ArcSwap<AppConfig>>,
+        editor: Editor,
+    }
+
+    impl TestHarness {
+        fn new() -> Self {
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            let _guard = runtime.enter();
+
+            let mut app_config = AppConfig::default();
+            app_config.editor.statusline.left = vec![
+                StatusLineElement::Mode,
+                StatusLineElement::FileName,
+                StatusLineElement::CompletionSuggestions,
+            ];
+            app_config.editor.statusline.right = vec![StatusLineElement::Position];
+
+            let app_config = Arc::new(ArcSwap::from_pointee(app_config));
+            let handlers = handlers::setup(Arc::clone(&app_config));
+            let editor_config =
+                Arc::new(Map::new(Arc::clone(&app_config), |config: &AppConfig| {
+                    &config.editor
+                }));
+
+            let mut editor = Editor::new(
+                Rect::new(0, 0, 40, 5),
+                Arc::new(theme::Loader::new(&[])),
+                Arc::new(ArcSwap::from_pointee(syntax::Loader::default())),
+                editor_config,
+                handlers,
+            );
+            editor.new_file(Action::VerticalSplit);
+            editor.mode = Mode::Insert;
+
+            let (view, doc) = current!(editor);
+            doc.set_selection(view.id, Selection::point(0));
+            doc.set_path(Some(Path::new("src/main.rs")));
+
+            Self {
+                _runtime: runtime,
+                app_config,
+                editor,
+            }
+        }
+
+        fn set_completion_display(&self, completion_display: CompletionDisplay) {
+            let mut config = (*self.app_config.load_full()).clone();
+            config.editor.completion_display = completion_display;
+            self.app_config.store(Arc::new(config));
+        }
+    }
+
+    fn test_completion(editor: &Editor, labels: &[&str]) -> Completion {
+        let (_, doc) = current_ref!(editor);
+        let items = labels
+            .iter()
+            .map(|label| {
+                CompletionItem::Other(helix_core::CompletionItem {
+                    transaction: Transaction::new(doc.text()),
+                    label: Cow::Owned((*label).to_owned()),
+                    kind: Cow::Borrowed(""),
+                    documentation: None,
+                    provider: CompletionProvider::Word,
+                })
+            })
+            .collect();
+
+        Completion::new(editor, items, 0)
+    }
+
+    fn render_statusline(editor: &Editor, completion: Option<&Completion>, width: u16) -> String {
+        let (view, doc) = current_ref!(editor);
+        let viewport = Rect::new(0, 0, width, 1);
+        let mut surface = Surface::empty(viewport);
+        let spinners = ProgressSpinners::default();
+        let mut context = RenderContext::new(editor, doc, view, true, &spinners, completion);
+
+        render(&mut context, viewport, &mut surface);
+
+        let mut line = String::new();
+        for x in 0..width {
+            line.push_str(&surface.get(x, 0).unwrap().symbol);
+        }
+        line.trim_end().to_owned()
+    }
+
+    #[test]
+    fn statusline_completion_respects_display_mode_and_editor_mode() {
+        let mut harness = TestHarness::new();
+        let completion = test_completion(&harness.editor, &["alpha", "beta", "gamma"]);
+
+        harness.set_completion_display(CompletionDisplay::Statusline);
+        harness.editor.mode = Mode::Insert;
+        let line = render_statusline(&harness.editor, Some(&completion), 26);
+        assert!(line.contains("alpha"));
+        assert!(line.contains("beta"));
+        assert!(!line.contains("src/main.rs"));
+        assert!(!line.contains("1:1"));
+
+        harness.set_completion_display(CompletionDisplay::Popup);
+        harness.editor.mode = Mode::Insert;
+        let line = render_statusline(&harness.editor, Some(&completion), 40);
+        assert!(line.contains("src/main.rs"));
+        assert!(line.contains("1:1"));
+        assert!(!line.contains("alpha"));
+
+        harness.set_completion_display(CompletionDisplay::Both);
+        harness.editor.mode = Mode::Normal;
+        let line = render_statusline(&harness.editor, Some(&completion), 40);
+        assert!(line.contains("src/main.rs"));
+        assert!(line.contains("1:1"));
+        assert!(!line.contains("alpha"));
     }
 }

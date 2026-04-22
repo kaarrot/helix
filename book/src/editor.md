@@ -153,7 +153,7 @@ The following statusline elements can be configured:
 | `spacer` | Inserts a space between elements (multiple/contiguous spacers may be specified) |
 | `version-control` | The current branch name or detached commit hash of the opened workspace |
 | `register` | The current selected register |
-| `completion-suggestions` | A horizontal list of the top few completion candidates, only rendered in insert mode while a completion popup is active (see [Statusline completion suggestions](#statusline-completion-suggestions) below). |
+| `completion-suggestions` | A horizontal list of the top few completion candidates, only rendered in insert mode while completion suggestions are active (see [Statusline completion suggestions](#statusline-completion-suggestions) below). |
 
 #### Statusline completion suggestions
 
@@ -185,8 +185,8 @@ cursor-position elements (`position`, `position-percentage`, `total-line-numbers
 so that the full width is available for suggestions. The cursor row/column is
 still visible via the gutter, so hiding the position elements during completion
 avoids them being drawn on top of the suggestions on narrow terminals. The path
-and position reappear as soon as you leave insert mode or the completion popup
-closes.
+and position reappear as soon as you leave insert mode or the active completion
+session ends.
 
 **Insert mode** — suggestions replace the file path, with the currently
 selected candidate highlighted:

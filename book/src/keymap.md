@@ -312,10 +312,18 @@ This layer is a kludge of mappings, mostly pickers.
 | `y`     | Yank selections to clipboard                                            | `yank_to_clipboard`                        |
 | `Y`     | Yank main selection to clipboard                                        | `yank_main_selection_to_clipboard`         |
 | `R`     | Replace selections by clipboard contents                                | `replace_selections_with_clipboard`        |
-| `/`     | Global search in workspace folder                                       | `global_search`                            |
+| `/`     | Enter [search mode](#search-mode)                                       | N/A                                        |
 | `?`     | Open command palette                                                    | `command_palette`                          |
 
-> 💡 Global search displays results in a fuzzy picker, use `Space + '` to bring it back up after opening a file.
+> 💡 Search results open in a fuzzy picker. Use `Space + '` to bring the last picker back up after opening a file.
+
+##### Search mode
+
+| Key | Description | Command |
+| --- | ----------- | ------- |
+| `/` | Search in the workspace folder | `global_search` |
+| `.` | Search in the current file's directory and its subdirectories | `search_in_directory` |
+| `,` | Search in the current buffer | `search_in_buffer` |
 
 ##### Popup
 

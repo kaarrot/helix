@@ -33,7 +33,7 @@
 | `scroll-lines` | Number of lines to scroll per scroll wheel step | `3` |
 | `shell` | Shell to use when running external commands | Unix: `["sh", "-c"]`<br/>Windows: `["cmd", "/C"]` |
 | `line-number` | Line number display: `absolute` simply shows each line's number, while `relative` shows the distance from the current line. When unfocused or in insert mode, `relative` will still show absolute line numbers | `"absolute"` |
-| `cursorline` | Highlight all lines with a cursor. Accepts either a boolean or a per-mode table; see [`[editor.cursorline]`](#editorcursorline-section). | `false` |
+| `cursorline` | Highlight all lines with a cursor. `true` or `false` applies to all modes; use [`[editor.cursorline]`](#editorcursorline-section) for per-mode values. | `false` |
 | `cursorcolumn` | Highlight all columns with a cursor | `false` |
 | `continue-comments` | if helix should automatically add a line comment token if you create a new line inside a comment. | `true` |
 | `gutters` | Gutters to display: Available are `diagnostics` and `diff` and `line-numbers` and `spacer`, note that `diagnostics` also includes other features like breakpoints, 1-width padding will be inserted if gutters is non-empty | `["diagnostics", "spacer", "line-numbers", "spacer", "diff"]` |
@@ -178,7 +178,8 @@ The following statusline elements can be configured:
 Defines whether the cursor line highlight is shown in each mode.
 
 You can configure `cursorline` either as a plain boolean, which applies to all
-modes, or as a per-mode table:
+modes, or as a per-mode table when you want different behavior in normal,
+insert, and select mode:
 
 ```toml
 cursorline = true
@@ -192,6 +193,10 @@ select = false
 ```
 
 Unspecified modes default to `false`.
+
+This means `cursorline = true` is equivalent to setting all three per-mode
+values to `true`, while omitting a mode from `[editor.cursorline]` leaves it
+disabled.
 
 | Key      | Description                                      | Default |
 | ---      | -----------                                      | ------- |

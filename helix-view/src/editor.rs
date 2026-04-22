@@ -876,6 +876,63 @@ impl Default for CursorlineConfig {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::Config;
+    use crate::document::Mode;
+
+    fn parse_editor_config(toml: &str) -> Config {
+        toml::from_str(toml).unwrap()
+    }
+
+    #[test]
+    fn cursorline_true_enables_all_modes() {
+        let config = parse_editor_config("cursorline = true");
+
+        assert!(config.cursorline.from_mode(Mode::Normal));
+        assert!(config.cursorline.from_mode(Mode::Insert));
+        assert!(config.cursorline.from_mode(Mode::Select));
+    }
+
+    #[test]
+    fn cursorline_false_disables_all_modes() {
+        let config = parse_editor_config("cursorline = false");
+
+        assert!(!config.cursorline.from_mode(Mode::Normal));
+        assert!(!config.cursorline.from_mode(Mode::Insert));
+        assert!(!config.cursorline.from_mode(Mode::Select));
+    }
+
+    #[test]
+    fn cursorline_partial_table_defaults_unspecified_modes_to_false() {
+        let config = parse_editor_config(
+            r#"
+            [cursorline]
+            normal = true
+        "#,
+        );
+
+        assert!(config.cursorline.from_mode(Mode::Normal));
+        assert!(!config.cursorline.from_mode(Mode::Insert));
+        assert!(!config.cursorline.from_mode(Mode::Select));
+    }
+
+    #[test]
+    fn cursorline_ignores_unknown_keys_without_affecting_valid_modes() {
+        let config = parse_editor_config(
+            r#"
+            [cursorline]
+            normal = true
+            typo = "x"
+        "#,
+        );
+
+        assert!(config.cursorline.from_mode(Mode::Normal));
+        assert!(!config.cursorline.from_mode(Mode::Insert));
+        assert!(!config.cursorline.from_mode(Mode::Select));
+    }
+}
+
 /// bufferline render modes
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]

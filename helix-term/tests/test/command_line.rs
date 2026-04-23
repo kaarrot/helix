@@ -17,6 +17,23 @@ async fn history_completion() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn history_prefix_search() -> anyhow::Result<()> {
+    test_key_sequence(
+        &mut AppBuilder::new().build()?,
+        Some(":echo alpha<ret>:theme default<ret>:ec<up><ret>"),
+        Some(&|app| {
+            let (status, &severity) = app.editor.get_status().unwrap();
+            assert_eq!(severity, Severity::Info);
+            assert_eq!(status.as_ref(), "alpha");
+        }),
+        false,
+    )
+    .await?;
+
+    Ok(())
+}
+
 async fn test_statusline(
     line: &str,
     expected_status: &str,

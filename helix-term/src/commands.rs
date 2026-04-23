@@ -7053,7 +7053,7 @@ fn shell_stream(cx: &mut compositor::Context, cmd: &str, behavior: &ShellBehavio
         let status = child.wait().await?;
 
         if cancelled {
-            bail!("Stream cancelled by user");
+            return Ok(Callback::Editor(Box::new(|_editor| {})));
         }
 
         if has_error {

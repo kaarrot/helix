@@ -79,6 +79,8 @@
 | `:config-open-workspace` | Open the workspace config.toml file. |
 | `:log-open` | Open the helix log file. |
 | `:insert-output` | Run shell command, inserting output before each selection. |
+| `:insert-stream-output`, `::` | Run shell command, streaming output in real-time. When stream is running, send input to it. |
+| `:cancel-stream`, `:::` | Cancel the currently running stream process. |
 | `:append-output` | Run shell command, appending output after each selection. |
 | `:pipe`, `:\|` | Pipe each selection to the shell command. |
 | `:pipe-to` | Pipe each selection to the shell command, ignoring output. |

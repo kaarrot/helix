@@ -2415,7 +2415,12 @@ fn insert_stream_output(
     let process_info = {
         let processes = STREAM_PROCESSES.lock().unwrap();
         processes.as_ref().map(|p| {
-            (p.stdin_tx.clone(), p.buffer_name.clone(), p.doc_id, p.view_id)
+            (
+                p.stdin_tx.clone(),
+                p.buffer_name.clone(),
+                p.doc_id,
+                p.view_id,
+            )
         })
     };
 
@@ -3659,7 +3664,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "insert-stream-output",
-        aliases: &["\\", ":"],
+        aliases: &[":"],
         doc: "Run shell command, streaming output in real-time. When stream is running, send input to it.",
         fun: insert_stream_output,
         completer: SHELL_COMPLETER,
@@ -3667,7 +3672,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "cancel-stream",
-        aliases: &["\\\\"],
+        aliases: &["::"],
         doc: "Cancel the currently running stream process.",
         fun: cancel_stream,
         completer: CommandCompleter::none(),

@@ -408,6 +408,85 @@ pub async fn run_event_loop_until_idle(app: &mut Application) {
     app.event_loop_until_idle(&mut rx_stream).await;
 }
 
+pub async fn send_key_sequence(app: &mut Application, in_keys: &str) -> anyhow::Result<()> {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut rx_stream = UnboundedReceiverStream::new(rx);
+
+    for key_event in parse_macro(in_keys)?.into_iter() {
+        tx.send(Ok(Event::Key(KeyEvent::from(key_event))))?;
+    }
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        app.event_loop_until_idle(&mut rx_stream),
+    )
+    .await;
+
+    if matches!(result, Ok(false)) {
+        bail!("application exited before key sequence could finish");
+    }
+
+    Ok(())
+}
+
+pub async fn wait_for_condition(
+    app: &mut Application,
+    description: &str,
+    condition: impl Fn(&Application) -> bool,
+) -> anyhow::Result<()> {
+    const TIMEOUT: Duration = Duration::from_secs(5);
+    let deadline = tokio::time::Instant::now() + TIMEOUT;
+
+    while tokio::time::Instant::now() < deadline {
+        if condition(app) {
+            return Ok(());
+        }
+
+        let (_, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut rx_stream = UnboundedReceiverStream::new(rx);
+        let _ = tokio::time::timeout(
+            Duration::from_millis(200),
+            app.event_loop_until_idle(&mut rx_stream),
+        )
+        .await;
+    }
+
+    let (view, doc) = current_ref!(app.editor);
+    let state = test::plain(doc.text().slice(..), doc.selection(view.id));
+    let status = app
+        .editor
+        .get_status()
+        .map(|(status, severity)| format!("{severity:?}: {}", status))
+        .unwrap_or_else(|| "none".to_string());
+    bail!("timed out waiting for {description}; status: {status}; document state:\n{state}");
+}
+
+pub async fn close_app(app: &mut Application) -> anyhow::Result<()> {
+    const TIMEOUT: Duration = Duration::from_millis(500);
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut rx_stream = UnboundedReceiverStream::new(rx);
+
+    for key_event in parse_macro("<esc>:q!<ret>")?.into_iter() {
+        tx.send(Ok(Event::Key(KeyEvent::from(key_event))))?;
+    }
+
+    let event_loop = app.event_loop(&mut rx_stream);
+    tokio::time::timeout(TIMEOUT, event_loop).await?;
+
+    let errs = app.close().await;
+    if !errs.is_empty() {
+        log::error!("Errors closing app");
+
+        for err in errs {
+            log::error!("{}", err);
+        }
+
+        bail!("Error closing app");
+    }
+
+    Ok(())
+}
+
 pub fn assert_file_has_content(file: &mut NamedTempFile, content: &str) -> anyhow::Result<()> {
     reload_file(file)?;
 

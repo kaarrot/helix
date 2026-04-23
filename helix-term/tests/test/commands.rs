@@ -1,4 +1,5 @@
 use helix_term::application::Application;
+use helix_view::doc;
 
 use super::*;
 
@@ -271,6 +272,91 @@ async fn test_multi_selection_shell_commands() -> anyhow::Result<()> {
     ))
     .await?;
 
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_insert_stream_commands_and_aliases() -> anyhow::Result<()> {
+    let mut app = AppBuilder::new().build()?;
+
+    send_key_sequence(&mut app, ":: printf foo<ret>").await?;
+    wait_for_condition(&mut app, "stream alias output", |app| {
+        doc!(app.editor).text().to_string() == "printf foo\nfoo\n"
+    })
+    .await?;
+
+    {
+        let doc = doc!(app.editor);
+        assert_eq!(doc.text().to_string(), "printf foo\nfoo\n");
+        assert_eq!(doc.display_name().as_ref(), "printf foo");
+        assert_eq!(
+            app.editor.get_status().unwrap().0.as_ref(),
+            "Stream completed in '[scratch]'"
+        );
+    }
+
+    send_key_sequence(&mut app, ":new<ret>").await?;
+    wait_for_condition(&mut app, "fresh scratch buffer", |app| {
+        let doc = doc!(app.editor);
+        doc.text().to_string() == "\n" && doc.display_name().as_ref() == "[scratch]"
+    })
+    .await?;
+
+    send_key_sequence(&mut app, ":insert-stream-output printf one; cat<ret>").await?;
+    wait_for_condition(&mut app, "initial streamed output", |app| {
+        doc!(app.editor).text().to_string() == "printf one; cat\none\n"
+    })
+    .await?;
+
+    {
+        let doc = doc!(app.editor);
+        assert_eq!(doc.display_name().as_ref(), "printf one; cat");
+    }
+
+    send_key_sequence(&mut app, ":insert-stream-output hello<ret>").await?;
+    wait_for_condition(&mut app, "stream input echo", |app| {
+        let text = doc!(app.editor).text().to_string();
+        text.contains(">>> hello\n") && text.matches("hello\n").count() >= 2
+    })
+    .await?;
+
+    {
+        let doc = doc!(app.editor);
+        let text = doc.text().to_string();
+
+        assert_eq!(doc.display_name().as_ref(), "printf one; cat");
+        assert!(text.starts_with("printf one; cat\none"));
+        assert!(text.contains(">>> hello\n"));
+        assert!(text.matches("hello\n").count() >= 2);
+        assert_eq!(
+            app.editor.get_status().unwrap().0.as_ref(),
+            "Input sent to '[scratch]'"
+        );
+    }
+
+    send_key_sequence(&mut app, ":::<ret>").await?;
+    wait_for_condition(&mut app, "stream cancellation", |app| {
+        app.editor
+            .get_status()
+            .is_some_and(|(status, _)| status.as_ref() == "Stream cancelled (buffer: [scratch])")
+    })
+    .await?;
+
+    {
+        let doc = doc!(app.editor);
+        let text = doc.text().to_string();
+
+        assert_eq!(doc.display_name().as_ref(), "printf one; cat");
+        assert!(text.contains(">>> hello\n"));
+        assert!(text.matches("hello\n").count() >= 2);
+        assert_eq!(
+            app.editor.get_status().unwrap().0.as_ref(),
+            "Stream cancelled (buffer: [scratch])"
+        );
+    }
+
+    close_app(&mut app).await?;
     Ok(())
 }
 

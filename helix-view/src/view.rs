@@ -693,7 +693,9 @@ impl View {
         diff_views: &std::collections::HashMap<ViewId, crate::diff_view::DiffViewState>,
         documents: &'a std::collections::BTreeMap<DocumentId, Document>,
     ) {
-        let Some(diff_state) = diff_views.get(&self.id) else { return };
+        let Some(diff_state) = diff_views.get(&self.id) else {
+            return;
+        };
         let other_doc_id = if diff_state.is_base_view(self.id) {
             diff_state.working_doc_id
         } else {

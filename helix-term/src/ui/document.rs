@@ -587,7 +587,9 @@ impl<'t> OverlayHighlighter<'t> {
                 let subtle_bg = match theme_bg {
                     Color::Rgb(bg_r, bg_g, bg_b) => {
                         // Calculate luminance to determine if theme is light or dark
-                        let luminance = (0.299 * bg_r as f32 + 0.587 * bg_g as f32 + 0.114 * bg_b as f32) / 255.0;
+                        let luminance =
+                            (0.299 * bg_r as f32 + 0.587 * bg_g as f32 + 0.114 * bg_b as f32)
+                                / 255.0;
 
                         // Extract diff color RGB or use default
                         let (diff_r, diff_g, diff_b) = match diff_color {
@@ -602,22 +604,34 @@ impl<'t> OverlayHighlighter<'t> {
                             // Dark theme: blend diff color with reduced intensity for subtlety
                             // Reduce blend to 20-25% mix for darker, more subtle highlighting
                             Color::Rgb(
-                                bg_r.saturating_add((diff_r as i16 - bg_r as i16).max(0).min(30) as u8),
-                                bg_g.saturating_add((diff_g as i16 - bg_g as i16).max(0).min(45) as u8),
-                                bg_b.saturating_add((diff_b as i16 - bg_b as i16).max(0).min(30) as u8),
+                                bg_r.saturating_add(
+                                    (diff_r as i16 - bg_r as i16).max(0).min(30) as u8
+                                ),
+                                bg_g.saturating_add(
+                                    (diff_g as i16 - bg_g as i16).max(0).min(45) as u8
+                                ),
+                                bg_b.saturating_add(
+                                    (diff_b as i16 - bg_b as i16).max(0).min(30) as u8
+                                ),
                             )
                         } else {
                             // Light theme: darken slightly with diff color tint (10-15% mix)
                             Color::Rgb(
-                                bg_r.saturating_sub(((bg_r as i16 - diff_r as i16).max(0).min(255) / 8) as u8),
-                                bg_g.saturating_sub(((bg_g as i16 - diff_g as i16).max(0).min(255) / 8) as u8),
-                                bg_b.saturating_sub(((bg_b as i16 - diff_b as i16).max(0).min(255) / 8) as u8),
+                                bg_r.saturating_sub(
+                                    ((bg_r as i16 - diff_r as i16).max(0).min(255) / 8) as u8,
+                                ),
+                                bg_g.saturating_sub(
+                                    ((bg_g as i16 - diff_g as i16).max(0).min(255) / 8) as u8,
+                                ),
+                                bg_b.saturating_sub(
+                                    ((bg_b as i16 - diff_b as i16).max(0).min(255) / 8) as u8,
+                                ),
                             )
                         }
                     }
                     Color::Black => Color::Rgb(30, 50, 30), // Darker green tint for black bg
                     Color::White => Color::Rgb(230, 245, 230), // Light green tint for white bg
-                    _ => Color::Rgb(30, 50, 30), // Darker default for dark themes
+                    _ => Color::Rgb(30, 50, 30),            // Darker default for dark themes
                 };
 
                 style.bg = Some(subtle_bg);

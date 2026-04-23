@@ -39,7 +39,7 @@ use tokio::{
     time::{sleep, Duration, Instant, Sleep},
 };
 
-use anyhow::{anyhow, bail, Context, Error};
+use anyhow::{anyhow, bail, Error};
 
 pub use helix_core::diagnostic::Severity;
 use helix_core::{
@@ -1161,14 +1161,29 @@ impl DiffRange {
     /// - `"a"` → base `a`, target `None` (a vs working tree)
     pub fn parse(range_str: &str) -> anyhow::Result<Self> {
         if let Some((base, target)) = range_str.split_once("..") {
-            anyhow::ensure!(!base.is_empty() && !target.is_empty(), "invalid range: both sides must be non-empty");
-            Ok(Self { base_ref: base.to_string(), target_ref: Some(target.to_string()) })
+            anyhow::ensure!(
+                !base.is_empty() && !target.is_empty(),
+                "invalid range: both sides must be non-empty"
+            );
+            Ok(Self {
+                base_ref: base.to_string(),
+                target_ref: Some(target.to_string()),
+            })
         } else if let Some(base) = range_str.strip_suffix('!') {
-            anyhow::ensure!(!base.is_empty(), "invalid range: '!' must follow a reference");
-            Ok(Self { base_ref: format!("{}^", base), target_ref: Some(base.to_string()) })
+            anyhow::ensure!(
+                !base.is_empty(),
+                "invalid range: '!' must follow a reference"
+            );
+            Ok(Self {
+                base_ref: format!("{}^", base),
+                target_ref: Some(base.to_string()),
+            })
         } else {
             anyhow::ensure!(!range_str.is_empty(), "invalid range: cannot be empty");
-            Ok(Self { base_ref: range_str.to_string(), target_ref: None })
+            Ok(Self {
+                base_ref: range_str.to_string(),
+                target_ref: None,
+            })
         }
     }
 
@@ -1176,6 +1191,45 @@ impl DiffRange {
         match &self.target_ref {
             Some(t) => format!("{}..{}", self.base_ref, t),
             None => self.base_ref.clone(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod diff_range_tests {
+    use super::DiffRange;
+
+    #[test]
+    fn parses_single_ref_ranges() {
+        let range = DiffRange::parse("HEAD").unwrap();
+        assert_eq!(range.base_ref, "HEAD");
+        assert_eq!(range.target_ref, None);
+        assert_eq!(range.display(), "HEAD");
+    }
+
+    #[test]
+    fn parses_bang_ranges() {
+        let range = DiffRange::parse("abc1234!").unwrap();
+        assert_eq!(range.base_ref, "abc1234^");
+        assert_eq!(range.target_ref.as_deref(), Some("abc1234"));
+        assert_eq!(range.display(), "abc1234^..abc1234");
+    }
+
+    #[test]
+    fn parses_explicit_commit_ranges() {
+        let range = DiffRange::parse("main..feature").unwrap();
+        assert_eq!(range.base_ref, "main");
+        assert_eq!(range.target_ref.as_deref(), Some("feature"));
+        assert_eq!(range.display(), "main..feature");
+    }
+
+    #[test]
+    fn rejects_invalid_ranges() {
+        for invalid in ["", "!", "..HEAD", "HEAD.."] {
+            assert!(
+                DiffRange::parse(invalid).is_err(),
+                "expected '{invalid}' to be rejected"
+            );
         }
     }
 }
@@ -2492,7 +2546,10 @@ impl Editor {
             cumulative_delta += (target_end - target_start) - (source_end - source_start);
         }
 
-        (source_line.saturating_add(cumulative_delta).max(0) as usize, None)
+        (
+            source_line.saturating_add(cumulative_delta).max(0) as usize,
+            None,
+        )
     }
 
     fn map_line_before_to_after(source_line: usize, diff_handle: &helix_vcs::DiffHandle) -> usize {
@@ -2581,9 +2638,17 @@ impl Editor {
 
         let (target_view_id, target_doc_id, source_doc_id) =
             if source_view_id == diff_state.base_view_id {
-                (diff_state.working_view_id, diff_state.working_doc_id, diff_state.base_doc_id)
+                (
+                    diff_state.working_view_id,
+                    diff_state.working_doc_id,
+                    diff_state.base_doc_id,
+                )
             } else {
-                (diff_state.base_view_id, diff_state.base_doc_id, diff_state.working_doc_id)
+                (
+                    diff_state.base_view_id,
+                    diff_state.base_doc_id,
+                    diff_state.working_doc_id,
+                )
             };
 
         if !self.tree.contains(source_view_id) || !self.tree.contains(target_view_id) {
@@ -2591,14 +2656,32 @@ impl Editor {
         }
 
         let mapped_offset = {
-            let Some(source_doc) = self.documents.get(&source_doc_id) else { return };
-            let Some(source_offset) = source_doc.get_view_offset(source_view_id) else { return };
-            let Some(target_doc) = self.documents.get(&target_doc_id) else { return };
+            let Some(source_doc) = self.documents.get(&source_doc_id) else {
+                return;
+            };
+            let Some(source_offset) = source_doc.get_view_offset(source_view_id) else {
+                return;
+            };
+            let Some(target_doc) = self.documents.get(&target_doc_id) else {
+                return;
+            };
 
             if let Some(source_diff) = source_doc.diff_handle() {
-                Self::map_view_offset_using_diff(source_doc, target_doc, source_offset, source_diff, true)
+                Self::map_view_offset_using_diff(
+                    source_doc,
+                    target_doc,
+                    source_offset,
+                    source_diff,
+                    true,
+                )
             } else if let Some(target_diff) = target_doc.diff_handle() {
-                Self::map_view_offset_using_diff(source_doc, target_doc, source_offset, target_diff, false)
+                Self::map_view_offset_using_diff(
+                    source_doc,
+                    target_doc,
+                    source_offset,
+                    target_diff,
+                    false,
+                )
             } else {
                 Self::map_view_offset_by_line(source_doc, target_doc, source_offset)
             }
@@ -2614,6 +2697,7 @@ impl Editor {
     // -------------------------------------------------------------------------
 
     fn get_diff_content_or_empty(path: &Path, git_ref: &str) -> Result<Vec<u8>, Error> {
+        #[cfg(feature = "git")]
         match helix_vcs::git::get_diff_base_from_ref(path, git_ref) {
             Ok(content) => Ok(content),
             Err(err) => {
@@ -2626,6 +2710,11 @@ impl Editor {
                     Err(err.into())
                 }
             }
+        }
+        #[cfg(not(feature = "git"))]
+        {
+            let _ = (path, git_ref);
+            anyhow::bail!("git support not compiled in");
         }
     }
 
@@ -2714,11 +2803,17 @@ impl Editor {
             self.switch(working_doc_id, Action::VerticalSplit);
             let working_view_id = self.tree.focus;
             let diff_state = DiffViewState::new(
-                base_doc_id, working_doc_id, base_view_id, working_view_id,
+                base_doc_id,
+                working_doc_id,
+                base_view_id,
+                working_view_id,
                 git_ref.to_string(),
-            ).with_reopen(
-                base_path.clone(), working_path.clone(),
-                git_ref.to_string(), None,
+            )
+            .with_reopen(
+                base_path.clone(),
+                working_path.clone(),
+                git_ref.to_string(),
+                None,
             );
             self.diff.views.insert(base_view_id, diff_state.clone());
             self.diff.views.insert(working_view_id, diff_state);
@@ -2726,11 +2821,17 @@ impl Editor {
             self.switch(working_doc_id, Action::Replace);
             let working_view_id = self.tree.focus;
             let diff_state = DiffViewState::new(
-                base_doc_id, working_doc_id, working_view_id, working_view_id,
+                base_doc_id,
+                working_doc_id,
+                working_view_id,
+                working_view_id,
                 git_ref.to_string(),
-            ).with_reopen(
-                base_path.clone(), working_path.clone(),
-                git_ref.to_string(), None,
+            )
+            .with_reopen(
+                base_path.clone(),
+                working_path.clone(),
+                git_ref.to_string(),
+                None,
             );
             self.diff.views.insert(working_view_id, diff_state);
         }
@@ -2770,7 +2871,10 @@ impl Editor {
 
         match target_ref {
             None => self.open_diff_view_with_paths(
-                &base_path, &target_path, base_ref, split_view_override,
+                &base_path,
+                &target_path,
+                base_ref,
+                split_view_override,
             ),
             Some(target) => {
                 let base_content = Self::get_diff_content_or_empty(&base_path, base_ref)
@@ -2780,14 +2884,20 @@ impl Editor {
                 let target_content_for_diff = target_content.clone();
 
                 let base_doc = Document::from_git_revision(
-                    base_content.clone(), &base_path, base_ref,
-                    self.config.clone(), self.syn_loader.clone(),
+                    base_content.clone(),
+                    &base_path,
+                    base_ref,
+                    self.config.clone(),
+                    self.syn_loader.clone(),
                 )?;
                 let base_doc_id = self.new_document(base_doc);
 
                 let target_doc = Document::from_git_revision(
-                    target_content, &target_path, target,
-                    self.config.clone(), self.syn_loader.clone(),
+                    target_content,
+                    &target_path,
+                    target,
+                    self.config.clone(),
+                    self.syn_loader.clone(),
                 )?;
                 let target_doc_id = self.new_document(target_doc);
 
@@ -2804,24 +2914,35 @@ impl Editor {
                     doc.set_diff_base(base_content);
                 }
 
-                let split_view = split_view_override.unwrap_or_else(|| self.config().diff.split_view);
+                let split_view =
+                    split_view_override.unwrap_or_else(|| self.config().diff.split_view);
                 let display = format!("{}..{}", base_ref, target);
 
                 if split_view {
                     let views_to_close: Vec<ViewId> = self
-                        .tree.views()
+                        .tree
+                        .views()
                         .filter_map(|(v, focus)| if !focus { Some(v.id) } else { None })
                         .collect();
-                    for view_id in views_to_close { self.close(view_id); }
+                    for view_id in views_to_close {
+                        self.close(view_id);
+                    }
                     self.switch(base_doc_id, Action::Replace);
                     let base_view_id = self.tree.focus;
                     self.switch(target_doc_id, Action::VerticalSplit);
                     let target_view_id = self.tree.focus;
                     let diff_state = DiffViewState::new(
-                        base_doc_id, target_doc_id, base_view_id, target_view_id, display,
-                    ).with_reopen(
-                        base_path.clone(), target_path.clone(),
-                        base_ref.to_string(), Some(target.to_string()),
+                        base_doc_id,
+                        target_doc_id,
+                        base_view_id,
+                        target_view_id,
+                        display,
+                    )
+                    .with_reopen(
+                        base_path.clone(),
+                        target_path.clone(),
+                        base_ref.to_string(),
+                        Some(target.to_string()),
                     );
                     self.diff.views.insert(base_view_id, diff_state.clone());
                     self.diff.views.insert(target_view_id, diff_state);
@@ -2829,10 +2950,17 @@ impl Editor {
                     self.switch(target_doc_id, Action::Replace);
                     let target_view_id = self.tree.focus;
                     let diff_state = DiffViewState::new(
-                        base_doc_id, target_doc_id, target_view_id, target_view_id, display,
-                    ).with_reopen(
-                        base_path.clone(), target_path.clone(),
-                        base_ref.to_string(), Some(target.to_string()),
+                        base_doc_id,
+                        target_doc_id,
+                        target_view_id,
+                        target_view_id,
+                        display,
+                    )
+                    .with_reopen(
+                        base_path.clone(),
+                        target_path.clone(),
+                        base_ref.to_string(),
+                        Some(target.to_string()),
                     );
                     self.diff.views.insert(target_view_id, diff_state);
                 }
@@ -2881,86 +3009,112 @@ impl Editor {
     ///   top-right: THEIRS (read-only incoming revision, char diff vs OURS)
     ///   bottom:    RESULT (editable conflicted file — source of truth)
     pub fn open_merge_view(&mut self, path: &Path) -> Result<(), Error> {
-        use crate::merge_view;
-
-        let path = helix_stdx::path::canonicalize(path);
-
-        // 1. Open the conflicted file as the editable RESULT doc.
-        let result_doc_id = if let Some(id) = self.non_virtual_document_id_by_path(&path) {
-            id
-        } else {
-            self.open(&path, Action::Load)?
-        };
-
-        // 2. Ensure there are conflicts to resolve.
+        #[cfg(not(feature = "git"))]
         {
-            let doc = self.documents.get(&result_doc_id)
+            let _ = path;
+            anyhow::bail!("git support not compiled in");
+        }
+
+        #[cfg(feature = "git")]
+        {
+            use anyhow::Context as _;
+            use crate::merge_view;
+
+            let path = helix_stdx::path::canonicalize(path);
+
+            // 1. Open the conflicted file as the editable RESULT doc.
+            let result_doc_id = if let Some(id) = self.non_virtual_document_id_by_path(&path) {
+                id
+            } else {
+                self.open(&path, Action::Load)?
+            };
+
+            // 2. Ensure there are conflicts to resolve.
+            let doc = self
+                .documents
+                .get(&result_doc_id)
                 .ok_or_else(|| anyhow::anyhow!("document not found"))?;
             if merge_view::conflict_count(doc.text()) == 0 {
                 anyhow::bail!("No conflict markers found in file");
             }
+
+            // 3. Fetch OURS (stage 2) and THEIRS (stage 3) from git index.
+            let (ours_bytes, theirs_bytes) = helix_vcs::git::get_merge_versions(&path)
+                .context("Failed to fetch merge versions from git index")?;
+
+            // 4. Create virtual read-only documents.
+            let ours_doc = Document::from_git_revision(
+                ours_bytes.clone(),
+                &path,
+                "HEAD",
+                self.config.clone(),
+                self.syn_loader.clone(),
+            )?;
+            let theirs_doc = Document::from_git_revision(
+                theirs_bytes.clone(),
+                &path,
+                "incoming",
+                self.config.clone(),
+                self.syn_loader.clone(),
+            )?;
+
+            let ours_doc_id = self.new_document(ours_doc);
+            let theirs_doc_id = self.new_document(theirs_doc);
+
+            // 5. Wire char-diff: OURS shows diff vs THEIRS and vice-versa.
+            if let Some(doc) = self.documents.get_mut(&ours_doc_id) {
+                doc.set_diff_base(theirs_bytes.clone());
+                doc.char_diff_enabled = true;
+                doc.char_diff_minus_side = true;
+            }
+            if let Some(doc) = self.documents.get_mut(&theirs_doc_id) {
+                doc.set_diff_base(ours_bytes);
+                doc.char_diff_enabled = true;
+                doc.char_diff_minus_side = false;
+            }
+
+            // 6. Build layout: close non-focused panes, then split.
+            let views_to_close: Vec<ViewId> = self
+                .tree
+                .views()
+                .filter_map(|(v, focus)| if !focus { Some(v.id) } else { None })
+                .collect();
+            for id in views_to_close {
+                self.close(id);
+            }
+
+            // Bottom pane = RESULT (editable).
+            self.switch(result_doc_id, Action::Replace);
+            let result_view_id = self.tree.focus;
+
+            // Top pane (horizontal split) starts with OURS.
+            self.switch(ours_doc_id, Action::HorizontalSplit);
+            let ours_view_id = self.tree.focus;
+
+            // THEIRS goes in a vertical split within the top pane.
+            self.switch(theirs_doc_id, Action::VerticalSplit);
+            let theirs_view_id = self.tree.focus;
+
+            // 7. Register merge state.
+            let state = MergeViewState {
+                ours_doc_id,
+                theirs_doc_id,
+                result_doc_id,
+                ours_view_id,
+                theirs_view_id,
+                result_view_id,
+                sync_scroll: true,
+                last_resolution: None,
+            };
+            self.diff.merge_views.insert(ours_view_id, state.clone());
+            self.diff.merge_views.insert(theirs_view_id, state.clone());
+            self.diff.merge_views.insert(result_view_id, state);
+
+            // Focus RESULT pane so the user starts editing conflicts immediately.
+            self.tree.focus = result_view_id;
+
+            Ok(())
         }
-
-        // 3. Fetch OURS (stage 2) and THEIRS (stage 3) from git index.
-        let (ours_bytes, theirs_bytes) = helix_vcs::git::get_merge_versions(&path)
-            .context("Failed to fetch merge versions from git index")?;
-
-        // 4. Create virtual read-only documents.
-        let ours_doc = Document::from_git_revision(
-            ours_bytes.clone(), &path, "HEAD", self.config.clone(), self.syn_loader.clone(),
-        )?;
-        let theirs_doc = Document::from_git_revision(
-            theirs_bytes.clone(), &path, "incoming", self.config.clone(), self.syn_loader.clone(),
-        )?;
-
-        let ours_doc_id = self.new_document(ours_doc);
-        let theirs_doc_id = self.new_document(theirs_doc);
-
-        // 5. Wire char-diff: OURS shows diff vs THEIRS and vice-versa.
-        if let Some(doc) = self.documents.get_mut(&ours_doc_id) {
-            doc.set_diff_base(theirs_bytes.clone());
-            doc.char_diff_enabled = true;
-            doc.char_diff_minus_side = true;
-        }
-        if let Some(doc) = self.documents.get_mut(&theirs_doc_id) {
-            doc.set_diff_base(ours_bytes);
-            doc.char_diff_enabled = true;
-            doc.char_diff_minus_side = false;
-        }
-
-        // 6. Build layout: close non-focused panes, then split.
-        let views_to_close: Vec<ViewId> = self.tree.views()
-            .filter_map(|(v, focus)| if !focus { Some(v.id) } else { None })
-            .collect();
-        for id in views_to_close { self.close(id); }
-
-        // Bottom pane = RESULT (editable).
-        self.switch(result_doc_id, Action::Replace);
-        let result_view_id = self.tree.focus;
-
-        // Top pane (horizontal split) starts with OURS.
-        self.switch(ours_doc_id, Action::HorizontalSplit);
-        let ours_view_id = self.tree.focus;
-
-        // THEIRS goes in a vertical split within the top pane.
-        self.switch(theirs_doc_id, Action::VerticalSplit);
-        let theirs_view_id = self.tree.focus;
-
-        // 7. Register merge state.
-        let state = MergeViewState {
-            ours_doc_id, theirs_doc_id, result_doc_id,
-            ours_view_id, theirs_view_id, result_view_id,
-            sync_scroll: true,
-            last_resolution: None,
-        };
-        self.diff.merge_views.insert(ours_view_id, state.clone());
-        self.diff.merge_views.insert(theirs_view_id, state.clone());
-        self.diff.merge_views.insert(result_view_id, state);
-
-        // Focus RESULT pane so the user starts editing conflicts immediately.
-        self.tree.focus = result_view_id;
-
-        Ok(())
     }
 
     pub fn close_merge_view(&mut self, view_id: ViewId) -> bool {

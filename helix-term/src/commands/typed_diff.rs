@@ -82,8 +82,10 @@ pub(crate) fn diff_commit(
         .with_context(|| format!("failed to parse diff range: {}", range_str))?;
     let display = diff_range.display();
     cx.editor.diff.range = Some(diff_range);
-    cx.editor
-        .set_status(format!("Diff range set to: {} — use space+g to browse files", display));
+    cx.editor.set_status(format!(
+        "Diff range set to: {} — use space+g to browse files",
+        display
+    ));
 
     Ok(())
 }
@@ -96,10 +98,13 @@ pub(crate) fn open_merge_view(
     if event != PromptEvent::Validate {
         return Ok(());
     }
-    let path = doc!(cx.editor).path()
+    let path = doc!(cx.editor)
+        .path()
         .map(|p| p.to_path_buf())
         .context("Current buffer has no file path")?;
-    cx.editor.open_merge_view(&path).map_err(|e| anyhow::anyhow!("{e}"))
+    cx.editor
+        .open_merge_view(&path)
+        .map_err(|e| anyhow::anyhow!("{e}"))
 }
 
 pub(crate) fn diff_reset_typed(
@@ -113,23 +118,19 @@ pub(crate) fn diff_reset_typed(
 
     cx.editor.diff.range = None;
 
-    let diff_bases: Vec<_> = cx
+    let diff_docs: Vec<_> = cx
         .editor
         .documents
         .iter()
-        .filter_map(|(id, doc)| {
-            let path = doc.path()?.to_path_buf();
-            let diff_base = cx.editor.diff_providers.get_diff_base(&path)?;
-            Some((*id, diff_base))
-        })
+        .filter_map(|(id, doc)| doc.path().map(|_| *id))
         .collect();
 
     for (_, doc) in cx.editor.documents.iter_mut() {
         doc.char_diff_enabled = false;
     }
-    for (id, diff_base) in diff_bases {
+    for id in diff_docs {
         if let Some(doc) = cx.editor.documents.get_mut(&id) {
-            doc.set_diff_base(diff_base);
+            let _ = doc.reset_diff_base();
         }
     }
 
@@ -143,115 +144,160 @@ pub(crate) fn diff_files(
     args: Args,
     event: PromptEvent,
 ) -> anyhow::Result<()> {
-    use helix_vcs::FileChange;
-    use helix_view::theme::Style;
-
-    if event != PromptEvent::Validate {
-        return Ok(());
+    #[cfg(not(feature = "git"))]
+    {
+        let _ = (cx, args, event);
+        anyhow::bail!("git support not compiled in");
     }
 
-    let ref_name = args.first().context("missing git reference argument")?;
-    let ref_name_owned = ref_name.to_string();
+    #[cfg(feature = "git")]
+    {
+        use helix_vcs::FileChange;
+        use helix_view::theme::Style;
 
-    let cwd = helix_stdx::env::current_working_dir();
-    if !cwd.exists() {
-        cx.editor
-            .set_error("Current working directory does not exist");
-        return Ok(());
-    }
-
-    let modified = cx.editor.theme.get("diff.delta");
-    let deleted = cx.editor.theme.get("diff.minus");
-    let renamed = cx.editor.theme.get("diff.delta.moved");
-
-    let callback = async move {
-        use tui::text::Span;
-
-        #[derive(Clone)]
-        pub struct DiffFileChangeData {
-            cwd: PathBuf,
-            style_modified: Style,
-            style_deleted: Style,
-            style_renamed: Style,
+        if event != PromptEvent::Validate {
+            return Ok(());
         }
 
-        let call: job::Callback = job::Callback::EditorCompositor(Box::new(
-            move |_editor: &mut Editor, compositor: &mut Compositor| {
-                let columns = [
-                    ui::PickerColumn::new("change", |change: &FileChange, data: &DiffFileChangeData| {
-                        match change {
-                            FileChange::Modified { .. } => Span::styled("~ modified", data.style_modified),
-                            FileChange::Deleted { .. } => Span::styled("- deleted", data.style_deleted),
-                            FileChange::Renamed { .. } => Span::styled("> renamed", data.style_renamed),
-                            _ => Span::raw("  changed"),
-                        }
-                        .into()
-                    }),
-                    ui::PickerColumn::new("path", |change: &FileChange, data: &DiffFileChangeData| {
-                        let display_path = |path: &PathBuf| {
-                            path.strip_prefix(&data.cwd)
-                                .unwrap_or(path)
-                                .display()
-                                .to_string()
-                        };
-                        match change {
-                            FileChange::Modified { path } => display_path(path),
-                            FileChange::Deleted { path } => display_path(path),
-                            FileChange::Renamed { from_path, to_path } => {
-                                format!("{} -> {}", display_path(from_path), display_path(to_path))
-                            }
-                            FileChange::Untracked { path } => display_path(path),
-                            FileChange::Conflict { path } => display_path(path),
-                        }
-                        .into()
-                    }),
-                ];
+        let ref_name = args.first().context("missing git reference argument")?;
+        let ref_name_owned = ref_name.to_string();
 
-                let ref_name_for_callback = ref_name_owned.clone();
-                let picker = ui::Picker::new(
-                    columns,
-                    1, // path column
-                    [],
-                    DiffFileChangeData {
-                        cwd: cwd.clone(),
-                        style_modified: modified,
-                        style_deleted: deleted,
-                        style_renamed: renamed,
-                    },
-                    move |cx, meta: &FileChange, _action| {
-                        let path = meta.path();
-                        if let Err(e) = cx.editor.open_diff_view(path, &ref_name_for_callback, None) {
-                            cx.editor.set_error(format!("Failed to open diff view: {e}"));
-                        }
-                    },
-                )
-                .with_preview(|_editor, meta| Some((meta.path().into(), None)));
+        let cwd = helix_stdx::env::current_working_dir();
+        if !cwd.exists() {
+            cx.editor
+                .set_error("Current working directory does not exist");
+            return Ok(());
+        }
 
-                let injector = picker.injector();
-                let ref_name_for_thread = ref_name_owned.clone();
+        let modified = cx.editor.theme.get("diff.delta");
+        let deleted = cx.editor.theme.get("diff.minus");
+        let renamed = cx.editor.theme.get("diff.delta.moved");
 
-                std::thread::spawn(move || {
-                    use helix_vcs::git;
-                    let result = git::for_each_changed_file_between_commits(
-                        &cwd,
-                        &ref_name_for_thread,
-                        move |change| match change {
-                            Ok(change) => injector.push(change).is_ok(),
-                            Err(_err) => true,
+        let callback = async move {
+            use tui::text::Span;
+
+            #[derive(Clone)]
+            pub struct DiffFileChangeData {
+                cwd: PathBuf,
+                style_modified: Style,
+                style_deleted: Style,
+                style_renamed: Style,
+            }
+
+            let call: job::Callback = job::Callback::EditorCompositor(Box::new(
+                move |_editor: &mut Editor, compositor: &mut Compositor| {
+                    let columns = [
+                        ui::PickerColumn::new(
+                            "change",
+                            |change: &FileChange, data: &DiffFileChangeData| {
+                                match change {
+                                    FileChange::Modified { .. } => {
+                                        Span::styled("~ modified", data.style_modified)
+                                    }
+                                    FileChange::Deleted { .. } => {
+                                        Span::styled("- deleted", data.style_deleted)
+                                    }
+                                    FileChange::Renamed { .. } => {
+                                        Span::styled("> renamed", data.style_renamed)
+                                    }
+                                    _ => Span::raw("  changed"),
+                                }
+                                .into()
+                            },
+                        ),
+                        ui::PickerColumn::new(
+                            "path",
+                            |change: &FileChange, data: &DiffFileChangeData| {
+                                let display_path = |path: &PathBuf| {
+                                    path.strip_prefix(&data.cwd)
+                                        .unwrap_or(path)
+                                        .display()
+                                        .to_string()
+                                };
+                                match change {
+                                    FileChange::Modified { path } => display_path(path),
+                                    FileChange::Deleted { path } => display_path(path),
+                                    FileChange::Renamed { from_path, to_path } => {
+                                        format!(
+                                            "{} -> {}",
+                                            display_path(from_path),
+                                            display_path(to_path)
+                                        )
+                                    }
+                                    FileChange::Untracked { path } => display_path(path),
+                                    FileChange::Conflict { path } => display_path(path),
+                                }
+                                .into()
+                            },
+                        ),
+                    ];
+
+                    let ref_name_for_callback = ref_name_owned.clone();
+                    let picker = ui::Picker::new(
+                        columns,
+                        1, // path column
+                        [],
+                        DiffFileChangeData {
+                            cwd: cwd.clone(),
+                            style_modified: modified,
+                            style_deleted: deleted,
+                            style_renamed: renamed,
                         },
-                    );
+                        move |cx, meta: &FileChange, _action| {
+                            let path = meta.path();
+                            if let Err(e) =
+                                cx.editor.open_diff_view(path, &ref_name_for_callback, None)
+                            {
+                                cx.editor
+                                    .set_error(format!("Failed to open diff view: {e}"));
+                            }
+                        },
+                    )
+                    .with_preview(|_editor, meta| Some((meta.path().into(), None)));
 
-                    if let Err(err) = result {
-                        log::error!("Failed to get diff files: {}", err);
+                    let injector = picker.injector();
+                    let ref_name_for_thread = ref_name_owned.clone();
+
+                    #[cfg(feature = "integration")]
+                    {
+                        use helix_vcs::git;
+                        let result = git::for_each_changed_file_between_commits(
+                            &cwd,
+                            &ref_name_for_thread,
+                            move |change| match change {
+                                Ok(change) => injector.push(change).is_ok(),
+                                Err(_err) => true,
+                            },
+                        );
+
+                        if let Err(err) = result {
+                            log::error!("Failed to get diff files: {}", err);
+                        }
                     }
-                });
+                    #[cfg(not(feature = "integration"))]
+                    std::thread::spawn(move || {
+                        use helix_vcs::git;
+                        let result = git::for_each_changed_file_between_commits(
+                            &cwd,
+                            &ref_name_for_thread,
+                            move |change| match change {
+                                Ok(change) => injector.push(change).is_ok(),
+                                Err(_err) => true,
+                            },
+                        );
 
-                compositor.push(Box::new(overlaid(picker)));
-            },
-        ));
-        Ok(call)
-    };
+                        if let Err(err) = result {
+                            log::error!("Failed to get diff files: {}", err);
+                        }
+                    });
 
-    cx.jobs.callback(callback);
-    Ok(())
+                    compositor.push(Box::new(overlaid(picker)));
+                },
+            ));
+            Ok(call)
+        };
+
+        cx.jobs.callback(callback);
+        Ok(())
+    }
 }

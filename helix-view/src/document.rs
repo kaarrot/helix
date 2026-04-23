@@ -1929,22 +1929,39 @@ impl Document {
 
     /// Set the diff base to an arbitrary git ref (branch, tag, or commit hash).
     pub fn set_diff_base_from_ref(&mut self, ref_name: String) -> anyhow::Result<()> {
-        if let Some(path) = self.path() {
-            let diff_base = helix_vcs::git::get_diff_base_from_ref(path, &ref_name)?;
-            self.set_diff_base(diff_base);
-            self.diff_base_ref = Some(ref_name);
+        #[cfg(feature = "git")]
+        {
+            if let Some(path) = self.path() {
+                let diff_base = helix_vcs::git::get_diff_base_from_ref(path, &ref_name)?;
+                self.set_diff_base(diff_base);
+                self.diff_base_ref = Some(ref_name);
+            }
+            return Ok(());
         }
-        Ok(())
+
+        #[cfg(not(feature = "git"))]
+        {
+            let _ = ref_name;
+            anyhow::bail!("git support not compiled in");
+        }
     }
 
     /// Reset the diff base back to HEAD.
     pub fn reset_diff_base(&mut self) -> anyhow::Result<()> {
-        if let Some(path) = self.path() {
-            let diff_base = helix_vcs::git::get_diff_base(path)?;
-            self.set_diff_base(diff_base);
-            self.diff_base_ref = None;
+        #[cfg(feature = "git")]
+        {
+            if let Some(path) = self.path() {
+                let diff_base = helix_vcs::git::get_diff_base(path)?;
+                self.set_diff_base(diff_base);
+                self.diff_base_ref = None;
+            }
+            return Ok(());
         }
-        Ok(())
+
+        #[cfg(not(feature = "git"))]
+        {
+            anyhow::bail!("git support not compiled in");
+        }
     }
 
     /// Return the git ref currently used as the diff base, if any custom ref is set.

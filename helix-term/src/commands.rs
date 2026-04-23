@@ -4042,7 +4042,9 @@ fn goto_next_change_impl(cx: &mut Context, direction: Direction) {
             return;
         }
 
-        let mapped_line = cx.editor.map_line_between_documents(source_doc_id, other_doc_id, cursor_line);
+        let mapped_line =
+            cx.editor
+                .map_line_between_documents(source_doc_id, other_doc_id, cursor_line);
 
         let target_line = {
             let Some(other_doc) = cx.editor.documents.get(&other_doc_id) else {

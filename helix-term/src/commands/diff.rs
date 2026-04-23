@@ -1,148 +1,183 @@
 use super::*;
 
+#[cfg(feature = "git")]
 use helix_vcs::FileChange;
 use helix_view::editor::MergeViewState;
 
 pub fn changed_file_picker(cx: &mut Context) {
-    pub struct FileChangeData {
-        cwd: PathBuf,
-        style_untracked: Style,
-        style_modified: Style,
-        style_conflict: Style,
-        style_deleted: Style,
-        style_renamed: Style,
-    }
-
-    let cwd = helix_stdx::env::current_working_dir();
-    if !cwd.exists() {
-        cx.editor
-            .set_error("Current working directory does not exist");
+    #[cfg(not(feature = "git"))]
+    {
+        cx.editor.set_error("git support not compiled in");
         return;
     }
 
-    // Get the current file path for pre-selection in the picker
-    let current_file_path = {
-        let (_, doc) = current!(cx.editor);
-        doc.path().map(|p| p.to_path_buf())
-    };
+    #[cfg(feature = "git")]
+    {
+        pub struct FileChangeData {
+            cwd: PathBuf,
+            style_untracked: Style,
+            style_modified: Style,
+            style_conflict: Style,
+            style_deleted: Style,
+            style_renamed: Style,
+        }
 
-    // Get diff range from editor state or default to HEAD vs working tree
-    let diff_range = cx.editor.diff.range.clone().unwrap_or_else(|| DiffRange {
-        base_ref: "HEAD".to_string(),
-        target_ref: None,
-    });
+        let cwd = helix_stdx::env::current_working_dir();
+        if !cwd.exists() {
+            cx.editor
+                .set_error("Current working directory does not exist");
+            return;
+        }
 
-    let base_ref = diff_range.base_ref.clone();
-    let target_ref = diff_range.target_ref.clone();
+        // Get the current file path for pre-selection in the picker
+        let current_file_path = {
+            let (_, doc) = current!(cx.editor);
+            doc.path().map(|p| p.to_path_buf())
+        };
 
-    cx.editor.set_status(format!("Loading changes for: {}", diff_range.display()));
+        // Get diff range from editor state or default to HEAD vs working tree
+        let diff_range = cx.editor.diff.range.clone().unwrap_or_else(|| DiffRange {
+            base_ref: "HEAD".to_string(),
+            target_ref: None,
+        });
 
-    let added = cx.editor.theme.get("diff.plus");
-    let modified = cx.editor.theme.get("diff.delta");
-    let conflict = cx.editor.theme.get("diff.delta.conflict");
-    let deleted = cx.editor.theme.get("diff.minus");
-    let renamed = cx.editor.theme.get("diff.delta.moved");
+        let base_ref = diff_range.base_ref.clone();
+        let target_ref = diff_range.target_ref.clone();
 
-    let columns = [
-        PickerColumn::new("change", |change: &FileChange, data: &FileChangeData| {
-            match change {
-                FileChange::Untracked { .. } => Span::styled("+ untracked", data.style_untracked),
-                FileChange::Modified { .. } => Span::styled("~ modified", data.style_modified),
-                FileChange::Conflict { .. } => Span::styled("x conflict", data.style_conflict),
-                FileChange::Deleted { .. } => Span::styled("- deleted", data.style_deleted),
-                FileChange::Renamed { .. } => Span::styled("> renamed", data.style_renamed),
-            }
-            .into()
-        }),
-        PickerColumn::new("path", |change: &FileChange, data: &FileChangeData| {
-            let display_path = |path: &PathBuf| {
-                path.strip_prefix(&data.cwd)
-                    .unwrap_or(path)
-                    .display()
-                    .to_string()
-            };
-            match change {
-                FileChange::Untracked { path } => display_path(path),
-                FileChange::Modified { path } => display_path(path),
-                FileChange::Conflict { path } => display_path(path),
-                FileChange::Deleted { path } => display_path(path),
-                FileChange::Renamed { from_path, to_path } => {
-                    format!("{} -> {}", display_path(from_path), display_path(to_path))
-                }
-            }
-            .into()
-        }),
-    ];
+        cx.editor
+            .set_status(format!("Loading changes for: {}", diff_range.display()));
 
-    let picker = Picker::new(
-        columns,
-        1, // path
-        [],
-        FileChangeData {
-            cwd: cwd.clone(),
-            style_untracked: added,
-            style_modified: modified,
-            style_conflict: conflict,
-            style_deleted: deleted,
-            style_renamed: renamed,
-        },
-        {
-            let base_ref_cb = base_ref.clone();
-            let target_ref_cb = target_ref.clone();
-            move |cx, meta: &FileChange, _action| {
-                cx.editor.diff.last_changed_file_selection = Some(meta.path().to_path_buf());
-                let path = meta.path();
-                // Conflict files open the 3-way merge view directly
-                if matches!(meta, FileChange::Conflict { .. }) {
-                    if let Err(e) = cx.editor.open_merge_view(path) {
-                        cx.editor.set_error(format!("Failed to open merge view: {e}"));
+        let added = cx.editor.theme.get("diff.plus");
+        let modified = cx.editor.theme.get("diff.delta");
+        let conflict = cx.editor.theme.get("diff.delta.conflict");
+        let deleted = cx.editor.theme.get("diff.minus");
+        let renamed = cx.editor.theme.get("diff.delta.moved");
+
+        let columns = [
+            PickerColumn::new("change", |change: &FileChange, data: &FileChangeData| {
+                match change {
+                    FileChange::Untracked { .. } => {
+                        Span::styled("+ untracked", data.style_untracked)
                     }
-                    return;
+                    FileChange::Modified { .. } => Span::styled("~ modified", data.style_modified),
+                    FileChange::Conflict { .. } => Span::styled("x conflict", data.style_conflict),
+                    FileChange::Deleted { .. } => Span::styled("- deleted", data.style_deleted),
+                    FileChange::Renamed { .. } => Span::styled("> renamed", data.style_renamed),
                 }
-                if let Err(e) = cx.editor.open_diff_view_range(
-                    path, &base_ref_cb, target_ref_cb.as_deref(), None,
-                ) {
-                    cx.editor.set_error(format!("Failed to open diff view: {e}"));
+                .into()
+            }),
+            PickerColumn::new("path", |change: &FileChange, data: &FileChangeData| {
+                let display_path = |path: &PathBuf| {
+                    path.strip_prefix(&data.cwd)
+                        .unwrap_or(path)
+                        .display()
+                        .to_string()
+                };
+                match change {
+                    FileChange::Untracked { path } => display_path(path),
+                    FileChange::Modified { path } => display_path(path),
+                    FileChange::Conflict { path } => display_path(path),
+                    FileChange::Deleted { path } => display_path(path),
+                    FileChange::Renamed { from_path, to_path } => {
+                        format!("{} -> {}", display_path(from_path), display_path(to_path))
+                    }
                 }
-            }
-        },
-    )
-    .with_preview(|_editor, meta| Some((meta.path().into(), None)));
+                .into()
+            }),
+        ];
 
-    let picker = picker.with_pre_select(move |file_change: &FileChange| {
-        current_file_path
-            .as_ref()
-            .map_or(false, |p| file_change.path() == p)
-    });
-
-    let injector = picker.injector();
-    std::thread::spawn(move || {
-        use helix_vcs::git;
-        let _ = git::for_each_changed_file_between_refs(
-            &cwd,
-            &base_ref,
-            target_ref.as_deref(),
-            move |change| match change {
-                Ok(change) => injector.push(change).is_ok(),
-                Err(_) => true,
+        let picker = Picker::new(
+            columns,
+            1, // path
+            [],
+            FileChangeData {
+                cwd: cwd.clone(),
+                style_untracked: added,
+                style_modified: modified,
+                style_conflict: conflict,
+                style_deleted: deleted,
+                style_renamed: renamed,
             },
-        );
-    });
+            {
+                let base_ref_cb = base_ref.clone();
+                let target_ref_cb = target_ref.clone();
+                move |cx, meta: &FileChange, _action| {
+                    cx.editor.diff.last_changed_file_selection = Some(meta.path().to_path_buf());
+                    let path = meta.path();
+                    // Conflict files open the 3-way merge view directly
+                    if matches!(meta, FileChange::Conflict { .. }) {
+                        if let Err(e) = cx.editor.open_merge_view(path) {
+                            cx.editor
+                                .set_error(format!("Failed to open merge view: {e}"));
+                        }
+                        return;
+                    }
+                    if let Err(e) =
+                        cx.editor
+                            .open_diff_view_range(path, &base_ref_cb, target_ref_cb.as_deref(), None)
+                    {
+                        cx.editor
+                            .set_error(format!("Failed to open diff view: {e}"));
+                    }
+                }
+            },
+        )
+        .with_preview(|_editor, meta| Some((meta.path().into(), None)));
 
-    cx.push_layer(Box::new(overlaid(picker)));
+        let picker = picker.with_pre_select(move |file_change: &FileChange| {
+            current_file_path
+                .as_ref()
+                .map_or(false, |p| file_change.path() == p)
+        });
+
+        let injector = picker.injector();
+
+        #[cfg(feature = "integration")]
+        {
+            use helix_vcs::git;
+            let _ = git::for_each_changed_file_between_refs(
+                &cwd,
+                &base_ref,
+                target_ref.as_deref(),
+                move |change| match change {
+                    Ok(change) => injector.push(change).is_ok(),
+                    Err(_) => true,
+                },
+            );
+        }
+
+        #[cfg(not(feature = "integration"))]
+        std::thread::spawn(move || {
+            use helix_vcs::git;
+            let _ = git::for_each_changed_file_between_refs(
+                &cwd,
+                &base_ref,
+                target_ref.as_deref(),
+                move |change| match change {
+                    Ok(change) => injector.push(change).is_ok(),
+                    Err(_) => true,
+                },
+            );
+        });
+
+        cx.push_layer(Box::new(overlaid(picker)));
+    }
 }
 
 pub fn close_diff_or_merge_view(cx: &mut Context) {
     let view_id = view!(cx.editor).id;
-    let closed = cx.editor.close_diff_view(view_id)
-        || cx.editor.close_merge_view(view_id);
+    let closed = cx.editor.close_diff_view(view_id) || cx.editor.close_merge_view(view_id);
     if !closed {
         cx.editor.set_error("Not in a diff or merge view");
     }
 }
 
 #[derive(Copy, Clone)]
-enum AcceptSide { Ours, Theirs, Both }
+enum AcceptSide {
+    Ours,
+    Theirs,
+    Both,
+}
 
 impl AcceptSide {
     fn pick(self, ours: &str, theirs: &str, both: &str) -> String {
@@ -174,7 +209,7 @@ pub fn merge_accept_both(cx: &mut Context) {
 }
 
 fn merge_accept_impl(cx: &mut Context, side: AcceptSide) {
-    use helix_view::merge_view::{find_conflicts, extract_sides, LastResolution};
+    use helix_view::merge_view::{extract_sides, find_conflicts, LastResolution};
 
     let view_id = view!(cx.editor).id;
     let doc_id = doc!(cx.editor).id();
@@ -182,18 +217,29 @@ fn merge_accept_impl(cx: &mut Context, side: AcceptSide) {
     // 1. If we just resolved a conflict and the cursor is still inside the
     //    inserted replacement, replace it again with the new side instead of
     //    hunting for markers that no longer exist.
-    let prior = cx.editor.diff.merge_views.get(&view_id)
+    let prior = cx
+        .editor
+        .diff
+        .merge_views
+        .get(&view_id)
         .and_then(|s| s.last_resolution.clone());
     if let Some(prior) = prior {
         let (view, doc) = current!(cx.editor);
-        let cursor = doc.selection(view.id).primary().cursor(doc.text().slice(..));
+        let cursor = doc
+            .selection(view.id)
+            .primary()
+            .cursor(doc.text().slice(..));
         if cursor >= prior.start_char && cursor <= prior.end_char {
             let replacement = side.pick(&prior.ours, &prior.theirs, &prior.both);
             let new_end = prior.start_char + replacement.chars().count();
             let text = doc.text();
             let tx = helix_core::Transaction::change(
                 text,
-                std::iter::once((prior.start_char, prior.end_char, Some(replacement.clone().into()))),
+                std::iter::once((
+                    prior.start_char,
+                    prior.end_char,
+                    Some(replacement.clone().into()),
+                )),
             );
             doc.apply(&tx, view_id);
             let new_resolution = LastResolution {
@@ -203,8 +249,13 @@ fn merge_accept_impl(cx: &mut Context, side: AcceptSide) {
                 theirs: prior.theirs,
                 both: prior.both,
             };
-            update_last_resolutions(&mut cx.editor.diff.merge_views, doc_id, Some(new_resolution));
-            cx.editor.set_status(format!("Switched to {} version", side.label()));
+            update_last_resolutions(
+                &mut cx.editor.diff.merge_views,
+                doc_id,
+                Some(new_resolution),
+            );
+            cx.editor
+                .set_status(format!("Switched to {} version", side.label()));
             return;
         }
     }
@@ -213,12 +264,15 @@ fn merge_accept_impl(cx: &mut Context, side: AcceptSide) {
     let text = doc!(cx.editor).text().clone();
     let cursor_line = {
         let (view, doc) = current_ref!(cx.editor);
-        doc.selection(view.id).primary().cursor_line(doc.text().slice(..))
+        doc.selection(view.id)
+            .primary()
+            .cursor_line(doc.text().slice(..))
     };
 
-    let Some(region) = find_conflicts(&text).into_iter().find(|r| {
-        cursor_line >= r.start_line && cursor_line <= r.end_line
-    }) else {
+    let Some(region) = find_conflicts(&text)
+        .into_iter()
+        .find(|r| cursor_line >= r.start_line && cursor_line <= r.end_line)
+    else {
         cx.editor.set_status("No conflict at cursor");
         return;
     };
@@ -251,8 +305,13 @@ fn merge_accept_impl(cx: &mut Context, side: AcceptSide) {
         theirs,
         both,
     };
-    update_last_resolutions(&mut cx.editor.diff.merge_views, doc_id, Some(new_resolution));
-    cx.editor.set_status(format!("Accepted {} version", side.label()));
+    update_last_resolutions(
+        &mut cx.editor.diff.merge_views,
+        doc_id,
+        Some(new_resolution),
+    );
+    cx.editor
+        .set_status(format!("Accepted {} version", side.label()));
 }
 
 /// Update `last_resolution` on every MergeViewState entry tied to the given
@@ -282,7 +341,10 @@ fn merge_jump_impl(cx: &mut Context, direction: Direction) {
     let (view, doc) = current!(cx.editor);
     let view_id = view.id;
     let doc_id = doc.id();
-    let cursor_line = doc.selection(view_id).primary().cursor_line(doc.text().slice(..));
+    let cursor_line = doc
+        .selection(view_id)
+        .primary()
+        .cursor_line(doc.text().slice(..));
     let text = doc.text().clone();
     let conflicts = find_conflicts(&text);
 
@@ -296,10 +358,15 @@ fn merge_jump_impl(cx: &mut Context, direction: Direction) {
 
     let total = conflicts.len();
     let target_start = match direction {
-        Direction::Forward => conflicts.iter().find(|r| r.start_line > cursor_line)
+        Direction::Forward => conflicts
+            .iter()
+            .find(|r| r.start_line > cursor_line)
             .or_else(|| conflicts.first())
             .map(|r| r.start_line),
-        Direction::Backward => conflicts.iter().rev().find(|r| r.start_line < cursor_line)
+        Direction::Backward => conflicts
+            .iter()
+            .rev()
+            .find(|r| r.start_line < cursor_line)
             .or_else(|| conflicts.last())
             .map(|r| r.start_line),
     };
@@ -311,9 +378,13 @@ fn merge_jump_impl(cx: &mut Context, direction: Direction) {
         doc.set_selection(view_id, helix_core::Selection::point(pos));
         cx.editor.ensure_cursor_in_view(view_id);
 
-        let current_idx = conflicts.iter().position(|r| r.start_line == start_line)
-            .map(|i| i + 1).unwrap_or(1);
-        cx.editor.set_status(format!("Conflict {}/{}", current_idx, total));
+        let current_idx = conflicts
+            .iter()
+            .position(|r| r.start_line == start_line)
+            .map(|i| i + 1)
+            .unwrap_or(1);
+        cx.editor
+            .set_status(format!("Conflict {}/{}", current_idx, total));
     }
 }
 
@@ -323,7 +394,8 @@ pub fn merge_finish(cx: &mut Context) {
     let remaining = conflict_count(doc.text());
 
     if remaining > 0 {
-        cx.editor.set_error(format!("{} conflict(s) still unresolved", remaining));
+        cx.editor
+            .set_error(format!("{} conflict(s) still unresolved", remaining));
         return;
     }
 
@@ -337,7 +409,10 @@ pub fn merge_finish(cx: &mut Context) {
 
     // Stage with git add
     if let Some(p) = path {
-        let _ = std::process::Command::new("git").args(["add", "--"]).arg(&p).status();
+        let _ = std::process::Command::new("git")
+            .args(["add", "--"])
+            .arg(&p)
+            .status();
     }
 
     cx.editor.set_status("File saved and staged (git add)");
@@ -355,7 +430,11 @@ pub fn diff_toggle_sync_scroll(cx: &mut Context) {
             state.sync_scroll = new_val;
         }
     }
-    cx.editor.set_status(if new_val { "Sync scroll enabled" } else { "Sync scroll disabled" });
+    cx.editor.set_status(if new_val {
+        "Sync scroll enabled"
+    } else {
+        "Sync scroll disabled"
+    });
 }
 
 pub fn diff_toggle_split_view(cx: &mut Context) {
@@ -373,7 +452,8 @@ pub fn diff_toggle_split_view(cx: &mut Context) {
     let target_ref = diff_state.target_ref.clone();
 
     if base_path.as_os_str().is_empty() || working_path.as_os_str().is_empty() {
-        cx.editor.set_error("Can't toggle: diff view missing reopen paths");
+        cx.editor
+            .set_error("Can't toggle: diff view missing reopen paths");
         return;
     }
 
@@ -381,13 +461,22 @@ pub fn diff_toggle_split_view(cx: &mut Context) {
     cx.editor.close_diff_view(view_id);
 
     let result = cx.editor.open_diff_view_range_with_paths(
-        &base_path, &working_path, &base_ref, target_ref.as_deref(), Some(new_split),
+        &base_path,
+        &working_path,
+        &base_ref,
+        target_ref.as_deref(),
+        Some(new_split),
     );
     if let Err(e) = result {
-        cx.editor.set_error(format!("Failed to toggle split view: {e}"));
+        cx.editor
+            .set_error(format!("Failed to toggle split view: {e}"));
         return;
     }
-    cx.editor.set_status(if new_split { "Split view on" } else { "Split view off" });
+    cx.editor.set_status(if new_split {
+        "Split view on"
+    } else {
+        "Split view off"
+    });
 }
 
 pub fn diff_reset(cx: &mut Context) {
@@ -396,19 +485,18 @@ pub fn diff_reset(cx: &mut Context) {
         cx.editor.close_diff_view(view_id);
     }
     cx.editor.diff.range = None;
-    let diff_bases: Vec<_> = cx.editor.documents.iter()
-        .filter_map(|(id, doc)| {
-            let path = doc.path()?.to_path_buf();
-            let base = cx.editor.diff_providers.get_diff_base(&path)?;
-            Some((*id, base))
-        })
+    let diff_docs: Vec<_> = cx
+        .editor
+        .documents
+        .iter()
+        .filter_map(|(id, doc)| doc.path().map(|_| *id))
         .collect();
     for (_, doc) in cx.editor.documents.iter_mut() {
         doc.char_diff_enabled = false;
     }
-    for (id, base) in diff_bases {
+    for id in diff_docs {
         if let Some(doc) = cx.editor.documents.get_mut(&id) {
-            doc.set_diff_base(base);
+            let _ = doc.reset_diff_base();
         }
     }
     cx.editor.set_status("Diff reset to HEAD");
@@ -417,8 +505,7 @@ pub fn diff_reset(cx: &mut Context) {
 /// Extract a leading git-hash-like token from a line of text.
 fn extract_commit_hash(line: &str) -> Option<&str> {
     let token = line.split_whitespace().next()?;
-    let is_hash = (7..=40).contains(&token.len())
-        && token.chars().all(|c| c.is_ascii_hexdigit());
+    let is_hash = (7..=40).contains(&token.len()) && token.chars().all(|c| c.is_ascii_hexdigit());
     is_hash.then_some(token)
 }
 
@@ -439,13 +526,18 @@ pub fn diff_commit_from_selection(cx: &mut Context) {
             return;
         };
         let hash = hash.to_string();
-        cx.editor.diff.range = Some(DiffRange { base_ref: hash.clone(), target_ref: None });
-        cx.editor.set_status(format!("Diff set: {} vs working tree", hash));
+        cx.editor.diff.range = Some(DiffRange {
+            base_ref: hash.clone(),
+            target_ref: None,
+        });
+        cx.editor
+            .set_status(format!("Diff set: {} vs working tree", hash));
     } else {
         // In git log output, the first line is the newer commit; diff goes OLD..NEW.
-        let (Some(newer), Some(older)) =
-            (extract_commit_hash(lines[0]), extract_commit_hash(lines[lines.len() - 1]))
-        else {
+        let (Some(newer), Some(older)) = (
+            extract_commit_hash(lines[0]),
+            extract_commit_hash(lines[lines.len() - 1]),
+        ) else {
             cx.editor.set_error("Invalid commit hash in selection");
             return;
         };
@@ -454,7 +546,8 @@ pub fn diff_commit_from_selection(cx: &mut Context) {
             base_ref: older.clone(),
             target_ref: Some(newer.clone()),
         });
-        cx.editor.set_status(format!("Diff set: {}..{}", older, newer));
+        cx.editor
+            .set_status(format!("Diff set: {}..{}", older, newer));
     }
 }
 
@@ -477,5 +570,6 @@ pub fn diff_show_commit_from_selection(cx: &mut Context) {
         base_ref: format!("{}^", hash),
         target_ref: Some(hash.clone()),
     });
-    cx.editor.set_status(format!("Diff set: showing changes in {}", hash));
+    cx.editor
+        .set_status(format!("Diff set: showing changes in {}", hash));
 }

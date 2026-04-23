@@ -1,4 +1,7 @@
-use crate::{editor::{DiffRange, MergeViewState}, DocumentId, ViewId};
+use crate::{
+    editor::{DiffRange, MergeViewState},
+    DocumentId, ViewId,
+};
 use std::{collections::HashMap, path::PathBuf};
 
 /// All diff/merge runtime state aggregated into one Editor field.

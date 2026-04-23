@@ -133,7 +133,9 @@ pub fn get_merge_versions(file: &Path) -> Result<(Vec<u8>, Vec<u8>)> {
         .context("failed to open git repo")?
         .to_thread_local();
 
-    let work_dir = repo.workdir().ok_or_else(|| anyhow::anyhow!("not a working tree"))?;
+    let work_dir = repo
+        .workdir()
+        .ok_or_else(|| anyhow::anyhow!("not a working tree"))?;
     let rela_path = file.strip_prefix(work_dir)?;
     let rela_path = gix::path::try_into_bstr(rela_path)?;
 
@@ -144,26 +146,30 @@ pub fn get_merge_versions(file: &Path) -> Result<(Vec<u8>, Vec<u8>)> {
     for entry in index.entries() {
         if entry.path(&index) == rela_path.as_ref() {
             match entry.stage() {
-                gix::index::entry::Stage::Ours   => ours_oid   = Some(entry.id),
+                gix::index::entry::Stage::Ours => ours_oid = Some(entry.id),
                 gix::index::entry::Stage::Theirs => theirs_oid = Some(entry.id),
                 _ => {}
             }
         }
     }
 
-    let ours_oid = ours_oid.ok_or_else(|| anyhow::anyhow!("OURS (stage 2) not in index — is there an active merge?"))?;
+    let ours_oid = ours_oid.ok_or_else(|| {
+        anyhow::anyhow!("OURS (stage 2) not in index — is there an active merge?")
+    })?;
     let theirs_oid = theirs_oid.ok_or_else(|| anyhow::anyhow!("THEIRS (stage 3) not in index"))?;
 
     let (mut pipeline, _) = repo.filter_pipeline(None)?;
 
     let ours_data = repo.find_object(ours_oid)?.detach().data;
-    let mut ours_out = pipeline.convert_to_worktree(&ours_data, rela_path.as_ref(), Delay::Forbid)?;
+    let mut ours_out =
+        pipeline.convert_to_worktree(&ours_data, rela_path.as_ref(), Delay::Forbid)?;
     let mut ours_buf = Vec::with_capacity(ours_data.len());
     ours_out.read_to_end(&mut ours_buf)?;
 
     let (mut pipeline2, _) = repo.filter_pipeline(None)?;
     let theirs_data = repo.find_object(theirs_oid)?.detach().data;
-    let mut theirs_out = pipeline2.convert_to_worktree(&theirs_data, rela_path.as_ref(), Delay::Forbid)?;
+    let mut theirs_out =
+        pipeline2.convert_to_worktree(&theirs_data, rela_path.as_ref(), Delay::Forbid)?;
     let mut theirs_buf = Vec::with_capacity(theirs_data.len());
     theirs_out.read_to_end(&mut theirs_buf)?;
 
@@ -210,15 +216,25 @@ pub fn for_each_changed_file_between_refs(
                 |change| -> Result<_, std::convert::Infallible> {
                     use gix::object::tree::diff::Change;
                     let file_change = match change {
-                        Change::Addition { entry_mode, .. } | Change::Modification { entry_mode, .. } | Change::Rewrite { entry_mode, .. } => {
+                        Change::Addition { entry_mode, .. }
+                        | Change::Modification { entry_mode, .. }
+                        | Change::Rewrite { entry_mode, .. } => {
                             if entry_mode.is_blob() {
-                                Some(FileChange::Modified { path: work_dir.join(gix::path::from_bstr(change.location())) })
-                            } else { None }
+                                Some(FileChange::Modified {
+                                    path: work_dir.join(gix::path::from_bstr(change.location())),
+                                })
+                            } else {
+                                None
+                            }
                         }
                         Change::Deletion { entry_mode, .. } => {
                             if entry_mode.is_blob() {
-                                Some(FileChange::Deleted { path: work_dir.join(gix::path::from_bstr(change.location())) })
-                            } else { None }
+                                Some(FileChange::Deleted {
+                                    path: work_dir.join(gix::path::from_bstr(change.location())),
+                                })
+                            } else {
+                                None
+                            }
                         }
                     };
                     if let Some(change_item) = file_change {
@@ -255,15 +271,25 @@ pub fn for_each_changed_file_between_refs(
                 |change| -> Result<_, std::convert::Infallible> {
                     use gix::object::tree::diff::Change;
                     let file_change = match change {
-                        Change::Addition { entry_mode, .. } | Change::Modification { entry_mode, .. } | Change::Rewrite { entry_mode, .. } => {
+                        Change::Addition { entry_mode, .. }
+                        | Change::Modification { entry_mode, .. }
+                        | Change::Rewrite { entry_mode, .. } => {
                             if entry_mode.is_blob() {
-                                Some(FileChange::Modified { path: work_dir.join(gix::path::from_bstr(change.location())) })
-                            } else { None }
+                                Some(FileChange::Modified {
+                                    path: work_dir.join(gix::path::from_bstr(change.location())),
+                                })
+                            } else {
+                                None
+                            }
                         }
                         Change::Deletion { entry_mode, .. } => {
                             if entry_mode.is_blob() {
-                                Some(FileChange::Deleted { path: work_dir.join(gix::path::from_bstr(change.location())) })
-                            } else { None }
+                                Some(FileChange::Deleted {
+                                    path: work_dir.join(gix::path::from_bstr(change.location())),
+                                })
+                            } else {
+                                None
+                            }
                         }
                     };
                     if let Some(change_item) = file_change {
@@ -302,15 +328,25 @@ pub fn for_each_changed_file_between_commits(
         |change| -> Result<_, std::convert::Infallible> {
             use gix::object::tree::diff::Change;
             let file_change = match change {
-                Change::Addition { entry_mode, .. } | Change::Modification { entry_mode, .. } | Change::Rewrite { entry_mode, .. } => {
+                Change::Addition { entry_mode, .. }
+                | Change::Modification { entry_mode, .. }
+                | Change::Rewrite { entry_mode, .. } => {
                     if entry_mode.is_blob() {
-                        Some(FileChange::Modified { path: work_dir.join(gix::path::from_bstr(change.location())) })
-                    } else { None }
+                        Some(FileChange::Modified {
+                            path: work_dir.join(gix::path::from_bstr(change.location())),
+                        })
+                    } else {
+                        None
+                    }
                 }
                 Change::Deletion { entry_mode, .. } => {
                     if entry_mode.is_blob() {
-                        Some(FileChange::Deleted { path: work_dir.join(gix::path::from_bstr(change.location())) })
-                    } else { None }
+                        Some(FileChange::Deleted {
+                            path: work_dir.join(gix::path::from_bstr(change.location())),
+                        })
+                    } else {
+                        None
+                    }
                 }
             };
             if let Some(change_item) = file_change {

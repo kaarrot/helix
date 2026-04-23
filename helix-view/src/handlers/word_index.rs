@@ -6,7 +6,8 @@
 use std::{borrow::Cow, collections::HashMap, iter, mem, sync::Arc, time::Duration};
 
 use helix_core::{
-    chars::char_is_word, fuzzy::fuzzy_match, movement, ChangeSet, Range, Rope, RopeSlice,
+    chars::char_is_word, diff::compare_ropes, fuzzy::fuzzy_match, movement, ChangeSet, Range,
+    Rope, RopeSlice,
 };
 use helix_event::{register_hook, AsyncHook};
 use helix_stdx::rope::RopeSliceExt as _;
@@ -84,10 +85,19 @@ impl AsyncHook for Hook {
             Event::Update(doc, change) => {
                 if let Some(pending_change) = self.changes.get_mut(&doc) {
                     // If there is already a change waiting for this document, merge the two
-                    // changes together by composing the changesets and saving the new `text`.
-                    pending_change.changes =
-                        mem::take(&mut pending_change.changes).compose(change.changes);
-                    pending_change.text = change.text;
+                    // changes together. This is usually a direct changeset composition, but
+                    // some workflows replace the buffer contents while async hooks are still
+                    // catching up. In that case, recompute a diff from the original text to
+                    // the newest text instead of composing incompatible changesets.
+                    if pending_change.text == change.old_text {
+                        pending_change.changes =
+                            mem::take(&mut pending_change.changes).compose(change.changes);
+                        pending_change.text = change.text;
+                    } else {
+                        pending_change.changes =
+                            compare_ropes(&pending_change.old_text, &change.text).changes().clone();
+                        pending_change.text = change.text;
+                    }
                     Some(Instant::now() + DEBOUNCE)
                 } else if !is_changeset_significant(&change.changes) {
                     // If the changeset is fairly large, debounce before updating the index.

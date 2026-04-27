@@ -107,6 +107,8 @@ struct StreamProcess {
 
 static STREAM_PROCESSES: Lazy<Arc<Mutex<Option<StreamProcess>>>> =
     Lazy::new(|| Arc::new(Mutex::new(None)));
+static LAST_STREAM_DOC_ID: Lazy<Arc<Mutex<Option<DocumentId>>>> =
+    Lazy::new(|| Arc::new(Mutex::new(None)));
 static STREAM_INPUT_HISTORY_LOADED: Lazy<Mutex<bool>> = Lazy::new(|| Mutex::new(false));
 
 const STREAM_INPUT_HISTORY_REGISTER: char = '>';
@@ -6710,6 +6712,35 @@ fn cancel_stream_command(cx: &mut compositor::Context) {
     }
 }
 
+fn prepare_stream_output_buffer(cx: &mut compositor::Context) {
+    let (current_doc_id, current_is_file_buffer, current_len_chars) = {
+        let (_, doc) = current!(cx.editor);
+        (doc.id(), doc.path().is_some(), doc.text().len_chars())
+    };
+    let last_doc_id = *LAST_STREAM_DOC_ID.lock().unwrap();
+    let Some(doc_id) = last_doc_id.filter(|doc_id| cx.editor.document(*doc_id).is_some()) else {
+        return;
+    };
+
+    if doc_id != current_doc_id {
+        // Preserve existing behavior for a fresh scratch buffer (`:new`) where
+        // users expect the first stream to start in the current buffer.
+        let should_reuse_last = current_is_file_buffer || current_len_chars > 1;
+        if !should_reuse_last {
+            return;
+        }
+        cx.editor.switch(doc_id, Action::Replace);
+    }
+
+    let view_id = {
+        let (view, doc) = current!(cx.editor);
+        let end = doc.text().len_chars();
+        doc.set_selection(view.id, Selection::point(end));
+        view.id
+    };
+    cx.editor.ensure_cursor_in_view(view_id);
+}
+
 fn shell_stream(cx: &mut compositor::Context, cmd: &str, behavior: &ShellBehavior) {
     // Check if a stream is already running
     let existing_stream = {
@@ -6875,6 +6906,11 @@ fn shell_stream(cx: &mut compositor::Context, cmd: &str, behavior: &ShellBehavio
                 doc_id,
                 view_id,
             });
+        }
+
+        {
+            let mut last_doc = LAST_STREAM_DOC_ID.lock().unwrap();
+            *last_doc = Some(doc_id);
         }
 
         // Spawn stdin writer task for interactive input support

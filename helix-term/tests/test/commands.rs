@@ -1,5 +1,9 @@
 use helix_term::application::Application;
+use helix_view::current_ref;
 use helix_view::doc;
+use helix_view::editor::Action;
+use once_cell::sync::Lazy;
+use std::sync::Arc;
 
 use super::*;
 
@@ -8,6 +12,9 @@ mod movement;
 mod reverse_selection_contents;
 mod rotate_selection_contents;
 mod write;
+
+static STREAM_TEST_LOCK: Lazy<Arc<tokio::sync::Mutex<()>>> =
+    Lazy::new(|| Arc::new(tokio::sync::Mutex::new(())));
 
 #[tokio::test(flavor = "multi_thread")]
 async fn search_selection_detect_word_boundaries_at_eof() -> anyhow::Result<()> {
@@ -278,6 +285,7 @@ async fn test_multi_selection_shell_commands() -> anyhow::Result<()> {
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_insert_stream_commands_and_aliases() -> anyhow::Result<()> {
+    let _lock = Arc::clone(&STREAM_TEST_LOCK).lock_owned().await;
     let mut app = AppBuilder::new().build()?;
 
     send_key_sequence(&mut app, ":: printf foo<ret>").await?;
@@ -355,6 +363,127 @@ async fn test_insert_stream_commands_and_aliases() -> anyhow::Result<()> {
             "Stream cancelled (buffer: [scratch])"
         );
     }
+
+    close_app(&mut app).await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_insert_stream_output_reuses_last_stream_buffer() -> anyhow::Result<()> {
+    let _lock = Arc::clone(&STREAM_TEST_LOCK).lock_owned().await;
+    let source_file = helpers::temp_file_with_contents("source\n")?;
+    let source_path = source_file.path().to_path_buf();
+    let mut app = AppBuilder::new().with_file(&source_path, None).build()?;
+
+    let source_doc_id = app
+        .editor
+        .documents()
+        .find(|doc| doc.path().is_some_and(|path| path == &source_path))
+        .expect("source file should be open")
+        .id();
+
+    send_key_sequence(&mut app, ":new<ret>").await?;
+    wait_for_condition(&mut app, "fresh scratch buffer", |app| {
+        let doc = doc!(app.editor);
+        doc.display_name().as_ref() == "[scratch]"
+    })
+    .await?;
+
+    send_key_sequence(&mut app, ":insert-stream-output echo one<ret>").await?;
+    wait_for_condition(&mut app, "initial stream output", |app| {
+        let text = doc!(app.editor).text().to_string();
+        text.contains("echo one\none")
+    })
+    .await?;
+
+    let output_doc_id = doc!(app.editor).id();
+    assert_ne!(output_doc_id, source_doc_id);
+
+    app.editor.switch(source_doc_id, Action::Replace);
+    wait_for_condition(&mut app, "source buffer focused", |app| {
+        let doc = doc!(app.editor);
+        doc.id() == source_doc_id && doc.path().is_some_and(|path| path == &source_path)
+    })
+    .await?;
+
+    send_key_sequence(&mut app, ":insert-stream-output echo two<ret>").await?;
+    wait_for_condition(&mut app, "reused stream output buffer", |app| {
+        let doc = doc!(app.editor);
+        let text = doc.text().to_string();
+        doc.id() == output_doc_id
+            && text.contains("echo one\none")
+            && text.contains("echo two\ntwo")
+            && text.find("echo one") < text.find("echo two")
+    })
+    .await?;
+
+    {
+        let (view, doc) = current_ref!(app.editor);
+        let text = doc.text().to_string();
+        assert_eq!(doc.id(), output_doc_id);
+        assert!(text.contains("echo one\none"));
+        assert!(text.contains("echo two\ntwo"));
+        assert!(text.find("echo one") < text.find("echo two"));
+        assert_eq!(
+            doc.selection(view.id).primary().cursor(doc.text().slice(..)),
+            doc.text().len_chars()
+        );
+    }
+
+    assert_eq!(
+        app.editor.document(source_doc_id).unwrap().text().to_string(),
+        "source\n"
+    );
+
+    close_app(&mut app).await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_insert_stream_output_reuses_last_stream_buffer_from_scratch() -> anyhow::Result<()> {
+    let _lock = Arc::clone(&STREAM_TEST_LOCK).lock_owned().await;
+    let mut app = AppBuilder::new().build()?;
+
+    send_key_sequence(&mut app, ":new<ret>").await?;
+    wait_for_condition(&mut app, "first scratch buffer", |app| {
+        doc!(app.editor).display_name().as_ref() == "[scratch]"
+    })
+    .await?;
+
+    send_key_sequence(&mut app, ":insert-stream-output echo one<ret>").await?;
+    wait_for_condition(&mut app, "first stream output", |app| {
+        let text = doc!(app.editor).text().to_string();
+        text.contains("echo one\none")
+    })
+    .await?;
+
+    let output_doc_id = doc!(app.editor).id();
+
+    send_key_sequence(&mut app, ":new<ret>").await?;
+    send_key_sequence(&mut app, "itest<esc>").await?;
+    wait_for_condition(&mut app, "second scratch buffer", |app| {
+        let doc = doc!(app.editor);
+        doc.id() != output_doc_id && doc.text().to_string() == "test\n"
+    })
+    .await?;
+
+    let other_scratch_id = doc!(app.editor).id();
+
+    send_key_sequence(&mut app, ":insert-stream-output echo two<ret>").await?;
+    wait_for_condition(&mut app, "output appended in original scratch buffer", |app| {
+        let doc = doc!(app.editor);
+        let text = doc.text().to_string();
+        doc.id() == output_doc_id
+            && text.contains("echo one\none")
+            && text.contains("echo two\ntwo")
+            && text.find("echo one") < text.find("echo two")
+    })
+    .await?;
+
+    assert_eq!(
+        app.editor.document(other_scratch_id).unwrap().text().to_string(),
+        "test\n"
+    );
 
     close_app(&mut app).await?;
     Ok(())

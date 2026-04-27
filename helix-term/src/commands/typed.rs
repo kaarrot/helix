@@ -2438,6 +2438,7 @@ fn insert_stream_output(
     }
 
     // No stream running - start a new stream
+    prepare_stream_output_buffer(cx);
     shell_stream(cx, &args.join(" "), &ShellBehavior::Insert);
     Ok(())
 }

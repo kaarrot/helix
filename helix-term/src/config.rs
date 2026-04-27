@@ -184,4 +184,25 @@ mod tests {
         let default_keys = Config::default().keys;
         assert_eq!(default_keys, keymap::default());
     }
+
+    #[test]
+    fn statusline_preserves_completion_suggestions_and_ignores_unknown_elements() {
+        use helix_view::editor::StatusLineElement;
+
+        let config = Config::load_test(
+            r#"
+            [editor.statusline]
+            left = ["mode", "completion-suggestions", "mystery-element", "file-name"]
+        "#,
+        );
+
+        assert_eq!(
+            config.editor.statusline.left,
+            vec![
+                StatusLineElement::Mode,
+                StatusLineElement::CompletionSuggestions,
+                StatusLineElement::FileName
+            ]
+        );
+    }
 }

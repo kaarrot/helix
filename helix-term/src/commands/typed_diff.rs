@@ -67,6 +67,144 @@ pub(crate) fn toggle_char_diff(
     Ok(())
 }
 
+#[derive(Clone)]
+struct DiffBufferMeta {
+    id: DocumentId,
+    name: String,
+    is_modified: bool,
+    focused_at: std::time::Instant,
+}
+
+fn diff_buffer_name(doc: &Document) -> String {
+    doc.relative_path()
+        .and_then(|path| path.to_str())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| doc.display_name().into_owned())
+}
+
+fn resolve_diff_buffer_arg(
+    editor: &Editor,
+    arg: &str,
+    working_doc_id: DocumentId,
+) -> anyhow::Result<DocumentId> {
+    let mut matches = editor
+        .documents
+        .values()
+        .filter(|doc| doc.id() != working_doc_id)
+        .filter(|doc| {
+            doc.id().to_string() == arg
+                || doc
+                    .relative_path()
+                    .and_then(|path| path.to_str())
+                    .is_some_and(|path| path == arg)
+                || doc
+                    .path()
+                    .and_then(|path| path.to_str())
+                    .is_some_and(|path| path == arg)
+                || doc.display_name().as_ref() == arg
+        })
+        .map(Document::id);
+
+    let Some(first) = matches.next() else {
+        anyhow::bail!("No matching buffer: {arg}");
+    };
+    if matches.next().is_some() {
+        anyhow::bail!("Ambiguous buffer '{arg}', use a buffer id");
+    }
+    Ok(first)
+}
+
+fn open_diff_buffer_picker(
+    cx: &mut compositor::Context,
+    working_doc_id: DocumentId,
+) -> anyhow::Result<()> {
+    let mut items = cx
+        .editor
+        .documents
+        .values()
+        .filter(|doc| doc.id() != working_doc_id)
+        .map(|doc| DiffBufferMeta {
+            id: doc.id(),
+            name: diff_buffer_name(doc),
+            is_modified: doc.is_modified(),
+            focused_at: doc.focused_at,
+        })
+        .collect::<Vec<_>>();
+
+    if items.is_empty() {
+        cx.editor.set_error("No other buffer to diff");
+        return Ok(());
+    }
+
+    items.sort_unstable_by_key(|item| std::cmp::Reverse(item.focused_at));
+
+    let callback = async move {
+        let call: job::Callback = job::Callback::EditorCompositor(Box::new(
+            move |_editor: &mut Editor, compositor: &mut Compositor| {
+                let columns = [
+                    ui::PickerColumn::new("id", |meta: &DiffBufferMeta, _| {
+                        meta.id.to_string().into()
+                    }),
+                    ui::PickerColumn::new("flags", |meta: &DiffBufferMeta, _| {
+                        if meta.is_modified { "+" } else { "" }.into()
+                    }),
+                    ui::PickerColumn::new("buffer", |meta: &DiffBufferMeta, _| {
+                        meta.name.as_str().into()
+                    }),
+                ];
+
+                let picker = ui::Picker::new(columns, 2, items, (), move |cx, meta, _action| {
+                    if let Err(e) =
+                        cx.editor
+                            .open_buffer_diff_view(meta.id, working_doc_id, Some(true))
+                    {
+                        cx.editor
+                            .set_error(format!("Failed to open buffer diff: {e}"));
+                    } else {
+                        cx.editor.set_status(format!(
+                            "Diffing buffer {} against current buffer",
+                            meta.id
+                        ));
+                    }
+                })
+                .with_preview(|_editor, meta| Some((meta.id.into(), None)));
+
+                compositor.push(Box::new(overlaid(picker)));
+            },
+        ));
+        Ok(call)
+    };
+
+    cx.jobs.callback(callback);
+    Ok(())
+}
+
+pub(crate) fn diff_buffer(
+    cx: &mut compositor::Context,
+    args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+
+    let working_doc_id = view!(cx.editor).doc;
+    let base_doc_id = if let Some(arg) = args.first() {
+        resolve_diff_buffer_arg(cx.editor, arg, working_doc_id)?
+    } else {
+        return open_diff_buffer_picker(cx, working_doc_id);
+    };
+
+    cx.editor
+        .open_buffer_diff_view(base_doc_id, working_doc_id, Some(true))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    cx.editor.set_status(format!(
+        "Diffing buffer {base_doc_id} against current buffer"
+    ));
+
+    Ok(())
+}
+
 pub(crate) fn diff_commit(
     cx: &mut compositor::Context,
     args: Args,
@@ -116,6 +254,10 @@ pub(crate) fn diff_reset_typed(
         return Ok(());
     }
 
+    let view_id = view!(cx.editor).id;
+    if cx.editor.diff.views.contains_key(&view_id) {
+        cx.editor.close_diff_view(view_id);
+    }
     cx.editor.diff.range = None;
 
     let diff_docs: Vec<_> = cx
@@ -127,6 +269,11 @@ pub(crate) fn diff_reset_typed(
 
     for (_, doc) in cx.editor.documents.iter_mut() {
         doc.char_diff_enabled = false;
+        doc.char_diff_minus_side = false;
+        doc.linked_diff_doc = None;
+        if doc.path().is_none() {
+            doc.clear_diff_handle();
+        }
     }
     for id in diff_docs {
         if let Some(doc) = cx.editor.documents.get_mut(&id) {

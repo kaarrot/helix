@@ -112,10 +112,12 @@ pub fn changed_file_picker(cx: &mut Context) {
                         }
                         return;
                     }
-                    if let Err(e) =
-                        cx.editor
-                            .open_diff_view_range(path, &base_ref_cb, target_ref_cb.as_deref(), None)
-                    {
+                    if let Err(e) = cx.editor.open_diff_view_range(
+                        path,
+                        &base_ref_cb,
+                        target_ref_cb.as_deref(),
+                        None,
+                    ) {
                         cx.editor
                             .set_error(format!("Failed to open diff view: {e}"));
                     }
@@ -451,22 +453,30 @@ pub fn diff_toggle_split_view(cx: &mut Context) {
     let base_ref = diff_state.base_ref.clone();
     let target_ref = diff_state.target_ref.clone();
 
-    if base_path.as_os_str().is_empty() || working_path.as_os_str().is_empty() {
-        cx.editor
-            .set_error("Can't toggle: diff view missing reopen paths");
-        return;
-    }
-
     cx.editor.diff.split_view_override = Some(new_split);
     cx.editor.close_diff_view(view_id);
 
-    let result = cx.editor.open_diff_view_range_with_paths(
-        &base_path,
-        &working_path,
-        &base_ref,
-        target_ref.as_deref(),
-        Some(new_split),
-    );
+    let result = match diff_state.source {
+        helix_view::diff_view::DiffViewSource::Git => {
+            if base_path.as_os_str().is_empty() || working_path.as_os_str().is_empty() {
+                cx.editor
+                    .set_error("Can't toggle: diff view missing reopen paths");
+                return;
+            }
+            cx.editor.open_diff_view_range_with_paths(
+                &base_path,
+                &working_path,
+                &base_ref,
+                target_ref.as_deref(),
+                Some(new_split),
+            )
+        }
+        helix_view::diff_view::DiffViewSource::Buffers => cx.editor.open_buffer_diff_view(
+            diff_state.base_doc_id,
+            diff_state.working_doc_id,
+            Some(new_split),
+        ),
+    };
     if let Err(e) = result {
         cx.editor
             .set_error(format!("Failed to toggle split view: {e}"));
@@ -493,6 +503,11 @@ pub fn diff_reset(cx: &mut Context) {
         .collect();
     for (_, doc) in cx.editor.documents.iter_mut() {
         doc.char_diff_enabled = false;
+        doc.char_diff_minus_side = false;
+        doc.linked_diff_doc = None;
+        if doc.path().is_none() {
+            doc.clear_diff_handle();
+        }
     }
     for id in diff_docs {
         if let Some(doc) = cx.editor.documents.get_mut(&id) {

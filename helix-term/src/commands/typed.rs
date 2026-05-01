@@ -3812,6 +3812,17 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         },
     },
     TypableCommand {
+        name: "diff-buffer",
+        aliases: &["dbuf"],
+        doc: "Compare the current buffer against another open buffer.",
+        fun: typed_diff::diff_buffer,
+        completer: CommandCompleter::positional(&[completers::buffer_id]),
+        signature: Signature {
+            positionals: (0, Some(1)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
         name: "diff-commit",
         aliases: &["dc"],
         doc: "Set the diff range for the space+g changed-file picker. Accepts: REF (REF vs working tree), REF! (changes introduced by REF, i.e. REF^..REF), or REF1..REF2 (changes between two refs).",

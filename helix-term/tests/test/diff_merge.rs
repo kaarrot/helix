@@ -1,8 +1,10 @@
 use std::path::Path;
 
 use helix_core::diagnostic::Severity;
+use helix_core::Transaction;
 use helix_stdx::path;
 use helix_term::application::Application;
+use helix_view::editor::Action;
 
 use super::*;
 
@@ -66,6 +68,94 @@ fn assert_split_diff_cursor_line(app: &Application, expected_line: usize) {
 fn main_diff_state(app: &Application) -> helix_view::diff_view::DiffViewState {
     let view_id = app.editor.tree.focus;
     app.editor.diff.views.get(&view_id).unwrap().clone()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn scratch_buffers_can_be_diffed_and_update_live() -> anyhow::Result<()> {
+    let mut app = AppBuilder::new().build()?;
+    {
+        let (view, doc) = helix_view::current!(app.editor);
+        let tx = Transaction::change(
+            doc.text(),
+            std::iter::once((0, doc.text().len_chars(), Some("base\nsame\n".into()))),
+        );
+        doc.apply(&tx, view.id);
+    }
+    let base_doc_id = app.editor.tree.get(app.editor.tree.focus).doc;
+    let working_doc_id = app.editor.new_file(Action::Replace);
+    {
+        let (view, doc) = helix_view::current!(app.editor);
+        let tx = Transaction::change(
+            doc.text(),
+            std::iter::once((0, doc.text().len_chars(), Some("working\nsame\n".into()))),
+        );
+        doc.apply(&tx, view.id);
+    }
+
+    let mut harness = AppTestHarness::new();
+    assert!(harness.send_keys(&mut app, ":diff-buffer<ret>").await?);
+    assert!(harness.wait_for_idle(&mut app).await?);
+    assert!(harness.send_keys(&mut app, "<ret>").await?);
+    assert!(harness.wait_for_idle(&mut app).await?);
+
+    {
+        let diff_state = main_diff_state(&app);
+        assert!(matches!(
+            diff_state.source,
+            helix_view::diff_view::DiffViewSource::Buffers
+        ));
+        assert_eq!(diff_state.base_doc_id, base_doc_id);
+        assert_eq!(diff_state.working_doc_id, working_doc_id);
+        assert_eq!(app.editor.diff.views.len(), 2);
+
+        let base_doc = app.editor.document(base_doc_id).unwrap();
+        let working_doc = app.editor.document(working_doc_id).unwrap();
+        assert!(base_doc.path().is_none());
+        assert!(working_doc.path().is_none());
+        assert!(base_doc.diff_handle().is_some());
+        assert!(working_doc.diff_handle().is_some());
+        assert!(base_doc.char_diff_minus_side);
+        assert!(!working_doc.char_diff_minus_side);
+        assert!(!working_doc.diff_handle().unwrap().load().is_empty());
+    }
+
+    let diff_state = main_diff_state(&app);
+    app.editor.focus(diff_state.base_view_id);
+
+    assert!(harness.send_keys(&mut app, "Goleft-only<esc>").await?);
+    assert!(harness.wait_for_idle(&mut app).await?);
+    let expected_base = app.editor.document(base_doc_id).unwrap().text().to_string();
+    let actual_base = app
+        .editor
+        .document(working_doc_id)
+        .unwrap()
+        .diff_handle()
+        .unwrap()
+        .load()
+        .diff_base()
+        .to_string();
+    assert_eq!(actual_base, expected_base);
+
+    let doc_count = app.editor.documents.len();
+    assert!(harness.send_keys(&mut app, "<space>mq").await?);
+    assert!(app.editor.diff.views.is_empty());
+    assert_eq!(app.editor.documents.len(), doc_count);
+    assert!(app
+        .editor
+        .document(base_doc_id)
+        .unwrap()
+        .diff_handle()
+        .is_none());
+    assert!(app
+        .editor
+        .document(working_doc_id)
+        .unwrap()
+        .diff_handle()
+        .is_none());
+
+    harness.close(&mut app).await?;
+
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -1914,6 +1914,15 @@ impl Document {
         self.diff_handle.as_ref()
     }
 
+    pub fn set_diff_handle(&mut self, diff_handle: DiffHandle) {
+        self.diff_handle = Some(diff_handle);
+    }
+
+    pub fn clear_diff_handle(&mut self) {
+        self.diff_handle = None;
+        self.diff_base_ref = None;
+    }
+
     /// Intialize/updates the differ for this document with a new base.
     pub fn set_diff_base(&mut self, diff_base: Vec<u8>) {
         if let Ok((diff_base, ..)) = from_reader(&mut diff_base.as_slice(), Some(self.encoding)) {

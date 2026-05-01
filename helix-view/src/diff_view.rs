@@ -14,6 +14,12 @@ pub struct DiffSession {
     pub last_changed_file_selection: Option<PathBuf>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiffViewSource {
+    Git,
+    Buffers,
+}
+
 #[derive(Debug, Clone)]
 pub struct DiffViewState {
     pub base_doc_id: DocumentId,
@@ -22,11 +28,14 @@ pub struct DiffViewState {
     pub working_view_id: ViewId,
     pub sync_scroll: bool,
     pub git_ref: String,
+    pub source: DiffViewSource,
     /// Reopen recipe: paths and refs so :diff-toggle-split can rebuild the view.
     pub base_path: PathBuf,
     pub working_path: PathBuf,
     pub base_ref: String,
     pub target_ref: Option<String>,
+    pub close_base_doc_on_close: bool,
+    pub close_working_doc_on_close: bool,
 }
 
 impl DiffViewState {
@@ -44,10 +53,13 @@ impl DiffViewState {
             working_view_id,
             sync_scroll: true,
             git_ref: git_ref.clone(),
+            source: DiffViewSource::Git,
             base_path: PathBuf::new(),
             working_path: PathBuf::new(),
             base_ref: git_ref,
             target_ref: None,
+            close_base_doc_on_close: false,
+            close_working_doc_on_close: false,
         }
     }
 
@@ -62,6 +74,21 @@ impl DiffViewState {
         self.working_path = working_path;
         self.base_ref = base_ref;
         self.target_ref = target_ref;
+        self
+    }
+
+    pub fn with_buffer_reopen(mut self) -> Self {
+        self.source = DiffViewSource::Buffers;
+        self
+    }
+
+    pub fn close_base_doc_on_close(mut self) -> Self {
+        self.close_base_doc_on_close = true;
+        self
+    }
+
+    pub fn close_working_doc_on_close(mut self) -> Self {
+        self.close_working_doc_on_close = true;
         self
     }
 

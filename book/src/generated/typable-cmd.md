@@ -94,6 +94,7 @@
 | `:echo` | Prints the given arguments to the statusline. |
 | `:noop` | Does nothing. |
 | `:toggle-char-diff`, `:tcd` | Toggle character-level diff highlighting for the current buffer. |
+| `:diff-buffer`, `:dbuf` | Compare the current buffer against another open buffer. |
 | `:diff-commit`, `:dc` | Set the diff range for the space+g changed-file picker. Accepts: REF (REF vs working tree), REF! (changes introduced by REF, i.e. REF^..REF), or REF1..REF2 (changes between two refs). |
 | `:diff-reset`, `:dr` | Reset the diff base to HEAD (default behavior). |
 | `:diff-files`, `:df` | Show a picker with all files changed between current branch and specified commit. |

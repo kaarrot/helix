@@ -13,6 +13,16 @@ With no argument it resets the buffer back to `HEAD`.
 - `:diff-reset` clears any custom diff range and restores the default `HEAD`
   comparison.
 
+## Buffer diffing
+
+Use `:diff-buffer [BUFFER]` to compare the current buffer against another open
+buffer. `BUFFER` can be a buffer id, a path, or a display name. With no argument
+it opens a picker.
+
+This works for scratch buffers and other buffers that have not been written to
+disk. Buffer diffs open side-by-side by default; use `Space-m v` to toggle back
+to a single-pane diff view.
+
 ## Repo-wide review
 
 Use `Space-g` to open the changed-file picker for the current repository. By

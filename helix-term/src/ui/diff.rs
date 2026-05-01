@@ -112,7 +112,12 @@ pub(super) fn char_diff_highlights_into(
     let doc_text = doc.text();
     let diff_base = diff.diff_base();
 
-    let Some(add_highlight) = theme.find_highlight_exact("diff.plus") else {
+    let highlight_name = if doc.char_diff_minus_side {
+        "diff.minus"
+    } else {
+        "diff.plus"
+    };
+    let Some(diff_highlight) = theme.find_highlight_exact(highlight_name) else {
         return;
     };
 
@@ -184,7 +189,7 @@ pub(super) fn char_diff_highlights_into(
 
     if !add_ranges.is_empty() {
         overlay_highlights.push(OverlayHighlights::Homogeneous {
-            highlight: add_highlight,
+            highlight: diff_highlight,
             ranges: add_ranges,
         });
     }

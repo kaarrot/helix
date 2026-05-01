@@ -39,6 +39,7 @@ impl DiffWorker {
             self.perform_diff(lines);
         }
         self.apply_hunks(interner.diff_base(), interner.doc());
+        helix_event::request_redraw();
         while let Some(event) = self.channel.recv().await {
             let (doc, diff_base) = self.accumulate_events(event).await;
 

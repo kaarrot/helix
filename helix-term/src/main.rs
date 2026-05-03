@@ -125,8 +125,13 @@ FLAGS:
         helix_stdx::env::set_current_working_dir(path)?;
     }
 
-    let config = match Config::load_default() {
-        Ok(config) => config,
+    let config = match Config::load_default_with_warnings() {
+        Ok((config, warnings)) => {
+            for warning in warnings {
+                println!("Config warning: {}", warning);
+            }
+            config
+        }
         Err(ConfigLoadError::Error(err)) if err.kind() == std::io::ErrorKind::NotFound => {
             Config::default()
         }

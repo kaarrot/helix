@@ -22,7 +22,7 @@ use tui::backend::Backend;
 use crate::{
     args::Args,
     compositor::{Compositor, Event},
-    config::Config,
+    config::{Config, ConfigLoadWarning},
     handlers,
     job::Jobs,
     keymap::Keymaps,
@@ -410,8 +410,8 @@ impl Application {
     }
 
     fn refresh_config(&mut self) {
-        let mut refresh_config = || -> Result<(), Error> {
-            let default_config = Config::load_default()
+        let mut refresh_config = || -> Result<Vec<ConfigLoadWarning>, Error> {
+            let (default_config, warnings) = Config::load_default_with_warnings()
                 .map_err(|err| anyhow::anyhow!("Failed to load config: {}", err))?;
 
             // Update the syntax language loader before setting the theme. Setting the theme will
@@ -443,12 +443,28 @@ impl Application {
             self.terminal.reconfigure((&default_config.editor).into())?;
             // Store new config
             self.config.store(Arc::new(default_config));
-            Ok(())
+            Ok(warnings)
         };
 
         match refresh_config() {
-            Ok(_) => {
-                self.editor.set_status("Config refreshed");
+            Ok(warnings) => {
+                if warnings.is_empty() {
+                    self.editor.set_status("Config refreshed");
+                } else {
+                    for warning in &warnings {
+                        warn!("Config warning: {}", warning);
+                    }
+                    self.editor.set_warning(format!(
+                        "Config refreshed with {} warning{}: {}",
+                        warnings.len(),
+                        if warnings.len() == 1 { "" } else { "s" },
+                        warnings
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                            .join("; ")
+                    ));
+                }
             }
             Err(err) => {
                 self.editor.set_error(err.to_string());

@@ -1186,35 +1186,36 @@ async fn global_search_with_multibyte_chars() -> anyhow::Result<()> {
 async fn search_in_buffer_jumps_within_scratch_buffer() -> anyhow::Result<()> {
     let mut app = AppBuilder::new()
         .with_input_text(indoc! {"\
-            alpha
+            buffer_scope_title
             scoped_buffer_match
             omega#[|
             ]#"})
         .build()?;
 
-    test_key_sequences(
-        &mut app,
-        vec![
-            (Some(" /,scoped_buffer_match"), None),
-            (
-                Some("<ret>"),
-                Some(&|app| {
-                    let (view, doc) = current_ref!(app.editor);
-                    let text = doc.text().slice(..);
-                    let cursor_line = doc.selection(view.id).primary().cursor_line(text);
-
-                    assert!(doc.path().is_none());
-                    assert_eq!(cursor_line, 1);
-                    assert!(text
-                        .line(cursor_line)
-                        .to_string()
-                        .contains("scoped_buffer_match"));
-                }),
-            ),
-        ],
-        false,
-    )
+    send_key_sequence(&mut app, " /,scoped_buffer_match").await?;
+    wait_for_condition(&mut app, "buffer search picker result", |app| {
+        screen_lines(app)
+            .iter()
+            .any(|line| line.contains("buffer_scope_title") && line.contains(":2"))
+    })
     .await?;
+
+    send_key_sequence(&mut app, "<ret>").await?;
+
+    {
+        let (view, doc) = current_ref!(app.editor);
+        let text = doc.text().slice(..);
+        let cursor_line = doc.selection(view.id).primary().cursor_line(text);
+
+        assert!(doc.path().is_none());
+        assert_eq!(cursor_line, 1);
+        assert!(text
+            .line(cursor_line)
+            .to_string()
+            .contains("scoped_buffer_match"));
+    }
+
+    close_app(&mut app).await?;
 
     Ok(())
 }

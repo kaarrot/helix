@@ -8,7 +8,6 @@ pub(crate) mod typed_diff;
 pub use dap::*;
 pub(crate) use diff::*;
 use futures_util::FutureExt;
-use helix_event::status;
 use helix_stdx::{
     path::{self, find_paths},
     rope::{self, RopeSliceExt},
@@ -77,7 +76,6 @@ use std::{
     char::{ToLowercase, ToUppercase},
     cmp::Ordering,
     collections::{HashMap, HashSet},
-    error::Error,
     fmt, fs,
     future::Future,
     io::Read,
@@ -3522,7 +3520,6 @@ fn buffer_picker(cx: &mut Context) {
 
     struct BufferMeta {
         id: DocumentId,
-        path: Option<PathBuf>,
         display_name: String,
         is_modified: bool,
         is_current: bool,
@@ -3531,7 +3528,6 @@ fn buffer_picker(cx: &mut Context) {
 
     let new_meta = |doc: &Document| BufferMeta {
         id: doc.id(),
-        path: doc.path().cloned(),
         display_name: doc.display_name().to_string(),
         is_modified: doc.is_modified(),
         is_current: doc.id() == current,

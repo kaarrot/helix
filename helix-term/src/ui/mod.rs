@@ -1,4 +1,5 @@
 mod completion;
+mod diff;
 mod document;
 pub(crate) mod editor;
 mod info;
@@ -440,6 +441,15 @@ pub mod completers {
         });
 
         fuzzy_match(input, names, true)
+            .into_iter()
+            .map(|(name, _)| ((0..), name.into()))
+            .collect()
+    }
+
+    pub fn buffer_id(editor: &Editor, input: &str) -> Vec<Completion> {
+        let ids = editor.documents.values().map(|doc| doc.id().to_string());
+
+        fuzzy_match(input, ids, true)
             .into_iter()
             .map(|(name, _)| ((0..), name.into()))
             .collect()

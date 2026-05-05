@@ -1,3 +1,5 @@
+use super::diff;
+
 use crate::{
     commands::{self, OnKeyCallback, OnKeyCallbackKind},
     compositor::{Component, Context, Event, EventResult},
@@ -91,8 +93,20 @@ impl EditorView {
 
         let view_offset = doc.view_offset(view.id);
 
-        let text_annotations = view.text_annotations(doc, Some(theme));
+        let mut text_annotations = view.text_annotations(doc, Some(theme));
+        view.apply_diff_alignment(
+            doc,
+            &mut text_annotations,
+            &editor.diff.views,
+            &editor.documents,
+        );
         let mut decorations = DecorationManager::default();
+
+        if editor.diff.views.contains_key(&view.id) {
+            if let Some(diff_handle) = doc.diff_handle() {
+                decorations.add_decoration(diff::DiffSpacerDecoration::new(diff_handle, theme));
+            }
+        }
 
         if is_focused && config.cursorline.from_mode(editor.mode) {
             decorations.add_decoration(Self::cursorline(doc, view, theme));
@@ -140,6 +154,7 @@ impl EditorView {
         }
 
         Self::doc_diagnostics_highlights_into(doc, theme, &mut overlays);
+        diff::char_diff_highlights_into(doc, theme, &mut overlays);
 
         if is_focused {
             if let Some(tabstops) = Self::tabstop_highlights(doc, theme) {
@@ -196,6 +211,7 @@ impl EditorView {
             inline_diagnostic_config,
             config.end_of_line_diagnostics,
         ));
+
         render_document(
             surface,
             inner,

@@ -26,6 +26,11 @@ pub type RenderLockGuard = RwLockReadGuard<'static, ()>;
 /// 30FPS) so this can be called many times without causing a ton of frames to
 /// be rendered.
 pub fn request_redraw() {
+    #[cfg(feature = "integration_test")]
+    if tokio::runtime::Handle::try_current().is_err() {
+        return;
+    }
+
     REDRAW_NOTIFY.notify_one();
 }
 

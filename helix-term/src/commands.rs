@@ -1,16 +1,19 @@
 pub(crate) mod dap;
+pub(crate) mod diff;
 pub(crate) mod lsp;
 pub(crate) mod syntax;
 pub(crate) mod typed;
+pub(crate) mod typed_diff;
 
 pub use dap::*;
+pub(crate) use diff::*;
 use futures_util::FutureExt;
 use helix_event::status;
 use helix_stdx::{
     path::{self, find_paths},
     rope::{self, RopeSliceExt},
 };
-use helix_vcs::{FileChange, Hunk};
+use helix_vcs::Hunk;
 pub use lsp::*;
 pub use syntax::*;
 use tui::{
@@ -46,7 +49,7 @@ use helix_core::{
 };
 use helix_view::{
     document::{FormatterError, Mode, SCRATCH_BUFFER_NAME},
-    editor::Action,
+    editor::{Action, DiffRange},
     expansion,
     info::Info,
     input::KeyEvent,
@@ -575,6 +578,18 @@ impl MappableCommand {
         vsplit_new, "Vertical right split scratch buffer",
         wclose, "Close window",
         wonly, "Close windows except current",
+        close_diff_or_merge_view, "Close diff or merge view",
+        diff_toggle_split_view, "Toggle between single-pane and side-by-side diff",
+        diff_toggle_sync_scroll, "Toggle synchronized scrolling in split diff",
+        diff_reset, "Reset diff base to HEAD",
+        diff_commit_from_selection, "Set diff range from selected commit hash(es)",
+        diff_show_commit_from_selection, "Show changes introduced by selected commit",
+        merge_accept_ours, "Accept HEAD version for current conflict",
+        merge_accept_theirs, "Accept incoming version for current conflict",
+        merge_accept_both, "Accept both versions for current conflict",
+        merge_next_conflict, "Jump to next merge conflict",
+        merge_prev_conflict, "Jump to previous merge conflict",
+        merge_finish, "Save and stage the resolved file",
         select_register, "Select register",
         insert_register, "Insert register",
         copy_between_registers, "Copy between two registers",
@@ -3642,100 +3657,6 @@ fn jumplist_picker(cx: &mut Context) {
     cx.push_layer(Box::new(overlaid(picker)));
 }
 
-fn changed_file_picker(cx: &mut Context) {
-    pub struct FileChangeData {
-        cwd: PathBuf,
-        style_untracked: Style,
-        style_modified: Style,
-        style_conflict: Style,
-        style_deleted: Style,
-        style_renamed: Style,
-    }
-
-    let cwd = helix_stdx::env::current_working_dir();
-    if !cwd.exists() {
-        cx.editor
-            .set_error("Current working directory does not exist");
-        return;
-    }
-
-    let added = cx.editor.theme.get("diff.plus");
-    let modified = cx.editor.theme.get("diff.delta");
-    let conflict = cx.editor.theme.get("diff.delta.conflict");
-    let deleted = cx.editor.theme.get("diff.minus");
-    let renamed = cx.editor.theme.get("diff.delta.moved");
-
-    let columns = [
-        PickerColumn::new("change", |change: &FileChange, data: &FileChangeData| {
-            match change {
-                FileChange::Untracked { .. } => Span::styled("+ untracked", data.style_untracked),
-                FileChange::Modified { .. } => Span::styled("~ modified", data.style_modified),
-                FileChange::Conflict { .. } => Span::styled("x conflict", data.style_conflict),
-                FileChange::Deleted { .. } => Span::styled("- deleted", data.style_deleted),
-                FileChange::Renamed { .. } => Span::styled("> renamed", data.style_renamed),
-            }
-            .into()
-        }),
-        PickerColumn::new("path", |change: &FileChange, data: &FileChangeData| {
-            let display_path = |path: &PathBuf| {
-                path.strip_prefix(&data.cwd)
-                    .unwrap_or(path)
-                    .display()
-                    .to_string()
-            };
-            match change {
-                FileChange::Untracked { path } => display_path(path),
-                FileChange::Modified { path } => display_path(path),
-                FileChange::Conflict { path } => display_path(path),
-                FileChange::Deleted { path } => display_path(path),
-                FileChange::Renamed { from_path, to_path } => {
-                    format!("{} -> {}", display_path(from_path), display_path(to_path))
-                }
-            }
-            .into()
-        }),
-    ];
-
-    let picker = Picker::new(
-        columns,
-        1, // path
-        [],
-        FileChangeData {
-            cwd: cwd.clone(),
-            style_untracked: added,
-            style_modified: modified,
-            style_conflict: conflict,
-            style_deleted: deleted,
-            style_renamed: renamed,
-        },
-        |cx, meta: &FileChange, action| {
-            let path_to_open = meta.path();
-            if let Err(e) = cx.editor.open(path_to_open, action) {
-                let err = if let Some(err) = e.source() {
-                    format!("{}", err)
-                } else {
-                    format!("unable to open \"{}\"", path_to_open.display())
-                };
-                cx.editor.set_error(err);
-            }
-        },
-    )
-    .with_preview(|_editor, meta| Some((meta.path().into(), None)));
-    let injector = picker.injector();
-
-    cx.editor
-        .diff_providers
-        .clone()
-        .for_each_changed_file(cwd, move |change| match change {
-            Ok(change) => injector.push(change).is_ok(),
-            Err(err) => {
-                status::report_blocking(err);
-                true
-            }
-        });
-    cx.push_layer(Box::new(overlaid(picker)));
-}
-
 pub fn command_palette(cx: &mut Context) {
     let register = cx.register;
     let count = cx.count;
@@ -4418,23 +4339,82 @@ fn goto_next_change_impl(cx: &mut Context, direction: Direction) {
             };
             let hunk = diff.nth_hunk(hunk_idx);
             let new_range = hunk_range(hunk, doc_text);
-            if editor.mode == Mode::Select {
-                let head = if new_range.head < range.anchor {
-                    new_range.anchor
-                } else {
-                    new_range.head
-                };
-
-                Range::new(range.anchor, head)
-            } else {
-                new_range.with_direction(direction)
-            }
+            // Non-selecting in all modes so diff text stays readable
+            Range::point(new_range.from())
         });
 
         push_jump(view, doc);
         doc.set_selection(view.id, selection)
     };
     cx.editor.apply_motion(motion);
+
+    // Sync the paired pane in a split diff view
+    let view_id = view!(cx.editor).id;
+    let scrolloff = cx.editor.config().scrolloff;
+
+    if let Some(diff_state) = cx.editor.diff.views.get(&view_id).cloned() {
+        let (other_view_id, other_doc_id) = if view_id == diff_state.base_view_id {
+            (diff_state.working_view_id, diff_state.working_doc_id)
+        } else {
+            (diff_state.base_view_id, diff_state.base_doc_id)
+        };
+
+        let (source_doc_id, cursor_line, source_hunk_idx) = {
+            let (view, doc) = current!(cx.editor);
+            let text = doc.text().slice(..);
+            let cursor_line = doc.selection(view.id).primary().cursor_line(text);
+            let source_hunk_idx = doc.diff_handle().and_then(|dh| {
+                let diff = dh.load();
+                diff.hunk_at(cursor_line as u32, true)
+            });
+            (doc.id(), cursor_line, source_hunk_idx)
+        };
+
+        if other_view_id == view_id || other_doc_id == source_doc_id {
+            cx.editor.ensure_cursor_in_view(view_id);
+            return;
+        }
+
+        let mapped_line =
+            cx.editor
+                .map_line_between_documents(source_doc_id, other_doc_id, cursor_line);
+
+        let target_line = {
+            let Some(other_doc) = cx.editor.documents.get(&other_doc_id) else {
+                cx.editor.ensure_cursor_in_view(view_id);
+                return;
+            };
+            let mut target_line = mapped_line.min(other_doc.text().len_lines().saturating_sub(1));
+            if let Some(target_dh) = other_doc.diff_handle() {
+                let target_diff = target_dh.load();
+                let target_hunk_idx = source_hunk_idx
+                    .filter(|&idx| idx < target_diff.len())
+                    .or_else(|| target_diff.hunk_at(mapped_line as u32, true));
+                if let Some(idx) = target_hunk_idx {
+                    target_line = target_diff.nth_hunk(idx).after.start as usize;
+                }
+            }
+            target_line.min(other_doc.text().len_lines().saturating_sub(1))
+        };
+
+        {
+            let other_doc = doc_mut!(cx.editor, &other_doc_id);
+            let pos = other_doc.text().line_to_char(target_line);
+            other_doc.set_selection(other_view_id, helix_core::Selection::point(pos));
+        }
+        {
+            let (view, doc) = current!(cx.editor);
+            align_view(doc, view, Align::Top);
+        }
+        {
+            let other_doc = doc_mut!(cx.editor, &other_doc_id);
+            let other_view = view_mut!(cx.editor, other_view_id);
+            align_view(other_doc, other_view, Align::Top);
+            other_view.ensure_cursor_in_view(other_doc, scrolloff);
+        }
+    } else {
+        cx.editor.ensure_cursor_in_view(view_id);
+    }
 }
 
 /// Returns the [Range] for a [Hunk] in the given text.

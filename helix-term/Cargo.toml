@@ -34,7 +34,7 @@ assets = [
 default = ["git"]
 unicode-lines = ["helix-core/unicode-lines", "helix-view/unicode-lines"]
 integration = ["helix-event/integration_test"]
-git = ["helix-vcs/git"]
+git = ["helix-vcs/git", "helix-view/git"]
 
 [[bin]]
 name = "hx"
@@ -77,6 +77,8 @@ grep-searcher = "=0.1.14"
 grep-matcher = "=0.1.7"
 # markdown doc rendering
 pulldown-cmark = { version = "0.13", default-features = false }
+# character-level diff
+similar = "2.7"
 # file type detection
 content_inspector = "0.2.4"
 thiserror.workspace = true

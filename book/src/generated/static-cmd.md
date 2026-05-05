@@ -250,6 +250,18 @@
 | `vsplit_new` | Vertical right split scratch buffer | normal: `` <C-w>nv ``, `` <space>wnv ``, `` <C-w>n<C-v> ``, `` <space>wn<C-v> ``, select: `` <C-w>nv ``, `` <space>wnv ``, `` <C-w>n<C-v> ``, `` <space>wn<C-v> `` |
 | `wclose` | Close window | normal: `` <C-w>q ``, `` <space>wq ``, `` <C-w><C-q> ``, `` <space>w<C-q> ``, select: `` <C-w>q ``, `` <space>wq ``, `` <C-w><C-q> ``, `` <space>w<C-q> `` |
 | `wonly` | Close windows except current | normal: `` <C-w>o ``, `` <space>wo ``, `` <C-w><C-o> ``, `` <space>w<C-o> ``, select: `` <C-w>o ``, `` <space>wo ``, `` <C-w><C-o> ``, `` <space>w<C-o> `` |
+| `close_diff_or_merge_view` | Close diff or merge view | normal: `` <space>mq ``, select: `` <space>mq `` |
+| `diff_toggle_split_view` | Toggle between single-pane and side-by-side diff | normal: `` <space>mv ``, select: `` <space>mv `` |
+| `diff_toggle_sync_scroll` | Toggle synchronized scrolling in split diff | normal: `` <space>ms ``, select: `` <space>ms `` |
+| `diff_reset` | Reset diff base to HEAD | normal: `` <space>mr ``, select: `` <space>mr `` |
+| `diff_commit_from_selection` | Set diff range from selected commit hash(es) | normal: `` <space>mc ``, select: `` <space>mc `` |
+| `diff_show_commit_from_selection` | Show changes introduced by selected commit | normal: `` <space>mC ``, select: `` <space>mC `` |
+| `merge_accept_ours` | Accept HEAD version for current conflict | normal: `` <space>mo ``, select: `` <space>mo `` |
+| `merge_accept_theirs` | Accept incoming version for current conflict | normal: `` <space>mt ``, select: `` <space>mt `` |
+| `merge_accept_both` | Accept both versions for current conflict | normal: `` <space>mb ``, select: `` <space>mb `` |
+| `merge_next_conflict` | Jump to next merge conflict | normal: `` <space>mn ``, select: `` <space>mn `` |
+| `merge_prev_conflict` | Jump to previous merge conflict | normal: `` <space>mp ``, select: `` <space>mp `` |
+| `merge_finish` | Save and stage the resolved file | normal: `` <space>mf ``, select: `` <space>mf `` |
 | `select_register` | Select register | normal: `` " ``, select: `` " `` |
 | `insert_register` | Insert register | insert: `` <C-r> `` |
 | `copy_between_registers` | Copy between two registers |  |

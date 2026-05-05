@@ -12,6 +12,7 @@
     - [Match mode](#match-mode)
     - [Window mode](#window-mode)
     - [Space mode](#space-mode)
+      - [Merge / Diff mode](#merge--diff-mode)
       - [Popup](#popup)
       - [Completion Menu](#completion-menu)
       - [Signature-help Popup](#signature-help-popup)
@@ -284,7 +285,8 @@ This layer is similar to Vim keybindings as Kakoune does not support windows.
 
 Accessed by typing `Space` in [normal mode](#normal-mode).
 
-This layer is a kludge of mappings, mostly pickers.
+This layer collects workspace pickers, clipboard helpers, and the `Space-m`
+merge/diff submode.
 
 | Key     | Description                                                             | Command                                    |
 | -----   | -----------                                                             | -------                                    |
@@ -292,7 +294,7 @@ This layer is a kludge of mappings, mostly pickers.
 | `F`     | Open file picker at current buffer's directory                          | `file_picker_in_current_buffer_directory`  |
 | `b`     | Open buffer picker                                                      | `buffer_picker`                            |
 | `j`     | Open jumplist picker                                                    | `jumplist_picker`                          |
-| `g`     | Open changed file picker                                                | `changed_file_picker`                      |
+| `g`     | Open the changed-file diff picker                                       | `changed_file_picker`                      |
 | `G`     | Debug (experimental)                                                    | N/A                                        |
 | `k`     | Show documentation for item under cursor in a [popup](#popup) (**LSP**) | `hover`                                    |
 | `s`     | Open document symbol picker (**LSP**)                                   | `symbol_picker`                            |
@@ -324,6 +326,35 @@ This layer is a kludge of mappings, mostly pickers.
 | `/` | Search in the workspace folder | `global_search` |
 | `.` | Search in the current file's directory and its subdirectories | `search_in_directory` |
 | `,` | Search in the current buffer | `search_in_buffer` |
+
+`Space-g` opens a git-backed picker for changed files. By default it compares
+`HEAD` to the working tree. Use `:diff-commit`, `Space-m c`, or `Space-m C` to
+change that picker to another commit range before opening it. Selecting a
+regular entry opens a diff view for that file, while selecting a conflicted
+entry opens the 3-way merge view.
+
+##### Merge / Diff mode
+
+Accessed by typing `Space-m` in [space mode](#space-mode).
+
+These mappings control diff review, commit-range selection, and merge
+resolution. The commands that open diff or merge views are documented in
+[Diff and merge](./diff-and-merge.md).
+
+| Key | Description | Command |
+| --- | --- | --- |
+| `c` | Set the changed-file picker range from selected git log lines | `diff_commit_from_selection` |
+| `C` | Set the changed-file picker range to show the selected commit only (`COMMIT^..COMMIT`) | `diff_show_commit_from_selection` |
+| `r` | Reset diff state back to `HEAD` vs working tree | `diff_reset` |
+| `v` | Toggle side-by-side split diff view | `diff_toggle_split_view` |
+| `s` | Toggle synchronized scrolling in split diff view | `diff_toggle_sync_scroll` |
+| `q` | Close the current diff or merge view | `close_diff_or_merge_view` |
+| `o` | Accept the `HEAD` version for the current conflict | `merge_accept_ours` |
+| `t` | Accept the incoming version for the current conflict | `merge_accept_theirs` |
+| `b` | Accept both sides for the current conflict | `merge_accept_both` |
+| `n` | Jump to the next unresolved conflict | `merge_next_conflict` |
+| `p` | Jump to the previous unresolved conflict | `merge_prev_conflict` |
+| `f` | Save and stage the resolved file (`git add`) | `merge_finish` |
 
 ##### Popup
 

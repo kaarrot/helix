@@ -269,6 +269,8 @@ pub struct Picker<T: 'static + Send + Sync, D: 'static> {
     /// An event handler for syntax highlighting the currently previewed file.
     preview_highlight_handler: Sender<Arc<Path>>,
     dynamic_query_handler: Option<Sender<DynamicQueryChange>>,
+    /// One-shot predicate to pre-select a matching item once items are loaded.
+    pre_select_fn: Option<Box<dyn Fn(&T) -> bool + Send>>,
 }
 
 impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
@@ -394,7 +396,13 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             file_fn: None,
             preview_highlight_handler: PreviewHighlightHandler::<T, D>::default().spawn(),
             dynamic_query_handler: None,
+            pre_select_fn: None,
         }
+    }
+
+    pub fn with_pre_select(mut self, f: impl Fn(&T) -> bool + Send + 'static) -> Self {
+        self.pre_select_fn = Some(Box::new(f));
+        self
     }
 
     pub fn injector(&self) -> Injector<T, D> {
@@ -688,6 +696,19 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             self.cursor = self
                 .cursor
                 .min(snapshot.matched_item_count().saturating_sub(1))
+        }
+
+        // One-shot pre-select: scan matched items for a match, then clear
+        if self.pre_select_fn.is_some() && snapshot.matched_item_count() > 0 {
+            let pred = self.pre_select_fn.take().unwrap();
+            for idx in 0..snapshot.matched_item_count() {
+                if let Some(item) = snapshot.get_matched_item(idx) {
+                    if pred(item.data) {
+                        self.cursor = idx;
+                        break;
+                    }
+                }
+            }
         }
 
         let text_style = cx.editor.theme.get("ui.text");

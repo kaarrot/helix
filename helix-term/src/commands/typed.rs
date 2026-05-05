@@ -3455,6 +3455,17 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         },
     },
     TypableCommand {
+        name: "diff-base",
+        aliases: &["db"],
+        doc: "Set diff base to a specific commit (branch, tag, SHA, or HEAD~N). No arguments resets to HEAD.",
+        fun: typed_diff::diff_base,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(1)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
         name: "update",
         aliases: &["u"],
         doc: "Write changes only if the file has been modified.",
@@ -3914,6 +3925,72 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         completer: CommandCompleter::none(),
         signature: Signature {
             positionals: (0, None),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "toggle-char-diff",
+        aliases: &["tcd"],
+        doc: "Toggle character-level diff highlighting for the current buffer.",
+        fun: typed_diff::toggle_char_diff,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "diff-buffer",
+        aliases: &["dbuf"],
+        doc: "Compare the current buffer against another open buffer.",
+        fun: typed_diff::diff_buffer,
+        completer: CommandCompleter::positional(&[completers::buffer_id]),
+        signature: Signature {
+            positionals: (0, Some(1)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "diff-commit",
+        aliases: &["dc"],
+        doc: "Set the diff range for the space+g changed-file picker. Accepts: REF (REF vs working tree), REF! (changes introduced by REF, i.e. REF^..REF), or REF1..REF2 (changes between two refs).",
+        fun: typed_diff::diff_commit,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (1, Some(1)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "diff-reset",
+        aliases: &["dr"],
+        doc: "Reset the diff base to HEAD (default behavior).",
+        fun: typed_diff::diff_reset_typed,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "diff-files",
+        aliases: &["df"],
+        doc: "Show a picker with all files changed between current branch and specified commit.",
+        fun: typed_diff::diff_files,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (1, Some(1)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "merge",
+        aliases: &["3way"],
+        doc: "Open a 3-way merge view for the current conflicted file.",
+        fun: typed_diff::open_merge_view,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
             ..Signature::DEFAULT
         },
     },

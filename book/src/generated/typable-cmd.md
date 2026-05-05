@@ -53,6 +53,7 @@
 | `:character-info`, `:char` | Get info about the character under the primary cursor. |
 | `:reload`, `:rl` | Discard changes and reload from the source file. |
 | `:reload-all`, `:rla` | Discard changes and reload all documents from the source files. |
+| `:diff-base`, `:db` | Set diff base to a specific commit (branch, tag, SHA, or HEAD~N). No arguments resets to HEAD. |
 | `:update`, `:u` | Write changes only if the file has been modified. |
 | `:lsp-workspace-command` | Open workspace command picker |
 | `:lsp-restart` | Restarts the given language servers, or all language servers that are used by the current file if no arguments are supplied |
@@ -95,3 +96,9 @@
 | `:read`, `:r` | Load a file into buffer |
 | `:echo` | Prints the given arguments to the statusline. |
 | `:noop` | Does nothing. |
+| `:toggle-char-diff`, `:tcd` | Toggle character-level diff highlighting for the current buffer. |
+| `:diff-buffer`, `:dbuf` | Compare the current buffer against another open buffer. |
+| `:diff-commit`, `:dc` | Set the diff range for the space+g changed-file picker. Accepts: REF (REF vs working tree), REF! (changes introduced by REF, i.e. REF^..REF), or REF1..REF2 (changes between two refs). |
+| `:diff-reset`, `:dr` | Reset the diff base to HEAD (default behavior). |
+| `:diff-files`, `:df` | Show a picker with all files changed between current branch and specified commit. |
+| `:merge`, `:3way` | Open a 3-way merge view for the current conflicted file. |

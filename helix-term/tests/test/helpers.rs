@@ -1,7 +1,10 @@
 use std::{
+    fs,
     io::{Read, Write},
     mem::replace,
-    path::PathBuf,
+    path::{Path, PathBuf},
+    process::{Command, Output},
+    sync::Arc,
     time::Duration,
 };
 
@@ -9,7 +12,8 @@ use anyhow::bail;
 use helix_core::{diagnostic::Severity, test, Selection, Transaction};
 use helix_term::{application::Application, args::Args, config::Config, keymap::merge_keys};
 use helix_view::{current_ref, doc, editor::LspConfig, input::parse_macro, Editor};
-use tempfile::NamedTempFile;
+use once_cell::sync::Lazy;
+use tempfile::{NamedTempFile, TempDir};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tui::buffer::Buffer;
 
@@ -188,6 +192,66 @@ pub async fn test_key_sequences(
     Ok(())
 }
 
+pub struct AppTestHarness {
+    tx: tokio::sync::mpsc::UnboundedSender<std::io::Result<Event>>,
+    rx_stream: UnboundedReceiverStream<std::io::Result<Event>>,
+}
+
+impl AppTestHarness {
+    const TIMEOUT: Duration = Duration::from_secs(2);
+
+    pub fn new() -> Self {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        Self {
+            tx,
+            rx_stream: UnboundedReceiverStream::new(rx),
+        }
+    }
+
+    pub async fn send_keys(
+        &mut self,
+        app: &mut Application,
+        in_keys: &str,
+    ) -> anyhow::Result<bool> {
+        for key_event in parse_macro(in_keys)?.into_iter() {
+            self.tx.send(Ok(Event::Key(KeyEvent::from(key_event))))?;
+        }
+
+        Ok(tokio::time::timeout(
+            Self::TIMEOUT,
+            app.event_loop_until_idle(&mut self.rx_stream),
+        )
+        .await?)
+    }
+
+    pub async fn wait_for_idle(&mut self, app: &mut Application) -> anyhow::Result<bool> {
+        app.editor.reset_idle_timer();
+        Ok(tokio::time::timeout(
+            Self::TIMEOUT,
+            app.event_loop_until_idle(&mut self.rx_stream),
+        )
+        .await?)
+    }
+
+    pub async fn close(mut self, app: &mut Application) -> anyhow::Result<()> {
+        for key_event in parse_macro("<esc>:q!<ret>")?.into_iter() {
+            self.tx.send(Ok(Event::Key(KeyEvent::from(key_event))))?;
+        }
+
+        tokio::time::timeout(Self::TIMEOUT, app.event_loop(&mut self.rx_stream)).await?;
+
+        let errs = app.close().await;
+        if !errs.is_empty() {
+            for err in errs {
+                log::error!("{}", err);
+            }
+            bail!("Error closing app");
+        }
+
+        Ok(())
+    }
+}
+
 pub async fn test_key_sequence_with_input_text<T: Into<TestCase>>(
     app: Option<Application>,
     test_case: T,
@@ -322,6 +386,168 @@ pub fn new_readonly_tempfile_in_dir(
     file.as_file_mut().set_permissions(perms)?;
     Ok(file)
 }
+
+static CWD_TEST_LOCK: Lazy<Arc<tokio::sync::Mutex<()>>> =
+    Lazy::new(|| Arc::new(tokio::sync::Mutex::new(())));
+
+pub struct CwdGuard {
+    previous_cwd: PathBuf,
+    _lock: tokio::sync::OwnedMutexGuard<()>,
+}
+
+impl CwdGuard {
+    pub async fn enter(path: impl AsRef<Path>) -> anyhow::Result<Self> {
+        let lock = Arc::clone(&CWD_TEST_LOCK).lock_owned().await;
+        let previous_cwd = helix_stdx::env::current_working_dir();
+        helix_stdx::env::set_current_working_dir(path)?;
+        Ok(Self {
+            previous_cwd,
+            _lock: lock,
+        })
+    }
+}
+
+impl Drop for CwdGuard {
+    fn drop(&mut self) {
+        helix_stdx::env::set_current_working_dir(&self.previous_cwd)
+            .expect("restore test working directory");
+    }
+}
+
+pub struct GitRepoFixture {
+    dir: TempDir,
+}
+
+impl GitRepoFixture {
+    pub fn new() -> anyhow::Result<Self> {
+        let dir = tempfile::tempdir()?;
+        let repo = Self { dir };
+        repo.git(&["init"])?;
+        repo.git(&["config", "user.email", "test@helix.org"])?;
+        repo.git(&["config", "user.name", "helix-test"])?;
+        Ok(repo)
+    }
+
+    pub fn path(&self) -> &Path {
+        self.dir.path()
+    }
+
+    pub fn file(&self, relative_path: impl AsRef<Path>) -> PathBuf {
+        self.path().join(relative_path)
+    }
+
+    pub fn write_file(
+        &self,
+        relative_path: impl AsRef<Path>,
+        contents: &str,
+    ) -> anyhow::Result<()> {
+        let path = self.file(relative_path);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(path, contents)?;
+        Ok(())
+    }
+
+    pub fn commit_all(&self, message: &str) -> anyhow::Result<()> {
+        self.git(&["add", "-A"])?;
+        self.git(&["commit", "-m", message])?;
+        Ok(())
+    }
+
+    pub fn checkout_new_branch(&self, branch: &str) -> anyhow::Result<()> {
+        self.git(&["checkout", "-b", branch])?;
+        Ok(())
+    }
+
+    pub fn checkout(&self, branch: &str) -> anyhow::Result<()> {
+        self.git(&["checkout", branch])?;
+        Ok(())
+    }
+
+    pub fn merge_expect_conflict(&self, branch: &str) -> anyhow::Result<()> {
+        let output = self.git_output_raw(&["merge", branch])?;
+        if output.status.success() {
+            bail!("expected `git merge {branch}` to conflict");
+        }
+        Ok(())
+    }
+
+    pub fn rev_parse(&self, rev: &str) -> anyhow::Result<String> {
+        self.git_output(&["rev-parse", rev])
+    }
+
+    pub fn rev_parse_short(&self, rev: &str) -> anyhow::Result<String> {
+        self.git_output(&["rev-parse", "--short", rev])
+    }
+
+    pub fn diff_cached_names(&self) -> anyhow::Result<Vec<String>> {
+        let output = self.git_output(&["diff", "--cached", "--name-only"])?;
+        Ok(output
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(ToOwned::to_owned)
+            .collect())
+    }
+
+    pub fn unmerged_entries(&self) -> anyhow::Result<Vec<String>> {
+        let output = self.git_output(&["ls-files", "-u"])?;
+        Ok(output
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(ToOwned::to_owned)
+            .collect())
+    }
+
+    pub fn git(&self, args: &[&str]) -> anyhow::Result<()> {
+        let output = self.git_output_raw(args)?;
+        if output.status.success() {
+            return Ok(());
+        }
+
+        println!("{}", String::from_utf8_lossy(&output.stdout));
+        eprintln!("{}", String::from_utf8_lossy(&output.stderr));
+        bail!("`git {}` failed", args.join(" "));
+    }
+
+    pub fn git_output(&self, args: &[&str]) -> anyhow::Result<String> {
+        let output = self.git_output_raw(args)?;
+        if !output.status.success() {
+            println!("{}", String::from_utf8_lossy(&output.stdout));
+            eprintln!("{}", String::from_utf8_lossy(&output.stderr));
+            bail!("`git {}` failed", args.join(" "));
+        }
+
+        Ok(String::from_utf8(output.stdout)?.trim().to_string())
+    }
+
+    fn git_output_raw(&self, args: &[&str]) -> anyhow::Result<Output> {
+        Ok(Command::new("git")
+            .arg("-C")
+            .arg(self.path())
+            .args(args)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_ASKPASS")
+            .env_remove("SSH_ASKPASS")
+            .env("GIT_TERMINAL_PROMPT", "false")
+            .env("GIT_MERGE_AUTOEDIT", "no")
+            .env("GIT_AUTHOR_DATE", "2000-01-01 00:00:00 +0000")
+            .env("GIT_AUTHOR_EMAIL", "author@example.com")
+            .env("GIT_AUTHOR_NAME", "author")
+            .env("GIT_COMMITTER_DATE", "2000-01-02 00:00:00 +0000")
+            .env("GIT_COMMITTER_EMAIL", "committer@example.com")
+            .env("GIT_COMMITTER_NAME", "committer")
+            .env("GIT_CONFIG_COUNT", "2")
+            .env("GIT_CONFIG_KEY_0", "commit.gpgsign")
+            .env("GIT_CONFIG_VALUE_0", "false")
+            .env("GIT_CONFIG_KEY_1", "init.defaultBranch")
+            .env("GIT_CONFIG_VALUE_1", "main")
+            .output()?)
+    }
+}
+
 pub struct AppBuilder {
     args: Args,
     config: Config,

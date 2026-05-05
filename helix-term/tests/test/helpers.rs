@@ -11,6 +11,7 @@ use helix_term::{application::Application, args::Args, config::Config, keymap::m
 use helix_view::{current_ref, doc, editor::LspConfig, input::parse_macro, Editor};
 use tempfile::NamedTempFile;
 use tokio_stream::wrappers::UnboundedReceiverStream;
+use tui::buffer::Buffer;
 
 #[cfg(windows)]
 use crossterm::event::{Event, KeyEvent};
@@ -356,8 +357,6 @@ impl AppBuilder {
         self
     }
 
-    // Remove this attribute once `with_config` is used in a test:
-    #[allow(dead_code)]
     pub fn with_config(mut self, mut config: Config) -> Self {
         let keys = replace(&mut config.keys, helix_term::keymap::default());
         merge_keys(&mut config.keys, keys);
@@ -485,6 +484,31 @@ pub async fn close_app(app: &mut Application) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+pub fn buffer_lines(buffer: &Buffer) -> Vec<String> {
+    let area = buffer.area();
+
+    (area.top()..area.bottom())
+        .map(|y| {
+            let mut line = String::with_capacity(area.width as usize);
+            for x in area.left()..area.right() {
+                line.push_str(&buffer.get(x, y).unwrap().symbol);
+            }
+            line.trim_end().to_owned()
+        })
+        .collect()
+}
+
+pub fn screen_lines(app: &Application) -> Vec<String> {
+    buffer_lines(app.screen())
+}
+
+pub fn count_screen_occurrences(app: &Application, needle: &str) -> usize {
+    screen_lines(app)
+        .iter()
+        .map(|line| line.matches(needle).count())
+        .sum()
 }
 
 pub fn assert_file_has_content(file: &mut NamedTempFile, content: &str) -> anyhow::Result<()> {

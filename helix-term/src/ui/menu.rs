@@ -191,6 +191,21 @@ impl<T: Item> Menu<T> {
     pub fn len(&self) -> usize {
         self.matches.len()
     }
+
+    pub fn cursor(&self) -> Option<usize> {
+        self.cursor
+    }
+
+    /// Iterator over the currently-matched items, paired with a `selected` flag
+    /// indicating whether the item is the cursor selection.
+    pub fn matched_items(&self) -> impl Iterator<Item = (&T, bool)> + '_ {
+        let cursor = self.cursor;
+        self.matches.iter().enumerate().map(move |(i, (idx, _))| {
+            let item = &self.options[*idx as usize];
+            let selected = cursor == Some(i);
+            (item, selected)
+        })
+    }
 }
 
 impl<T: Item + PartialEq> Menu<T> {

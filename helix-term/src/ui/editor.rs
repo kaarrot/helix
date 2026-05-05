@@ -231,8 +231,14 @@ impl EditorView {
             .clip_top(view.area.height.saturating_sub(1))
             .clip_bottom(1); // -1 from bottom to remove commandline
 
-        let mut context =
-            statusline::RenderContext::new(editor, doc, view, is_focused, &self.spinners);
+        let mut context = statusline::RenderContext::new(
+            editor,
+            doc,
+            view,
+            is_focused,
+            &self.spinners,
+            self.completion.as_ref(),
+        );
 
         statusline::render(&mut context, statusline_area, surface);
     }
@@ -1620,7 +1626,13 @@ impl Component for EditorView {
         }
 
         if let Some(completion) = self.completion.as_mut() {
-            completion.render(area, surface, cx);
+            use helix_view::editor::CompletionDisplay;
+            if !matches!(
+                cx.editor.config().completion_display,
+                CompletionDisplay::Statusline
+            ) {
+                completion.render(area, surface, cx);
+            }
         }
     }
 

@@ -45,6 +45,7 @@
 | `preview-completion-insert` | Whether to apply completion item instantly when selected | `true` |
 | `completion-trigger-len` | The min-length of word under cursor to trigger autocompletion | `2` |
 | `completion-replace` | Whether to make completions always replace the entire word and not just the part before the cursor | `false` |
+| `completion-display` | Where completion suggestions are rendered: `popup` (default vertical popup), `statusline` (horizontal strip inside the statusline, requires `completion-suggestions` in the statusline layout), or `both`. When the statusline is active, it replaces path elements to save space. | `popup` |
 | `auto-info` | Whether to display info boxes | `true` |
 | `true-color` | Whether to override automatic detection of terminal truecolor support in the event of a false negative | `false` |
 | `undercurl` | Whether to override automatic detection of terminal undercurl support in the event of a false negative | `false` |
@@ -153,6 +154,53 @@ The following statusline elements can be configured:
 | `spacer` | Inserts a space between elements (multiple/contiguous spacers may be specified) |
 | `version-control` | The current branch name or detached commit hash of the opened workspace |
 | `register` | The current selected register |
+| `completion-suggestions` | A horizontal list of the top few completion candidates, only rendered in insert mode while completion suggestions are active (see [Statusline completion suggestions](#statusline-completion-suggestions) below). |
+
+#### Statusline completion suggestions
+
+On small or split terminals the default vertical popup can obscure code. The
+`completion-suggestions` statusline element renders the top completion
+candidates as a compact horizontal strip inside the statusline — similar to the
+suggestion bar on smartphone keyboards — instead of (or alongside) the popup.
+
+To enable it, set `completion-display` **and** add the element to the
+statusline layout:
+
+```toml
+[editor]
+completion-display = "statusline"   # "popup" (default) | "statusline" | "both"
+
+[editor.statusline]
+left = ["mode", "spinner", "completion-suggestions", "file-name", "read-only-indicator", "file-modification-indicator"]
+```
+
+| `completion-display` value | Popup shown | Statusline strip shown |
+| --- | :---: | :---: |
+| `popup` (default) | ✓ | — |
+| `statusline` | — | ✓ |
+| `both` | ✓ | ✓ |
+
+While the statusline strip is active in insert mode it temporarily replaces the
+path elements (`file-name`, `file-absolute-path`, `file-base-name`) and the
+cursor-position elements (`position`, `position-percentage`, `total-line-numbers`)
+so that the full width is available for suggestions. The cursor row/column is
+still visible via the gutter, so hiding the position elements during completion
+avoids them being drawn on top of the suggestions on narrow terminals. The path
+and position reappear as soon as you leave insert mode or the active completion
+session ends.
+
+**Insert mode** — suggestions replace the file path, with the currently
+selected candidate highlighted:
+
+![Statusline in insert mode showing completion suggestions](images/status_line_completion_insert_mode.png)
+
+**Normal mode** — suggestions are hidden and the file path is restored:
+
+![Statusline in normal mode showing file path](images/status_line_completion_normal_mode.png)
+
+> **Note:** the `completion-suggestions` element only renders when
+> `completion-display` is `statusline` or `both`. Adding the element to the
+> layout has no visible effect when `completion-display = "popup"`.
 
 ### `[editor.lsp]` Section
 

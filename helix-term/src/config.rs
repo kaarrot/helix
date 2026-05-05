@@ -750,19 +750,23 @@ mod tests {
     }
 
     #[test]
-    fn statusline_ignores_unknown_elements() {
+    fn statusline_preserves_completion_suggestions_and_ignores_unknown_elements() {
         use helix_view::editor::StatusLineElement;
 
         let config = Config::load_test(
             r#"
             [editor.statusline]
-            left = ["mode", "completion-suggestions", "file-name"]
+            left = ["mode", "completion-suggestions", "mystery-element", "file-name"]
         "#,
         );
 
         assert_eq!(
             config.editor.statusline.left,
-            vec![StatusLineElement::Mode, StatusLineElement::FileName]
+            vec![
+                StatusLineElement::Mode,
+                StatusLineElement::CompletionSuggestions,
+                StatusLineElement::FileName
+            ]
         );
     }
 }

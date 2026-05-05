@@ -239,7 +239,6 @@ async fn insert_at_end_of_document() -> anyhow::Result<()> {
             in_keys: format!("i{}", pair.0),
             out_text: format!("{}{}{}", LINE_END, pair.0, pair.1),
             out_selection: Selection::single(LINE_END.len() + 1, LINE_END.len() + 2),
-            line_feed_handling: LineFeedHandling::AsIs,
         })
         .await?;
 
@@ -249,7 +248,6 @@ async fn insert_at_end_of_document() -> anyhow::Result<()> {
             in_keys: format!("i{}", pair.0),
             out_text: format!("foo{}{}{}", LINE_END, pair.0, pair.1),
             out_selection: Selection::single(LINE_END.len() + 4, LINE_END.len() + 5),
-            line_feed_handling: LineFeedHandling::AsIs,
         })
         .await?;
     }

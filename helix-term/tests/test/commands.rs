@@ -132,6 +132,23 @@ async fn test_goto_file_impl() -> anyhow::Result<()> {
             .count()
     }
 
+    fn assert_current_file_line(app: &Application, expected_file_name: &str, expected_line: usize) {
+        let (view, doc) = helix_view::current_ref!(app.editor);
+        assert_eq!(
+            expected_file_name,
+            doc.path()
+                .and_then(|path| path.file_name())
+                .unwrap()
+                .to_string_lossy()
+        );
+        assert_eq!(
+            expected_line - 1,
+            doc.selection(view.id)
+                .primary()
+                .cursor_line(doc.text().slice(..))
+        );
+    }
+
     // Single selection
     test_key_sequence(
         &mut AppBuilder::new().with_file(file.path(), None).build()?,
@@ -194,6 +211,39 @@ async fn test_goto_file_impl() -> anyhow::Result<()> {
         Some(&|app| {
             assert_eq!(1, match_paths(app, vec!["one123.js"]));
         }),
+        false,
+    )
+    .await?;
+
+    let dir = tempfile::tempdir()?;
+    let source_path = dir.path().join("source.txt");
+    let target_path = dir.path().join("target.txt");
+    std::fs::write(&source_path, "\n")?;
+    std::fs::write(&target_path, "one\ntwo\nthree\nfour\n")?;
+
+    // Line number suffix with cursor on path
+    test_key_sequence(
+        &mut AppBuilder::new().with_file(&source_path, None).build()?,
+        Some("itarget.txt:3<esc>ghgf"),
+        Some(&|app| assert_current_file_line(app, "target.txt", 3)),
+        false,
+    )
+    .await?;
+
+    // Line number suffix with cursor on line number
+    test_key_sequence(
+        &mut AppBuilder::new().with_file(&source_path, None).build()?,
+        Some("itarget.txt:4<esc>hgf"),
+        Some(&|app| assert_current_file_line(app, "target.txt", 4)),
+        false,
+    )
+    .await?;
+
+    // Line number suffix in selection
+    test_key_sequence(
+        &mut AppBuilder::new().with_file(&source_path, None).build()?,
+        Some("itarget.txt:2<esc>%gf"),
+        Some(&|app| assert_current_file_line(app, "target.txt", 2)),
         false,
     )
     .await?;

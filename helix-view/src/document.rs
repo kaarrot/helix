@@ -156,6 +156,8 @@ pub struct Document {
 
     path: Option<PathBuf>,
     relative_path: OnceCell<Option<PathBuf>>,
+    /// Custom name for scratch buffers (when path is None)
+    scratch_buffer_name: Option<String>,
     encoding: &'static encoding::Encoding,
     has_bom: bool,
 
@@ -699,6 +701,7 @@ impl Document {
             active_snippet: None,
             path: None,
             relative_path: OnceCell::new(),
+            scratch_buffer_name: None,
             encoding,
             has_bom,
             text,
@@ -1288,6 +1291,46 @@ impl Document {
         self.pickup_last_saved_time();
     }
 
+    /// Set the custom name for scratch buffers (buffers without a file path).
+    /// This name will be displayed instead of "[scratch]".
+    /// If the buffer has a path, this setting is ignored.
+    pub fn set_scratch_buffer_name(&mut self, name: Option<String>) {
+        self.scratch_buffer_name = name;
+    }
+
+    /// Update the scratch buffer name based on the first line of the document.
+    /// Only updates if this is a scratch buffer (no path).
+    fn update_scratch_buffer_name_from_first_line(&mut self) {
+        if self.path.is_some() {
+            // Not a scratch buffer, don't update
+            return;
+        }
+
+        let text = self.text();
+        if text.len_lines() == 0 {
+            self.scratch_buffer_name = None;
+            return;
+        }
+
+        // Get the first line
+        let first_line = text.line(0);
+        let first_line_str = first_line.to_string();
+        let trimmed = first_line_str.trim();
+
+        if trimmed.is_empty() {
+            // First line is empty, use default scratch buffer name
+            self.scratch_buffer_name = None;
+        } else {
+            // Use first line as buffer name, limit to 50 characters
+            let name = if trimmed.len() > 50 {
+                format!("{}...", &trimmed[..47])
+            } else {
+                trimmed.to_string()
+            };
+            self.scratch_buffer_name = Some(name);
+        }
+    }
+
     /// Set the programming language for the file and load associated data (e.g. highlighting)
     /// if it exists.
     pub fn set_language(
@@ -1571,6 +1614,12 @@ impl Document {
                 changes.compose(transaction.changes().clone())
             });
         }
+
+        // Update scratch buffer name based on first line if this is a scratch buffer
+        if success && self.path.is_none() && !transaction.changes().is_empty() {
+            self.update_scratch_buffer_name_from_first_line();
+        }
+
         success
     }
     /// Apply a [`Transaction`] to the [`Document`] to change its text.
@@ -2000,8 +2049,15 @@ impl Document {
     }
 
     pub fn display_name(&self) -> Cow<'_, str> {
-        self.relative_path()
-            .map_or_else(|| SCRATCH_BUFFER_NAME.into(), |path| path.to_string_lossy())
+        self.relative_path().map_or_else(
+            || {
+                self.scratch_buffer_name
+                    .as_ref()
+                    .map(|name| Cow::Borrowed(name.as_str()))
+                    .unwrap_or_else(|| SCRATCH_BUFFER_NAME.into())
+            },
+            |path| path.to_string_lossy(),
+        )
     }
 
     // transact(Fn) ?

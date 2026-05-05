@@ -571,6 +571,49 @@ fn new_file(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> an
     Ok(())
 }
 
+fn copy_path_to_clipboard(
+    cx: &mut compositor::Context,
+    args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+
+    let doc = doc!(cx.editor);
+
+    // Determine which path to copy based on the argument
+    let use_absolute = args.first().map(|s| s == "absolute").unwrap_or(false);
+
+    let path_str = if use_absolute {
+        // Use absolute path
+        if let Some(path) = doc.path() {
+            path.to_string_lossy().to_string()
+        } else {
+            return Err(anyhow::anyhow!("No file path available (scratch buffer)"));
+        }
+    } else {
+        // Use relative path (default)
+        if let Some(path) = doc.relative_path() {
+            path.to_string_lossy().to_string()
+        } else if let Some(path) = doc.path() {
+            path.to_string_lossy().to_string()
+        } else {
+            return Err(anyhow::anyhow!("No file path available (scratch buffer)"));
+        }
+    };
+
+    // Write to system clipboard (register '+')
+    match cx.editor.registers.write('+', vec![path_str.clone()]) {
+        Ok(_) => {
+            cx.editor
+                .set_status(format!("Copied path to clipboard: {}", path_str));
+            Ok(())
+        }
+        Err(err) => Err(anyhow::anyhow!("Failed to copy to clipboard: {}", err)),
+    }
+}
+
 fn format(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> anyhow::Result<()> {
     if event != PromptEvent::Validate {
         return Ok(());
@@ -2451,6 +2494,32 @@ fn insert_output(
     Ok(())
 }
 
+fn insert_stream_output(
+    cx: &mut compositor::Context,
+    args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+
+    shell_stream(cx, &args.join(" "), &ShellBehavior::Insert);
+    Ok(())
+}
+
+fn cancel_stream(
+    cx: &mut compositor::Context,
+    _args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+
+    cancel_stream_command(cx);
+    Ok(())
+}
+
 fn pipe_to(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow::Result<()> {
     pipe_impl(cx, args, event, &ShellBehavior::Ignore)
 }
@@ -2959,6 +3028,17 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         completer: CommandCompleter::none(),
         signature: Signature {
             positionals: (0, Some(0)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "copy-path",
+        aliases: &["cp"],
+        doc: "Copy the current file path to the system clipboard. Use ':copy-path absolute' for absolute path, or no argument for relative path.",
+        fun: copy_path_to_clipboard,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(1)),
             ..Signature::DEFAULT
         },
     },
@@ -3668,6 +3748,25 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         fun: insert_output,
         completer: SHELL_COMPLETER,
         signature: SHELL_SIGNATURE,
+    },
+    TypableCommand {
+        name: "insert-stream-output",
+        aliases: &[],
+        doc: "Run shell command, streaming output in real-time before the primary selection.",
+        fun: insert_stream_output,
+        completer: SHELL_COMPLETER,
+        signature: SHELL_SIGNATURE,
+    },
+    TypableCommand {
+        name: "cancel-stream",
+        aliases: &[],
+        doc: "Cancel the currently running stream process.",
+        fun: cancel_stream,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
+            ..Signature::DEFAULT
+        },
     },
     TypableCommand {
         name: "append-output",

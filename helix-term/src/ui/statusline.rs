@@ -59,10 +59,11 @@ pub fn render(context: &mut RenderContext, viewport: Rect, surface: &mut Surface
 
     surface.set_style(viewport.with_height(1), base_style);
 
-    // Left side of the status line.
+    // Build all parts first before rendering
 
     let config = context.editor.config();
 
+    // Left side of the status line.
     for element_id in &config.statusline.left {
         let render = get_render_function(*element_id);
         (render)(context, |context, span| {
@@ -70,21 +71,16 @@ pub fn render(context: &mut RenderContext, viewport: Rect, surface: &mut Surface
         });
     }
 
-    surface.set_spans(
-        viewport.x,
-        viewport.y,
-        &context.parts.left,
-        context.parts.left.width() as u16,
-    );
-
     // Right side of the status line.
-
     for element_id in &config.statusline.right {
         let render = get_render_function(*element_id);
         (render)(context, |context, span| {
             append(&mut context.parts.right, span, base_style)
         })
     }
+
+    let right_reserved_width = context.parts.right.width() as u16;
+    render_left_section(surface, viewport, &context.parts.left, right_reserved_width);
 
     surface.set_spans(
         viewport.x
@@ -118,6 +114,16 @@ pub fn render(context: &mut RenderContext, viewport: Rect, surface: &mut Surface
         &context.parts.center,
         center_width,
     );
+}
+
+fn render_left_section(
+    surface: &mut Surface,
+    viewport: Rect,
+    left: &Spans<'_>,
+    right_reserved_width: u16,
+) {
+    let left_max_width = viewport.width.saturating_sub(right_reserved_width + 1);
+    surface.set_spans_truncated(viewport.x, viewport.y, left, left_max_width);
 }
 
 fn append<'a>(buffer: &mut Spans<'a>, mut span: Span<'a>, base_style: Style) {
@@ -582,4 +588,30 @@ where
         .to_string_lossy()
         .to_string();
     write(context, cwd.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tui::buffer::Buffer as Surface;
+
+    #[test]
+    fn long_left_section_is_truncated_from_the_left() {
+        let viewport = Rect::new(0, 0, 24, 1);
+        let mut surface = Surface::empty(viewport);
+        let title = " very/long/nested/path/buffer-file-path-statusline.rs ";
+        let left = Spans::from(vec![Span::raw(title)]);
+        render_left_section(&mut surface, viewport, &left, 0);
+
+        let left_width = viewport.width as usize - 1;
+        assert!(title.len() > left_width);
+
+        let expected = format!("…{}", &title[title.len() - (left_width - 1)..]);
+        let rendered = (0..left_width as u16)
+            .map(|x| surface.get(x, 0).unwrap().symbol.as_str())
+            .collect::<String>();
+
+        assert_eq!(expected, rendered);
+        assert_eq!(" ", surface.get(viewport.width - 1, 0).unwrap().symbol);
+    }
 }

@@ -18,6 +18,7 @@
 | `:write-buffer-close`, `:wbc` | Write changes to disk and closes the buffer. Accepts an optional path (:write-buffer-close some/path.txt) |
 | `:write-buffer-close!`, `:wbc!` | Force write changes to disk creating necessary subdirectories and closes the buffer. Accepts an optional path (:write-buffer-close! some/path.txt) |
 | `:new`, `:n` | Create a new scratch buffer. |
+| `:copy-path`, `:cp` | Copy the current file path to the system clipboard. Use ':copy-path absolute' for absolute path, or no argument for relative path. |
 | `:format`, `:fmt` | Format the file using an external formatter or language server. |
 | `:indent-style` | Set the indentation style for editing. ('t' for tabs or 1-16 for number of spaces.) |
 | `:line-ending` | Set the document's default line ending. Options: crlf, lf. |
@@ -80,6 +81,8 @@
 | `:config-open-workspace` | Open the workspace config.toml file. |
 | `:log-open` | Open the helix log file. |
 | `:insert-output` | Run shell command, inserting output before each selection. |
+| `:insert-stream-output` | Run shell command, streaming output in real-time before the primary selection. |
+| `:cancel-stream` | Cancel the currently running stream process. |
 | `:append-output` | Run shell command, appending output after each selection. |
 | `:pipe`, `:\|` | Pipe each selection to the shell command. |
 | `:pipe-to` | Pipe each selection to the shell command, ignoring output. |

@@ -990,3 +990,67 @@ async fn search_in_buffer_jumps_within_scratch_buffer() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_copy_path_command() -> anyhow::Result<()> {
+    let file = tempfile::NamedTempFile::new()?;
+    let expected_relative = helix_stdx::path::get_relative_path(file.path())
+        .to_string_lossy()
+        .into_owned();
+    let expected_absolute = file.path().to_string_lossy().into_owned();
+
+    test_key_sequence(
+        &mut AppBuilder::new().with_file(file.path(), None).build()?,
+        Some(":copy-path<ret>"),
+        Some(&|app| {
+            let copied = app
+                .editor
+                .registers
+                .first('+', &app.editor)
+                .unwrap()
+                .into_owned();
+            assert_eq!(expected_relative, copied);
+            assert_eq!(
+                format!("Copied path to clipboard: {}", expected_relative),
+                app.editor.get_status().unwrap().0.as_ref()
+            );
+        }),
+        false,
+    )
+    .await?;
+
+    test_key_sequence(
+        &mut AppBuilder::new().with_file(file.path(), None).build()?,
+        Some(":copy-path absolute<ret>"),
+        Some(&|app| {
+            let copied = app
+                .editor
+                .registers
+                .first('+', &app.editor)
+                .unwrap()
+                .into_owned();
+            assert_eq!(expected_absolute, copied);
+            assert_eq!(
+                format!("Copied path to clipboard: {}", expected_absolute),
+                app.editor.get_status().unwrap().0.as_ref()
+            );
+        }),
+        false,
+    )
+    .await?;
+
+    test_key_sequence(
+        &mut AppBuilder::new().build()?,
+        Some(":copy-path<ret>"),
+        Some(&|app| {
+            assert_eq!(
+                "'copy-path': No file path available (scratch buffer)",
+                app.editor.get_status().unwrap().0
+            );
+        }),
+        false,
+    )
+    .await?;
+
+    Ok(())
+}

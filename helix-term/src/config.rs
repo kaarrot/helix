@@ -491,6 +491,7 @@ fn config_path(root: &str, path: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use helix_view::document::Mode;
 
     impl Config {
         fn load_test(config: &str) -> Config {
@@ -501,6 +502,12 @@ mod tests {
             Config::load_with_warnings(Ok(config.to_owned()), Err(ConfigLoadError::default()))
                 .unwrap()
         }
+    }
+
+    fn assert_cursorline_modes(config: &Config, normal: bool, insert: bool, select: bool) {
+        assert_eq!(config.editor.cursorline.from_mode(Mode::Normal), normal);
+        assert_eq!(config.editor.cursorline.from_mode(Mode::Insert), insert);
+        assert_eq!(config.editor.cursorline.from_mode(Mode::Select), select);
     }
 
     #[test]
@@ -579,7 +586,7 @@ mod tests {
         );
 
         assert_eq!(config.editor.scrolloff, 9);
-        assert!(config.editor.cursorline);
+        assert_cursorline_modes(&config, true, true, true);
         assert_eq!(
             config.editor.mouse,
             helix_view::editor::Config::default().mouse
@@ -666,7 +673,7 @@ mod tests {
             Config::load_with_warnings(Ok(global.to_owned()), Ok(local.to_owned())).unwrap();
 
         assert_eq!(config.editor.scrolloff, 7);
-        assert!(config.editor.cursorline);
+        assert_cursorline_modes(&config, true, true, true);
         assert_eq!(
             config.editor.scroll_lines,
             helix_view::editor::Config::default().scroll_lines
@@ -687,5 +694,75 @@ mod tests {
                 .unwrap_err();
 
         assert!(matches!(err, ConfigLoadError::BadConfig(_)));
+    }
+
+    #[test]
+    fn cursorline_bool_true_applies_to_all_modes() {
+        let config = Config::load_test("editor.cursorline = true");
+
+        assert_cursorline_modes(&config, true, true, true);
+    }
+
+    #[test]
+    fn cursorline_bool_false_applies_to_all_modes() {
+        let config = Config::load_test("editor.cursorline = false");
+
+        assert_cursorline_modes(&config, false, false, false);
+    }
+
+    #[test]
+    fn cursorline_per_mode_defaults_unspecified_modes_to_false() {
+        let config = Config::load_test(
+            r#"
+            [editor.cursorline]
+            normal = true
+        "#,
+        );
+
+        assert_cursorline_modes(&config, true, false, false);
+    }
+
+    #[test]
+    fn cursorline_per_mode_preserves_each_mode_value() {
+        let config = Config::load_test(
+            r#"
+            [editor.cursorline]
+            normal = true
+            insert = false
+            select = true
+        "#,
+        );
+
+        assert_cursorline_modes(&config, true, false, true);
+    }
+
+    #[test]
+    fn cursorline_ignores_unknown_nested_fields_with_non_bool_values() {
+        let config = Config::load_test(
+            r#"
+            [editor.cursorline]
+            normal = true
+            completion-display = "statusline"
+        "#,
+        );
+
+        assert_cursorline_modes(&config, true, false, false);
+    }
+
+    #[test]
+    fn statusline_ignores_unknown_elements() {
+        use helix_view::editor::StatusLineElement;
+
+        let config = Config::load_test(
+            r#"
+            [editor.statusline]
+            left = ["mode", "completion-suggestions", "file-name"]
+        "#,
+        );
+
+        assert_eq!(
+            config.editor.statusline.left,
+            vec![StatusLineElement::Mode, StatusLineElement::FileName]
+        );
     }
 }

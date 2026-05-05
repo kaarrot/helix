@@ -303,7 +303,7 @@ pub struct Config {
     /// Line number mode.
     pub line_number: LineNumber,
     /// Highlight the lines cursors are currently on. Defaults to false.
-    pub cursorline: bool,
+    pub cursorline: CursorlineConfig,
     /// Highlight the columns cursors are currently on. Defaults to false.
     pub cursorcolumn: bool,
     #[serde(deserialize_with = "deserialize_gutter_seq_or_struct")]
@@ -562,8 +562,11 @@ pub struct SearchConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case", default, deny_unknown_fields)]
 pub struct StatusLineConfig {
+    #[serde(deserialize_with = "deserialize_statusline_elements")]
     pub left: Vec<StatusLineElement>,
+    #[serde(deserialize_with = "deserialize_statusline_elements")]
     pub center: Vec<StatusLineElement>,
+    #[serde(deserialize_with = "deserialize_statusline_elements")]
     pub right: Vec<StatusLineElement>,
     pub separator: String,
     pub mode: ModeConfig,
@@ -597,6 +600,56 @@ impl Default for StatusLineConfig {
             workspace_diagnostics: vec![Severity::Warning, Severity::Error],
         }
     }
+}
+
+fn deserialize_statusline_elements<'de, D>(
+    deserializer: D,
+) -> Result<Vec<StatusLineElement>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let values = Vec::<String>::deserialize(deserializer)?;
+    let mut elements = Vec::with_capacity(values.len());
+
+    for value in values {
+        match parse_statusline_element(&value) {
+            Some(element) => elements.push(element),
+            None => log::warn!("Ignoring unknown statusline element `{value}`"),
+        }
+    }
+
+    Ok(elements)
+}
+
+fn parse_statusline_element(value: &str) -> Option<StatusLineElement> {
+    use StatusLineElement as E;
+
+    Some(match value {
+        "mode" => E::Mode,
+        "spinner" => E::Spinner,
+        "file-base-name" => E::FileBaseName,
+        "file-name" => E::FileName,
+        "file-absolute-path" => E::FileAbsolutePath,
+        "file-modification-indicator" => E::FileModificationIndicator,
+        "read-only-indicator" => E::ReadOnlyIndicator,
+        "file-encoding" => E::FileEncoding,
+        "file-line-ending" => E::FileLineEnding,
+        "file-indent-style" => E::FileIndentStyle,
+        "file-type" => E::FileType,
+        "diagnostics" => E::Diagnostics,
+        "workspace-diagnostics" => E::WorkspaceDiagnostics,
+        "selections" => E::Selections,
+        "primary-selection-length" => E::PrimarySelectionLength,
+        "position" => E::Position,
+        "separator" => E::Separator,
+        "position-percentage" => E::PositionPercentage,
+        "total-line-numbers" => E::TotalLineNumbers,
+        "spacer" => E::Spacer,
+        "version-control" => E::VersionControl,
+        "register" => E::Register,
+        "current-working-directory" => E::CurrentWorkingDirectory,
+        _ => return None,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -741,6 +794,142 @@ impl std::ops::Deref for CursorShapeConfig {
 impl Default for CursorShapeConfig {
     fn default() -> Self {
         Self([CursorKind::Block; 3])
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CursorlineConfig([bool; 3]);
+
+impl CursorlineConfig {
+    pub fn from_mode(&self, mode: Mode) -> bool {
+        self.get(mode as usize).copied().unwrap_or(false)
+    }
+}
+
+impl<'de> Deserialize<'de> for CursorlineConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        use serde::de::{IgnoredAny, MapAccess, Visitor};
+
+        struct CursorlineVisitor;
+
+        impl<'de> Visitor<'de> for CursorlineVisitor {
+            type Value = CursorlineConfig;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a boolean or a table with normal/insert/select keys")
+            }
+
+            fn visit_bool<E: serde::de::Error>(self, v: bool) -> Result<Self::Value, E> {
+                Ok(CursorlineConfig([v; 3]))
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut result = [false; 3];
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "normal" => result[Mode::Normal as usize] = map.next_value::<bool>()?,
+                        "insert" => result[Mode::Insert as usize] = map.next_value::<bool>()?,
+                        "select" => result[Mode::Select as usize] = map.next_value::<bool>()?,
+                        // Unknown mode names are silently ignored so typos don't
+                        // abort the entire config load.
+                        _ => {
+                            map.next_value::<IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(CursorlineConfig(result))
+            }
+        }
+
+        deserializer.deserialize_any(CursorlineVisitor)
+    }
+}
+
+impl Serialize for CursorlineConfig {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut map = serializer.serialize_map(Some(self.len()))?;
+        let modes = [Mode::Normal, Mode::Select, Mode::Insert];
+        for mode in modes {
+            map.serialize_entry(&mode, &self.from_mode(mode))?;
+        }
+        map.end()
+    }
+}
+
+impl std::ops::Deref for CursorlineConfig {
+    type Target = [bool; 3];
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Default for CursorlineConfig {
+    fn default() -> Self {
+        Self([false; 3])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Config;
+    use crate::document::Mode;
+
+    fn parse_editor_config(toml: &str) -> Config {
+        toml::from_str(toml).unwrap()
+    }
+
+    #[test]
+    fn cursorline_true_enables_all_modes() {
+        let config = parse_editor_config("cursorline = true");
+
+        assert!(config.cursorline.from_mode(Mode::Normal));
+        assert!(config.cursorline.from_mode(Mode::Insert));
+        assert!(config.cursorline.from_mode(Mode::Select));
+    }
+
+    #[test]
+    fn cursorline_false_disables_all_modes() {
+        let config = parse_editor_config("cursorline = false");
+
+        assert!(!config.cursorline.from_mode(Mode::Normal));
+        assert!(!config.cursorline.from_mode(Mode::Insert));
+        assert!(!config.cursorline.from_mode(Mode::Select));
+    }
+
+    #[test]
+    fn cursorline_partial_table_defaults_unspecified_modes_to_false() {
+        let config = parse_editor_config(
+            r#"
+            [cursorline]
+            normal = true
+        "#,
+        );
+
+        assert!(config.cursorline.from_mode(Mode::Normal));
+        assert!(!config.cursorline.from_mode(Mode::Insert));
+        assert!(!config.cursorline.from_mode(Mode::Select));
+    }
+
+    #[test]
+    fn cursorline_ignores_unknown_keys_without_affecting_valid_modes() {
+        let config = parse_editor_config(
+            r#"
+            [cursorline]
+            normal = true
+            typo = "x"
+        "#,
+        );
+
+        assert!(config.cursorline.from_mode(Mode::Normal));
+        assert!(!config.cursorline.from_mode(Mode::Insert));
+        assert!(!config.cursorline.from_mode(Mode::Select));
     }
 }
 
@@ -1065,7 +1254,7 @@ impl Default for Config {
                 vec!["sh".to_owned(), "-c".to_owned()]
             },
             line_number: LineNumber::Absolute,
-            cursorline: false,
+            cursorline: CursorlineConfig::default(),
             cursorcolumn: false,
             gutters: GutterConfig::default(),
             middle_click_paste: true,

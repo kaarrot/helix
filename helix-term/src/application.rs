@@ -452,7 +452,7 @@ impl Application {
                     self.editor.set_status("Config refreshed");
                 } else {
                     for warning in &warnings {
-                        warn!("Config warning: {}", warning);
+                        warn!("Config warning: {warning}");
                     }
                     self.editor.set_warning(format!(
                         "Config refreshed with {} warning{}: {}",
@@ -467,6 +467,7 @@ impl Application {
                 }
             }
             Err(err) => {
+                error!("{err}");
                 self.editor.set_error(err.to_string());
             }
         }

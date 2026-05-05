@@ -4,6 +4,7 @@
 - [`[editor.clipboard-provider]` Section](#editorclipboard-provider-section)
 - [`[editor.statusline]` Section](#editorstatusline-section)
 - [`[editor.lsp]` Section](#editorlsp-section)
+- [`[editor.cursorline]` Section](#editorcursorline-section)
 - [`[editor.cursor-shape]` Section](#editorcursor-shape-section)
 - [`[editor.file-picker]` Section](#editorfile-picker-section)
 - [`[editor.auto-pairs]` Section](#editorauto-pairs-section)
@@ -32,7 +33,7 @@
 | `scroll-lines` | Number of lines to scroll per scroll wheel step | `3` |
 | `shell` | Shell to use when running external commands | Unix: `["sh", "-c"]`<br/>Windows: `["cmd", "/C"]` |
 | `line-number` | Line number display: `absolute` simply shows each line's number, while `relative` shows the distance from the current line. When unfocused or in insert mode, `relative` will still show absolute line numbers | `"absolute"` |
-| `cursorline` | Highlight all lines with a cursor | `false` |
+| `cursorline` | Highlight all lines with a cursor. `true` or `false` applies to all modes; use [`[editor.cursorline]`](#editorcursorline-section) for per-mode values. | `false` |
 | `cursorcolumn` | Highlight all columns with a cursor | `false` |
 | `continue-comments` | if helix should automatically add a line comment token if you create a new line inside a comment. | `true` |
 | `gutters` | Gutters to display: Available are `diagnostics` and `diff` and `line-numbers` and `spacer`, note that `diagnostics` also includes other features like breakpoints, 1-width padding will be inserted if gutters is non-empty | `["diagnostics", "spacer", "line-numbers", "spacer", "diff"]` |
@@ -171,6 +172,37 @@ The following statusline elements can be configured:
 [^1]: By default, a progress spinner is shown in the statusline beside the file path.
 
 [^2]: You may also have to activate them in the language server config for them to appear, not just in Helix. Inlay hints in Helix are still being improved on and may be a little bit laggy/janky under some circumstances. Please report any bugs you see so we can fix them!
+
+### `[editor.cursorline]` Section
+
+Defines whether the cursor line highlight is shown in each mode.
+
+You can configure `cursorline` either as a plain boolean, which applies to all
+modes, or as a per-mode table when you want different behavior in normal,
+insert, and select mode:
+
+```toml
+cursorline = true
+```
+
+```toml
+[editor.cursorline]
+normal = true
+insert = false
+select = false
+```
+
+Unspecified modes default to `false`.
+
+This means `cursorline = true` is equivalent to setting all three per-mode
+values to `true`, while omitting a mode from `[editor.cursorline]` leaves it
+disabled.
+
+| Key      | Description                                      | Default |
+| ---      | -----------                                      | ------- |
+| `normal` | Cursor line highlight in [normal mode][normal mode] | `false` |
+| `insert` | Cursor line highlight in [insert mode][insert mode] | `false` |
+| `select` | Cursor line highlight in [select mode][select mode] | `false` |
 
 ### `[editor.cursor-shape]` Section
 

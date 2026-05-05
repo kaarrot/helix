@@ -1327,6 +1327,90 @@ fn goto_file_vsplit(cx: &mut Context) {
     goto_file_impl(cx, Action::VerticalSplit);
 }
 
+#[derive(Debug)]
+struct GotoFileTarget {
+    path: String,
+    line: Option<NonZeroUsize>,
+}
+
+fn split_path_line_suffix(input: &str) -> (&str, Option<NonZeroUsize>) {
+    let Some((path, line)) = input.rsplit_once(':') else {
+        return (input, None);
+    };
+
+    if path.is_empty() || line.is_empty() || !line.bytes().all(|byte| byte.is_ascii_digit()) {
+        return (input, None);
+    }
+
+    match line.parse::<usize>().ok().and_then(NonZeroUsize::new) {
+        Some(line) => (path, Some(line)),
+        None => (input, None),
+    }
+}
+
+fn path_line_suffix_end(source: RopeSlice<'_>, path_end: usize) -> Option<(usize, NonZeroUsize)> {
+    let mut chars = source.byte_slice(path_end..).chars();
+    if chars.next() != Some(':') {
+        return None;
+    }
+
+    let mut line = String::new();
+    let mut suffix_len = 1;
+    for ch in chars {
+        if !ch.is_ascii_digit() {
+            break;
+        }
+
+        line.push(ch);
+        suffix_len += ch.len_utf8();
+    }
+
+    if line.is_empty() {
+        return None;
+    }
+
+    line.parse::<usize>()
+        .ok()
+        .and_then(NonZeroUsize::new)
+        .map(|line| (path_end + suffix_len, line))
+}
+
+fn goto_file_target_from_selection(selection: &str) -> Option<GotoFileTarget> {
+    let selection = selection.trim();
+    if selection.is_empty() {
+        return None;
+    }
+
+    Some(GotoFileTarget {
+        path: selection.to_owned(),
+        line: None,
+    })
+}
+
+fn select_line_in_opened_file(
+    editor: &mut Editor,
+    doc_id: DocumentId,
+    line: NonZeroUsize,
+    action: Action,
+) {
+    let view = view_mut!(editor);
+    let doc = doc_mut!(editor, &doc_id);
+    let text = doc.text().slice(..);
+    let max_line = if text.line(text.len_lines() - 1).len_chars() == 0 {
+        // If the last line is blank, don't jump to it.
+        text.len_lines().saturating_sub(2)
+    } else {
+        text.len_lines() - 1
+    };
+    let line_idx = std::cmp::min(line.get() - 1, max_line);
+    let pos = text.line_to_char(line_idx);
+
+    doc.set_selection(view.id, Selection::point(pos));
+    if action.align_view(view, doc.id()) {
+        align_view(doc, view, Align::Center);
+    }
+}
+
 /// Goto files in selection.
 fn goto_file_impl(cx: &mut Context, action: Action) {
     let (view, doc) = current_ref!(cx.editor);
@@ -1354,33 +1438,58 @@ fn goto_file_impl(cx: &mut Context, action: Action) {
         // but apparently that is how gf has worked historically in helix)
         let path = find_paths(search_range, true)
             .take_while(|range| search_start + range.start <= pos + 1)
-            .find(|range| pos <= search_start + range.end)
-            .map(|range| Cow::from(search_range.byte_slice(range)));
+            .find_map(|range| {
+                let (target_end, line) = path_line_suffix_end(search_range, range.end)
+                    .map_or((range.end, None), |(end, line)| (end, Some(line)));
+
+                (pos <= search_start + target_end).then(|| GotoFileTarget {
+                    path: Cow::from(search_range.byte_slice(range)).into_owned(),
+                    line,
+                })
+            });
         log::debug!("goto_file auto-detected path: {path:?}");
-        let path = path.unwrap_or_else(|| primary.fragment(text));
-        vec![path.into_owned()]
+        vec![path.unwrap_or_else(|| GotoFileTarget {
+            path: primary.fragment(text).into_owned(),
+            line: None,
+        })]
     } else {
         // Otherwise use each selection, trimmed.
         selections
             .fragments(text)
-            .map(|sel| sel.trim().to_owned())
-            .filter(|sel| !sel.is_empty())
+            .filter_map(|sel| goto_file_target_from_selection(&sel))
             .collect()
     };
 
-    for sel in paths {
-        if let Ok(url) = Url::parse(&sel) {
+    for target in paths {
+        if target.path.is_empty() {
+            continue;
+        }
+
+        let (path, line) = match target.line {
+            Some(line) => (target.path.as_str(), Some(line)),
+            None if target.path.contains("://") => (target.path.as_str(), None),
+            None => split_path_line_suffix(&target.path),
+        };
+
+        if let Ok(url) = Url::parse(path) {
             open_url(cx, url, action);
             continue;
         }
 
-        let path = path::expand(&sel);
+        let path = path::expand(path);
         let path = &rel_path.join(path);
         if path.is_dir() {
             let picker = ui::file_picker(cx.editor, path.into());
             cx.push_layer(Box::new(overlaid(picker)));
-        } else if let Err(e) = cx.editor.open(path, action) {
-            cx.editor.set_error(format!("Open file failed: {:?}", e));
+        } else {
+            match cx.editor.open(path, action) {
+                Ok(doc_id) => {
+                    if let Some(line) = line {
+                        select_line_in_opened_file(cx.editor, doc_id, line, action);
+                    }
+                }
+                Err(e) => cx.editor.set_error(format!("Open file failed: {:?}", e)),
+            }
         }
     }
 }

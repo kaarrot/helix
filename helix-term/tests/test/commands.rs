@@ -253,6 +253,64 @@ async fn test_goto_file_impl() -> anyhow::Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn space_f_file_picker_opens_sibling_and_child() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let child_dir = dir.path().join("child");
+    std::fs::create_dir(&child_dir)?;
+
+    let source_path = dir.path().join("source.txt");
+    let sibling_path = dir.path().join("scoped_picker_sibling.txt");
+    let child_path = child_dir.join("scoped_picker_child.txt");
+
+    std::fs::write(&source_path, "source\n")?;
+    std::fs::write(&sibling_path, "sibling\n")?;
+    std::fs::write(&child_path, "child\n")?;
+
+    async fn assert_space_f_opens(
+        source_path: &std::path::Path,
+        query: &str,
+        expected_file_name: &str,
+        expected_text: &str,
+    ) -> anyhow::Result<()> {
+        let keys = format!(" F{query}<ret>");
+        test_key_sequence(
+            &mut AppBuilder::new().with_file(source_path, None).build()?,
+            Some(&keys),
+            Some(&|app| {
+                let (_, doc) = helix_view::current_ref!(app.editor);
+                assert_eq!(
+                    expected_file_name,
+                    doc.path()
+                        .and_then(|path| path.file_name())
+                        .unwrap()
+                        .to_string_lossy()
+                );
+                assert_eq!(expected_text, doc.text().to_string());
+            }),
+            false,
+        )
+        .await
+    }
+
+    assert_space_f_opens(
+        &source_path,
+        "scoped_picker_sibling",
+        "scoped_picker_sibling.txt",
+        "sibling\n",
+    )
+    .await?;
+    assert_space_f_opens(
+        &source_path,
+        "scoped_picker_child",
+        "scoped_picker_child.txt",
+        "child\n",
+    )
+    .await?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_multi_selection_paste() -> anyhow::Result<()> {
     test((
         indoc! {"\

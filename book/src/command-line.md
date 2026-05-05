@@ -68,12 +68,15 @@ Note that expansions are only evaluated once the Enter key is pressed in command
 The following commands support expansions but otherwise pass the given argument directly to the shell program without interpreting quotes:
 
 * `:insert-output`
+* `:insert-stream-output`
 * `:append-output`
 * `:pipe`
 * `:pipe-to`
 * `:run-shell-command`
 
 For example executing `:sh echo "%{buffer_name}:%{cursor_column}"` would pass text like `echo "README.md:1"` as an argument to the shell program: the expansions are evaluated but not the quotes. As mentioned above, percent characters can be used in shell commands by doubling the percent character. To insert the output of a command like `date -u +'%Y-%m-%d'` use `:insert-output date -u +'%%Y-%%m-%%d'`.
+
+`:insert-stream-output` uses the same shell argument rules, but inserts the command and then streams stdout/stderr into the buffer as output arrives. If a stream is already running, invoking `:insert-stream-output` with arguments sends that text to the running process' stdin; invoking it without arguments opens a prompt for stdin. Use `:cancel-stream` to stop the running stream.
 
 The `:set-option` and `:toggle-option` commands use regular parsing for the first argument - the config option name - and parse the rest depending on the config option's type. `:set-option` interprets the second argument as a string for string config options and parses everything else as JSON.
 

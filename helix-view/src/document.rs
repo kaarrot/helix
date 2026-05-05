@@ -40,6 +40,7 @@ use helix_core::{
     indent::{auto_detect_indent_style, IndentStyle},
     line_ending::auto_detect_line_ending,
     syntax::{self, config::LanguageConfiguration},
+    unicode::segmentation::UnicodeSegmentation,
     ChangeSet, Diagnostic, LineEnding, Range, Rope, RopeBuilder, Selection, Syntax, Transaction,
 };
 
@@ -1322,8 +1323,11 @@ impl Document {
             self.scratch_buffer_name = None;
         } else {
             // Use first line as buffer name, limit to 50 characters
-            let name = if trimmed.len() > 50 {
-                format!("{}...", &trimmed[..47])
+            let name = if trimmed.graphemes(true).count() > 50 {
+                format!(
+                    "{}...",
+                    trimmed.graphemes(true).take(47).collect::<String>()
+                )
             } else {
                 trimmed.to_string()
             };
@@ -2573,6 +2577,60 @@ mod test {
             .text()
             .to_string(),
             helix_core::NATIVE_LINE_ENDING.as_str()
+        );
+    }
+
+    fn scratch_doc() -> Document {
+        Document::from(
+            Rope::default(),
+            None,
+            Arc::new(ArcSwap::new(Arc::new(Config::default()))),
+            Arc::new(ArcSwap::from_pointee(syntax::Loader::default())),
+        )
+    }
+
+    #[test]
+    fn scratch_buffer_name_uses_first_line() {
+        let mut doc = scratch_doc();
+        let view = ViewId::default();
+        doc.set_selection(view, Selection::single(0, 0));
+
+        let transaction =
+            Transaction::insert(doc.text(), doc.selection(view), "first line\nbody".into());
+        doc.apply(&transaction, view);
+
+        assert_eq!(doc.display_name().as_ref(), "first line");
+    }
+
+    #[test]
+    fn scratch_buffer_name_truncates_long_first_line() {
+        let mut doc = scratch_doc();
+        let view = ViewId::default();
+        doc.set_selection(view, Selection::single(0, 0));
+
+        let long_line = "12345678901234567890123456789012345678901234567890XYZ";
+        let transaction = Transaction::insert(doc.text(), doc.selection(view), long_line.into());
+        doc.apply(&transaction, view);
+
+        assert_eq!(
+            doc.display_name().as_ref(),
+            "12345678901234567890123456789012345678901234567..."
+        );
+    }
+
+    #[test]
+    fn scratch_buffer_name_truncates_unicode_safely() {
+        let mut doc = scratch_doc();
+        let view = ViewId::default();
+        doc.set_selection(view, Selection::single(0, 0));
+
+        let long_line = "🏴‍☠️".repeat(51);
+        let transaction = Transaction::insert(doc.text(), doc.selection(view), long_line.into());
+        doc.apply(&transaction, view);
+
+        assert_eq!(
+            doc.display_name().as_ref(),
+            format!("{}...", "🏴‍☠️".repeat(47))
         );
     }
 

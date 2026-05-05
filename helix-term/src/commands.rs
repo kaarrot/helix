@@ -383,6 +383,8 @@ impl MappableCommand {
         search_selection_detect_word_boundaries, "Use current selection as the search pattern, automatically wrapping with `\\b` on word boundaries",
         make_search_word_bounded, "Modify current search to make it word bounded",
         global_search, "Global search in workspace folder",
+        search_in_directory, "Search in current file's directory and subdirectories",
+        search_in_buffer, "Search in current buffer",
         extend_line, "Select current line, if already selected, extend to another line based on the anchor",
         extend_line_below, "Select current line, if already selected, extend to next line",
         extend_line_above, "Select current line, if already selected, extend to previous line",
@@ -2561,6 +2563,20 @@ fn make_search_word_bounded(cx: &mut Context) {
 }
 
 fn global_search(cx: &mut Context) {
+    let root = helix_stdx::env::current_working_dir();
+    search_in_root(cx, root);
+}
+
+fn search_in_directory(cx: &mut Context) {
+    let root = doc!(cx.editor)
+        .path()
+        .and_then(|p| p.parent())
+        .map(PathBuf::from)
+        .unwrap_or_else(helix_stdx::env::current_working_dir);
+    search_in_root(cx, root);
+}
+
+fn search_in_root(cx: &mut Context, search_root: PathBuf) {
     #[derive(Debug)]
     struct FileResult {
         path: PathBuf,
@@ -2583,6 +2599,7 @@ fn global_search(cx: &mut Context) {
         directory_style: Style,
         number_style: Style,
         colon_style: Style,
+        search_root: PathBuf,
     }
 
     let config = cx.editor.config();
@@ -2592,6 +2609,7 @@ fn global_search(cx: &mut Context) {
         directory_style: cx.editor.theme.get("ui.text.directory"),
         number_style: cx.editor.theme.get("constant.numeric.integer"),
         colon_style: cx.editor.theme.get("punctuation"),
+        search_root,
     };
 
     let columns = [
@@ -2628,10 +2646,8 @@ fn global_search(cx: &mut Context) {
             return async { Ok(()) }.boxed();
         }
 
-        let search_root = helix_stdx::env::current_working_dir();
-        if !search_root.exists() {
-            return async { Err(anyhow::anyhow!("Current working directory does not exist")) }
-                .boxed();
+        if !config.search_root.exists() {
+            return async { Err(anyhow::anyhow!("Search directory does not exist")) }.boxed();
         }
 
         let documents: Vec<_> = editor
@@ -2655,6 +2671,7 @@ fn global_search(cx: &mut Context) {
         };
 
         let dedup_symlinks = config.file_picker_config.deduplicate_links;
+        let search_root = config.search_root.clone();
         let absolute_root = search_root
             .canonicalize()
             .unwrap_or_else(|_| search_root.clone());
@@ -2786,6 +2803,188 @@ fn global_search(cx: &mut Context) {
     })
     .with_history_register(Some(reg))
     .with_dynamic_query(get_files, Some(275));
+
+    cx.push_layer(Box::new(overlaid(picker)));
+}
+
+fn search_in_buffer(cx: &mut Context) {
+    #[derive(Debug)]
+    enum BufferResultLocation {
+        Path(PathBuf),
+        Document(DocumentId),
+    }
+
+    #[derive(Debug)]
+    struct LineResult {
+        location: BufferResultLocation,
+        display_name: String,
+        line_num: usize,
+    }
+
+    struct BufferSearchConfig {
+        smart_case: bool,
+        directory_style: Style,
+        number_style: Style,
+        colon_style: Style,
+        text: helix_core::Rope,
+        location: BufferResultLocation,
+        display_name: String,
+    }
+
+    let (_, doc) = current_ref!(cx.editor);
+    let (location, display_name) = match doc.path().cloned() {
+        Some(path) => (
+            BufferResultLocation::Path(path),
+            doc.display_name().into_owned(),
+        ),
+        None => (
+            BufferResultLocation::Document(doc.id()),
+            doc.display_name().into_owned(),
+        ),
+    };
+    let editor_config = cx.editor.config();
+    let config = BufferSearchConfig {
+        smart_case: editor_config.search.smart_case,
+        directory_style: cx.editor.theme.get("ui.text.directory"),
+        number_style: cx.editor.theme.get("constant.numeric.integer"),
+        colon_style: cx.editor.theme.get("punctuation"),
+        text: doc.text().clone(),
+        location,
+        display_name,
+    };
+
+    let columns = [
+        PickerColumn::new("path", |item: &LineResult, config: &BufferSearchConfig| {
+            let (directories, filename) = match &item.location {
+                BufferResultLocation::Path(path) => {
+                    let path = helix_stdx::path::get_relative_path(path);
+                    let directories = path
+                        .parent()
+                        .filter(|p| !p.as_os_str().is_empty())
+                        .map(|p| format!("{}{}", p.display(), std::path::MAIN_SEPARATOR))
+                        .unwrap_or_default();
+                    let filename = path
+                        .file_name()
+                        .map(|f| f.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    (directories, filename)
+                }
+                BufferResultLocation::Document(_) => (String::new(), item.display_name.clone()),
+            };
+            Cell::from(Spans::from(vec![
+                Span::styled(directories, config.directory_style),
+                Span::raw(filename),
+                Span::styled(":", config.colon_style),
+                Span::styled((item.line_num + 1).to_string(), config.number_style),
+            ]))
+        }),
+        PickerColumn::hidden("contents"),
+    ];
+
+    let get_lines = |query: &str,
+                     _editor: &mut Editor,
+                     config: std::sync::Arc<BufferSearchConfig>,
+                     injector: &ui::picker::Injector<_, _>| {
+        if query.is_empty() {
+            return async { Ok(()) }.boxed();
+        }
+
+        let matcher = match RegexMatcherBuilder::new()
+            .case_smart(config.smart_case)
+            .build(query)
+        {
+            Ok(m) => m,
+            Err(_) => return async { Err(anyhow::anyhow!("Failed to compile regex")) }.boxed(),
+        };
+
+        let injector = injector.clone();
+        let text = config.text.clone();
+        let display_name = config.display_name.clone();
+        let location = match &config.location {
+            BufferResultLocation::Path(path) => BufferResultLocation::Path(path.clone()),
+            BufferResultLocation::Document(id) => BufferResultLocation::Document(*id),
+        };
+        async move {
+            let mut searcher = SearcherBuilder::new()
+                .binary_detection(BinaryDetection::quit(b'\x00'))
+                .build();
+            let sink = sinks::UTF8(|line_num, _| {
+                let stop = injector
+                    .push(LineResult {
+                        location: match &location {
+                            BufferResultLocation::Path(path) => {
+                                BufferResultLocation::Path(path.clone())
+                            }
+                            BufferResultLocation::Document(id) => BufferResultLocation::Document(*id),
+                        },
+                        display_name: display_name.clone(),
+                        line_num: line_num as usize - 1,
+                    })
+                    .is_err();
+                Ok(!stop)
+            });
+            let text_str = text.to_string();
+            let _ = searcher.search_slice(&matcher, text_str.as_bytes(), sink);
+            Ok(())
+        }
+        .boxed()
+    };
+
+    let reg = cx.register.unwrap_or('/');
+    cx.editor.registers.last_search_register = reg;
+
+    let picker = Picker::new(
+        columns,
+        1,
+        [],
+        config,
+        move |cx, LineResult { location, line_num, .. }, action| {
+            let doc_id = match location {
+                BufferResultLocation::Path(path) => match cx.editor.open(path, action) {
+                    Ok(id) => id,
+                    Err(e) => {
+                        cx.editor
+                            .set_error(format!("Failed to open file '{}': {}", path.display(), e));
+                        return;
+                    }
+                },
+                BufferResultLocation::Document(id) => {
+                    if cx.editor.document(*id).is_none() {
+                        cx.editor
+                            .set_error("The buffer you selected is no longer available.");
+                        return;
+                    }
+                    cx.editor.switch(*id, action);
+                    *id
+                }
+            };
+            let doc = doc_mut!(cx.editor, &doc_id);
+            let line_num = *line_num;
+            let view = view_mut!(cx.editor);
+            let text = doc.text();
+            if line_num >= text.len_lines() {
+                cx.editor.set_error(
+                    "The line you jumped to does not exist anymore because the file has changed.",
+                );
+                return;
+            }
+            let start = text.line_to_char(line_num);
+            let end = text.line_to_char((line_num + 1).min(text.len_lines()));
+            doc.set_selection(view.id, Selection::single(start, end));
+            if action.align_view(view, doc.id()) {
+                align_view(doc, view, Align::Center);
+            }
+        },
+    )
+    .with_preview(|_editor, LineResult { location, line_num, .. }| {
+        let location = match location {
+            BufferResultLocation::Path(path) => path.as_path().into(),
+            BufferResultLocation::Document(id) => (*id).into(),
+        };
+        Some((location, Some((*line_num, *line_num))))
+    })
+    .with_history_register(Some(reg))
+    .with_dynamic_query(get_lines, Some(275));
 
     cx.push_layer(Box::new(overlaid(picker)));
 }

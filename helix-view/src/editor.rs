@@ -666,6 +666,7 @@ fn parse_statusline_element(value: &str) -> Option<StatusLineElement> {
         "version-control" => E::VersionControl,
         "register" => E::Register,
         "current-working-directory" => E::CurrentWorkingDirectory,
+        "completion-suggestions" => E::CompletionSuggestions,
         _ => return None,
     })
 }

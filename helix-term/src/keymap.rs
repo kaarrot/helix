@@ -537,6 +537,18 @@ mod tests {
     }
 
     #[test]
+    fn scoped_file_picker_binding_is_present_in_default_keymap() {
+        let keymaps = Keymaps::default().map();
+        let root = keymaps.get(&Mode::Normal).unwrap();
+
+        assert_eq!(
+            root.search(&[key!(' '), key!('F')]).unwrap(),
+            &KeyTrie::MappableCommand(MappableCommand::file_picker_in_current_buffer_directory),
+            "Mismatch for scoped file picker on `Space-F`"
+        );
+    }
+
+    #[test]
     fn reverse_map() {
         let normal_mode = keymap!({ "Normal mode"
             "i" => insert_mode,

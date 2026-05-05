@@ -414,7 +414,11 @@ impl Prompt {
         };
 
         // Filter history by prefix
-        let prefix = self.history_prefix.as_ref().map(|s| s.as_str()).unwrap_or("");
+        let prefix = self
+            .history_prefix
+            .as_ref()
+            .map(|s| s.as_str())
+            .unwrap_or("");
         let filtered: Vec<String> = values
             .filter(|entry| entry.starts_with(prefix))
             .map(|s| s.to_string())

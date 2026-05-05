@@ -172,7 +172,9 @@ mod tests {
 
     #[test]
     fn rejects_malformed_conflict_markers() {
-        let text = rope(&format!("{START_MARKER} ours\nours line\n{END_MARKER} theirs\n"));
+        let text = rope(&format!(
+            "{START_MARKER} ours\nours line\n{END_MARKER} theirs\n"
+        ));
         let conflicts = find_conflicts(&text);
         assert_eq!(conflicts.len(), 1);
         assert!(extract_sides(&text, &conflicts[0]).is_none());

@@ -533,13 +533,19 @@ async fn test_insert_stream_output_reuses_last_stream_buffer() -> anyhow::Result
         assert!(text.contains("echo two\ntwo"));
         assert!(text.find("echo one") < text.find("echo two"));
         assert_eq!(
-            doc.selection(view.id).primary().cursor(doc.text().slice(..)),
+            doc.selection(view.id)
+                .primary()
+                .cursor(doc.text().slice(..)),
             doc.text().len_chars()
         );
     }
 
     assert_eq!(
-        app.editor.document(source_doc_id).unwrap().text().to_string(),
+        app.editor
+            .document(source_doc_id)
+            .unwrap()
+            .text()
+            .to_string(),
         "source\n"
     );
 
@@ -578,18 +584,26 @@ async fn test_insert_stream_output_reuses_last_stream_buffer_from_scratch() -> a
     let other_scratch_id = doc!(app.editor).id();
 
     send_key_sequence(&mut app, ":insert-stream-output echo two<ret>").await?;
-    wait_for_condition(&mut app, "output appended in original scratch buffer", |app| {
-        let doc = doc!(app.editor);
-        let text = doc.text().to_string();
-        doc.id() == output_doc_id
-            && text.contains("echo one\none")
-            && text.contains("echo two\ntwo")
-            && text.find("echo one") < text.find("echo two")
-    })
+    wait_for_condition(
+        &mut app,
+        "output appended in original scratch buffer",
+        |app| {
+            let doc = doc!(app.editor);
+            let text = doc.text().to_string();
+            doc.id() == output_doc_id
+                && text.contains("echo one\none")
+                && text.contains("echo two\ntwo")
+                && text.find("echo one") < text.find("echo two")
+        },
+    )
     .await?;
 
     assert_eq!(
-        app.editor.document(other_scratch_id).unwrap().text().to_string(),
+        app.editor
+            .document(other_scratch_id)
+            .unwrap()
+            .text()
+            .to_string(),
         "test\n"
     );
 

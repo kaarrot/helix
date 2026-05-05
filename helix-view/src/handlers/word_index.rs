@@ -6,8 +6,8 @@
 use std::{borrow::Cow, collections::HashMap, iter, mem, sync::Arc, time::Duration};
 
 use helix_core::{
-    chars::char_is_word, diff::compare_ropes, fuzzy::fuzzy_match, movement, ChangeSet, Range,
-    Rope, RopeSlice,
+    chars::char_is_word, diff::compare_ropes, fuzzy::fuzzy_match, movement, ChangeSet, Range, Rope,
+    RopeSlice,
 };
 use helix_event::{register_hook, AsyncHook};
 use helix_stdx::rope::RopeSliceExt as _;
@@ -95,7 +95,9 @@ impl AsyncHook for Hook {
                         pending_change.text = change.text;
                     } else {
                         pending_change.changes =
-                            compare_ropes(&pending_change.old_text, &change.text).changes().clone();
+                            compare_ropes(&pending_change.old_text, &change.text)
+                                .changes()
+                                .clone();
                         pending_change.text = change.text;
                     }
                     Some(Instant::now() + DEBOUNCE)

@@ -2952,7 +2952,9 @@ fn search_in_buffer(cx: &mut Context) {
                             BufferResultLocation::Path(path) => {
                                 BufferResultLocation::Path(path.clone())
                             }
-                            BufferResultLocation::Document(id) => BufferResultLocation::Document(*id),
+                            BufferResultLocation::Document(id) => {
+                                BufferResultLocation::Document(*id)
+                            }
                         },
                         display_name: display_name.clone(),
                         line_num: line_num as usize - 1,
@@ -2975,13 +2977,20 @@ fn search_in_buffer(cx: &mut Context) {
         1,
         [],
         config,
-        move |cx, LineResult { location, line_num, .. }, action| {
+        move |cx,
+              LineResult {
+                  location, line_num, ..
+              },
+              action| {
             let doc_id = match location {
                 BufferResultLocation::Path(path) => match cx.editor.open(path, action) {
                     Ok(id) => id,
                     Err(e) => {
-                        cx.editor
-                            .set_error(format!("Failed to open file '{}': {}", path.display(), e));
+                        cx.editor.set_error(format!(
+                            "Failed to open file '{}': {}",
+                            path.display(),
+                            e
+                        ));
                         return;
                     }
                 },
@@ -3013,13 +3022,18 @@ fn search_in_buffer(cx: &mut Context) {
             }
         },
     )
-    .with_preview(|_editor, LineResult { location, line_num, .. }| {
-        let location = match location {
-            BufferResultLocation::Path(path) => path.as_path().into(),
-            BufferResultLocation::Document(id) => (*id).into(),
-        };
-        Some((location, Some((*line_num, *line_num))))
-    })
+    .with_preview(
+        |_editor,
+         LineResult {
+             location, line_num, ..
+         }| {
+            let location = match location {
+                BufferResultLocation::Path(path) => path.as_path().into(),
+                BufferResultLocation::Document(id) => (*id).into(),
+            };
+            Some((location, Some((*line_num, *line_num))))
+        },
+    )
     .with_history_register(Some(reg))
     .with_dynamic_query(get_lines, Some(275));
 

@@ -112,6 +112,27 @@ pub async fn test_key_sequence(
     test_key_sequences(app, vec![(in_keys, test_fn)], should_exit).await
 }
 
+pub async fn dispatch_key_sequence(app: &mut Application, in_keys: &str) -> anyhow::Result<bool> {
+    let events = parse_macro(in_keys)?
+        .into_iter()
+        .map(|key_event| Event::Key(KeyEvent::from(key_event)));
+    dispatch_events(app, events).await
+}
+
+pub async fn dispatch_events<I>(app: &mut Application, events: I) -> anyhow::Result<bool>
+where
+    I: IntoIterator<Item = Event>,
+{
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut rx_stream = UnboundedReceiverStream::new(rx);
+
+    for event in events {
+        tx.send(Ok(event))?;
+    }
+
+    Ok(app.event_loop_until_idle(&mut rx_stream).await)
+}
+
 #[allow(clippy::type_complexity)]
 pub async fn test_key_sequences(
     app: &mut Application,

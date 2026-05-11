@@ -6,6 +6,46 @@ const COMPLETION_PREFIX: &str = "status";
 const COMPLETION_LABELS: [&str; 3] = ["statusalpha", "statusbeta", "statusgamma"];
 const OFFSCREEN_BLANK_LINES: usize = 220;
 
+#[cfg(not(windows))]
+fn left_click_events(row: u16, column: u16) -> [termina::event::Event; 2] {
+    use termina::event::{Event, Modifiers, MouseButton, MouseEvent, MouseEventKind};
+
+    [
+        Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: Modifiers::NONE,
+        }),
+        Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column,
+            row,
+            modifiers: Modifiers::NONE,
+        }),
+    ]
+}
+
+#[cfg(windows)]
+fn left_click_events(row: u16, column: u16) -> [crossterm::event::Event; 2] {
+    use crossterm::event::{Event, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+
+    [
+        Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::empty(),
+        }),
+        Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::empty(),
+        }),
+    ]
+}
+
 fn statusline_completion_config() -> Config {
     let mut config = test_config();
     config.editor.completion_display = CompletionDisplay::Statusline;
@@ -86,6 +126,40 @@ async fn statusline_completion_renders_without_popup() -> anyhow::Result<()> {
         false,
     )
     .await?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn statusline_completion_accepts_mouse_click() -> anyhow::Result<()> {
+    let file = temp_file_with_contents(completion_source_text())?;
+    let mut app = AppBuilder::new()
+        .with_config(statusline_completion_config())
+        .with_file(file.path(), None)
+        .build()?;
+
+    run_event_loop_until_idle(&mut app).await;
+    dispatch_key_sequence(&mut app, &format!("i{COMPLETION_PREFIX}<C-x>")).await?;
+
+    let lines = screen_lines(&app);
+    let (row, statusline) = lines
+        .iter()
+        .enumerate()
+        .find(|(_, line)| line.contains(COMPLETION_LABELS[1]))
+        .expect("expected statusline completion label to render");
+    let column = statusline
+        .find(COMPLETION_LABELS[1])
+        .expect("expected label column") as u16;
+
+    dispatch_events(&mut app, left_click_events(row as u16, column)).await?;
+
+    let (_, doc) = helix_view::current_ref!(app.editor);
+    assert_eq!(
+        format!("{}\n", COMPLETION_LABELS[1]),
+        doc.text().line(0).to_string()
+    );
+
+    test_key_sequence(&mut app, Some("<esc>:q!<ret>"), None, true).await?;
 
     Ok(())
 }

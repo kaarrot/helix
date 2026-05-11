@@ -455,6 +455,10 @@ impl Completion {
         self.popup.contents().cursor()
     }
 
+    pub fn select(&mut self, index: usize, editor: &mut Editor, event: PromptEvent) -> bool {
+        self.popup.contents_mut().select(index, editor, event)
+    }
+
     pub fn replace_item(
         &mut self,
         old_item: &impl PartialEq<CompletionItem>,

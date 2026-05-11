@@ -33,6 +33,7 @@ pub struct Popup<T: Component> {
     contents: T,
     position: Option<Position>,
     area: Rect,
+    child_area: Rect,
     position_bias: Open,
     scroll_half_pages: usize,
     auto_close: bool,
@@ -48,6 +49,7 @@ impl<T: Component> Popup<T> {
             position: None,
             position_bias: Open::Below,
             area: Rect::new(0, 0, 0, 0),
+            child_area: Rect::new(0, 0, 0, 0),
             scroll_half_pages: 0,
             auto_close: false,
             ignore_escape_key: false,
@@ -121,6 +123,10 @@ impl<T: Component> Popup<T> {
 
     pub fn area(&mut self, viewport: Rect, editor: &Editor) -> Rect {
         self.render_info(viewport, editor).area
+    }
+
+    pub fn child_area(&self) -> Rect {
+        self.child_area
     }
 
     fn render_info(&mut self, viewport: Rect, editor: &Editor) -> RenderInfo {
@@ -326,6 +332,7 @@ impl<T: Component> Component for Popup<T> {
             inner = area.inner(Margin::all(1));
             Widget::render(Block::bordered(), area, surface);
         }
+        self.child_area = inner;
         let border = usize::from(render_borders);
 
         let max_offset = child_height.saturating_sub(inner.height) as usize;

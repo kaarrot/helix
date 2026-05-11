@@ -960,6 +960,27 @@ mod tests {
         assert!(!line.contains("src/main.rs"));
         assert!(!line.contains("1:1"));
 
+        let beta_column = line.find("beta").expect("beta should render") as u16;
+        let (view, doc) = current_ref!(harness.editor);
+        let viewport = Rect::new(0, 0, 26, 1);
+        let spinners = ProgressSpinners::default();
+        let mut context = RenderContext::new(
+            &harness.editor,
+            doc,
+            view,
+            true,
+            &spinners,
+            Some(&completion),
+        );
+        assert_eq!(
+            Some(1),
+            completion_suggestion_index_at(&mut context, viewport, beta_column, 0)
+        );
+        assert_eq!(
+            None,
+            completion_suggestion_index_at(&mut context, viewport, beta_column, 1)
+        );
+
         harness.set_completion_display(CompletionDisplay::Popup);
         harness.editor.mode = Mode::Insert;
         let line = render_statusline(&harness.editor, Some(&completion), 40);
@@ -973,35 +994,5 @@ mod tests {
         assert!(line.contains("src/main.rs"));
         assert!(line.contains("1:1"));
         assert!(!line.contains("alpha"));
-    }
-
-    #[test]
-    fn statusline_completion_hit_test_returns_rendered_item_index() {
-        let harness = TestHarness::new();
-        let completion = test_completion(&harness.editor, &["alpha", "beta", "gamma"]);
-        harness.set_completion_display(CompletionDisplay::Statusline);
-
-        let line = render_statusline(&harness.editor, Some(&completion), 40);
-        let beta_column = line.find("beta").expect("beta should render") as u16;
-        let (view, doc) = current_ref!(harness.editor);
-        let viewport = Rect::new(0, 0, 40, 1);
-        let spinners = ProgressSpinners::default();
-        let mut context = RenderContext::new(
-            &harness.editor,
-            doc,
-            view,
-            true,
-            &spinners,
-            Some(&completion),
-        );
-
-        assert_eq!(
-            Some(1),
-            completion_suggestion_index_at(&mut context, viewport, beta_column, 0)
-        );
-        assert_eq!(
-            None,
-            completion_suggestion_index_at(&mut context, viewport, beta_column, 1)
-        );
     }
 }

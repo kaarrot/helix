@@ -2,7 +2,7 @@ use super::diff;
 
 use crate::{
     commands::{self, OnKeyCallback, OnKeyCallbackKind},
-    compositor::{Component, Context, Event, EventResult},
+    compositor::{Callback, Component, Context, Event, EventResult},
     events::{OnModeSwitch, PostCommand},
     handlers::completion::CompletionItem,
     key,
@@ -44,6 +44,7 @@ pub struct EditorView {
     pub(crate) last_insert: (commands::MappableCommand, Vec<InsertEvent>),
     pub(crate) completion: Option<Completion>,
     statusline_completion_mouse_down: Option<usize>,
+    popup_completion_mouse_down: Option<usize>,
     spinners: ProgressSpinners,
     /// Tracks if the terminal window is focused by reaction to terminal focus events
     terminal_focused: bool,
@@ -60,6 +61,14 @@ pub enum InsertEvent {
     RequestCompletion,
 }
 
+fn request_full_redraw(compositor: &mut crate::compositor::Compositor, _cx: &mut Context) {
+    compositor.need_full_redraw();
+}
+
+fn full_redraw_callback() -> Callback {
+    Box::new(request_full_redraw)
+}
+
 impl EditorView {
     pub fn new(keymaps: Keymaps) -> Self {
         Self {
@@ -69,6 +78,7 @@ impl EditorView {
             last_insert: (commands::MappableCommand::normal_mode, Vec::new()),
             completion: None,
             statusline_completion_mouse_down: None,
+            popup_completion_mouse_down: None,
             spinners: ProgressSpinners::default(),
             terminal_focused: true,
         }
@@ -1079,6 +1089,7 @@ impl EditorView {
 
     pub fn clear_completion(&mut self, editor: &mut Editor) -> Option<OnKeyCallback> {
         self.statusline_completion_mouse_down = None;
+        self.popup_completion_mouse_down = None;
         self.completion = None;
         let mut on_next_key: Option<OnKeyCallback> = None;
         editor.handlers.completions.request_controller.restart();
@@ -1178,17 +1189,46 @@ impl EditorView {
             && column < statusline_area.right()
     }
 
-    fn select_statusline_completion(
-        &mut self,
-        editor: &mut Editor,
-        index: usize,
-        event: PromptEvent,
-    ) -> bool {
+    fn popup_completion_index_at(&self, row: u16, column: u16) -> Option<usize> {
+        self.completion.as_ref()?.index_at(row, column)
+    }
+
+    fn select_completion(&mut self, editor: &mut Editor, index: usize, event: PromptEvent) -> bool {
         let Some(completion) = self.completion.as_mut() else {
             return false;
         };
 
         completion.select(index, editor, event)
+    }
+
+    fn cursor_overlaps_diagnostic(editor: &Editor) -> bool {
+        let (view, doc) = current_ref!(editor);
+        let text = doc.text().slice(..);
+        let cursor = doc.selection(view.id).primary().cursor(text);
+
+        doc.diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic.range.start <= cursor && diagnostic.range.end >= cursor)
+    }
+
+    fn trigger_completion_at_cursor(editor: &Editor) {
+        let (view, doc) = current_ref!(editor);
+        let text = doc.text().slice(..);
+        let cursor = doc.selection(view.id).primary().cursor(text);
+        editor
+            .handlers
+            .trigger_completions(cursor, doc.id(), view.id);
+    }
+
+    fn clear_completion_for_mouse_reposition(&mut self, editor: &mut Editor) -> bool {
+        if self.completion.is_none() {
+            return false;
+        }
+
+        if let Some(cb) = self.clear_completion(editor) {
+            self.on_next_key = Some((cb, OnKeyCallbackKind::Fallback));
+        }
+        true
     }
 
     fn handle_mouse_event(
@@ -1231,8 +1271,16 @@ impl EditorView {
         match kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 if let Some(index) = self.statusline_completion_index_at(cxt.editor, row, column) {
-                    if self.select_statusline_completion(cxt.editor, index, PromptEvent::Update) {
+                    if self.select_completion(cxt.editor, index, PromptEvent::Update) {
                         self.statusline_completion_mouse_down = Some(index);
+                    }
+
+                    return EventResult::Consumed(None);
+                }
+
+                if let Some(index) = self.popup_completion_index_at(row, column) {
+                    if self.select_completion(cxt.editor, index, PromptEvent::Update) {
+                        self.popup_completion_mouse_down = Some(index);
                     }
 
                     return EventResult::Consumed(None);
@@ -1241,25 +1289,31 @@ impl EditorView {
                 let editor = &mut cxt.editor;
 
                 if let Some((pos, view_id)) = pos_and_view(editor, row, column, true) {
+                    let had_completion = self.clear_completion_for_mouse_reposition(editor);
+                    let prev_view_id = view!(editor).id;
                     editor.focus(view_id);
 
-                    let prev_view_id = view!(editor).id;
-                    let doc = doc_mut!(editor, &view!(editor, view_id).doc);
+                    {
+                        let doc = doc_mut!(editor, &view!(editor, view_id).doc);
 
-                    if modifiers == KeyModifiers::ALT {
-                        let selection = doc.selection(view_id).clone();
-                        doc.set_selection(view_id, selection.push(Range::point(pos)));
-                    } else if editor.mode == Mode::Select {
-                        // Discards non-primary selections for consistent UX with normal mode
-                        let primary = doc.selection(view_id).primary().put_cursor(
-                            doc.text().slice(..),
-                            pos,
-                            true,
-                        );
-                        editor.mouse_down_range = Some(primary);
-                        doc.set_selection(view_id, Selection::single(primary.anchor, primary.head));
-                    } else {
-                        doc.set_selection(view_id, Selection::point(pos));
+                        if modifiers == KeyModifiers::ALT {
+                            let selection = doc.selection(view_id).clone();
+                            doc.set_selection(view_id, selection.push(Range::point(pos)));
+                        } else if editor.mode == Mode::Select {
+                            // Discards non-primary selections for consistent UX with normal mode
+                            let primary = doc.selection(view_id).primary().put_cursor(
+                                doc.text().slice(..),
+                                pos,
+                                true,
+                            );
+                            editor.mouse_down_range = Some(primary);
+                            doc.set_selection(
+                                view_id,
+                                Selection::single(primary.anchor, primary.head),
+                            );
+                        } else {
+                            doc.set_selection(view_id, Selection::point(pos));
+                        }
                     }
 
                     if view_id != prev_view_id {
@@ -1267,18 +1321,32 @@ impl EditorView {
                     }
 
                     editor.ensure_cursor_in_view(view_id);
+                    if had_completion
+                        && editor.mode == Mode::Insert
+                        && modifiers != KeyModifiers::ALT
+                        && Self::cursor_overlaps_diagnostic(editor)
+                    {
+                        Self::trigger_completion_at_cursor(editor);
+                    }
 
-                    return EventResult::Consumed(None);
+                    return EventResult::Consumed(had_completion.then(full_redraw_callback));
                 }
 
                 if let Some((coords, view_id)) = gutter_coords_and_view(editor, row, column) {
+                    let had_completion = self.clear_completion_for_mouse_reposition(editor);
                     editor.focus(view_id);
 
                     let (view, doc) = current!(cxt.editor);
 
                     let path = match doc.path() {
                         Some(path) => path.clone(),
-                        None => return EventResult::Ignored(None),
+                        None => {
+                            return if had_completion {
+                                EventResult::Consumed(Some(full_redraw_callback()))
+                            } else {
+                                EventResult::Ignored(None)
+                            };
+                        }
                     };
 
                     if let Some(char_idx) =
@@ -1286,11 +1354,21 @@ impl EditorView {
                     {
                         let line = doc.text().char_to_line(char_idx);
                         commands::dap_toggle_breakpoint_impl(cxt, path, line);
-                        return EventResult::Consumed(None);
+                        return EventResult::Consumed(had_completion.then(full_redraw_callback));
                     }
+
+                    return if had_completion {
+                        EventResult::Consumed(Some(full_redraw_callback()))
+                    } else {
+                        EventResult::Ignored(None)
+                    };
                 }
 
-                EventResult::Ignored(None)
+                if self.clear_completion_for_mouse_reposition(editor) {
+                    EventResult::Consumed(Some(full_redraw_callback()))
+                } else {
+                    EventResult::Ignored(None)
+                }
             }
 
             MouseEventKind::Drag(MouseButton::Left) => {
@@ -1298,9 +1376,18 @@ impl EditorView {
                     if let Some(index) =
                         self.statusline_completion_index_at(cxt.editor, row, column)
                     {
-                        if self.select_statusline_completion(cxt.editor, index, PromptEvent::Update)
-                        {
+                        if self.select_completion(cxt.editor, index, PromptEvent::Update) {
                             self.statusline_completion_mouse_down = Some(index);
+                        }
+                    }
+
+                    return EventResult::Consumed(None);
+                }
+
+                if self.popup_completion_mouse_down.is_some() {
+                    if let Some(index) = self.popup_completion_index_at(row, column) {
+                        if self.select_completion(cxt.editor, index, PromptEvent::Update) {
+                            self.popup_completion_mouse_down = Some(index);
                         }
                     }
 
@@ -1349,15 +1436,25 @@ impl EditorView {
             MouseEventKind::Up(MouseButton::Left) => {
                 if let Some(down_index) = self.statusline_completion_mouse_down.take() {
                     if self.statusline_area_contains(cxt.editor, row, column)
-                        && self.select_statusline_completion(
-                            cxt.editor,
-                            down_index,
-                            PromptEvent::Validate,
-                        )
+                        && self.select_completion(cxt.editor, down_index, PromptEvent::Validate)
                     {
                         if let Some(cb) = self.clear_completion(cxt.editor) {
                             self.on_next_key = Some((cb, OnKeyCallbackKind::Fallback));
                         }
+                    }
+
+                    return EventResult::Consumed(None);
+                }
+
+                if let Some(down_index) = self.popup_completion_mouse_down.take() {
+                    if self.popup_completion_index_at(row, column).is_some()
+                        && self.select_completion(cxt.editor, down_index, PromptEvent::Validate)
+                    {
+                        if let Some(cb) = self.clear_completion(cxt.editor) {
+                            self.on_next_key = Some((cb, OnKeyCallbackKind::Fallback));
+                        }
+
+                        return EventResult::Consumed(Some(full_redraw_callback()));
                     }
 
                     return EventResult::Consumed(None);

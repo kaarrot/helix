@@ -207,6 +207,19 @@ impl<T: Item> Menu<T> {
         true
     }
 
+    pub fn index_at(&self, area: Rect, row: u16, column: u16) -> Option<usize> {
+        if row < area.top()
+            || row >= area.bottom()
+            || column < area.left()
+            || column >= area.right()
+        {
+            return None;
+        }
+
+        let index = self.scroll + usize::from(row - area.top());
+        (index < self.matches.len()).then_some(index)
+    }
+
     /// Iterator over the currently-matched items, paired with a `selected` flag
     /// indicating whether the item is the cursor selection.
     pub fn matched_items(&self) -> impl Iterator<Item = (&T, bool)> + '_ {

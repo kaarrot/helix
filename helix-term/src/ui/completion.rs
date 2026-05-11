@@ -459,6 +459,12 @@ impl Completion {
         self.popup.contents_mut().select(index, editor, event)
     }
 
+    pub fn index_at(&self, row: u16, column: u16) -> Option<usize> {
+        self.popup
+            .contents()
+            .index_at(self.popup.child_area(), row, column)
+    }
+
     pub fn replace_item(
         &mut self,
         old_item: &impl PartialEq<CompletionItem>,

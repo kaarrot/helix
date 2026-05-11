@@ -163,3 +163,62 @@ async fn statusline_completion_accepts_mouse_click() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn popup_completion_accepts_mouse_click() -> anyhow::Result<()> {
+    let file = temp_file_with_contents(completion_source_text())?;
+    let mut app = AppBuilder::new().with_file(file.path(), None).build()?;
+
+    run_event_loop_until_idle(&mut app).await;
+    dispatch_key_sequence(&mut app, &format!("i{COMPLETION_PREFIX}<C-x>")).await?;
+
+    let lines = screen_lines(&app);
+    let (row, line) = lines
+        .iter()
+        .enumerate()
+        .find(|(_, line)| line.contains(COMPLETION_LABELS[1]))
+        .expect("expected popup completion label to render");
+    let column = line
+        .find(COMPLETION_LABELS[1])
+        .expect("expected label column") as u16;
+
+    dispatch_events(&mut app, left_click_events(row as u16, column)).await?;
+
+    let (_, doc) = helix_view::current_ref!(app.editor);
+    assert_eq!(
+        format!("{}\n", COMPLETION_LABELS[1]),
+        doc.text().line(0).to_string()
+    );
+
+    test_key_sequence(&mut app, Some("<esc>:q!<ret>"), None, true).await?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn popup_completion_closes_on_buffer_click() -> anyhow::Result<()> {
+    let file = temp_file_with_contents(completion_source_text())?;
+    let mut app = AppBuilder::new().with_file(file.path(), None).build()?;
+
+    run_event_loop_until_idle(&mut app).await;
+    dispatch_key_sequence(&mut app, &format!("i{COMPLETION_PREFIX}<C-x>")).await?;
+    assert_eq!(1, count_screen_occurrences(&app, COMPLETION_LABELS[0]));
+
+    let lines = screen_lines(&app);
+    let row = lines
+        .iter()
+        .enumerate()
+        .find(|(row, line)| *row > 5 && line.is_empty())
+        .map(|(row, _)| row)
+        .expect("expected a blank buffer row outside the popup");
+
+    dispatch_events(&mut app, left_click_events(row as u16, 0)).await?;
+
+    for label in COMPLETION_LABELS {
+        assert_eq!(0, count_screen_occurrences(&app, label));
+    }
+
+    test_key_sequence(&mut app, Some("<esc>:q!<ret>"), None, true).await?;
+
+    Ok(())
+}

@@ -9,7 +9,7 @@ use crate::{
         document::{render_document, LinePos, TextRenderer},
         statusline,
         text_decorations::{self, Decoration, DecorationManager, InlineDiagnostics},
-        Completion, ProgressSpinners,
+        Completion, ProgressSpinners, PromptEvent,
     },
 };
 
@@ -41,6 +41,7 @@ pub struct EditorView {
     pseudo_pending: Vec<KeyEvent>,
     pub(crate) last_insert: (commands::MappableCommand, Vec<InsertEvent>),
     pub(crate) completion: Option<Completion>,
+    statusline_completion_mouse_down: Option<usize>,
     spinners: ProgressSpinners,
     /// Tracks if the terminal window is focused by reaction to terminal focus events
     terminal_focused: bool,
@@ -65,6 +66,7 @@ impl EditorView {
             pseudo_pending: Vec::new(),
             last_insert: (commands::MappableCommand::normal_mode, Vec::new()),
             completion: None,
+            statusline_completion_mouse_down: None,
             spinners: ProgressSpinners::default(),
             terminal_focused: true,
         }
@@ -1060,6 +1062,7 @@ impl EditorView {
     }
 
     pub fn clear_completion(&mut self, editor: &mut Editor) -> Option<OnKeyCallback> {
+        self.statusline_completion_mouse_down = None;
         self.completion = None;
         let mut on_next_key: Option<OnKeyCallback> = None;
         editor.handlers.completions.request_controller.restart();
@@ -1123,6 +1126,55 @@ impl EditorView {
         self.pseudo_pending.clear();
     }
 
+    fn statusline_completion_index_at(
+        &self,
+        editor: &Editor,
+        row: u16,
+        column: u16,
+    ) -> Option<usize> {
+        let completion = self.completion.as_ref()?;
+        let (view, doc) = current_ref!(editor);
+        let statusline_area = view
+            .area
+            .clip_top(view.area.height.saturating_sub(1))
+            .clip_bottom(1);
+        let mut context = statusline::RenderContext::new(
+            editor,
+            doc,
+            view,
+            true,
+            &self.spinners,
+            Some(completion),
+        );
+
+        statusline::completion_suggestion_index_at(&mut context, statusline_area, column, row)
+    }
+
+    fn statusline_area_contains(&self, editor: &Editor, row: u16, column: u16) -> bool {
+        let (view, _) = current_ref!(editor);
+        let statusline_area = view
+            .area
+            .clip_top(view.area.height.saturating_sub(1))
+            .clip_bottom(1);
+
+        row == statusline_area.y
+            && column >= statusline_area.left()
+            && column < statusline_area.right()
+    }
+
+    fn select_statusline_completion(
+        &mut self,
+        editor: &mut Editor,
+        index: usize,
+        event: PromptEvent,
+    ) -> bool {
+        let Some(completion) = self.completion.as_mut() else {
+            return false;
+        };
+
+        completion.select(index, editor, event)
+    }
+
     fn handle_mouse_event(
         &mut self,
         event: &MouseEvent,
@@ -1162,6 +1214,14 @@ impl EditorView {
 
         match kind {
             MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(index) = self.statusline_completion_index_at(cxt.editor, row, column) {
+                    if self.select_statusline_completion(cxt.editor, index, PromptEvent::Update) {
+                        self.statusline_completion_mouse_down = Some(index);
+                    }
+
+                    return EventResult::Consumed(None);
+                }
+
                 let editor = &mut cxt.editor;
 
                 if let Some((pos, view_id)) = pos_and_view(editor, row, column, true) {
@@ -1218,6 +1278,19 @@ impl EditorView {
             }
 
             MouseEventKind::Drag(MouseButton::Left) => {
+                if self.statusline_completion_mouse_down.is_some() {
+                    if let Some(index) =
+                        self.statusline_completion_index_at(cxt.editor, row, column)
+                    {
+                        if self.select_statusline_completion(cxt.editor, index, PromptEvent::Update)
+                        {
+                            self.statusline_completion_mouse_down = Some(index);
+                        }
+                    }
+
+                    return EventResult::Consumed(None);
+                }
+
                 let (view, doc) = current!(cxt.editor);
 
                 let pos = match view.pos_at_screen_coords(doc, row, column, true) {
@@ -1258,6 +1331,22 @@ impl EditorView {
             }
 
             MouseEventKind::Up(MouseButton::Left) => {
+                if let Some(down_index) = self.statusline_completion_mouse_down.take() {
+                    if self.statusline_area_contains(cxt.editor, row, column)
+                        && self.select_statusline_completion(
+                            cxt.editor,
+                            down_index,
+                            PromptEvent::Validate,
+                        )
+                    {
+                        if let Some(cb) = self.clear_completion(cxt.editor) {
+                            self.on_next_key = Some((cb, OnKeyCallbackKind::Fallback));
+                        }
+                    }
+
+                    return EventResult::Consumed(None);
+                }
+
                 if !config.middle_click_paste {
                     return EventResult::Ignored(None);
                 }

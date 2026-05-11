@@ -196,6 +196,17 @@ impl<T: Item> Menu<T> {
         self.cursor
     }
 
+    pub fn select(&mut self, cursor: usize, editor: &mut Editor, event: MenuEvent) -> bool {
+        if cursor >= self.matches.len() {
+            return false;
+        }
+
+        self.cursor = Some(cursor);
+        self.adjust_scroll();
+        (self.callback_fn)(editor, self.selection(), event);
+        true
+    }
+
     /// Iterator over the currently-matched items, paired with a `selected` flag
     /// indicating whether the item is the cursor selection.
     pub fn matched_items(&self) -> impl Iterator<Item = (&T, bool)> + '_ {

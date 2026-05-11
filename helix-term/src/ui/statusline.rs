@@ -15,6 +15,9 @@ use helix_view::editor::StatusLineElement as StatusLineElementID;
 use tui::buffer::Buffer as Surface;
 use tui::text::{Span, Spans};
 
+const COMPLETION_MAX_ITEMS: usize = 5;
+const COMPLETION_MAX_LABEL_WIDTH: usize = 16;
+
 pub struct RenderContext<'a> {
     pub editor: &'a Editor,
     pub doc: &'a Document,
@@ -121,6 +124,115 @@ pub fn render(context: &mut RenderContext, viewport: Rect, surface: &mut Surface
         &context.parts.center,
         center_width,
     );
+}
+
+pub fn completion_suggestion_index_at(
+    context: &mut RenderContext,
+    viewport: Rect,
+    column: u16,
+    row: u16,
+) -> Option<usize> {
+    if row != viewport.y || column < viewport.left() || column >= viewport.right() {
+        return None;
+    }
+
+    let (left_elements, center_elements, right_elements) = {
+        let config = context.editor.config();
+        let statusline = &config.statusline;
+        (
+            statusline.left.clone(),
+            statusline.center.clone(),
+            statusline.right.clone(),
+        )
+    };
+
+    let left = section_layout(context, &left_elements);
+    let right = section_layout(context, &right_elements);
+    let center = section_layout(context, &center_elements);
+
+    let spacing = 1u16;
+    let left_width = left.width.min(u16::MAX as usize) as u16;
+    let right_width = right.width.min(u16::MAX as usize) as u16;
+    let edge_width = left_width.max(right_width);
+    let center_max_width = viewport.width.saturating_sub(2 * edge_width + 2 * spacing);
+    let center_width = center_max_width.min(center.width.min(u16::MAX as usize) as u16);
+
+    let center_start = viewport.x + viewport.width / 2 - center_width / 2;
+    let right_start = viewport.x + viewport.width.saturating_sub(right_width);
+
+    hit_test_completion_suggestion(&center, center_start, center_width, viewport, column)
+        .or_else(|| {
+            hit_test_completion_suggestion(&right, right_start, right_width, viewport, column)
+        })
+        .or_else(|| hit_test_completion_suggestion(&left, viewport.x, left_width, viewport, column))
+}
+
+#[derive(Default)]
+struct SectionLayout {
+    width: usize,
+    suggestions: Vec<CompletionSuggestionRange>,
+}
+
+struct CompletionSuggestionRange {
+    start: usize,
+    end: usize,
+    index: usize,
+}
+
+fn section_layout(context: &mut RenderContext, elements: &[StatusLineElementID]) -> SectionLayout {
+    let mut layout = SectionLayout::default();
+
+    for element_id in elements {
+        if matches!(element_id, StatusLineElementID::CompletionSuggestions) {
+            for part in completion_suggestion_spans(context) {
+                let span_width = part.span.content.width();
+                if let Some(index) = part.index {
+                    layout.suggestions.push(CompletionSuggestionRange {
+                        start: layout.width,
+                        end: layout.width + span_width,
+                        index,
+                    });
+                }
+                layout.width += span_width;
+            }
+        } else {
+            let render = get_render_function(*element_id);
+            let span_count_before = context.parts.left.0.len();
+            let width_before = context.parts.left.width();
+            (render)(context, |context, span| {
+                context.parts.left.0.push(span);
+            });
+            layout.width += context.parts.left.width() - width_before;
+            context.parts.left.0.truncate(span_count_before);
+        }
+    }
+
+    layout
+}
+
+fn hit_test_completion_suggestion(
+    layout: &SectionLayout,
+    section_start: u16,
+    section_width: u16,
+    viewport: Rect,
+    column: u16,
+) -> Option<usize> {
+    let section_start = section_start as usize;
+    let section_end = section_start + section_width as usize;
+    let viewport_start = viewport.left() as usize;
+    let viewport_end = viewport.right() as usize;
+    let column = column as usize;
+
+    if column < section_start.max(viewport_start) || column >= section_end.min(viewport_end) {
+        return None;
+    }
+
+    let relative_column = column.saturating_sub(section_start);
+    layout
+        .suggestions
+        .iter()
+        .find(|range| relative_column >= range.start && relative_column < range.end)
+        .map(|range| range.index)
 }
 
 fn append<'a>(buffer: &mut Spans<'a>, mut span: Span<'a>, base_style: Style) {
@@ -645,24 +757,34 @@ fn render_completion_suggestions<'a, F>(context: &mut RenderContext<'a>, write: 
 where
     F: Fn(&mut RenderContext<'a>, Span<'a>) + Copy,
 {
+    for part in completion_suggestion_spans(context) {
+        write(context, part.span);
+    }
+}
+
+struct CompletionSuggestionSpan<'a> {
+    span: Span<'a>,
+    index: Option<usize>,
+}
+
+fn completion_suggestion_spans<'a>(
+    context: &RenderContext<'a>,
+) -> Vec<CompletionSuggestionSpan<'a>> {
     use crate::handlers::completion::{CompletionItem, LspCompletionItem};
     use helix_core::CompletionItem as CoreCompletionItem;
     use helix_view::editor::CompletionDisplay;
 
-    const MAX_ITEMS: usize = 5;
-    const MAX_LABEL_WIDTH: usize = 16;
-
     if context.editor.mode() != Mode::Insert {
-        return;
+        return Vec::new();
     }
     if matches!(
         context.editor.config().completion_display,
         CompletionDisplay::Popup
     ) {
-        return;
+        return Vec::new();
     }
     let Some(completion) = context.completion else {
-        return;
+        return Vec::new();
     };
 
     let unselected_style = context.editor.theme.get("ui.menu");
@@ -670,22 +792,24 @@ where
 
     let window_start = completion
         .cursor()
-        .map_or(0, |c| c.saturating_sub(MAX_ITEMS - 1));
+        .map_or(0, |c| c.saturating_sub(COMPLETION_MAX_ITEMS - 1));
 
+    let mut spans = Vec::new();
     let mut wrote_any = false;
-    for (item, selected) in completion
+    for (relative_index, (item, selected)) in completion
         .matched_items()
         .skip(window_start)
-        .take(MAX_ITEMS)
+        .take(COMPLETION_MAX_ITEMS)
+        .enumerate()
     {
         let label = match item {
             CompletionItem::Lsp(LspCompletionItem { item, .. }) => item.label.as_str(),
             CompletionItem::Other(CoreCompletionItem { label, .. }) => label.as_ref(),
         };
 
-        let mut truncated = String::with_capacity(MAX_LABEL_WIDTH + 1);
+        let mut truncated = String::with_capacity(COMPLETION_MAX_LABEL_WIDTH + 1);
         for (i, ch) in label.chars().enumerate() {
-            if i >= MAX_LABEL_WIDTH {
+            if i >= COMPLETION_MAX_LABEL_WIDTH {
                 truncated.push('…');
                 break;
             }
@@ -693,16 +817,24 @@ where
         }
 
         if wrote_any {
-            write(context, Span::styled(" ", unselected_style));
+            spans.push(CompletionSuggestionSpan {
+                span: Span::styled(" ", unselected_style),
+                index: None,
+            });
         }
         let style = if selected {
             selected_style
         } else {
             unselected_style
         };
-        write(context, Span::styled(format!(" {truncated} "), style));
+        spans.push(CompletionSuggestionSpan {
+            span: Span::styled(format!(" {truncated} "), style),
+            index: Some(window_start + relative_index),
+        });
         wrote_any = true;
     }
+
+    spans
 }
 
 #[cfg(test)]
@@ -725,7 +857,7 @@ mod tests {
         ui::{Completion, ProgressSpinners},
     };
 
-    use super::{render, RenderContext, Surface};
+    use super::{completion_suggestion_index_at, render, RenderContext, Surface};
 
     struct TestHarness {
         _runtime: tokio::runtime::Runtime,
@@ -841,5 +973,35 @@ mod tests {
         assert!(line.contains("src/main.rs"));
         assert!(line.contains("1:1"));
         assert!(!line.contains("alpha"));
+    }
+
+    #[test]
+    fn statusline_completion_hit_test_returns_rendered_item_index() {
+        let harness = TestHarness::new();
+        let completion = test_completion(&harness.editor, &["alpha", "beta", "gamma"]);
+        harness.set_completion_display(CompletionDisplay::Statusline);
+
+        let line = render_statusline(&harness.editor, Some(&completion), 40);
+        let beta_column = line.find("beta").expect("beta should render") as u16;
+        let (view, doc) = current_ref!(harness.editor);
+        let viewport = Rect::new(0, 0, 40, 1);
+        let spinners = ProgressSpinners::default();
+        let mut context = RenderContext::new(
+            &harness.editor,
+            doc,
+            view,
+            true,
+            &spinners,
+            Some(&completion),
+        );
+
+        assert_eq!(
+            Some(1),
+            completion_suggestion_index_at(&mut context, viewport, beta_column, 0)
+        );
+        assert_eq!(
+            None,
+            completion_suggestion_index_at(&mut context, viewport, beta_column, 1)
+        );
     }
 }

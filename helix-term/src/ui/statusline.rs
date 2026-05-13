@@ -86,7 +86,18 @@ pub fn render(context: &mut RenderContext, viewport: Rect, surface: &mut Surface
     }
 
     let right_reserved_width = context.parts.right.width() as u16;
-    render_left_section(surface, viewport, &context.parts.left, right_reserved_width);
+    let left_overflow = if suggestions_taking_over(context) {
+        LeftSectionOverflow::PreserveStart
+    } else {
+        LeftSectionOverflow::PreserveEnd
+    };
+    render_left_section(
+        surface,
+        viewport,
+        &context.parts.left,
+        right_reserved_width,
+        left_overflow,
+    );
 
     surface.set_spans(
         viewport.x
@@ -127,9 +138,29 @@ fn render_left_section(
     viewport: Rect,
     left: &Spans<'_>,
     right_reserved_width: u16,
+    overflow: LeftSectionOverflow,
 ) {
-    let left_max_width = viewport.width.saturating_sub(right_reserved_width + 1);
-    surface.set_spans_truncated(viewport.x, viewport.y, left, left_max_width);
+    let left_max_width = left_available_width(viewport, right_reserved_width);
+    match overflow {
+        LeftSectionOverflow::PreserveStart => {
+            surface.set_spans(viewport.x, viewport.y, left, left_max_width);
+        }
+        LeftSectionOverflow::PreserveEnd => {
+            surface.set_spans_truncated(viewport.x, viewport.y, left, left_max_width);
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum LeftSectionOverflow {
+    PreserveStart,
+    PreserveEnd,
+}
+
+fn left_available_width(viewport: Rect, right_reserved_width: u16) -> u16 {
+    viewport
+        .width
+        .saturating_sub(right_reserved_width.saturating_add(1))
 }
 
 pub fn completion_suggestion_index_at(
@@ -162,6 +193,11 @@ pub fn completion_suggestion_index_at(
     let edge_width = left_width.max(right_width);
     let center_max_width = viewport.width.saturating_sub(2 * edge_width + 2 * spacing);
     let center_width = center_max_width.min(center.width.min(u16::MAX as usize) as u16);
+    let left_visible_width = if suggestions_taking_over(context) {
+        left_width.min(left_available_width(viewport, right_width))
+    } else {
+        left_width
+    };
 
     let center_start = viewport.x + viewport.width / 2 - center_width / 2;
     let right_start = viewport.x + viewport.width.saturating_sub(right_width);
@@ -170,7 +206,9 @@ pub fn completion_suggestion_index_at(
         .or_else(|| {
             hit_test_completion_suggestion(&right, right_start, right_width, viewport, column)
         })
-        .or_else(|| hit_test_completion_suggestion(&left, viewport.x, left_width, viewport, column))
+        .or_else(|| {
+            hit_test_completion_suggestion(&left, viewport.x, left_visible_width, viewport, column)
+        })
 }
 
 #[derive(Default)]
@@ -872,7 +910,8 @@ mod tests {
     use tui::text::{Span, Spans};
 
     use super::{
-        completion_suggestion_index_at, render, render_left_section, RenderContext, Surface,
+        completion_suggestion_index_at, render, render_left_section, LeftSectionOverflow,
+        RenderContext, Surface,
     };
 
     #[test]
@@ -881,7 +920,13 @@ mod tests {
         let mut surface = Surface::empty(viewport);
         let title = " very/long/nested/path/buffer-file-path-statusline.rs ";
         let left = Spans::from(vec![Span::raw(title)]);
-        render_left_section(&mut surface, viewport, &left, 0);
+        render_left_section(
+            &mut surface,
+            viewport,
+            &left,
+            0,
+            LeftSectionOverflow::PreserveEnd,
+        );
 
         let left_width = viewport.width as usize - 1;
         assert!(title.len() > left_width);
@@ -1015,6 +1060,20 @@ mod tests {
         assert_eq!(
             None,
             completion_suggestion_index_at(&mut context, viewport, beta_column, 1)
+        );
+
+        let narrow_line = render_statusline(&harness.editor, Some(&completion), 20);
+        assert!(
+            narrow_line.contains("alpha"),
+            "statusline row: {narrow_line:?}"
+        );
+        assert!(
+            narrow_line.contains("beta"),
+            "statusline row: {narrow_line:?}"
+        );
+        assert!(
+            !narrow_line.contains("gamma"),
+            "statusline row: {narrow_line:?}"
         );
 
         harness.set_completion_display(CompletionDisplay::Popup);

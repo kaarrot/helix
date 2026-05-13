@@ -981,6 +981,20 @@ mod tests {
             completion_suggestion_index_at(&mut context, viewport, beta_column, 1)
         );
 
+        let narrow_line = render_statusline(&harness.editor, Some(&completion), 20);
+        assert!(
+            narrow_line.contains("alpha"),
+            "statusline row: {narrow_line:?}"
+        );
+        assert!(
+            narrow_line.contains("beta"),
+            "statusline row: {narrow_line:?}"
+        );
+        assert!(
+            !narrow_line.contains("gamma"),
+            "statusline row: {narrow_line:?}"
+        );
+
         harness.set_completion_display(CompletionDisplay::Popup);
         harness.editor.mode = Mode::Insert;
         let line = render_statusline(&harness.editor, Some(&completion), 40);

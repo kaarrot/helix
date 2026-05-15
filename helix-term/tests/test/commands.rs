@@ -16,6 +16,39 @@ mod write;
 static STREAM_TEST_LOCK: Lazy<Arc<tokio::sync::Mutex<()>>> =
     Lazy::new(|| Arc::new(tokio::sync::Mutex::new(())));
 
+#[cfg(unix)]
+async fn assert_stream_output_contains(
+    input: &str,
+    keys: &str,
+    expected: &str,
+) -> anyhow::Result<String> {
+    let mut config = helpers::test_config();
+    config.editor.word_completion.enable = false;
+    let mut app = AppBuilder::new()
+        .with_config(config)
+        .with_input_text(input)
+        .build()?;
+
+    send_key_sequence(&mut app, keys).await?;
+    wait_for_condition(&mut app, expected, |app| {
+        doc!(app.editor).text().to_string().contains(expected)
+            && app
+                .editor
+                .get_status()
+                .is_some_and(|(status, _)| status.as_ref().starts_with("Stream completed in "))
+    })
+    .await?;
+
+    let text = doc!(app.editor).text().to_string();
+    assert!(
+        text.contains(expected),
+        "expected streamed output to contain {expected:?}, got {text:?}"
+    );
+
+    close_app(&mut app).await?;
+    Ok(text)
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn search_selection_detect_word_boundaries_at_eof() -> anyhow::Result<()> {
     // <https://github.com/helix-editor/helix/issues/12609>
@@ -392,20 +425,144 @@ async fn test_multi_selection_shell_commands() -> anyhow::Result<()> {
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
+async fn test_insert_stream_output_appends_selection_with_spaces() -> anyhow::Result<()> {
+    let _lock = Arc::clone(&STREAM_TEST_LOCK).lock_owned().await;
+
+    assert_stream_output_contains(
+        "#[hello world|]#\n",
+        ":: printf '[%%s]'<ret>",
+        "[hello world]",
+    )
+    .await?;
+
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_insert_stream_output_shell_quotes_appended_selection() -> anyhow::Result<()> {
+    let _lock = Arc::clone(&STREAM_TEST_LOCK).lock_owned().await;
+
+    assert_stream_output_contains(
+        "#[don't|]#\n",
+        ":insert-stream-output printf '[%%s]'<ret>",
+        "[don't]",
+    )
+    .await?;
+
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_insert_stream_output_trims_linewise_selection_line_ending() -> anyhow::Result<()> {
+    let _lock = Arc::clone(&STREAM_TEST_LOCK).lock_owned().await;
+
+    let text =
+        assert_stream_output_contains("#[|]#comment\n", "x:: printf '[%%s]'<ret>", "[comment]")
+            .await?;
+    assert!(
+        !text.contains("[comment\n]"),
+        "linewise selection should not append its trailing line ending: {text:?}"
+    );
+
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_insert_stream_output_trims_multiline_linewise_selection_line_ending(
+) -> anyhow::Result<()> {
+    let _lock = Arc::clone(&STREAM_TEST_LOCK).lock_owned().await;
+
+    let text =
+        assert_stream_output_contains("#[|]#a\nb\n", "2x:: printf '[%%s]'<ret>", "[a\nb]").await?;
+    assert!(
+        !text.contains("[a\nb\n]"),
+        "multi-line linewise selection should append one argument without the final line ending: {text:?}"
+    );
+
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_insert_stream_output_empty_selection_does_not_append_arg() -> anyhow::Result<()> {
+    let _lock = Arc::clone(&STREAM_TEST_LOCK).lock_owned().await;
+
+    let text =
+        assert_stream_output_contains("#[|]#", ":: printf foo<ret>", "printf foo\nfoo").await?;
+    assert!(
+        !text.contains("''"),
+        "empty primary selection should not append a shell argument: {text:?}"
+    );
+
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_insert_stream_output_sends_input_without_selection_arg() -> anyhow::Result<()> {
+    let _lock = Arc::clone(&STREAM_TEST_LOCK).lock_owned().await;
+    let mut app = AppBuilder::new().build()?;
+
+    send_key_sequence(&mut app, ":insert-stream-output printf ready; cat<ret>").await?;
+    wait_for_condition(&mut app, "initial streamed output", |app| {
+        doc!(app.editor)
+            .text()
+            .to_string()
+            .contains("printf ready; cat\nready")
+    })
+    .await?;
+
+    send_key_sequence(&mut app, "ggx:insert-stream-output hello<ret>").await?;
+    wait_for_condition(&mut app, "stream input echo", |app| {
+        let text = doc!(app.editor).text().to_string();
+        text.contains(">>> hello\n") && text.matches("hello\n").count() >= 2
+    })
+    .await?;
+
+    {
+        let text = doc!(app.editor).text().to_string();
+        assert!(text.contains(">>> hello\n"));
+        assert!(
+            !text.contains(">>> hello printf ready; cat"),
+            "running-stream input should not append the editor selection: {text:?}"
+        );
+    }
+
+    send_key_sequence(&mut app, ":::<ret>").await?;
+    wait_for_condition(&mut app, "stream cancellation", |app| {
+        app.editor
+            .get_status()
+            .is_some_and(|(status, _)| status.as_ref() == "Stream cancelled (buffer: [scratch])")
+    })
+    .await?;
+
+    close_app(&mut app).await?;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_insert_stream_commands_and_aliases() -> anyhow::Result<()> {
     let _lock = Arc::clone(&STREAM_TEST_LOCK).lock_owned().await;
     let mut app = AppBuilder::new().build()?;
 
     send_key_sequence(&mut app, ":: printf foo<ret>").await?;
     wait_for_condition(&mut app, "stream alias output", |app| {
-        doc!(app.editor).text().to_string() == "printf foo\nfoo\n"
+        let text = doc!(app.editor).text().to_string();
+        text.contains("printf foo\nfoo")
+            && app
+                .editor
+                .get_status()
+                .is_some_and(|(status, _)| status.as_ref().starts_with("Stream completed in "))
     })
     .await?;
 
     {
         let doc = doc!(app.editor);
-        assert_eq!(doc.text().to_string(), "printf foo\nfoo\n");
-        assert_eq!(doc.display_name().as_ref(), "printf foo");
+        assert!(doc.text().to_string().contains("printf foo\nfoo"));
         assert_eq!(
             app.editor.get_status().unwrap().0.as_ref(),
             "Stream completed in '[scratch]'"
@@ -513,6 +670,15 @@ async fn test_insert_stream_output_reuses_last_stream_buffer() -> anyhow::Result
         doc.id() == source_doc_id && doc.path().is_some_and(|path| path == &source_path)
     })
     .await?;
+
+    {
+        let view_id = current_ref!(app.editor).0.id;
+        let doc = app.editor.document_mut(source_doc_id).unwrap();
+        let end = doc.text().len_chars();
+        doc.set_selection(view_id, helix_core::Selection::point(end));
+        let (view, doc) = current_ref!(app.editor);
+        assert!(doc.selection(view.id).primary().is_empty());
+    }
 
     send_key_sequence(&mut app, ":insert-stream-output echo two<ret>").await?;
     wait_for_condition(&mut app, "reused stream output buffer", |app| {

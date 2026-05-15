@@ -2495,6 +2495,39 @@ fn insert_output(
     Ok(())
 }
 
+fn shell_quote_arg(arg: &str) -> String {
+    let mut quoted = String::with_capacity(arg.len() + 2);
+    quoted.push('\'');
+    for ch in arg.chars() {
+        if ch == '\'' {
+            quoted.push_str("'\\''");
+        } else {
+            quoted.push(ch);
+        }
+    }
+    quoted.push('\'');
+    quoted
+}
+
+fn primary_selection_stream_arg(cx: &mut compositor::Context) -> Option<String> {
+    let (view, doc) = current!(cx.editor);
+    let selection = doc.selection(view.id);
+    let range = selection.primary();
+
+    if range.is_empty() {
+        return None;
+    }
+
+    let mut text = range.slice(doc.text().slice(..)).to_string();
+    if text.ends_with("\r\n") {
+        text.truncate(text.len() - 2);
+    } else if text.ends_with('\n') {
+        text.pop();
+    }
+
+    (!text.is_empty()).then(|| shell_quote_arg(&text))
+}
+
 fn insert_stream_output(
     cx: &mut compositor::Context,
     args: Args,
@@ -2531,8 +2564,16 @@ fn insert_stream_output(
     }
 
     // No stream running - start a new stream
+    let selection_arg = primary_selection_stream_arg(cx);
     prepare_stream_output_buffer(cx);
-    shell_stream(cx, &args.join(" "), &ShellBehavior::Insert);
+    let mut command = args.join(" ");
+    if let Some(selection_arg) = selection_arg {
+        if !command.is_empty() {
+            command.push(' ');
+        }
+        command.push_str(&selection_arg);
+    }
+    shell_stream(cx, &command, &ShellBehavior::Insert);
     Ok(())
 }
 

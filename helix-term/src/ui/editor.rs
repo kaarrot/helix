@@ -154,7 +154,13 @@ impl EditorView {
         }
 
         Self::doc_diagnostics_highlights_into(doc, theme, &mut overlays);
-        diff::char_diff_highlights_into(doc, theme, &mut overlays);
+        diff::char_diff_highlights_into(
+            doc,
+            theme,
+            view_offset.anchor,
+            inner.height as usize,
+            &mut overlays,
+        );
 
         if is_focused {
             if let Some(tabstops) = Self::tabstop_highlights(doc, theme) {

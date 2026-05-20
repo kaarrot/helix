@@ -439,6 +439,149 @@ pub fn diff_toggle_sync_scroll(cx: &mut Context) {
     });
 }
 
+#[derive(Clone, Copy)]
+enum DiffToggleSide {
+    Base,
+    Working,
+}
+
+struct DiffTogglePosition {
+    side: DiffToggleSide,
+    selection: Selection,
+    view_offset: helix_view::view::ViewPosition,
+}
+
+fn map_position_between_documents(
+    editor: &Editor,
+    source_doc_id: DocumentId,
+    target_doc_id: DocumentId,
+    source_pos: usize,
+) -> Option<usize> {
+    let source_doc = editor.document(source_doc_id)?;
+    let target_doc = editor.document(target_doc_id)?;
+    let source_text = source_doc.text();
+    let target_text = target_doc.text();
+
+    let source_pos = source_pos.min(source_text.len_chars());
+    let source_line = source_text.char_to_line(source_pos);
+    let source_line_start = source_text.line_to_char(source_line);
+    let source_col = source_pos.saturating_sub(source_line_start);
+
+    let target_line = editor.map_line_between_documents(source_doc_id, target_doc_id, source_line);
+    let target_line_start = target_text.line_to_char(target_line);
+    let target_line_end = target_text.line_to_char((target_line + 1).min(target_text.len_lines()));
+
+    Some((target_line_start + source_col).min(target_line_end))
+}
+
+fn capture_diff_toggle_position(
+    editor: &Editor,
+    view_id: ViewId,
+    diff_state: &helix_view::diff_view::DiffViewState,
+    new_split: bool,
+) -> Option<DiffTogglePosition> {
+    let view = editor.tree.get(view_id);
+    let doc = editor.document(view.doc)?;
+    let selection = doc.selection(view.id).clone();
+    let view_offset = doc.view_offset(view.id);
+
+    let side = if view.doc == diff_state.base_doc_id {
+        DiffToggleSide::Base
+    } else {
+        DiffToggleSide::Working
+    };
+
+    if new_split || matches!(side, DiffToggleSide::Working) {
+        return Some(DiffTogglePosition {
+            side,
+            selection,
+            view_offset,
+        });
+    }
+
+    let cursor = selection.primary().cursor(doc.text().slice(..));
+    let target_cursor = map_position_between_documents(
+        editor,
+        diff_state.base_doc_id,
+        diff_state.working_doc_id,
+        cursor,
+    )?;
+    let target_anchor = map_position_between_documents(
+        editor,
+        diff_state.base_doc_id,
+        diff_state.working_doc_id,
+        view_offset.anchor,
+    )?;
+
+    Some(DiffTogglePosition {
+        side: DiffToggleSide::Working,
+        selection: Selection::point(target_cursor),
+        view_offset: helix_view::view::ViewPosition {
+            anchor: target_anchor,
+            vertical_offset: view_offset.vertical_offset,
+            horizontal_offset: view_offset.horizontal_offset,
+        },
+    })
+}
+
+fn restore_diff_toggle_position(editor: &mut Editor, position: DiffTogglePosition) {
+    let focused_view_id = editor.tree.focus;
+    let Some(diff_state) = editor.diff.views.get(&focused_view_id).cloned() else {
+        return;
+    };
+
+    let (doc_id, view_id, paired) = match position.side {
+        DiffToggleSide::Base if diff_state.base_view_id != diff_state.working_view_id => (
+            diff_state.base_doc_id,
+            diff_state.base_view_id,
+            Some((diff_state.working_doc_id, diff_state.working_view_id)),
+        ),
+        _ => (
+            diff_state.working_doc_id,
+            diff_state.working_view_id,
+            (diff_state.base_view_id != diff_state.working_view_id)
+                .then_some((diff_state.base_doc_id, diff_state.base_view_id)),
+        ),
+    };
+
+    let paired_position = paired.and_then(|(paired_doc_id, paired_view_id)| {
+        let doc = editor.document(doc_id)?;
+        let cursor = position.selection.primary().cursor(doc.text().slice(..));
+        let mapped_cursor = map_position_between_documents(editor, doc_id, paired_doc_id, cursor)?;
+        let mapped_anchor = map_position_between_documents(
+            editor,
+            doc_id,
+            paired_doc_id,
+            position.view_offset.anchor,
+        )?;
+
+        Some((
+            paired_doc_id,
+            paired_view_id,
+            Selection::point(mapped_cursor),
+            helix_view::view::ViewPosition {
+                anchor: mapped_anchor,
+                vertical_offset: position.view_offset.vertical_offset,
+                horizontal_offset: position.view_offset.horizontal_offset,
+            },
+        ))
+    });
+
+    if let Some(doc) = editor.document_mut(doc_id) {
+        doc.set_selection(view_id, position.selection);
+        doc.set_view_offset(view_id, position.view_offset);
+    }
+    if let Some((paired_doc_id, paired_view_id, paired_selection, paired_offset)) = paired_position
+    {
+        if let Some(doc) = editor.document_mut(paired_doc_id) {
+            doc.set_selection(paired_view_id, paired_selection);
+            doc.set_view_offset(paired_view_id, paired_offset);
+        }
+    }
+    editor.focus(view_id);
+    editor.ensure_cursor_in_view(view_id);
+}
+
 pub fn diff_toggle_split_view(cx: &mut Context) {
     let view_id = view!(cx.editor).id;
     let Some(diff_state) = cx.editor.diff.views.get(&view_id).cloned() else {
@@ -447,6 +590,7 @@ pub fn diff_toggle_split_view(cx: &mut Context) {
     };
     let was_split = diff_state.base_view_id != diff_state.working_view_id;
     let new_split = !was_split;
+    let position = capture_diff_toggle_position(&cx.editor, view_id, &diff_state, new_split);
 
     let base_path = diff_state.base_path.clone();
     let working_path = diff_state.working_path.clone();
@@ -481,6 +625,9 @@ pub fn diff_toggle_split_view(cx: &mut Context) {
         cx.editor
             .set_error(format!("Failed to toggle split view: {e}"));
         return;
+    }
+    if let Some(position) = position {
+        restore_diff_toggle_position(&mut cx.editor, position);
     }
     cx.editor.set_status(if new_split {
         "Split view on"

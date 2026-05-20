@@ -443,6 +443,28 @@ async fn split_diff_controls_and_cross_pane_navigation_work() -> anyhow::Result<
     assert!(harness.send_keys(&mut app, "[g").await?);
     assert_split_diff_cursor_line(&app, 1);
 
+    assert!(harness.send_keys(&mut app, "<space>mv").await?);
+    assert_status(&app, "Split view off", Severity::Info);
+    assert_eq!(app.editor.diff.views.len(), 1);
+    assert_eq!(app.editor.tree.views().count(), 1);
+    assert_eq!(current_cursor_line(&app), 1);
+
+    assert!(harness.send_keys(&mut app, "<space>mv").await?);
+    assert_status(&app, "Split view on", Severity::Info);
+    assert_eq!(app.editor.diff.views.len(), 2);
+    assert_eq!(app.editor.tree.views().count(), 2);
+    assert_split_diff_cursor_line(&app, 1);
+
+    {
+        let diff_state = main_diff_state(&app);
+        app.editor.focus(diff_state.base_view_id);
+    }
+    assert!(harness.send_keys(&mut app, "<space>mv").await?);
+    assert_status(&app, "Split view off", Severity::Info);
+    assert_eq!(app.editor.diff.views.len(), 1);
+    assert_eq!(app.editor.tree.views().count(), 1);
+    assert_eq!(current_cursor_line(&app), 1);
+
     assert!(harness.send_keys(&mut app, "<space>mq").await?);
     assert!(app.editor.diff.views.is_empty());
     assert_eq!(app.editor.tree.views().count(), 1);

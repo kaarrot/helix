@@ -184,4 +184,14 @@ mod tests {
         let default_keys = Config::default().keys;
         assert_eq!(default_keys, keymap::default());
     }
+
+    #[test]
+    fn auto_reload_config_defaults_to_false_and_accepts_true() {
+        assert!(!Config::load_test("").editor.auto_reload);
+        assert!(
+            Config::load_test("[editor]\nauto-reload = true")
+                .editor
+                .auto_reload
+        );
+    }
 }

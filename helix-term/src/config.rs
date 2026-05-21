@@ -560,6 +560,16 @@ mod tests {
     }
 
     #[test]
+    fn auto_reload_config_defaults_to_false_and_accepts_true() {
+        assert!(!Config::load_test("").editor.auto_reload);
+        assert!(
+            Config::load_test("[editor]\nauto-reload = true")
+                .editor
+                .auto_reload
+        );
+    }
+
+    #[test]
     fn unknown_top_level_keys_do_not_discard_valid_config() {
         let (config, warnings) = Config::load_test_with_warnings(
             r#"

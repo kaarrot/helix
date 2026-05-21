@@ -1132,9 +1132,61 @@ impl EditorView {
     }
 
     pub fn handle_idle_timeout(&mut self, cx: &mut commands::Context) -> EventResult {
+        let auto_reloaded = self.auto_reload_current_buffer(cx);
         commands::compute_inlay_hints_for_all_views(cx.editor, cx.jobs);
 
-        EventResult::Ignored(None)
+        if auto_reloaded {
+            EventResult::Consumed(None)
+        } else {
+            EventResult::Ignored(None)
+        }
+    }
+
+    fn auto_reload_current_buffer(&mut self, cx: &mut commands::Context) -> bool {
+        if !cx.editor.config().auto_reload {
+            return false;
+        }
+
+        match doc!(cx.editor).has_newer_file_on_disk() {
+            Ok(true) => {}
+            Ok(false) => return false,
+            Err(err) => {
+                cx.editor
+                    .set_error(format!("failed to check file for auto-reload: {err}"));
+                return true;
+            }
+        }
+
+        if doc!(cx.editor).is_modified() {
+            cx.editor.set_warning(
+                "File changed on disk; buffer has unsaved changes. Use :reload to discard changes.",
+            );
+            return true;
+        }
+
+        let scrolloff = cx.editor.config().scrolloff;
+        let reload_result = {
+            let (view, doc) = current!(cx.editor);
+            doc.reload(view, &cx.editor.diff_providers).map(|()| {
+                view.ensure_cursor_in_view(doc, scrolloff);
+                doc.path().map(|path| path.to_owned())
+            })
+        };
+
+        match reload_result {
+            Ok(Some(path)) => {
+                cx.editor
+                    .language_servers
+                    .file_event_handler
+                    .file_changed(path);
+                true
+            }
+            Ok(None) => true,
+            Err(err) => {
+                cx.editor.set_error(format!("auto-reload failed: {err}"));
+                true
+            }
+        }
     }
 }
 
@@ -1717,6 +1769,7 @@ impl Component for EditorView {
             Event::IdleTimeout => self.handle_idle_timeout(&mut cx),
             Event::FocusGained => {
                 self.terminal_focused = true;
+                self.auto_reload_current_buffer(&mut cx);
                 EventResult::Consumed(None)
             }
             Event::FocusLost => {

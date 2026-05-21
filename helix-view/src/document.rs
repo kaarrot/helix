@@ -1227,6 +1227,28 @@ impl Document {
         };
     }
 
+    /// Returns whether the document's path points to a regular file that was modified after
+    /// the document was last opened or saved.
+    pub fn has_newer_file_on_disk(&self) -> io::Result<bool> {
+        let Some(path) = self.path() else {
+            return Ok(false);
+        };
+
+        let metadata = match path.metadata() {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(err) => return Err(err),
+        };
+
+        if !metadata.is_file() {
+            return Ok(false);
+        }
+
+        metadata
+            .modified()
+            .map(|mtime| mtime > self.last_saved_time)
+    }
+
     // Detect if the file is readonly and change the readonly field if necessary (unix only)
     pub fn detect_readonly(&mut self) {
         // Allows setting the flag for files the user cannot modify, like root files

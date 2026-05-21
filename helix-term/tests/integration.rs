@@ -17,6 +17,7 @@ mod test {
 
     mod auto_indent;
     mod auto_pairs;
+    mod auto_reload;
     mod command_line;
     mod commands;
     mod completion;

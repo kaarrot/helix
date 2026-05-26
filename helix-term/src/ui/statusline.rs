@@ -326,6 +326,9 @@ fn render_mode<'a, F>(context: &mut RenderContext<'a>, write: F)
 where
     F: Fn(&mut RenderContext<'a>, Span<'a>) + Copy,
 {
+    if suggestions_taking_over(context) {
+        return;
+    }
     let visible = context.focused;
     let config = context.editor.config();
     let modenames = &config.statusline.mode;
@@ -493,6 +496,9 @@ fn render_selections<'a, F>(context: &mut RenderContext<'a>, write: F)
 where
     F: Fn(&mut RenderContext<'a>, Span<'a>) + Copy,
 {
+    if suggestions_taking_over(context) {
+        return;
+    }
     let selection = context.doc.selection(context.view.id);
     let count = selection.len();
     write(
@@ -509,6 +515,9 @@ fn render_primary_selection_length<'a, F>(context: &mut RenderContext<'a>, write
 where
     F: Fn(&mut RenderContext<'a>, Span<'a>) + Copy,
 {
+    if suggestions_taking_over(context) {
+        return;
+    }
     let tot_sel = context.doc.selection(context.view.id).primary().len();
     write(
         context,
@@ -957,7 +966,8 @@ mod tests {
                 StatusLineElement::FileName,
                 StatusLineElement::CompletionSuggestions,
             ];
-            app_config.editor.statusline.right = vec![StatusLineElement::Position];
+            app_config.editor.statusline.right =
+                vec![StatusLineElement::Position, StatusLineElement::Selections];
 
             let app_config = Arc::new(ArcSwap::from_pointee(app_config));
             let handlers = handlers::setup(Arc::clone(&app_config));
@@ -1040,6 +1050,18 @@ mod tests {
         assert!(line.contains("beta"));
         assert!(!line.contains("src/main.rs"));
         assert!(!line.contains("1:1"));
+        assert!(
+            !line.contains("INS"),
+            "mode indicator should be hidden while completion suggestions are shown: {line:?}"
+        );
+        assert!(
+            !line.contains("1 sel"),
+            "selection counter should be hidden while completion suggestions are shown: {line:?}"
+        );
+        assert!(
+            line.contains("gamma"),
+            "freed space should allow an extra completion entry: {line:?}"
+        );
 
         let beta_column = line.find("beta").expect("beta should render") as u16;
         let (view, doc) = current_ref!(harness.editor);
@@ -1082,6 +1104,14 @@ mod tests {
         assert!(line.contains("src/main.rs"));
         assert!(line.contains("1:1"));
         assert!(!line.contains("alpha"));
+        assert!(
+            line.contains("INS"),
+            "mode indicator should reappear once statusline completions are not in use: {line:?}"
+        );
+        assert!(
+            line.contains("1 sel"),
+            "selection counter should reappear once statusline completions are not in use: {line:?}"
+        );
 
         harness.set_completion_display(CompletionDisplay::Both);
         harness.editor.mode = Mode::Normal;
@@ -1089,5 +1119,10 @@ mod tests {
         assert!(line.contains("src/main.rs"));
         assert!(line.contains("1:1"));
         assert!(!line.contains("alpha"));
+        assert!(
+            line.contains("NOR"),
+            "mode indicator should be visible outside insert mode: {line:?}"
+        );
+        assert!(line.contains("1 sel"));
     }
 }

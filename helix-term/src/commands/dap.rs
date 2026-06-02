@@ -77,6 +77,135 @@ fn thread_picker(
     );
 }
 
+/// Resolve a process name to a single PID by scanning `/proc`.
+/// Matches `/proc/<pid>/comm` or the basename of `argv[0]` from `/proc/<pid>/cmdline`.
+/// Errors when zero or more than one process matches; multi-match output is
+/// sorted with the most recently started process first and includes the full
+/// cmdline so PIDs of the same name can be distinguished at a glance.
+#[cfg(target_os = "linux")]
+fn resolve_process_name(name: &str) -> anyhow::Result<u32> {
+    use std::fs;
+    use std::path::Path;
+
+    /// Returns `/proc/<pid>/stat` field 22 (process start time, in clock ticks
+    /// since boot). Higher = more recently started. 0 on failure so unparseable
+    /// entries sort to the bottom.
+    fn read_starttime(pid: u32) -> u64 {
+        let Ok(stat) = fs::read_to_string(format!("/proc/{}/stat", pid)) else {
+            return 0;
+        };
+        // The `comm` field is wrapped in `(...)` and may contain spaces and
+        // parens; split at the last `)` to skip over it safely.
+        let Some(last_paren) = stat.rfind(')') else { return 0 };
+        // After `)`: state ppid pgrp session tty_nr tpgid flags minflt cminflt
+        // majflt cmajflt utime stime cutime cstime priority nice num_threads
+        // itrealvalue starttime ...    (starttime is the 20th token)
+        stat[last_paren + 1..]
+            .split_whitespace()
+            .nth(19)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0)
+    }
+
+    let own_pid = std::process::id();
+    // (starttime, pid, display_cmdline)
+    let mut matches: Vec<(u64, u32, String)> = Vec::new();
+
+    for entry in fs::read_dir("/proc")?.flatten() {
+        let file_name = entry.file_name();
+        let Some(pid) = file_name.to_str().and_then(|s| s.parse::<u32>().ok()) else {
+            continue;
+        };
+        if pid == own_pid {
+            continue;
+        }
+
+        let comm = fs::read_to_string(entry.path().join("comm"))
+            .ok()
+            .map(|s| s.trim().to_owned())
+            .unwrap_or_default();
+
+        let cmdline_bytes = fs::read(entry.path().join("cmdline")).ok().unwrap_or_default();
+        let cmdline_parts: Vec<&str> = cmdline_bytes
+            .split(|&c| c == 0)
+            .filter_map(|seg| std::str::from_utf8(seg).ok())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let arg0 = cmdline_parts.first().copied().unwrap_or("");
+        let arg0_basename = Path::new(arg0)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(arg0);
+
+        // For interpreter-style commands (python3 ./script.py, node app.js,
+        // ruby task.rb) `comm` and `argv[0]` are the interpreter, which is
+        // useless for disambiguation. Also check the first non-flag arg —
+        // that's typically the script or module being executed.
+        let script_arg = cmdline_parts
+            .iter()
+            .skip(1)
+            .find(|s| !s.starts_with('-'))
+            .copied();
+        let script_basename = script_arg.and_then(|s| {
+            Path::new(s).file_name().and_then(|n| n.to_str())
+        });
+        let script_stem = script_arg.and_then(|s| {
+            Path::new(s).file_stem().and_then(|n| n.to_str())
+        });
+
+        let is_match = comm == name
+            || arg0_basename == name
+            || script_basename == Some(name)
+            || script_stem == Some(name);
+
+        if is_match {
+            let display = if cmdline_parts.is_empty() {
+                comm.clone()
+            } else {
+                cmdline_parts.join(" ")
+            };
+            matches.push((read_starttime(pid), pid, display));
+        }
+    }
+
+    // Most recently started first.
+    matches.sort_by(|a, b| b.0.cmp(&a.0));
+
+    match matches.len() {
+        0 => anyhow::bail!("No process found matching '{}'", name),
+        1 => Ok(matches[0].1),
+        _ => {
+            // Per-entry truncation keeps the status line readable.
+            const PER_ENTRY: usize = 60;
+            let preview: Vec<String> = matches
+                .iter()
+                .take(8)
+                .map(|(_, p, d)| {
+                    let snippet: String = d.chars().take(PER_ENTRY).collect();
+                    let ellipsis = if d.chars().count() > PER_ENTRY { "…" } else { "" };
+                    format!("{}: {}{}", p, snippet, ellipsis)
+                })
+                .collect();
+            let suffix = if matches.len() > 8 {
+                format!(" (+{} more)", matches.len() - 8)
+            } else {
+                String::new()
+            };
+            anyhow::bail!(
+                "Multiple processes match '{}' (newest first): [{}]{} — re-run with a PID",
+                name,
+                preview.join(" | "),
+                suffix
+            )
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn resolve_process_name(_name: &str) -> anyhow::Result<u32> {
+    anyhow::bail!("Process name resolution is only implemented on Linux; please enter a numeric PID")
+}
+
 fn get_breakpoint_at_current_line(editor: &mut Editor) -> Option<(usize, Breakpoint)> {
     let (view, doc) = current!(editor);
     let text = doc.text().slice(..);
@@ -146,11 +275,21 @@ pub fn dap_start_impl(
             for (i, x) in params.iter().enumerate() {
                 let mut param = x.to_string();
                 if let Some(DebugConfigCompletion::Advanced(cfg)) = template.completion.get(i) {
-                    if matches!(cfg.completion.as_deref(), Some("filename" | "directory")) {
-                        param = std::fs::canonicalize(x.as_ref())
-                            .ok()
-                            .and_then(|pb| pb.into_os_string().into_string().ok())
-                            .unwrap_or_else(|| x.to_string());
+                    match cfg.completion.as_deref() {
+                        Some("filename" | "directory") => {
+                            param = std::fs::canonicalize(x.as_ref())
+                                .ok()
+                                .and_then(|pb| pb.into_os_string().into_string().ok())
+                                .unwrap_or_else(|| x.to_string());
+                        }
+                        Some("process") => {
+                            // Numeric → keep as PID. Non-numeric → look up by name.
+                            if param.parse::<u32>().is_err() {
+                                let pid = resolve_process_name(&param)?;
+                                param = pid.to_string();
+                            }
+                        }
+                        _ => {}
                     }
                 }
                 // For param #0 replace {0} in args

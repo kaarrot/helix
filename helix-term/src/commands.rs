@@ -5056,19 +5056,36 @@ fn paste_impl(
         out
     };
 
-    let repeat = std::iter::repeat(
-        // `values` is asserted to have at least one entry above.
-        map_value(values.last().unwrap()),
-    );
-
-    let mut values = values.iter().map(|value| map_value(value)).chain(repeat);
-
     let text = doc.text();
     let selection = doc.selection(view.id);
+    let primary_index = selection.primary_index();
+
+    // One mapped value per register entry.
+    let mapped: Vec<Tendril> = values.iter().map(|value| map_value(value)).collect();
+
+    // When the register holds more entries than there are selections, the surplus
+    // entries would otherwise be silently dropped (each selection only consumes one
+    // entry). Instead, stack the surplus on new lines below the primary selection so a
+    // multi-selection yank can be pasted back in full from a single cursor.
+    let spillover: Option<Tendril> = if mapped.len() > selection.len() {
+        let mut out = Tendril::new();
+        for value in &mapped[selection.len()..] {
+            // `linewise` values already carry a trailing line ending; charwise ones
+            // need an explicit break so each entry lands on its own line.
+            if !linewise {
+                out.push_str(doc.line_ending.as_str());
+            }
+            out.push_str(value);
+        }
+        Some(out)
+    } else {
+        None
+    };
 
     let mut offset = 0;
     let mut ranges = SmallVec::with_capacity(selection.len());
 
+    let mut value_index = 0;
     let mut transaction = Transaction::change_by_selection(text, selection, |range| {
         let pos = match (action, linewise) {
             // paste linewise before
@@ -5086,19 +5103,29 @@ fn paste_impl(
             (Paste::Cursor, _) => range.cursor(text.slice(..)),
         };
 
-        let value = values.next();
-
-        let value_len = value
-            .as_ref()
-            .map(|content| content.chars().count())
+        // Pad with the last entry when there are more selections than entries.
+        let mut value = mapped
+            .get(value_index)
+            .or_else(|| mapped.last())
+            .cloned()
             .unwrap_or_default();
+
+        // Append any surplus register entries to the primary selection.
+        if value_index == primary_index {
+            if let Some(spillover) = &spillover {
+                value.push_str(spillover);
+            }
+        }
+        value_index += 1;
+
+        let value_len = value.chars().count();
         let anchor = offset + pos;
 
         let new_range = Range::new(anchor, anchor + value_len).with_direction(range.direction());
         ranges.push(new_range);
         offset += value_len;
 
-        (pos, pos, value)
+        (pos, pos, Some(value))
     });
 
     if mode == Mode::Normal {

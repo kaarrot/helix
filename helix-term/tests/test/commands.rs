@@ -371,6 +371,31 @@ async fn test_multi_selection_paste() -> anyhow::Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn test_multi_selection_paste_spillover() -> anyhow::Result<()> {
+    // Yanking a multi-selection and pasting it back from a single cursor stacks the
+    // surplus register entries on new lines below the primary selection instead of
+    // dropping them. ("," keeps only the primary selection before pasting.)
+    test((
+        indoc! {"\
+            #[|lorem]#
+            #(|ipsum)#
+            #(|dolor)#
+            "},
+        "y,p",
+        indoc! {"\
+            lorem#[|lorem
+            ipsum
+            dolor]#
+            ipsum
+            dolor
+            "},
+    ))
+    .await?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_multi_selection_shell_commands() -> anyhow::Result<()> {
     // pipe
     test((

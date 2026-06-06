@@ -224,7 +224,8 @@ impl Client {
         // Resolve path to the binary
         let cmd = helix_stdx::env::which(cmd)?;
 
-        let process = Command::new(cmd)
+        let mut command = Command::new(cmd);
+        command
             .envs(server_environment)
             .args(args)
             .stdin(Stdio::piped())
@@ -232,10 +233,32 @@ impl Client {
             .stderr(Stdio::piped())
             .current_dir(&root_path)
             // make sure the process is reaped on drop
-            .kill_on_drop(true)
-            .spawn();
+            .kill_on_drop(true);
 
-        let mut process = process?;
+        // Isolate the language server from helix's controlling terminal so it cannot
+        // corrupt the TUI, while still guaranteeing it is cleaned up when helix exits.
+        #[cfg(unix)]
+        {
+            let parent_pid = std::process::id();
+            // Safety: `detach_from_controlling_terminal` only calls async-signal-safe
+            // syscalls and does not allocate.
+            unsafe {
+                command.pre_exec(move || {
+                    helix_stdx::process::detach_from_controlling_terminal(parent_pid)
+                });
+            }
+        }
+        #[cfg(windows)]
+        command.creation_flags(helix_stdx::process::DETACHED_CREATION_FLAGS);
+
+        let mut process = command.spawn()?;
+
+        #[cfg(windows)]
+        if let Some(handle) = process.raw_handle() {
+            if let Err(err) = helix_stdx::process::assign_to_job(handle) {
+                log::error!("failed to assign language server {name} to job object: {err}");
+            }
+        }
 
         // TODO: do we need bufreader/writer here? or do we use async wrappers on unblock?
         let writer = BufWriter::new(process.stdin.take().expect("Failed to open stdin"));

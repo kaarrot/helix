@@ -4,6 +4,7 @@
 pub mod env;
 pub mod faccess;
 pub mod path;
+pub mod process;
 pub mod range;
 pub mod rope;
 

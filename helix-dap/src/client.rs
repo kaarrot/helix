@@ -58,13 +58,15 @@ impl Client {
         args: Vec<&str>,
         port_arg: Option<&str>,
         id: DebugAdapterId,
+        detached: bool,
     ) -> Result<(Self, UnboundedReceiver<(DebugAdapterId, Payload)>)> {
         if command.is_empty() {
             return Result::Err(Error::Other(anyhow!("Command not provided")));
         }
         match (transport, port_arg) {
+            // tcp adapters are spawned detached by design (they exit on their own).
             ("tcp", Some(port_arg)) => Self::tcp_process(command, args, port_arg, id).await,
-            ("stdio", _) => Self::stdio(command, args, id),
+            ("stdio", _) => Self::stdio(command, args, id, detached),
             _ => Result::Err(Error::Other(anyhow!("Incorrect transport {}", transport))),
         }
     }
@@ -115,6 +117,7 @@ impl Client {
         cmd: &str,
         args: Vec<&str>,
         id: DebugAdapterId,
+        detached: bool,
     ) -> Result<(Self, UnboundedReceiver<(DebugAdapterId, Payload)>)> {
         // Resolve path to the binary
         let cmd = helix_stdx::env::which(cmd)?;
@@ -130,8 +133,9 @@ impl Client {
 
         // Isolate the debug adapter from helix's controlling terminal so it cannot
         // corrupt the TUI, while still guaranteeing it is cleaned up when helix exits.
+        // Opt-out via the `detached` debugger config option.
         #[cfg(unix)]
-        {
+        if detached {
             let parent_pid = std::process::id();
             // Safety: `detach_from_controlling_terminal` only calls async-signal-safe
             // syscalls and does not allocate.
@@ -142,14 +146,18 @@ impl Client {
             }
         }
         #[cfg(windows)]
-        command.creation_flags(helix_stdx::process::DETACHED_CREATION_FLAGS);
+        if detached {
+            command.creation_flags(helix_stdx::process::DETACHED_CREATION_FLAGS);
+        }
 
         let mut process = command.spawn()?;
 
         #[cfg(windows)]
-        if let Some(handle) = process.raw_handle() {
-            if let Err(err) = helix_stdx::process::assign_to_job(handle) {
-                log::error!("failed to assign debug adapter to job object: {err}");
+        if detached {
+            if let Some(handle) = process.raw_handle() {
+                if let Err(err) = helix_stdx::process::assign_to_job(handle) {
+                    log::error!("failed to assign debug adapter to job object: {err}");
+                }
             }
         }
 

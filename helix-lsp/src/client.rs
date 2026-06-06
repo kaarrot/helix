@@ -215,6 +215,7 @@ impl Client {
         id: LanguageServerId,
         name: String,
         req_timeout: u64,
+        detached: bool,
     ) -> Result<(
         Self,
         UnboundedReceiver<(LanguageServerId, Call)>,
@@ -237,8 +238,9 @@ impl Client {
 
         // Isolate the language server from helix's controlling terminal so it cannot
         // corrupt the TUI, while still guaranteeing it is cleaned up when helix exits.
+        // Opt-out via the `detached` language-server config option.
         #[cfg(unix)]
-        {
+        if detached {
             let parent_pid = std::process::id();
             // Safety: `detach_from_controlling_terminal` only calls async-signal-safe
             // syscalls and does not allocate.
@@ -249,14 +251,18 @@ impl Client {
             }
         }
         #[cfg(windows)]
-        command.creation_flags(helix_stdx::process::DETACHED_CREATION_FLAGS);
+        if detached {
+            command.creation_flags(helix_stdx::process::DETACHED_CREATION_FLAGS);
+        }
 
         let mut process = command.spawn()?;
 
         #[cfg(windows)]
-        if let Some(handle) = process.raw_handle() {
-            if let Err(err) = helix_stdx::process::assign_to_job(handle) {
-                log::error!("failed to assign language server {name} to job object: {err}");
+        if detached {
+            if let Some(handle) = process.raw_handle() {
+                if let Err(err) = helix_stdx::process::assign_to_job(handle) {
+                    log::error!("failed to assign language server {name} to job object: {err}");
+                }
             }
         }
 

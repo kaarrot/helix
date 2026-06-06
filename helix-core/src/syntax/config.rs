@@ -445,6 +445,11 @@ pub struct LanguageServerConfiguration {
     pub timeout: u64,
     #[serde(default)]
     pub required_root_patterns: Option<GlobSet>,
+    /// Run the language server in its own session, isolated from helix's
+    /// controlling terminal, and reaped when helix exits. Enabled by default;
+    /// set to `false` for servers that misbehave when detached.
+    #[serde(default = "default_detached")]
+    pub detached: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -494,6 +499,11 @@ pub struct DebugAdapterConfig {
     pub templates: Vec<DebugTemplate>,
     #[serde(default)]
     pub quirks: DebuggerQuirks,
+    /// Run the debug adapter in its own session, isolated from helix's
+    /// controlling terminal, and reaped when helix exits. Enabled by default;
+    /// set to `false` for adapters that misbehave when detached.
+    #[serde(default = "default_detached")]
+    pub detached: bool,
 }
 
 // Different workarounds for adapters' differences
@@ -649,4 +659,8 @@ where
 
 fn default_timeout() -> u64 {
     20
+}
+
+fn default_detached() -> bool {
+    true
 }

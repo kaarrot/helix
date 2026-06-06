@@ -48,9 +48,8 @@ mod unix {
 
             // If helix already exited, the death signal will never fire, so abort
             // rather than leak an orphan.
-            let reparented = getppid().map_or(true, |ppid| {
-                ppid.as_raw_nonzero().get() as u32 != parent_pid
-            });
+            let reparented =
+                getppid().is_none_or(|ppid| ppid.as_raw_nonzero().get() as u32 != parent_pid);
             if reparented {
                 return Err(io::Error::other("parent process already exited"));
             }

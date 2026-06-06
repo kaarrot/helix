@@ -44,6 +44,7 @@ impl Registry {
                     config.args.iter().map(|arg| arg.as_str()).collect(),
                     config.port_arg.as_deref(),
                     id,
+                    config.detached,
                 )),
             };
 

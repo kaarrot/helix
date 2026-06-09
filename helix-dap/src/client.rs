@@ -390,12 +390,48 @@ impl Client {
     }
 
     pub fn restart(&self) -> impl Future<Output = Result<Value>> {
+        // Per the DAP spec, the `restart` request's arguments are `RestartArguments`,
+        // which nests the latest `launch`/`attach` configuration under an `arguments`
+        // key. Send that shape so spec-conformant adapters (e.g. CodeLLDB) accept it;
+        // sending the launch args flat makes CodeLLDB fail to parse and panic.
         let args = if let Some(args) = &self.starting_request_args {
-            args.clone()
+            serde_json::json!({ "arguments": args })
         } else {
             Value::Null
         };
         self.call::<requests::Restart>(args)
+    }
+
+    /// Restart by tearing the session down and re-issuing the original
+    /// `launch`/`attach` request. This is a fallback for adapters that report
+    /// `supportsRestartRequest = false` (e.g. the LLVM-14 `lldb-dap`), which
+    /// cannot honour the native `restart` request.
+    pub fn restart_relaunch(&mut self) -> impl Future<Output = Result<Value>> {
+        use futures_util::future::FutureExt;
+
+        let connection_type = self.connection_type;
+        let args = self.starting_request_args.clone().unwrap_or(Value::Null);
+
+        let disconnect = self.disconnect(Some(DisconnectArguments {
+            restart: Some(true),
+            terminate_debuggee: None,
+            suspend_debuggee: None,
+        }));
+
+        // `disconnect` cleared these; restore them so a subsequent restart still
+        // has the configuration to relaunch with.
+        self.connection_type = connection_type;
+        self.starting_request_args = Some(args.clone());
+
+        let relaunch = match connection_type {
+            Some(ConnectionType::Attach) => self.call::<requests::Attach>(args).boxed(),
+            _ => self.call::<requests::Launch>(args).boxed(),
+        };
+
+        async move {
+            disconnect.await?;
+            relaunch.await
+        }
     }
 
     pub async fn set_breakpoints(

@@ -423,33 +423,43 @@ pub fn dap_launch(cx: &mut Context) {
 }
 
 pub fn dap_restart(cx: &mut Context) {
-    let debugger = match cx.editor.debug_adapters.get_active_client() {
+    let debugger = match cx.editor.debug_adapters.get_active_client_mut() {
         Some(debugger) => debugger,
         None => {
             cx.editor.set_error("Debugger is not running");
             return;
         }
     };
-    if !debugger
-        .capabilities()
-        .supports_restart_request
-        .unwrap_or(false)
-    {
-        cx.editor
-            .set_error("Debugger does not support session restarts");
-        return;
-    }
     if debugger.starting_request_args().is_none() {
         cx.editor
             .set_error("No arguments found with which to restart the sessions");
         return;
     }
 
-    dap_callback(
-        cx.jobs,
-        debugger.restart(),
-        |editor, _compositor, _resp: ()| editor.set_status("Debugging session restarted"),
-    );
+    // Prefer the adapter's native `restart` request. For adapters that report
+    // `supportsRestartRequest = false` (e.g. LLVM-14 lldb-dap), fall back to a
+    // full disconnect + relaunch so `dap_restart` still works as one key.
+    if debugger
+        .capabilities()
+        .supports_restart_request
+        .unwrap_or(false)
+    {
+        dap_callback(
+            cx.jobs,
+            debugger.restart(),
+            |editor, _compositor, _resp: serde_json::Value| {
+                editor.set_status("Debugging session restarted")
+            },
+        );
+    } else {
+        dap_callback(
+            cx.jobs,
+            debugger.restart_relaunch(),
+            |editor, _compositor, _resp: serde_json::Value| {
+                editor.set_status("Debugging session restarted")
+            },
+        );
+    }
 }
 
 fn debug_parameter_prompt(

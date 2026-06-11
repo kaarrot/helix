@@ -3981,6 +3981,7 @@ fn goto_next_change_impl(cx: &mut Context, direction: Direction) {
     let count = cx.count() as u32 - 1;
     let motion = move |editor: &mut Editor| {
         let (view, doc) = current!(editor);
+        let in_diff_view = editor.diff.views.contains_key(&view.id);
         let doc_text = doc.text().slice(..);
         let diff_handle = if let Some(diff_handle) = doc.diff_handle() {
             diff_handle
@@ -4006,8 +4007,21 @@ fn goto_next_change_impl(cx: &mut Context, direction: Direction) {
             };
             let hunk = diff.nth_hunk(hunk_idx);
             let new_range = hunk_range(hunk, doc_text);
-            // Non-selecting in all modes so diff text stays readable
-            Range::point(new_range.from())
+            if in_diff_view {
+                // Collapse to a point in diff views so the selection
+                // highlight doesn't obscure the diff coloring.
+                Range::point(new_range.from())
+            } else if editor.mode == Mode::Select {
+                let head = if new_range.head < range.anchor {
+                    new_range.anchor
+                } else {
+                    new_range.head
+                };
+
+                Range::new(range.anchor, head)
+            } else {
+                new_range.with_direction(direction)
+            }
         });
 
         push_jump(view, doc);

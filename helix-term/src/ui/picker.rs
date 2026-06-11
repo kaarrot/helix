@@ -465,6 +465,8 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
 
     /// Move the cursor by a number of lines, either down (`Forward`) or up (`Backward`)
     pub fn move_by(&mut self, amount: u32, direction: Direction) {
+        // Explicit navigation takes priority over a pending pre-selection.
+        self.pre_select_fn = None;
         let len = self.matcher.snapshot().matched_item_count();
 
         if len == 0 {
@@ -494,11 +496,13 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
 
     /// Move the cursor to the first entry
     pub fn to_start(&mut self) {
+        self.pre_select_fn = None;
         self.cursor = 0;
     }
 
     /// Move the cursor to the last entry
     pub fn to_end(&mut self) {
+        self.pre_select_fn = None;
         self.cursor = self
             .matcher
             .snapshot()
@@ -548,6 +552,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
         }
         // If the query has meaningfully changed, reset the cursor to the top of the results.
         self.cursor = 0;
+        self.pre_select_fn = None;
         // Have nucleo reparse each changed column.
         for (i, column) in self
             .columns
@@ -698,16 +703,20 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
                 .min(snapshot.matched_item_count().saturating_sub(1))
         }
 
-        // One-shot pre-select: scan matched items for a match, then clear
-        if self.pre_select_fn.is_some() && snapshot.matched_item_count() > 0 {
-            let pred = self.pre_select_fn.take().unwrap();
-            for idx in 0..snapshot.matched_item_count() {
-                if let Some(item) = snapshot.get_matched_item(idx) {
-                    if pred(item.data) {
-                        self.cursor = idx;
-                        break;
-                    }
-                }
+        // Pre-select: items may still be streaming in, so rescan every frame
+        // until the target item shows up or everything has loaded. User
+        // navigation or a query edit cancels the pre-selection.
+        if let Some(pred) = self.pre_select_fn.as_deref() {
+            let found = (0..snapshot.matched_item_count()).find(|&idx| {
+                snapshot
+                    .get_matched_item(idx)
+                    .is_some_and(|item| pred(item.data))
+            });
+            if let Some(idx) = found {
+                self.cursor = idx;
+                self.pre_select_fn = None;
+            } else if !status.running && self.matcher.active_injectors() == 0 {
+                self.pre_select_fn = None;
             }
         }
 

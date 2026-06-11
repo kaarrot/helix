@@ -518,6 +518,18 @@ fn status(repo: &Repository, f: impl Fn(Result<FileChange>) -> bool) -> Result<(
     Ok(())
 }
 
+/// The file does not exist in the requested revision (e.g. untracked or newly added).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileNotFoundInRevision;
+
+impl std::fmt::Display for FileNotFoundInRevision {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("file is untracked")
+    }
+}
+
+impl std::error::Error for FileNotFoundInRevision {}
+
 /// Finds the object that contains the contents of a file at a specific commit.
 fn find_file_in_commit(repo: &Repository, commit: &Commit, file: &Path) -> Result<ObjectId> {
     let repo_dir = repo.workdir().context("repo has no worktree")?;
@@ -525,7 +537,7 @@ fn find_file_in_commit(repo: &Repository, commit: &Commit, file: &Path) -> Resul
     let tree = commit.tree()?;
     let tree_entry = tree
         .lookup_entry_by_path(rel_path)?
-        .context("file is untracked")?;
+        .ok_or(FileNotFoundInRevision)?;
     match tree_entry.mode().kind() {
         // not a file, everything is new, do not show diff
         mode @ (EntryKind::Tree | EntryKind::Commit | EntryKind::Link) => {

@@ -408,16 +408,35 @@ pub fn merge_finish(cx: &mut Context) {
         cx.editor.set_error(format!("Failed to save: {e}"));
         return;
     }
-
-    // Stage with git add
-    if let Some(p) = path {
-        let _ = std::process::Command::new("git")
-            .args(["add", "--"])
-            .arg(&p)
-            .status();
+    // The save above is only queued; flush so git add stages the new content.
+    if let Err(e) = cx.block_try_flush_writes() {
+        cx.editor.set_error(format!("Failed to save: {e}"));
+        return;
     }
 
-    cx.editor.set_status("File saved and staged (git add)");
+    let Some(path) = path else {
+        cx.editor
+            .set_error("File saved but not staged: buffer has no file path");
+        return;
+    };
+
+    let mut command = std::process::Command::new("git");
+    if let Some(parent) = path.parent() {
+        command.arg("-C").arg(parent);
+    }
+    match command.args(["add", "--"]).arg(&path).status() {
+        Ok(status) if status.success() => {
+            cx.editor.set_status("File saved and staged (git add)");
+        }
+        Ok(status) => {
+            cx.editor
+                .set_error(format!("File saved but git add failed: {status}"));
+        }
+        Err(e) => {
+            cx.editor
+                .set_error(format!("File saved but git add failed to run: {e}"));
+        }
+    }
 }
 
 pub fn diff_toggle_sync_scroll(cx: &mut Context) {

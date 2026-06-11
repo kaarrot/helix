@@ -2703,7 +2703,7 @@ impl Editor {
             Err(err) => {
                 let is_missing = err
                     .chain()
-                    .any(|e| e.to_string().contains("file is untracked"));
+                    .any(|e| e.is::<helix_vcs::git::FileNotFoundInRevision>());
                 if is_missing {
                     Ok(Vec::new())
                 } else {
@@ -2946,7 +2946,8 @@ impl Editor {
                         base_ref.to_string(),
                         Some(target.to_string()),
                     )
-                    .close_base_doc_on_close();
+                    .close_base_doc_on_close()
+                    .close_working_doc_on_close();
                     self.diff.views.insert(base_view_id, diff_state.clone());
                     self.diff.views.insert(target_view_id, diff_state);
                 } else {
@@ -2965,7 +2966,8 @@ impl Editor {
                         base_ref.to_string(),
                         Some(target.to_string()),
                     )
-                    .close_base_doc_on_close();
+                    .close_base_doc_on_close()
+                    .close_working_doc_on_close();
                     self.diff.views.insert(target_view_id, diff_state);
                 }
 

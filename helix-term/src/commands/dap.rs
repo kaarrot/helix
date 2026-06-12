@@ -705,6 +705,47 @@ pub fn dap_goto_line(cx: &mut Context) {
     );
 }
 
+pub fn dap_evaluate(cx: &mut Context) {
+    if cx.editor.debug_adapters.get_active_client().is_none() {
+        cx.editor.set_error("Debugger is not running");
+        return;
+    }
+
+    let prompt = Prompt::new(
+        "eval: ".into(),
+        None,
+        ui::completers::none,
+        |cx, input: &str, event: PromptEvent| {
+            if event != PromptEvent::Validate || input.is_empty() {
+                return;
+            }
+
+            let debugger = match cx.editor.debug_adapters.get_active_client() {
+                Some(debugger) => debugger,
+                None => {
+                    cx.editor.set_error("Debugger is not running");
+                    return;
+                }
+            };
+            let (frame, thread_id) = match (debugger.active_frame, debugger.thread_id) {
+                (Some(frame), Some(thread_id)) => (frame, thread_id),
+                _ => {
+                    cx.editor
+                        .set_error("Cannot find current stack frame to access variables");
+                    return;
+                }
+            };
+            let frame_id = debugger.stack_frames[&thread_id][frame].id;
+            let result = block_on(debugger.eval(input.to_owned(), Some(frame_id)));
+            match result {
+                Ok(response) => cx.editor.set_status(response.result),
+                Err(e) => cx.editor.set_error(format!("Failed to evaluate: {}", e)),
+            }
+        },
+    );
+    cx.push_layer(Box::new(prompt));
+}
+
 pub fn dap_variables(cx: &mut Context) {
     let debugger = debugger!(cx.editor);
 

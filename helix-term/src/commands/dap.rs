@@ -647,6 +647,64 @@ pub fn dap_next(cx: &mut Context) {
     }
 }
 
+pub fn dap_goto_line(cx: &mut Context) {
+    let debugger = debugger!(cx.editor);
+
+    if debugger.capabilities().supports_goto_targets_request != Some(true) {
+        cx.editor
+            .set_error("Debugger does not support jumping to a line");
+        return;
+    }
+
+    let thread_id = match debugger.thread_id {
+        Some(thread_id) => thread_id,
+        None => {
+            cx.editor
+                .set_error("Currently active thread is not stopped. Switch the thread.");
+            return;
+        }
+    };
+
+    let (view, doc) = current!(cx.editor);
+    let path = match doc.path() {
+        Some(path) => path.clone(),
+        None => {
+            cx.editor.set_error("Can't jump: document has no path");
+            return;
+        }
+    };
+    let text = doc.text().slice(..);
+    // DAP lines are 1-indexed.
+    let line = doc.selection(view.id).primary().cursor_line(text) + 1;
+
+    let source = dap::Source {
+        path: Some(path),
+        ..Default::default()
+    };
+
+    let debugger = debugger!(cx.editor);
+    let request = debugger.goto_targets(source, line, None);
+    dap_callback(
+        cx.jobs,
+        request,
+        move |editor, _compositor, response: dap::requests::GotoTargetsResponse| {
+            let target = match response.targets.first() {
+                Some(target) => target,
+                None => {
+                    editor.set_error("No valid jump target on this line");
+                    return;
+                }
+            };
+            let debugger = debugger!(editor);
+            let request = debugger.goto(thread_id, target.id);
+            // A successful goto emits a "stopped" event that moves the cursor.
+            if let Err(e) = block_on(request) {
+                editor.set_error(format!("Failed to jump: {}", e));
+            }
+        },
+    );
+}
+
 pub fn dap_variables(cx: &mut Context) {
     let debugger = debugger!(cx.editor);
 

@@ -248,6 +248,22 @@ pub struct Thread {
 
 #[derive(Debug, PartialEq, Eq, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct GotoTarget {
+    pub id: usize,
+    pub label: String,
+    pub line: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub column: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_line: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_column: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instruction_pointer_reference: Option<String>,
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Scope {
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -656,6 +672,46 @@ pub mod requests {
         type Arguments = NextArguments;
         type Result = ();
         const COMMAND: &'static str = "next";
+    }
+
+    #[derive(Debug, PartialEq, Eq, Clone, Deserialize, Serialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct GotoTargetsArguments {
+        pub source: Source,
+        pub line: usize,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub column: Option<usize>,
+    }
+
+    #[derive(Debug, PartialEq, Eq, Clone, Deserialize, Serialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct GotoTargetsResponse {
+        pub targets: Vec<GotoTarget>,
+    }
+
+    #[derive(Debug)]
+    pub enum GotoTargets {}
+
+    impl Request for GotoTargets {
+        type Arguments = GotoTargetsArguments;
+        type Result = GotoTargetsResponse;
+        const COMMAND: &'static str = "gotoTargets";
+    }
+
+    #[derive(Debug, PartialEq, Eq, Clone, Deserialize, Serialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct GotoArguments {
+        pub thread_id: ThreadId,
+        pub target_id: usize,
+    }
+
+    #[derive(Debug)]
+    pub enum Goto {}
+
+    impl Request for Goto {
+        type Arguments = GotoArguments;
+        type Result = ();
+        const COMMAND: &'static str = "goto";
     }
 
     #[derive(Debug, PartialEq, Eq, Clone, Deserialize, Serialize)]

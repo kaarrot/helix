@@ -213,6 +213,64 @@ The list of supported features is:
 - `rename-symbol`
 - `inlay-hints`
 
+## Debugger configuration
+
+A language's debug adapter is configured in a `[language.debugger]` table on the
+`[[language]]` section. Individual debug configurations (what to launch or
+attach to) are listed as `[[language.debugger.templates]]`; these are what the
+`:debug-start` command and the `<space>G` debug menu present to you.
+
+These are the available options for a debugger:
+
+| Key          | Description                                                                                  |
+| ----         | -----------                                                                                  |
+| `name`       | The name of the debug adapter                                                                |
+| `transport`  | How Helix talks to the adapter: `"stdio"` or `"tcp"`                                         |
+| `command`    | The name or path of the debug adapter binary to execute                                      |
+| `args`       | A list of arguments to pass to the adapter binary                                            |
+| `port-arg`   | For TCP transport, the argument used to pass the port the adapter should listen on           |
+| `templates`  | A list of debug configurations. **Required** — see the note on overriding below             |
+| `quirks`     | Adapter-specific workarounds, e.g. `{ absolute-paths = true }`                               |
+
+> 💡 Overriding the built-in debugger replaces it wholesale. When you redefine
+> `[language.debugger]` for a language that already ships with a default
+> configuration, your table replaces the built-in one entirely rather than
+> merging field by field. This means you must re-specify `templates` even if you
+> only wanted to change `command`; otherwise loading fails with a
+> `missing field templates` error.
+
+For example, to point Python's debugger at a custom interpreter while keeping the
+default attach templates, copy the whole block and edit `command`:
+
+```toml
+[[language]]
+name = "python"
+
+[language.debugger]
+name = "debugpy"
+transport = "stdio"
+command = "/path/to/your/python"
+args = ["-m", "debugpy.adapter"]
+
+# Attach to a running process by PID or process name.
+[[language.debugger.templates]]
+name = "outer-in"
+request = "attach"
+completion = [{ name = "pid or process name", completion = "process" }]
+args = { processId = "{0}", justMyCode = false }
+
+# Connect to a debugpy server the script already started with
+# `debugpy.listen(("127.0.0.1", 5678))`, via `:debug-remote 127.0.0.1:5678 inner-out`.
+[[language.debugger.templates]]
+name = "inner-out"
+request = "attach"
+args = { justMyCode = false }
+```
+
+Only the `name` field and the `[language.debugger]` table are needed here; the
+rest of Python's configuration (file types, language servers, grammar, …) is
+inherited from the built-in defaults.
+
 ## Tree-sitter grammar configuration
 
 The source for a language's tree-sitter grammar is specified in a `[[grammar]]`

@@ -30,11 +30,12 @@ impl From<tui::text::Text<'static>> for Text {
 }
 
 impl Component for Text {
-    fn render(&mut self, area: Rect, surface: &mut Surface, _cx: &mut Context) {
+    fn render(&mut self, area: Rect, surface: &mut Surface, cx: &mut Context) {
         use tui::widgets::{Paragraph, Widget, Wrap};
 
-        let par = Paragraph::new(&self.contents).wrap(Wrap { trim: false });
-        // .scroll(x, y) offsets
+        let par = Paragraph::new(&self.contents)
+            .wrap(Wrap { trim: false })
+            .scroll((cx.scroll.unwrap_or_default() as u16, 0));
 
         par.render(area, surface);
     }

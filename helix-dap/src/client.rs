@@ -542,6 +542,34 @@ impl Client {
         self.call::<requests::Pause>(args)
     }
 
+    pub fn goto_targets(
+        &self,
+        source: Source,
+        line: usize,
+        column: Option<usize>,
+    ) -> impl Future<Output = Result<Value>> {
+        let args = requests::GotoTargetsArguments {
+            source,
+            line,
+            column,
+        };
+
+        self.call::<requests::GotoTargets>(args)
+    }
+
+    pub fn goto(
+        &self,
+        thread_id: ThreadId,
+        target_id: usize,
+    ) -> impl Future<Output = Result<Value>> {
+        let args = requests::GotoArguments {
+            thread_id,
+            target_id,
+        };
+
+        self.call::<requests::Goto>(args)
+    }
+
     pub async fn eval(
         &self,
         expression: String,

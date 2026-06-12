@@ -35,7 +35,11 @@ pub struct Popup<T: Component> {
     area: Rect,
     child_area: Rect,
     position_bias: Open,
-    scroll_half_pages: usize,
+    /// Vertical scroll offset into the contents, in lines.
+    scroll: usize,
+    /// Half of the inner height, cached at render time so half-page scrolling
+    /// can be expressed in the same line-based unit as single-line scrolling.
+    half_page_size: usize,
     auto_close: bool,
     ignore_escape_key: bool,
     id: &'static str,
@@ -50,7 +54,8 @@ impl<T: Component> Popup<T> {
             position_bias: Open::Below,
             area: Rect::new(0, 0, 0, 0),
             child_area: Rect::new(0, 0, 0, 0),
-            scroll_half_pages: 0,
+            scroll: 0,
+            half_page_size: 1,
             auto_close: false,
             ignore_escape_key: false,
             id,
@@ -98,11 +103,19 @@ impl<T: Component> Popup<T> {
     }
 
     pub fn scroll_half_page_down(&mut self) {
-        self.scroll_half_pages += 1;
+        self.scroll += self.half_page_size.max(1);
     }
 
     pub fn scroll_half_page_up(&mut self) {
-        self.scroll_half_pages = self.scroll_half_pages.saturating_sub(1);
+        self.scroll = self.scroll.saturating_sub(self.half_page_size.max(1));
+    }
+
+    pub fn scroll_line_down(&mut self) {
+        self.scroll += 1;
+    }
+
+    pub fn scroll_line_up(&mut self) {
+        self.scroll = self.scroll.saturating_sub(1);
     }
 
     /// Toggles the Popup's scrollbar.
@@ -293,6 +306,27 @@ impl<T: Component> Component for Popup<T> {
             _ => {
                 let contents_event_result = self.contents.handle_event(event, cx);
 
+                // Fall back to single-line scrolling for keys the contents don't
+                // handle themselves, so list-like children (e.g. Menu) keep their
+                // own arrow-key navigation. Skipped for auto-closing popups
+                // (signature help, completion docs), which rely on ignored keys to
+                // close or pass through, and where j/k are literal insert-mode text.
+                if self.has_scrollbar && !self.auto_close {
+                    if let EventResult::Ignored(_) = contents_event_result {
+                        match key {
+                            key!(Down) | key!('j') => {
+                                self.scroll_line_down();
+                                return EventResult::Consumed(None);
+                            }
+                            key!(Up) | key!('k') => {
+                                self.scroll_line_up();
+                                return EventResult::Consumed(None);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+
                 if self.auto_close {
                     if let EventResult::Ignored(None) = contents_event_result {
                         return EventResult::Ignored(Some(close_fn));
@@ -336,11 +370,9 @@ impl<T: Component> Component for Popup<T> {
         let border = usize::from(render_borders);
 
         let max_offset = child_height.saturating_sub(inner.height) as usize;
-        let half_page_size = (inner.height / 2) as usize;
-        let scroll = max_offset.min(self.scroll_half_pages * half_page_size);
-        if half_page_size > 0 {
-            self.scroll_half_pages = scroll / half_page_size;
-        }
+        self.half_page_size = (inner.height / 2) as usize;
+        self.scroll = self.scroll.min(max_offset);
+        let scroll = self.scroll;
         cx.scroll = Some(scroll);
         self.contents.render(inner, surface, cx);
 

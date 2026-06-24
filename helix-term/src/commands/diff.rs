@@ -4,6 +4,218 @@ use super::*;
 use helix_vcs::FileChange;
 use helix_view::editor::MergeViewState;
 
+/// Per-item data shared with the changed-file picker's column formatters.
+/// Hoisted to module scope (rather than nested in `changed_file_picker`) so the
+/// background-refresh callback can name `Picker<FileChange, FileChangeData>`
+/// when looking the picker back up in the compositor.
+#[cfg(feature = "git")]
+pub struct FileChangeData {
+    cwd: PathBuf,
+    style_untracked: Style,
+    style_modified: Style,
+    style_conflict: Style,
+    style_deleted: Style,
+    style_renamed: Style,
+}
+
+/// Collect the full changed-file listing for a diff range into a `Vec`.
+/// This is the expensive part (a tree diff and/or a working-tree scan), so it
+/// is run off the main thread by `changed_file_picker`.
+#[cfg(feature = "git")]
+fn collect_changed_files(
+    cwd: &std::path::Path,
+    base_ref: &str,
+    target_ref: Option<&str>,
+) -> Vec<FileChange> {
+    use helix_vcs::git;
+    // `for_each_changed_file_between_refs` takes an `Fn`, so accumulate through
+    // a `RefCell` rather than capturing the `Vec` mutably.
+    let files = std::cell::RefCell::new(Vec::new());
+    let _ = git::for_each_changed_file_between_refs(cwd, base_ref, target_ref, |change| {
+        if let Ok(change) = change {
+            files.borrow_mut().push(change);
+        }
+        true
+    });
+    files.into_inner()
+}
+
+/// The list to seed the changed-file picker with on open. Under the
+/// `integration` feature this is the freshly-computed listing (tests act on it
+/// synchronously); otherwise it is the cached listing for this range (empty on
+/// a cache miss), which [`spawn_changed_file_refresh`] reconciles in the
+/// background.
+#[cfg(feature = "git")]
+pub(crate) fn changed_file_seed(
+    editor: &Editor,
+    cwd: &std::path::Path,
+    base_ref: &str,
+    target_ref: Option<&str>,
+) -> Vec<FileChange> {
+    #[cfg(feature = "integration")]
+    {
+        let _ = editor;
+        collect_changed_files(cwd, base_ref, target_ref)
+    }
+    #[cfg(not(feature = "integration"))]
+    {
+        let _ = cwd;
+        editor
+            .diff
+            .changed_file_cache
+            .as_ref()
+            .filter(|cache| cache.base_ref == base_ref && cache.target_ref.as_deref() == target_ref)
+            .map(|cache| cache.files.clone())
+            .unwrap_or_default()
+    }
+}
+
+/// Build the changed-file picker, seeded with `seed` (shown instantly). Shared
+/// by `space g` (`changed_file_picker`) and `:diff-files` so the two stay a
+/// single implementation. Must run on the main thread: it reads the theme and
+/// the current file, and the picker it returns is not `Send`.
+#[cfg(feature = "git")]
+pub(crate) fn changed_file_picker_component(
+    editor: &mut Editor,
+    cwd: PathBuf,
+    base_ref: String,
+    target_ref: Option<String>,
+    seed: Vec<FileChange>,
+) -> Box<dyn Component> {
+    let current_file_path = {
+        let (_, doc) = current_ref!(editor);
+        doc.path().map(|p| p.to_path_buf())
+    };
+
+    let added = editor.theme.get("diff.plus");
+    let modified = editor.theme.get("diff.delta");
+    let conflict = editor.theme.get("diff.delta.conflict");
+    let deleted = editor.theme.get("diff.minus");
+    let renamed = editor.theme.get("diff.delta.moved");
+
+    let columns = [
+        PickerColumn::new("change", |change: &FileChange, data: &FileChangeData| {
+            match change {
+                FileChange::Untracked { .. } => Span::styled("+ untracked", data.style_untracked),
+                FileChange::Modified { .. } => Span::styled("~ modified", data.style_modified),
+                FileChange::Conflict { .. } => Span::styled("x conflict", data.style_conflict),
+                FileChange::Deleted { .. } => Span::styled("- deleted", data.style_deleted),
+                FileChange::Renamed { .. } => Span::styled("> renamed", data.style_renamed),
+            }
+            .into()
+        }),
+        PickerColumn::new("path", |change: &FileChange, data: &FileChangeData| {
+            let display_path = |path: &PathBuf| {
+                path.strip_prefix(&data.cwd)
+                    .unwrap_or(path)
+                    .display()
+                    .to_string()
+            };
+            match change {
+                FileChange::Untracked { path } => display_path(path),
+                FileChange::Modified { path } => display_path(path),
+                FileChange::Conflict { path } => display_path(path),
+                FileChange::Deleted { path } => display_path(path),
+                FileChange::Renamed { from_path, to_path } => {
+                    format!("{} -> {}", display_path(from_path), display_path(to_path))
+                }
+            }
+            .into()
+        }),
+    ];
+
+    let picker = Picker::new(
+        columns,
+        1, // path
+        seed,
+        FileChangeData {
+            cwd,
+            style_untracked: added,
+            style_modified: modified,
+            style_conflict: conflict,
+            style_deleted: deleted,
+            style_renamed: renamed,
+        },
+        move |cx, meta: &FileChange, _action| {
+            cx.editor.diff.last_changed_file_selection = Some(meta.path().to_path_buf());
+            let path = meta.path();
+            // Conflict files open the 3-way merge view directly.
+            if matches!(meta, FileChange::Conflict { .. }) {
+                if let Err(e) = cx.editor.open_merge_view(path) {
+                    cx.editor
+                        .set_error(format!("Failed to open merge view: {e}"));
+                }
+                return;
+            }
+            if let Err(e) =
+                cx.editor
+                    .open_diff_view_range(path, &base_ref, target_ref.as_deref(), None)
+            {
+                cx.editor
+                    .set_error(format!("Failed to open diff view: {e}"));
+            }
+        },
+    )
+    .with_preview(|_editor, meta| Some((meta.path().into(), None)));
+
+    let picker = picker.with_pre_select(move |file_change: &FileChange| {
+        current_file_path
+            .as_ref()
+            .map_or(false, |p| file_change.path() == p)
+    });
+
+    Box::new(overlaid(picker))
+}
+
+/// Recompute the changed-file listing off the main thread, then on the main
+/// thread refresh the cache and — if the listing actually changed and this is
+/// still the most recent picker — swap the open picker's contents in place.
+#[cfg(all(feature = "git", not(feature = "integration")))]
+pub(crate) fn spawn_changed_file_refresh(
+    jobs: &mut Jobs,
+    cwd: PathBuf,
+    base_ref: String,
+    target_ref: Option<String>,
+    seed: Vec<FileChange>,
+    request: u64,
+) {
+    jobs.callback(async move {
+        let fresh = {
+            let base = base_ref.clone();
+            let target = target_ref.clone();
+            tokio::task::spawn_blocking(move || {
+                collect_changed_files(&cwd, &base, target.as_deref())
+            })
+            .await?
+        };
+
+        Ok(job::Callback::EditorCompositor(Box::new(
+            move |editor: &mut Editor, compositor: &mut Compositor| {
+                editor.diff.changed_file_cache = Some(helix_view::diff_view::ChangedFileCache {
+                    base_ref,
+                    target_ref,
+                    files: fresh.clone(),
+                });
+
+                // A newer picker has opened since; don't disturb it.
+                if editor.diff.changed_file_request != request {
+                    return;
+                }
+                // Nothing changed since the cached seed; leave the picker (and
+                // the user's selection/query) untouched.
+                if fresh == seed {
+                    return;
+                }
+                if let Some(overlay) = compositor
+                    .find::<crate::ui::overlay::Overlay<Picker<FileChange, FileChangeData>>>()
+                {
+                    overlay.content.replace_options(fresh);
+                }
+            },
+        )))
+    });
+}
+
 pub fn changed_file_picker(cx: &mut Context) {
     #[cfg(not(feature = "git"))]
     {
@@ -13,15 +225,6 @@ pub fn changed_file_picker(cx: &mut Context) {
 
     #[cfg(feature = "git")]
     {
-        pub struct FileChangeData {
-            cwd: PathBuf,
-            style_untracked: Style,
-            style_modified: Style,
-            style_conflict: Style,
-            style_deleted: Style,
-            style_renamed: Style,
-        }
-
         let cwd = helix_stdx::env::current_working_dir();
         if !cwd.exists() {
             cx.editor
@@ -29,140 +232,42 @@ pub fn changed_file_picker(cx: &mut Context) {
             return;
         }
 
-        // Get the current file path for pre-selection in the picker
-        let current_file_path = {
-            let (_, doc) = current!(cx.editor);
-            doc.path().map(|p| p.to_path_buf())
-        };
-
-        // Get diff range from editor state or default to HEAD vs working tree
+        // Resolve the diff range (defaults to HEAD vs working tree).
         let diff_range = cx.editor.diff.range.clone().unwrap_or_else(|| DiffRange {
             base_ref: "HEAD".to_string(),
             target_ref: None,
         });
-
         let base_ref = diff_range.base_ref.clone();
         let target_ref = diff_range.target_ref.clone();
-
         cx.editor
             .set_status(format!("Loading changes for: {}", diff_range.display()));
 
-        let added = cx.editor.theme.get("diff.plus");
-        let modified = cx.editor.theme.get("diff.delta");
-        let conflict = cx.editor.theme.get("diff.delta.conflict");
-        let deleted = cx.editor.theme.get("diff.minus");
-        let renamed = cx.editor.theme.get("diff.delta.moved");
+        cx.editor.diff.changed_file_request = cx.editor.diff.changed_file_request.wrapping_add(1);
+        #[cfg(not(feature = "integration"))]
+        let request = cx.editor.diff.changed_file_request;
 
-        let columns = [
-            PickerColumn::new("change", |change: &FileChange, data: &FileChangeData| {
-                match change {
-                    FileChange::Untracked { .. } => {
-                        Span::styled("+ untracked", data.style_untracked)
-                    }
-                    FileChange::Modified { .. } => Span::styled("~ modified", data.style_modified),
-                    FileChange::Conflict { .. } => Span::styled("x conflict", data.style_conflict),
-                    FileChange::Deleted { .. } => Span::styled("- deleted", data.style_deleted),
-                    FileChange::Renamed { .. } => Span::styled("> renamed", data.style_renamed),
-                }
-                .into()
-            }),
-            PickerColumn::new("path", |change: &FileChange, data: &FileChangeData| {
-                let display_path = |path: &PathBuf| {
-                    path.strip_prefix(&data.cwd)
-                        .unwrap_or(path)
-                        .display()
-                        .to_string()
-                };
-                match change {
-                    FileChange::Untracked { path } => display_path(path),
-                    FileChange::Modified { path } => display_path(path),
-                    FileChange::Conflict { path } => display_path(path),
-                    FileChange::Deleted { path } => display_path(path),
-                    FileChange::Renamed { from_path, to_path } => {
-                        format!("{} -> {}", display_path(from_path), display_path(to_path))
-                    }
-                }
-                .into()
-            }),
-        ];
+        let seed = changed_file_seed(cx.editor, &cwd, &base_ref, target_ref.as_deref());
+        #[cfg(not(feature = "integration"))]
+        let seed_for_refresh = seed.clone();
 
-        let picker = Picker::new(
-            columns,
-            1, // path
-            [],
-            FileChangeData {
-                cwd: cwd.clone(),
-                style_untracked: added,
-                style_modified: modified,
-                style_conflict: conflict,
-                style_deleted: deleted,
-                style_renamed: renamed,
-            },
-            {
-                let base_ref_cb = base_ref.clone();
-                let target_ref_cb = target_ref.clone();
-                move |cx, meta: &FileChange, _action| {
-                    cx.editor.diff.last_changed_file_selection = Some(meta.path().to_path_buf());
-                    let path = meta.path();
-                    // Conflict files open the 3-way merge view directly
-                    if matches!(meta, FileChange::Conflict { .. }) {
-                        if let Err(e) = cx.editor.open_merge_view(path) {
-                            cx.editor
-                                .set_error(format!("Failed to open merge view: {e}"));
-                        }
-                        return;
-                    }
-                    if let Err(e) = cx.editor.open_diff_view_range(
-                        path,
-                        &base_ref_cb,
-                        target_ref_cb.as_deref(),
-                        None,
-                    ) {
-                        cx.editor
-                            .set_error(format!("Failed to open diff view: {e}"));
-                    }
-                }
-            },
-        )
-        .with_preview(|_editor, meta| Some((meta.path().into(), None)));
-
-        let picker = picker.with_pre_select(move |file_change: &FileChange| {
-            current_file_path
-                .as_ref()
-                .map_or(false, |p| file_change.path() == p)
-        });
-
-        let injector = picker.injector();
-
-        #[cfg(feature = "integration")]
-        {
-            use helix_vcs::git;
-            let _ = git::for_each_changed_file_between_refs(
-                &cwd,
-                &base_ref,
-                target_ref.as_deref(),
-                move |change| match change {
-                    Ok(change) => injector.push(change).is_ok(),
-                    Err(_) => true,
-                },
-            );
-        }
+        let component = changed_file_picker_component(
+            cx.editor,
+            cwd.clone(),
+            base_ref.clone(),
+            target_ref.clone(),
+            seed,
+        );
+        cx.push_layer(component);
 
         #[cfg(not(feature = "integration"))]
-        std::thread::spawn(move || {
-            use helix_vcs::git;
-            let _ = git::for_each_changed_file_between_refs(
-                &cwd,
-                &base_ref,
-                target_ref.as_deref(),
-                move |change| match change {
-                    Ok(change) => injector.push(change).is_ok(),
-                    Err(_) => true,
-                },
-            );
-        });
-
-        cx.push_layer(Box::new(overlaid(picker)));
+        spawn_changed_file_refresh(
+            cx.jobs,
+            cwd,
+            base_ref,
+            target_ref,
+            seed_for_refresh,
+            request,
+        );
     }
 }
 

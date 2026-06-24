@@ -2,6 +2,7 @@ use crate::{
     editor::{DiffRange, MergeViewState},
     DocumentId, ViewId,
 };
+use helix_vcs::FileChange;
 use std::{collections::HashMap, path::PathBuf};
 
 /// All diff/merge runtime state aggregated into one Editor field.
@@ -12,6 +13,26 @@ pub struct DiffSession {
     pub range: Option<DiffRange>,
     pub split_view_override: Option<bool>,
     pub last_changed_file_selection: Option<PathBuf>,
+    /// Last computed changed-file listing, kept so the changed-file picker
+    /// (`space g`) can display instantly on reopen instead of re-scanning the
+    /// repo every time. This is only a display seed: the picker always
+    /// recomputes in the background and reconciles, so a stale cache can never
+    /// produce a wrong result — only a brief out-of-date flash on a huge repo.
+    pub changed_file_cache: Option<ChangedFileCache>,
+    /// Incremented every time the changed-file picker opens. A background
+    /// refresh captures the value at launch and only touches the picker if it
+    /// still matches, so a slow refresh from an earlier invocation can't
+    /// clobber a picker that was reopened in the meantime.
+    pub changed_file_request: u64,
+}
+
+/// A changed-file listing cached together with the diff range it was computed
+/// for, so the cache can be reused only when the range still matches.
+#[derive(Debug)]
+pub struct ChangedFileCache {
+    pub base_ref: String,
+    pub target_ref: Option<String>,
+    pub files: Vec<FileChange>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

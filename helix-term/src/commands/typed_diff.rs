@@ -299,15 +299,19 @@ pub(crate) fn diff_files(
 
     #[cfg(feature = "git")]
     {
-        use helix_vcs::FileChange;
-        use helix_view::theme::Style;
-
         if event != PromptEvent::Validate {
             return Ok(());
         }
 
-        let ref_name = args.first().context("missing git reference argument")?;
-        let ref_name_owned = ref_name.to_string();
+        let base_ref = args
+            .first()
+            .context("missing git reference argument")?
+            .to_string();
+        // `:diff-files <ref>` browses the changes between <ref> and the working
+        // tree (target = None), i.e. the same listing as `space g` with that
+        // base. This shares `changed_file_picker`'s implementation so both get
+        // the instant cache + background refresh.
+        let target_ref: Option<String> = None;
 
         let cwd = helix_stdx::env::current_working_dir();
         if !cwd.exists() {
@@ -316,135 +320,36 @@ pub(crate) fn diff_files(
             return Ok(());
         }
 
-        let modified = cx.editor.theme.get("diff.delta");
-        let deleted = cx.editor.theme.get("diff.minus");
-        let renamed = cx.editor.theme.get("diff.delta.moved");
+        cx.editor.diff.changed_file_request = cx.editor.diff.changed_file_request.wrapping_add(1);
+        #[cfg(not(feature = "integration"))]
+        let request = cx.editor.diff.changed_file_request;
 
-        let callback = async move {
-            use tui::text::Span;
+        let seed = diff::changed_file_seed(cx.editor, &cwd, &base_ref, target_ref.as_deref());
 
-            #[derive(Clone)]
-            pub struct DiffFileChangeData {
-                cwd: PathBuf,
-                style_modified: Style,
-                style_deleted: Style,
-                style_renamed: Style,
-            }
-
-            let call: job::Callback = job::Callback::EditorCompositor(Box::new(
-                move |_editor: &mut Editor, compositor: &mut Compositor| {
-                    let columns = [
-                        ui::PickerColumn::new(
-                            "change",
-                            |change: &FileChange, data: &DiffFileChangeData| {
-                                match change {
-                                    FileChange::Modified { .. } => {
-                                        Span::styled("~ modified", data.style_modified)
-                                    }
-                                    FileChange::Deleted { .. } => {
-                                        Span::styled("- deleted", data.style_deleted)
-                                    }
-                                    FileChange::Renamed { .. } => {
-                                        Span::styled("> renamed", data.style_renamed)
-                                    }
-                                    _ => Span::raw("  changed"),
-                                }
-                                .into()
-                            },
-                        ),
-                        ui::PickerColumn::new(
-                            "path",
-                            |change: &FileChange, data: &DiffFileChangeData| {
-                                let display_path = |path: &PathBuf| {
-                                    path.strip_prefix(&data.cwd)
-                                        .unwrap_or(path)
-                                        .display()
-                                        .to_string()
-                                };
-                                match change {
-                                    FileChange::Modified { path } => display_path(path),
-                                    FileChange::Deleted { path } => display_path(path),
-                                    FileChange::Renamed { from_path, to_path } => {
-                                        format!(
-                                            "{} -> {}",
-                                            display_path(from_path),
-                                            display_path(to_path)
-                                        )
-                                    }
-                                    FileChange::Untracked { path } => display_path(path),
-                                    FileChange::Conflict { path } => display_path(path),
-                                }
-                                .into()
-                            },
-                        ),
-                    ];
-
-                    let ref_name_for_callback = ref_name_owned.clone();
-                    let picker = ui::Picker::new(
-                        columns,
-                        1, // path column
-                        [],
-                        DiffFileChangeData {
-                            cwd: cwd.clone(),
-                            style_modified: modified,
-                            style_deleted: deleted,
-                            style_renamed: renamed,
-                        },
-                        move |cx, meta: &FileChange, _action| {
-                            let path = meta.path();
-                            if let Err(e) =
-                                cx.editor.open_diff_view(path, &ref_name_for_callback, None)
-                            {
-                                cx.editor
-                                    .set_error(format!("Failed to open diff view: {e}"));
-                            }
-                        },
-                    )
-                    .with_preview(|_editor, meta| Some((meta.path().into(), None)));
-
-                    let injector = picker.injector();
-                    let ref_name_for_thread = ref_name_owned.clone();
-
-                    #[cfg(feature = "integration")]
-                    {
-                        use helix_vcs::git;
-                        let result = git::for_each_changed_file_between_commits(
-                            &cwd,
-                            &ref_name_for_thread,
-                            move |change| match change {
-                                Ok(change) => injector.push(change).is_ok(),
-                                Err(_err) => true,
-                            },
-                        );
-
-                        if let Err(err) = result {
-                            log::error!("Failed to get diff files: {}", err);
-                        }
-                    }
-                    #[cfg(not(feature = "integration"))]
-                    std::thread::spawn(move || {
-                        use helix_vcs::git;
-                        let result = git::for_each_changed_file_between_commits(
-                            &cwd,
-                            &ref_name_for_thread,
-                            move |change| match change {
-                                Ok(change) => injector.push(change).is_ok(),
-                                Err(_err) => true,
-                            },
-                        );
-
-                        if let Err(err) = result {
-                            log::error!("Failed to get diff files: {}", err);
-                        }
-                    });
-
-                    compositor.push(Box::new(overlaid(picker)));
+        // The picker isn't `Send`, and a typed command has no direct compositor,
+        // so build and push it on the main thread via a compositor callback.
+        let build_cwd = cwd.clone();
+        let build_base = base_ref.clone();
+        let build_target = target_ref.clone();
+        let build_seed = seed.clone();
+        cx.jobs.callback(async move {
+            Ok(job::Callback::EditorCompositor(Box::new(
+                move |editor: &mut Editor, compositor: &mut Compositor| {
+                    let component = diff::changed_file_picker_component(
+                        editor,
+                        build_cwd,
+                        build_base,
+                        build_target,
+                        build_seed,
+                    );
+                    compositor.push(component);
                 },
-            ));
-            Ok(call)
-        };
+            )))
+        });
 
-        cx.jobs.callback(callback);
+        #[cfg(not(feature = "integration"))]
+        diff::spawn_changed_file_refresh(cx.jobs, cwd, base_ref, target_ref, seed, request);
+
         Ok(())
     }
 }

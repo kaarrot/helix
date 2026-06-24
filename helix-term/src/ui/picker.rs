@@ -416,6 +416,24 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
         }
     }
 
+    /// Replace every item in the picker with `options`, cancelling any items a
+    /// previous population (such as a background refresh) might still be
+    /// streaming in. The active query is preserved, and the previous results
+    /// stay on screen until the replacements are matched, so there's no flash
+    /// of an empty list. Used to reconcile an instantly-shown cached listing
+    /// with a freshly recomputed one.
+    pub fn replace_options(&mut self, options: Vec<T>) {
+        // Bump the shared version so any outstanding `Injector`s stop pushing.
+        self.version.fetch_add(1, atomic::Ordering::Relaxed);
+        // Drop the matched items but keep the current snapshot visible until
+        // the replacements are matched in.
+        self.matcher.restart(false);
+        let injector = self.matcher.injector();
+        for item in options {
+            inject_nucleo_item(&injector, &self.columns, item, &self.editor_data);
+        }
+    }
+
     pub fn truncate_start(mut self, truncate_start: bool) -> Self {
         self.truncate_start = truncate_start;
         self

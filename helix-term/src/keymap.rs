@@ -537,24 +537,14 @@ mod tests {
     }
 
     #[test]
-    fn search_mode_bindings_are_present_in_default_keymap() {
+    fn global_search_is_bound_to_space_slash_in_default_keymap() {
         let keymaps = Keymaps::default().map();
         let root = keymaps.get(&Mode::Normal).unwrap();
 
         assert_eq!(
-            root.search(&[key!(' '), key!('/'), key!('/')]).unwrap(),
+            root.search(&[key!(' '), key!('/')]).unwrap(),
             &KeyTrie::MappableCommand(MappableCommand::global_search),
-            "Mismatch for workspace search on `Space-/-/`"
-        );
-        assert_eq!(
-            root.search(&[key!(' '), key!('/'), key!('.')]).unwrap(),
-            &KeyTrie::MappableCommand(MappableCommand::search_in_directory),
-            "Mismatch for directory search on `Space-/-.`"
-        );
-        assert_eq!(
-            root.search(&[key!(' '), key!('/'), key!(',')]).unwrap(),
-            &KeyTrie::MappableCommand(MappableCommand::search_in_buffer),
-            "Mismatch for buffer search on `Space-/-,'"
+            "Mismatch for global search on `Space-/`"
         );
     }
 

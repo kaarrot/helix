@@ -314,18 +314,10 @@ merge/diff submode.
 | `y`     | Yank selections to clipboard                                            | `yank_to_clipboard`                        |
 | `Y`     | Yank main selection to clipboard                                        | `yank_main_selection_to_clipboard`         |
 | `R`     | Replace selections by clipboard contents                                | `replace_selections_with_clipboard`        |
-| `/`     | Enter [search mode](#search-mode)                                       | N/A                                        |
+| `/`     | Global search in workspace folder                                       | `global_search`                            |
 | `?`     | Open command palette                                                    | `command_palette`                          |
 
-> 💡 Search results open in a fuzzy picker. Use `Space + '` to bring the last picker back up after opening a file.
-
-##### Search mode
-
-| Key | Description | Command |
-| --- | ----------- | ------- |
-| `/` | Search in the workspace folder | `global_search` |
-| `.` | Search in the current file's directory and its subdirectories | `search_in_directory` |
-| `,` | Search in the current buffer | `search_in_buffer` |
+> 💡 Global search displays results in a fuzzy picker, use `Space + '` to bring it back up after opening a file. Matches are ordered by proximity: the current file first, then its directory and subdirectories, then the rest of the workspace.
 
 `Space-g` opens a git-backed picker for changed files. By default it compares
 `HEAD` to the working tree. Use `:diff-commit`, `Space-m c`, or `Space-m C` to

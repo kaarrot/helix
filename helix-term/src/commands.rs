@@ -406,8 +406,6 @@ impl MappableCommand {
         search_selection_detect_word_boundaries, "Use current selection as the search pattern, automatically wrapping with `\\b` on word boundaries",
         make_search_word_bounded, "Modify current search to make it word bounded",
         global_search, "Global search in workspace folder",
-        search_in_directory, "Search in current file's directory and subdirectories",
-        search_in_buffer, "Search in current buffer",
         extend_line, "Select current line, if already selected, extend to another line based on the anchor",
         extend_line_below, "Select current line, if already selected, extend to next line",
         extend_line_above, "Select current line, if already selected, extend to previous line",
@@ -2600,20 +2598,6 @@ fn make_search_word_bounded(cx: &mut Context) {
 }
 
 fn global_search(cx: &mut Context) {
-    let root = helix_stdx::env::current_working_dir();
-    search_in_root(cx, root);
-}
-
-fn search_in_directory(cx: &mut Context) {
-    let root = doc!(cx.editor)
-        .path()
-        .and_then(|p| p.parent())
-        .map(PathBuf::from)
-        .unwrap_or_else(helix_stdx::env::current_working_dir);
-    search_in_root(cx, root);
-}
-
-fn search_in_root(cx: &mut Context, search_root: PathBuf) {
     #[derive(Debug)]
     struct FileResult {
         path: PathBuf,
@@ -2637,16 +2621,66 @@ fn search_in_root(cx: &mut Context, search_root: PathBuf) {
         number_style: Style,
         colon_style: Style,
         search_root: PathBuf,
+        current_file: Option<PathBuf>,
+        sibling_dir: Option<PathBuf>,
     }
 
-    let config = cx.editor.config();
+    /// Searches a single file — or its in-memory buffer if the file is open —
+    /// pushing each matching line into the picker. Returns `true` if the
+    /// injector was closed and searching should stop.
+    fn search_entry(
+        path: &Path,
+        searcher: &mut grep_searcher::Searcher,
+        matcher: &grep_regex::RegexMatcher,
+        documents: &[(Option<PathBuf>, Rope)],
+        injector: &ui::picker::Injector<FileResult, GlobalSearchConfig>,
+    ) -> bool {
+        let mut stop = false;
+        let sink = sinks::UTF8(|line_num, _line_content| {
+            stop = injector
+                .push(FileResult::new(path, line_num as usize - 1))
+                .is_err();
+            Ok(!stop)
+        });
+        let doc = documents.iter().find(|&(doc_path, _)| {
+            doc_path.as_ref().is_some_and(|doc_path| doc_path == path)
+        });
+        let result = if let Some((_, doc)) = doc {
+            // there is already a buffer for this file
+            // search the buffer instead of the file because it's faster
+            // and captures new edits without requiring a save
+            if searcher.multi_line_with_matcher(matcher) {
+                // in this case a continuous buffer is required
+                // convert the rope to a string
+                let text = doc.to_string();
+                searcher.search_slice(matcher, text.as_bytes(), sink)
+            } else {
+                searcher.search_reader(matcher, RopeReader::new(doc.slice(..)), sink)
+            }
+        } else {
+            searcher.search_path(matcher, path, sink)
+        };
+        if let Err(err) = result {
+            log::error!("Global search error: {}, {}", path.display(), err);
+        }
+        stop
+    }
+
+    let editor_config = cx.editor.config();
+    let current_file = doc!(cx.editor).path().cloned();
+    let sibling_dir = current_file
+        .as_ref()
+        .and_then(|p| p.parent())
+        .map(PathBuf::from);
     let config = GlobalSearchConfig {
-        smart_case: config.search.smart_case,
-        file_picker_config: config.file_picker.clone(),
+        smart_case: editor_config.search.smart_case,
+        file_picker_config: editor_config.file_picker.clone(),
         directory_style: cx.editor.theme.get("ui.text.directory"),
         number_style: cx.editor.theme.get("constant.numeric.integer"),
         colon_style: cx.editor.theme.get("punctuation"),
-        search_root,
+        search_root: helix_stdx::env::current_working_dir(),
+        current_file,
+        sibling_dir,
     };
 
     let columns = [
@@ -2683,10 +2717,6 @@ fn search_in_root(cx: &mut Context, search_root: PathBuf) {
             return async { Ok(()) }.boxed();
         }
 
-        if !config.search_root.exists() {
-            return async { Err(anyhow::anyhow!("Search directory does not exist")) }.boxed();
-        }
-
         let documents: Vec<_> = editor
             .documents()
             .map(|doc| (doc.path().cloned(), doc.text().to_owned()))
@@ -2709,91 +2739,106 @@ fn search_in_root(cx: &mut Context, search_root: PathBuf) {
 
         let dedup_symlinks = config.file_picker_config.deduplicate_links;
         let search_root = config.search_root.clone();
-        let absolute_root = search_root
-            .canonicalize()
-            .unwrap_or_else(|_| search_root.clone());
+        let current_file = config.current_file.clone();
+        let sibling_dir = config.sibling_dir.clone();
 
         let injector = injector.clone();
         async move {
+            use std::sync::atomic::Ordering;
+
             let searcher = SearcherBuilder::new()
                 .binary_detection(BinaryDetection::quit(b'\x00'))
                 .build();
-            WalkBuilder::new(search_root)
-                .hidden(config.file_picker_config.hidden)
-                .parents(config.file_picker_config.parents)
-                .ignore(config.file_picker_config.ignore)
-                .follow_links(config.file_picker_config.follow_symlinks)
-                .git_ignore(config.file_picker_config.git_ignore)
-                .git_global(config.file_picker_config.git_global)
-                .git_exclude(config.file_picker_config.git_exclude)
-                .max_depth(config.file_picker_config.max_depth)
-                .filter_entry(move |entry| {
-                    filter_picker_entry(entry, &absolute_root, dedup_symlinks)
-                })
-                .add_custom_ignore_filename(helix_loader::config_dir().join("ignore"))
-                .add_custom_ignore_filename(".helix/ignore")
-                .build_parallel()
-                .run(|| {
-                    let mut searcher = searcher.clone();
-                    let matcher = matcher.clone();
-                    let injector = injector.clone();
-                    let documents = &documents;
-                    Box::new(move |entry: Result<DirEntry, ignore::Error>| -> WalkState {
-                        let entry = match entry {
-                            Ok(entry) => entry,
-                            Err(_) => return WalkState::Continue,
-                        };
+            // Set once the picker's injector closes (query changed or picker
+            // dismissed), so later phases can bail out instead of walking on.
+            let stopped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-                        match entry.file_type() {
-                            Some(entry) if entry.is_file() => {}
-                            // skip everything else
-                            _ => return WalkState::Continue,
-                        };
+            // Phase 1: the current file, so nearby matches land at the top of
+            // the picker. Searched directly (bypassing ignore rules) so the file
+            // being edited is always covered, unsaved edits and all.
+            if let Some(file) = &current_file {
+                let mut searcher = searcher.clone();
+                if search_entry(file, &mut searcher, &matcher, &documents, &injector) {
+                    return Ok(());
+                }
+            }
 
-                        let mut stop = false;
-                        let sink = sinks::UTF8(|line_num, _line_content| {
-                            stop = injector
-                                .push(FileResult::new(entry.path(), line_num as usize - 1))
-                                .is_err();
-
-                            Ok(!stop)
-                        });
-                        let doc = documents.iter().find(|&(doc_path, _)| {
-                            doc_path
-                                .as_ref()
-                                .is_some_and(|doc_path| doc_path == entry.path())
-                        });
-
-                        let result = if let Some((_, doc)) = doc {
-                            // there is already a buffer for this file
-                            // search the buffer instead of the file because it's faster
-                            // and captures new edits without requiring a save
-                            if searcher.multi_line_with_matcher(&matcher) {
-                                // in this case a continuous buffer is required
-                                // convert the rope to a string
-                                let text = doc.to_string();
-                                searcher.search_slice(&matcher, text.as_bytes(), sink)
-                            } else {
-                                searcher.search_reader(
-                                    &matcher,
-                                    RopeReader::new(doc.slice(..)),
-                                    sink,
-                                )
-                            }
-                        } else {
-                            searcher.search_path(&matcher, entry.path(), sink)
-                        };
-
-                        if let Err(err) = result {
-                            log::error!("Global search error: {}, {}", entry.path().display(), err);
+            // Walks `walk_root` in parallel, optionally pruning `skip` — a path
+            // already covered by an earlier phase — to avoid duplicate results.
+            let run_walk = |walk_root: &Path, skip: Option<&Path>| {
+                let absolute_root = walk_root
+                    .canonicalize()
+                    .unwrap_or_else(|_| walk_root.to_path_buf());
+                let skip = skip.map(|p| p.to_path_buf());
+                WalkBuilder::new(walk_root)
+                    .hidden(config.file_picker_config.hidden)
+                    .parents(config.file_picker_config.parents)
+                    .ignore(config.file_picker_config.ignore)
+                    .follow_links(config.file_picker_config.follow_symlinks)
+                    .git_ignore(config.file_picker_config.git_ignore)
+                    .git_global(config.file_picker_config.git_global)
+                    .git_exclude(config.file_picker_config.git_exclude)
+                    .max_depth(config.file_picker_config.max_depth)
+                    .filter_entry(move |entry| {
+                        // Prune a path already searched by an earlier phase.
+                        // Returning `false` for a directory prunes its whole
+                        // subtree.
+                        if skip.as_deref() == Some(entry.path()) {
+                            return false;
                         }
-                        if stop {
-                            WalkState::Quit
-                        } else {
-                            WalkState::Continue
-                        }
+                        filter_picker_entry(entry, &absolute_root, dedup_symlinks)
                     })
-                });
+                    .add_custom_ignore_filename(helix_loader::config_dir().join("ignore"))
+                    .add_custom_ignore_filename(".helix/ignore")
+                    .build_parallel()
+                    .run(|| {
+                        let mut searcher = searcher.clone();
+                        let matcher = matcher.clone();
+                        let injector = injector.clone();
+                        let documents = &documents;
+                        let stopped = stopped.clone();
+                        Box::new(move |entry: Result<DirEntry, ignore::Error>| -> WalkState {
+                            let entry = match entry {
+                                Ok(entry) => entry,
+                                Err(_) => return WalkState::Continue,
+                            };
+
+                            match entry.file_type() {
+                                Some(entry) if entry.is_file() => {}
+                                // skip everything else
+                                _ => return WalkState::Continue,
+                            };
+
+                            if search_entry(
+                                entry.path(),
+                                &mut searcher,
+                                &matcher,
+                                documents,
+                                &injector,
+                            ) {
+                                stopped.store(true, Ordering::Relaxed);
+                                WalkState::Quit
+                            } else {
+                                WalkState::Continue
+                            }
+                        })
+                    });
+            };
+
+            // Phase 2: the current file's directory and its subdirectories (the
+            // "sibling location"), skipping the current file already searched in
+            // phase 1.
+            if let Some(dir) = &sibling_dir {
+                run_walk(dir.as_path(), current_file.as_deref());
+                if stopped.load(Ordering::Relaxed) {
+                    return Ok(());
+                }
+            }
+
+            // Phase 3: the rest of the repository, pruning the sibling directory
+            // subtree already covered by phase 2.
+            run_walk(search_root.as_path(), sibling_dir.as_deref());
+
             Ok(())
         }
         .boxed()
@@ -2840,202 +2885,6 @@ fn search_in_root(cx: &mut Context, search_root: PathBuf) {
     })
     .with_history_register(Some(reg))
     .with_dynamic_query(get_files, Some(275));
-
-    cx.push_layer(Box::new(overlaid(picker)));
-}
-
-fn search_in_buffer(cx: &mut Context) {
-    #[derive(Debug)]
-    enum BufferResultLocation {
-        Path(PathBuf),
-        Document(DocumentId),
-    }
-
-    #[derive(Debug)]
-    struct LineResult {
-        location: BufferResultLocation,
-        display_name: String,
-        line_num: usize,
-    }
-
-    struct BufferSearchConfig {
-        smart_case: bool,
-        directory_style: Style,
-        number_style: Style,
-        colon_style: Style,
-        text: helix_core::Rope,
-        location: BufferResultLocation,
-        display_name: String,
-    }
-
-    let (_, doc) = current_ref!(cx.editor);
-    let (location, display_name) = match doc.path().cloned() {
-        Some(path) => (
-            BufferResultLocation::Path(path),
-            doc.display_name().into_owned(),
-        ),
-        None => (
-            BufferResultLocation::Document(doc.id()),
-            doc.display_name().into_owned(),
-        ),
-    };
-    let editor_config = cx.editor.config();
-    let config = BufferSearchConfig {
-        smart_case: editor_config.search.smart_case,
-        directory_style: cx.editor.theme.get("ui.text.directory"),
-        number_style: cx.editor.theme.get("constant.numeric.integer"),
-        colon_style: cx.editor.theme.get("punctuation"),
-        text: doc.text().clone(),
-        location,
-        display_name,
-    };
-
-    let columns = [
-        PickerColumn::new("path", |item: &LineResult, config: &BufferSearchConfig| {
-            let (directories, filename) = match &item.location {
-                BufferResultLocation::Path(path) => {
-                    let path = helix_stdx::path::get_relative_path(path);
-                    let directories = path
-                        .parent()
-                        .filter(|p| !p.as_os_str().is_empty())
-                        .map(|p| format!("{}{}", p.display(), std::path::MAIN_SEPARATOR))
-                        .unwrap_or_default();
-                    let filename = path
-                        .file_name()
-                        .map(|f| f.to_string_lossy().into_owned())
-                        .unwrap_or_default();
-                    (directories, filename)
-                }
-                BufferResultLocation::Document(_) => (String::new(), item.display_name.clone()),
-            };
-            Cell::from(Spans::from(vec![
-                Span::styled(directories, config.directory_style),
-                Span::raw(filename),
-                Span::styled(":", config.colon_style),
-                Span::styled((item.line_num + 1).to_string(), config.number_style),
-            ]))
-        }),
-        PickerColumn::hidden("contents"),
-    ];
-
-    let get_lines = |query: &str,
-                     _editor: &mut Editor,
-                     config: std::sync::Arc<BufferSearchConfig>,
-                     injector: &ui::picker::Injector<_, _>| {
-        if query.is_empty() {
-            return async { Ok(()) }.boxed();
-        }
-
-        let matcher = match RegexMatcherBuilder::new()
-            .case_smart(config.smart_case)
-            .build(query)
-        {
-            Ok(m) => m,
-            Err(_) => return async { Err(anyhow::anyhow!("Failed to compile regex")) }.boxed(),
-        };
-
-        let injector = injector.clone();
-        let text = config.text.clone();
-        let display_name = config.display_name.clone();
-        let location = match &config.location {
-            BufferResultLocation::Path(path) => BufferResultLocation::Path(path.clone()),
-            BufferResultLocation::Document(id) => BufferResultLocation::Document(*id),
-        };
-        async move {
-            let mut searcher = SearcherBuilder::new()
-                .binary_detection(BinaryDetection::quit(b'\x00'))
-                .build();
-            let sink = sinks::UTF8(|line_num, _| {
-                let stop = injector
-                    .push(LineResult {
-                        location: match &location {
-                            BufferResultLocation::Path(path) => {
-                                BufferResultLocation::Path(path.clone())
-                            }
-                            BufferResultLocation::Document(id) => {
-                                BufferResultLocation::Document(*id)
-                            }
-                        },
-                        display_name: display_name.clone(),
-                        line_num: line_num as usize - 1,
-                    })
-                    .is_err();
-                Ok(!stop)
-            });
-            let text_str = text.to_string();
-            let _ = searcher.search_slice(&matcher, text_str.as_bytes(), sink);
-            Ok(())
-        }
-        .boxed()
-    };
-
-    let reg = cx.register.unwrap_or('/');
-    cx.editor.registers.last_search_register = reg;
-
-    let picker = Picker::new(
-        columns,
-        1,
-        [],
-        config,
-        move |cx,
-              LineResult {
-                  location, line_num, ..
-              },
-              action| {
-            let doc_id = match location {
-                BufferResultLocation::Path(path) => match cx.editor.open(path, action) {
-                    Ok(id) => id,
-                    Err(e) => {
-                        cx.editor.set_error(format!(
-                            "Failed to open file '{}': {}",
-                            path.display(),
-                            e
-                        ));
-                        return;
-                    }
-                },
-                BufferResultLocation::Document(id) => {
-                    if cx.editor.document(*id).is_none() {
-                        cx.editor
-                            .set_error("The buffer you selected is no longer available.");
-                        return;
-                    }
-                    cx.editor.switch(*id, action);
-                    *id
-                }
-            };
-            let doc = doc_mut!(cx.editor, &doc_id);
-            let line_num = *line_num;
-            let view = view_mut!(cx.editor);
-            let text = doc.text();
-            if line_num >= text.len_lines() {
-                cx.editor.set_error(
-                    "The line you jumped to does not exist anymore because the file has changed.",
-                );
-                return;
-            }
-            let start = text.line_to_char(line_num);
-            let end = text.line_to_char((line_num + 1).min(text.len_lines()));
-            doc.set_selection(view.id, Selection::single(start, end));
-            if action.align_view(view, doc.id()) {
-                align_view(doc, view, Align::Center);
-            }
-        },
-    )
-    .with_preview(
-        |_editor,
-         LineResult {
-             location, line_num, ..
-         }| {
-            let location = match location {
-                BufferResultLocation::Path(path) => path.as_path().into(),
-                BufferResultLocation::Document(id) => (*id).into(),
-            };
-            Some((location, Some((*line_num, *line_num))))
-        },
-    )
-    .with_history_register(Some(reg))
-    .with_dynamic_query(get_lines, Some(275));
 
     cx.push_layer(Box::new(overlaid(picker)));
 }

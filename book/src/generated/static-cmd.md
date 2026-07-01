@@ -79,9 +79,7 @@
 | `search_selection` | Use current selection as search pattern | normal: `` <A-*> ``, select: `` <A-*> `` |
 | `search_selection_detect_word_boundaries` | Use current selection as the search pattern, automatically wrapping with `\b` on word boundaries | normal: `` * ``, select: `` * `` |
 | `make_search_word_bounded` | Modify current search to make it word bounded |  |
-| `global_search` | Global search in workspace folder | normal: `` <space>// ``, select: `` <space>// `` |
-| `search_in_directory` | Search in current file's directory and subdirectories | normal: `` <space>/. ``, select: `` <space>/. `` |
-| `search_in_buffer` | Search in current buffer | normal: `` <space>/, ``, select: `` <space>/, `` |
+| `global_search` | Global search in workspace folder | normal: `` <space>/ ``, select: `` <space>/ `` |
 | `extend_line` | Select current line, if already selected, extend to another line based on the anchor |  |
 | `extend_line_below` | Select current line, if already selected, extend to next line | normal: `` x ``, select: `` x `` |
 | `extend_line_above` | Select current line, if already selected, extend to previous line |  |

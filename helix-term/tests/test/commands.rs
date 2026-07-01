@@ -1374,39 +1374,51 @@ async fn global_search_with_multibyte_chars() -> anyhow::Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn search_in_buffer_jumps_within_scratch_buffer() -> anyhow::Result<()> {
-    let mut app = AppBuilder::new()
-        .with_input_text(indoc! {"\
-            buffer_scope_title
-            scoped_buffer_match
-            omega#[|
-            ]#"})
-        .build()?;
+async fn global_search_jumps_to_match_in_current_file() -> anyhow::Result<()> {
+    // The ordered global search always searches the current file first (phase
+    // one), so a match in the open buffer is found and jumping lands on it.
+    let file = helpers::temp_file_with_contents(indoc! {"\
+        alpha
+        scoped_search_match
+        omega
+    "})?;
 
-    send_key_sequence(&mut app, " /,scoped_buffer_match").await?;
-    wait_for_condition(&mut app, "buffer search picker result", |app| {
-        screen_lines(app)
-            .iter()
-            .any(|line| line.contains("buffer_scope_title") && line.contains(":2"))
-    })
+    // The global search picker debounces its query by 275ms, so raise the idle
+    // timeout above that to guarantee the async search populates before `<ret>`.
+    let mut config = helpers::test_config();
+    config.editor.idle_timeout = std::time::Duration::from_millis(500);
+
+    test_key_sequences(
+        &mut AppBuilder::new()
+            .with_config(config)
+            .with_file(file.path(), None)
+            .build()?,
+        vec![
+            // Type the query and let the async search populate the picker before
+            // pressing enter.
+            (Some(" /scoped_search_match"), None),
+            (
+                Some("<ret>"),
+                Some(&|app| {
+                    let (view, doc) = current_ref!(app.editor);
+                    let text = doc.text().slice(..);
+                    let cursor_line = doc.selection(view.id).primary().cursor_line(text);
+
+                    assert_eq!(
+                        doc.path().and_then(|p| p.file_name()),
+                        file.path().file_name()
+                    );
+                    assert_eq!(cursor_line, 1);
+                    assert!(text
+                        .line(cursor_line)
+                        .to_string()
+                        .contains("scoped_search_match"));
+                }),
+            ),
+        ],
+        false,
+    )
     .await?;
-
-    send_key_sequence(&mut app, "<ret>").await?;
-
-    {
-        let (view, doc) = current_ref!(app.editor);
-        let text = doc.text().slice(..);
-        let cursor_line = doc.selection(view.id).primary().cursor_line(text);
-
-        assert!(doc.path().is_none());
-        assert_eq!(cursor_line, 1);
-        assert!(text
-            .line(cursor_line)
-            .to_string()
-            .contains("scoped_buffer_match"));
-    }
-
-    close_app(&mut app).await?;
 
     Ok(())
 }

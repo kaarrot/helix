@@ -2451,6 +2451,49 @@ fn make_search_word_bounded(cx: &mut Context) {
     }
 }
 
+/// One step of an ordered [`global_search`]. Phases are searched in sequence so
+/// matches nearest the current file are found — and therefore shown — first.
+#[derive(Debug, PartialEq, Eq)]
+enum SearchPhase {
+    /// Search a single file (the current file) directly.
+    File(PathBuf),
+    /// Walk a directory subtree, pruning `skip` — a path an earlier phase
+    /// already searched — to avoid duplicate results.
+    Walk {
+        root: PathBuf,
+        skip: Option<PathBuf>,
+    },
+}
+
+/// Builds the ordered search phases for a global search rooted at `search_root`:
+/// the current file first, then its parent directory (pruning the current
+/// file), then the workspace root (pruning that directory). A location covered
+/// by an earlier phase is recorded as the next phase's `skip` so the later walk
+/// does not revisit it. With no current file (e.g. a scratch buffer) this is
+/// just a plain walk of the workspace root.
+fn global_search_phases(current_file: Option<PathBuf>, search_root: PathBuf) -> Vec<SearchPhase> {
+    let sibling_dir = current_file
+        .as_ref()
+        .and_then(|path| path.parent())
+        .map(PathBuf::from);
+
+    let mut phases = Vec::new();
+    if let Some(file) = &current_file {
+        phases.push(SearchPhase::File(file.clone()));
+    }
+    if let Some(dir) = &sibling_dir {
+        phases.push(SearchPhase::Walk {
+            root: dir.clone(),
+            skip: current_file,
+        });
+    }
+    phases.push(SearchPhase::Walk {
+        root: search_root,
+        skip: sibling_dir,
+    });
+    phases
+}
+
 fn global_search(cx: &mut Context) {
     #[derive(Debug)]
     struct FileResult {
@@ -2476,7 +2519,6 @@ fn global_search(cx: &mut Context) {
         colon_style: Style,
         search_root: PathBuf,
         current_file: Option<PathBuf>,
-        sibling_dir: Option<PathBuf>,
     }
 
     /// Searches a single file — or its in-memory buffer if the file is open —
@@ -2521,11 +2563,6 @@ fn global_search(cx: &mut Context) {
     }
 
     let editor_config = cx.editor.config();
-    let current_file = doc!(cx.editor).path().cloned();
-    let sibling_dir = current_file
-        .as_ref()
-        .and_then(|p| p.parent())
-        .map(PathBuf::from);
     let config = GlobalSearchConfig {
         smart_case: editor_config.search.smart_case,
         file_picker_config: editor_config.file_picker.clone(),
@@ -2533,8 +2570,7 @@ fn global_search(cx: &mut Context) {
         number_style: cx.editor.theme.get("constant.numeric.integer"),
         colon_style: cx.editor.theme.get("punctuation"),
         search_root: helix_stdx::env::current_working_dir(),
-        current_file,
-        sibling_dir,
+        current_file: doc!(cx.editor).path().cloned(),
     };
 
     let columns = [
@@ -2594,7 +2630,6 @@ fn global_search(cx: &mut Context) {
         let dedup_symlinks = config.file_picker_config.deduplicate_links;
         let search_root = config.search_root.clone();
         let current_file = config.current_file.clone();
-        let sibling_dir = config.sibling_dir.clone();
 
         let injector = injector.clone();
         async move {
@@ -2606,16 +2641,6 @@ fn global_search(cx: &mut Context) {
             // Set once the picker's injector closes (query changed or picker
             // dismissed), so later phases can bail out instead of walking on.
             let stopped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-
-            // Phase 1: the current file, so nearby matches land at the top of
-            // the picker. Searched directly (bypassing ignore rules) so the file
-            // being edited is always covered, unsaved edits and all.
-            if let Some(file) = &current_file {
-                let mut searcher = searcher.clone();
-                if search_entry(file, &mut searcher, &matcher, &documents, &injector) {
-                    return Ok(());
-                }
-            }
 
             // Walks `walk_root` in parallel, optionally pruning `skip` — a path
             // already covered by an earlier phase — to avoid duplicate results.
@@ -2679,19 +2704,26 @@ fn global_search(cx: &mut Context) {
                     });
             };
 
-            // Phase 2: the current file's directory and its subdirectories (the
-            // "sibling location"), skipping the current file already searched in
-            // phase 1.
-            if let Some(dir) = &sibling_dir {
-                run_walk(dir.as_path(), current_file.as_deref());
-                if stopped.load(Ordering::Relaxed) {
-                    return Ok(());
+            // Search each phase in order — the current file (directly, so the
+            // edited buffer is always covered), then its directory, then the
+            // workspace root — so matches nearest the current file are injected,
+            // and therefore shown, first.
+            for phase in global_search_phases(current_file, search_root) {
+                match phase {
+                    SearchPhase::File(file) => {
+                        let mut searcher = searcher.clone();
+                        if search_entry(&file, &mut searcher, &matcher, &documents, &injector) {
+                            break;
+                        }
+                    }
+                    SearchPhase::Walk { root, skip } => {
+                        run_walk(root.as_path(), skip.as_deref());
+                        if stopped.load(Ordering::Relaxed) {
+                            break;
+                        }
+                    }
                 }
             }
-
-            // Phase 3: the rest of the repository, pruning the sibling directory
-            // subtree already covered by phase 2.
-            run_walk(search_root.as_path(), sibling_dir.as_deref());
 
             Ok(())
         }
@@ -7015,5 +7047,77 @@ fn lsp_or_syntax_workspace_symbol_picker(cx: &mut Context) {
         lsp::workspace_symbol_picker(cx);
     } else {
         syntax_workspace_symbol_picker(cx);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{global_search_phases, SearchPhase};
+    use std::path::PathBuf;
+
+    #[test]
+    fn global_search_phases_orders_current_file_then_directory_then_root() {
+        // Nested current file: search the file, then its directory, then the
+        // workspace root — each later phase pruning what an earlier one covered.
+        let phases = global_search_phases(
+            Some(PathBuf::from("/project/src/app/main.rs")),
+            PathBuf::from("/project"),
+        );
+
+        assert_eq!(
+            phases,
+            vec![
+                SearchPhase::File(PathBuf::from("/project/src/app/main.rs")),
+                SearchPhase::Walk {
+                    root: PathBuf::from("/project/src/app"),
+                    skip: Some(PathBuf::from("/project/src/app/main.rs")),
+                },
+                SearchPhase::Walk {
+                    root: PathBuf::from("/project"),
+                    skip: Some(PathBuf::from("/project/src/app")),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn global_search_phases_prune_current_directory_from_the_root_walk() {
+        // When the current file sits directly in the workspace root, the second
+        // phase already covers the root, so the third phase prunes the root and
+        // contributes nothing — no duplicate results.
+        let phases = global_search_phases(
+            Some(PathBuf::from("/project/main.rs")),
+            PathBuf::from("/project"),
+        );
+
+        assert_eq!(
+            phases,
+            vec![
+                SearchPhase::File(PathBuf::from("/project/main.rs")),
+                SearchPhase::Walk {
+                    root: PathBuf::from("/project"),
+                    skip: Some(PathBuf::from("/project/main.rs")),
+                },
+                SearchPhase::Walk {
+                    root: PathBuf::from("/project"),
+                    skip: Some(PathBuf::from("/project")),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn global_search_phases_without_current_file_walk_only_the_root() {
+        // A scratch buffer has no path, so the search degrades to a plain walk
+        // of the workspace root with nothing to prune.
+        let phases = global_search_phases(None, PathBuf::from("/project"));
+
+        assert_eq!(
+            phases,
+            vec![SearchPhase::Walk {
+                root: PathBuf::from("/project"),
+                skip: None,
+            }]
+        );
     }
 }

@@ -1791,6 +1791,39 @@ fn lsp_stop(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> any
     Ok(())
 }
 
+fn markdown_preview(
+    cx: &mut compositor::Context,
+    _args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+
+    let (view, doc) = current_ref!(cx.editor);
+    let view_id = view.id;
+    let doc_id = doc.id();
+    // Resolve relative links in the preview against the file's own directory.
+    let base_dir = doc
+        .path()
+        .and_then(|path| path.parent())
+        .map(|parent| parent.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+
+    let callback = async move {
+        let call: job::Callback = Callback::EditorCompositor(Box::new(
+            move |_editor: &mut Editor, compositor: &mut Compositor| {
+                let preview = ui::MarkdownPreview::new(view_id, doc_id, base_dir);
+                compositor.replace_or_push(ui::MarkdownPreview::ID, preview);
+            },
+        ));
+        Ok(call)
+    };
+    cx.jobs.callback(callback);
+
+    Ok(())
+}
+
 fn tree_sitter_scopes(
     cx: &mut compositor::Context,
     _args: Args,
@@ -3549,6 +3582,17 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         completer: CommandCompleter::all(completers::active_language_servers),
         signature: Signature {
             positionals: (0, None),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "markdown-preview",
+        aliases: &["md-preview", "mdp"],
+        doc: "Render the current buffer as markdown in a side panel for reading.",
+        fun: markdown_preview,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
             ..Signature::DEFAULT
         },
     },

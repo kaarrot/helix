@@ -14,10 +14,21 @@ use helix_core::{
     RopeSlice, Syntax,
 };
 use helix_view::{
-    graphics::{Margin, Rect, Style},
+    graphics::{Margin, Rect, Style, UnderlineStyle},
     theme::Modifier,
     Theme,
 };
+
+/// A markdown link/image destination anchored to a rendered line. Produced by
+/// [`Markdown::parse_with_map`] so the markdown preview can offer goto-file on
+/// the links written in the document.
+#[derive(Debug, Clone)]
+pub struct MarkdownLink {
+    /// Index into the rendered lines that this link's text appears on.
+    pub line: usize,
+    /// The link destination as written in the markdown (URL or path).
+    pub dest: String,
+}
 
 fn styled_multiline_text<'a>(text: &str, style: Style) -> Text<'a> {
     let spans: Vec<_> = text
@@ -150,6 +161,7 @@ impl Markdown {
     const TEXT_STYLE: &'static str = "ui.text";
     const BLOCK_STYLE: &'static str = "markup.raw.inline";
     const RULE_STYLE: &'static str = "punctuation.special";
+    const LINK_STYLE: &'static str = "markup.link.text";
     const UNNUMBERED_LIST_STYLE: &'static str = "markup.list.unnumbered";
     const NUMBERED_LIST_STYLE: &'static str = "markup.list.numbered";
     const HEADING_STYLES: [&'static str; 6] = [
@@ -170,21 +182,123 @@ impl Markdown {
     }
 
     pub fn parse(&self, theme: Option<&Theme>) -> tui::text::Text<'_> {
-        fn push_line<'a>(spans: &mut Vec<Span<'a>>, lines: &mut Vec<Spans<'a>>) {
+        self.parse_with_map(theme).0
+    }
+
+    /// Like [`Markdown::parse`], but also returns a per-rendered-line mapping
+    /// back to the source line it came from (`None` for inserted blank/separator
+    /// lines), plus the markdown links anchored to each rendered line. Used by
+    /// the markdown preview for click-to-source and goto-file.
+    pub fn parse_with_map(
+        &self,
+        theme: Option<&Theme>,
+    ) -> (tui::text::Text<'_>, Vec<Option<usize>>, Vec<MarkdownLink>) {
+        // Flush the accumulated spans as one finished line, recording its source
+        // line and any links anchored to it. ALL visible-line output must go
+        // through this (and blank-line output through `blank`) so `lines`,
+        // `line_map` and `links` stay in lockstep.
+        fn push_line<'a>(
+            spans: &mut Vec<Span<'a>>,
+            lines: &mut Vec<Spans<'a>>,
+            line_map: &mut Vec<Option<usize>>,
+            links: &mut Vec<MarkdownLink>,
+            cur_links: &mut Vec<String>,
+            src: Option<usize>,
+        ) {
             let spans = std::mem::take(spans);
             if !spans.is_empty() {
+                let idx = lines.len();
                 lines.push(Spans::from(spans));
+                line_map.push(src);
+                for dest in cur_links.drain(..) {
+                    links.push(MarkdownLink { line: idx, dest });
+                }
+            } else {
+                // No visible content to anchor links to; drop them.
+                cur_links.clear();
             }
         }
 
+        // Push an inserted blank/separator line with no corresponding source line.
+        fn blank<'a>(lines: &mut Vec<Spans<'a>>, line_map: &mut Vec<Option<usize>>) {
+            lines.push(Spans::default());
+            line_map.push(None);
+        }
+
+        // Render raw HTML (common in READMEs, e.g. `<div align="center">`,
+        // `<img ...>`, `<br>`) by stripping the tag markup rather than printing it
+        // verbatim. `<br>` becomes a line break; other tags are dropped but any
+        // text content between them is kept. HTML newlines are treated as
+        // whitespace so block tags don't introduce spurious blank lines.
+        #[allow(clippy::too_many_arguments)]
+        fn push_html<'a>(
+            html: &str,
+            style: Style,
+            spans: &mut Vec<Span<'a>>,
+            lines: &mut Vec<Spans<'a>>,
+            line_map: &mut Vec<Option<usize>>,
+            links: &mut Vec<MarkdownLink>,
+            cur_links: &mut Vec<String>,
+            src: Option<usize>,
+        ) {
+            let mut cur = String::new();
+            let mut chars = html.chars();
+            while let Some(c) = chars.next() {
+                match c {
+                    '<' => {
+                        let mut tag = String::new();
+                        for tc in chars.by_ref() {
+                            if tc == '>' {
+                                break;
+                            }
+                            tag.push(tc);
+                        }
+                        let name = tag.trim().trim_start_matches('/').to_ascii_lowercase();
+                        let is_br =
+                            name == "br" || name.starts_with("br ") || name.starts_with("br/");
+                        if is_br {
+                            if !cur.is_empty() {
+                                spans.push(Span::styled(std::mem::take(&mut cur), style));
+                            }
+                            push_line(spans, lines, line_map, links, cur_links, src);
+                        }
+                    }
+                    '\n' | '\r' => {}
+                    _ => cur.push(c),
+                }
+            }
+            if !cur.is_empty() {
+                spans.push(Span::styled(cur, style));
+            }
+        }
+
+        // Byte offset -> 0-based source line, via line-start offsets.
+        let mut line_starts = vec![0usize];
+        for (i, b) in self.contents.bytes().enumerate() {
+            if b == b'\n' {
+                line_starts.push(i + 1);
+            }
+        }
+        let byte_to_line =
+            |b: usize| line_starts.partition_point(|&start| start <= b).saturating_sub(1);
+
         let mut options = Options::empty();
         options.insert(Options::ENABLE_STRIKETHROUGH);
-        let parser = Parser::new_ext(&self.contents, options);
+        // `into_offset_iter` yields the source byte range alongside each event so
+        // we can map rendered lines back to source lines.
+        let parser = Parser::new_ext(&self.contents, options).into_offset_iter();
 
         // TODO: if possible, render links as terminal hyperlinks: https://gist.github.com/egmontkob/eb114294efbcd5adb1944c9f3cb5feda
         let mut tags = Vec::new();
         let mut spans = Vec::new();
         let mut lines = Vec::new();
+        let mut line_map: Vec<Option<usize>> = Vec::new();
+        let mut links: Vec<MarkdownLink> = Vec::new();
+        // Link destinations seen on the line currently being accumulated; flushed
+        // into `links` by `push_line` once the line is finalized.
+        let mut cur_links: Vec<String> = Vec::new();
+        // Source line of the content currently being accumulated into `spans`.
+        let mut src: Option<usize> = None;
         let mut list_stack = Vec::new();
 
         let get_indent = |level: usize| {
@@ -201,6 +315,7 @@ impl Markdown {
         let numbered_list_style = get_theme(Self::NUMBERED_LIST_STYLE);
         let unnumbered_list_style = get_theme(Self::UNNUMBERED_LIST_STYLE);
         let rule_style = get_theme(Self::RULE_STYLE);
+        let link_style = get_theme(Self::LINK_STYLE);
         let heading_styles: Vec<Style> = Self::HEADING_STYLES
             .iter()
             .map(|key| get_theme(key))
@@ -208,7 +323,7 @@ impl Markdown {
 
         // Transform text in `<code>` blocks into `Event::Code`
         let mut in_code = false;
-        let parser = parser.filter_map(|event| match event {
+        let parser = parser.filter_map(|(event, range)| match event {
             Event::Html(tag)
                 if tag.starts_with("<code") && matches!(tag.chars().nth(5), Some(' ' | '>')) =>
             {
@@ -219,17 +334,31 @@ impl Markdown {
                 in_code = false;
                 None
             }
-            Event::Text(text) if in_code => Some(Event::Code(text)),
-            _ => Some(event),
+            Event::Text(text) if in_code => Some((Event::Code(text), range)),
+            _ => Some((event, range)),
         });
 
-        for event in parser {
+        for (event, range) in parser {
+            // Track the source line of whatever content we're about to emit.
+            match &event {
+                Event::Start(_) | Event::Text(_) | Event::Code(_) => {
+                    src = Some(byte_to_line(range.start));
+                }
+                _ => {}
+            }
             match event {
                 Event::Start(Tag::List(list)) => {
                     // if the list stack is not empty this is a sub list, in that
                     // case we need to push the current line before proceeding
                     if !list_stack.is_empty() {
-                        push_line(&mut spans, &mut lines);
+                        push_line(
+                            &mut spans,
+                            &mut lines,
+                            &mut line_map,
+                            &mut links,
+                            &mut cur_links,
+                            src,
+                        );
                     }
 
                     list_stack.push(list);
@@ -239,7 +368,7 @@ impl Markdown {
 
                     // whenever top-level list closes, empty line
                     if list_stack.is_empty() {
-                        lines.push(Spans::default());
+                        blank(&mut lines, &mut line_map);
                     }
                 }
                 Event::Start(Tag::Item) => {
@@ -266,6 +395,12 @@ impl Markdown {
                     spans.push(Span::styled(prefix, bullet_style));
                 }
                 Event::Start(tag) => {
+                    // Capture link/image destinations so the preview can offer
+                    // goto-file on them. The link text itself flows through the
+                    // normal `Event::Text` path below.
+                    if let Tag::Link { dest_url, .. } | Tag::Image { dest_url, .. } = &tag {
+                        cur_links.push(dest_url.to_string());
+                    }
                     tags.push(tag);
                     if spans.is_empty() && !list_stack.is_empty() {
                         // TODO: could push indent + 2 or 3 spaces to align with
@@ -280,7 +415,14 @@ impl Markdown {
                         | TagEnd::Paragraph
                         | TagEnd::CodeBlock
                         | TagEnd::Item => {
-                            push_line(&mut spans, &mut lines);
+                            push_line(
+                                &mut spans,
+                                &mut lines,
+                                &mut line_map,
+                                &mut links,
+                                &mut cur_links,
+                                src,
+                            );
                         }
                         _ => (),
                     }
@@ -288,7 +430,7 @@ impl Markdown {
                     // whenever heading, code block or paragraph closes, empty line
                     match tag {
                         TagEnd::Heading(_) | TagEnd::Paragraph | TagEnd::CodeBlock => {
-                            lines.push(Spans::default());
+                            blank(&mut lines, &mut line_map);
                         }
                         _ => (),
                     }
@@ -306,9 +448,15 @@ impl Markdown {
                             &self.config_loader.load(),
                             None,
                         );
-                        lines.extend(tui_text.lines.into_iter());
+                        // The fenced block's text spans consecutive source lines,
+                        // one per highlighted output line.
+                        let start_line = byte_to_line(range.start);
+                        for (i, line) in tui_text.lines.into_iter().enumerate() {
+                            lines.push(line);
+                            line_map.push(Some(start_line + i));
+                        }
                     } else {
-                        let style = match tags.last() {
+                        let mut style = match tags.last() {
                             Some(Tag::Heading { level, .. }) => match level {
                                 HeadingLevel::H1 => heading_styles[0],
                                 HeadingLevel::H2 => heading_styles[1],
@@ -324,14 +472,43 @@ impl Markdown {
                             }
                             _ => text_style,
                         };
+                        // Make link/image text visibly clickable: apply the theme
+                        // link color (if any) and always underline, even when the
+                        // link text also carries emphasis/strong.
+                        if tags
+                            .iter()
+                            .any(|tag| matches!(tag, Tag::Link { .. } | Tag::Image { .. }))
+                        {
+                            style = style.patch(link_style);
+                            style.underline_style = Some(UnderlineStyle::Line);
+                        }
                         spans.push(Span::styled(text, style));
                     }
                 }
-                Event::Code(text) | Event::Html(text) => {
+                Event::Code(text) => {
                     spans.push(Span::styled(text, code_style));
                 }
+                Event::Html(text) | Event::InlineHtml(text) => {
+                    push_html(
+                        &text,
+                        text_style,
+                        &mut spans,
+                        &mut lines,
+                        &mut line_map,
+                        &mut links,
+                        &mut cur_links,
+                        src,
+                    );
+                }
                 Event::SoftBreak | Event::HardBreak => {
-                    push_line(&mut spans, &mut lines);
+                    push_line(
+                        &mut spans,
+                        &mut lines,
+                        &mut line_map,
+                        &mut links,
+                        &mut cur_links,
+                        src,
+                    );
                     if !list_stack.is_empty() {
                         // TODO: could push indent + 2 or 3 spaces to align with
                         // the rest of the list.
@@ -340,7 +517,8 @@ impl Markdown {
                 }
                 Event::Rule => {
                     lines.push(Spans::from(Span::styled("───", rule_style)));
-                    lines.push(Spans::default());
+                    line_map.push(None);
+                    blank(&mut lines, &mut line_map);
                 }
                 // TaskListMarker(bool) true if checked
                 _ => {
@@ -350,18 +528,24 @@ impl Markdown {
             // build up a vec of Paragraph tui widgets
         }
 
-        if !spans.is_empty() {
-            lines.push(Spans::from(spans));
-        }
+        push_line(
+            &mut spans,
+            &mut lines,
+            &mut line_map,
+            &mut links,
+            &mut cur_links,
+            src,
+        );
 
         // if last line is empty, remove it
         if let Some(line) = lines.last() {
             if line.0.is_empty() {
                 lines.pop();
+                line_map.pop();
             }
         }
 
-        Text::from(lines)
+        (Text::from(lines), line_map, links)
     }
 }
 

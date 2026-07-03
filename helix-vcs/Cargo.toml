@@ -17,7 +17,11 @@ tokio = { version = "1", features = ["rt", "rt-multi-thread", "time", "sync", "p
 parking_lot.workspace = true
 arc-swap = { version = "1.7.1" }
 
-gix = { version = "0.74.1", features = ["attributes", "status"], default-features = false, optional = true }
+# "parallel" matters for the changed-file scan twice over: without it gix's
+# status iterator buffers every item and yields them only when the whole scan
+# finishes (its non-parallel path collects into a Vec), and the worktree
+# modification checks all run on one thread.
+gix = { version = "0.74.1", features = ["attributes", "status", "parallel"], default-features = false, optional = true }
 imara-diff =  "0.2.0"
 anyhow = "1"
 

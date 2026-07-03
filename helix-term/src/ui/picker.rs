@@ -422,7 +422,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
     /// stay on screen until the replacements are matched, so there's no flash
     /// of an empty list. Used to reconcile an instantly-shown cached listing
     /// with a freshly recomputed one.
-    pub fn replace_options(&mut self, options: Vec<T>) {
+    pub fn replace_options(&mut self, options: impl IntoIterator<Item = T>) {
         // Bump the shared version so any outstanding `Injector`s stop pushing.
         self.version.fetch_add(1, atomic::Ordering::Relaxed);
         // Drop the matched items but keep the current snapshot visible until

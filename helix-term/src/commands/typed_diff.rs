@@ -328,27 +328,37 @@ pub(crate) fn diff_files(
 
         // The picker isn't `Send`, and a typed command has no direct compositor,
         // so build and push it on the main thread via a compositor callback.
-        let build_cwd = cwd.clone();
-        let build_base = base_ref.clone();
-        let build_target = target_ref.clone();
-        let build_seed = seed.clone();
+        // The background refresh is spawned from the same callback, after the
+        // picker is on the compositor stack, so even an instant scan can't
+        // finish before the picker it reconciles exists.
         cx.jobs.callback(async move {
             Ok(job::Callback::EditorCompositor(Box::new(
                 move |editor: &mut Editor, compositor: &mut Compositor| {
-                    let component = diff::changed_file_picker_component(
+                    let (component, injector) = diff::changed_file_picker_component(
                         editor,
-                        build_cwd,
-                        build_base,
-                        build_target,
-                        build_seed,
+                        cwd.clone(),
+                        base_ref.clone(),
+                        target_ref.clone(),
+                        seed.clone(),
                     );
                     compositor.push(component);
+
+                    #[cfg(not(feature = "integration"))]
+                    diff::spawn_changed_file_refresh(
+                        cwd,
+                        base_ref,
+                        target_ref,
+                        seed.clone(),
+                        request,
+                        // Stream into the empty picker on a cache miss;
+                        // reconcile the visible cached listing on a hit.
+                        seed.is_empty().then_some(injector),
+                    );
+                    #[cfg(feature = "integration")]
+                    let _ = injector;
                 },
             )))
         });
-
-        #[cfg(not(feature = "integration"))]
-        diff::spawn_changed_file_refresh(cx.jobs, cwd, base_ref, target_ref, seed, request);
 
         Ok(())
     }

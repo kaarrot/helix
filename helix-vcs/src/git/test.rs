@@ -215,7 +215,11 @@ fn for_each_changed_file_reports_untracked_files() {
 }
 
 #[test]
-fn for_each_changed_file_reports_renames() {
+fn for_each_changed_file_reports_renames_as_untracked_plus_deleted() {
+    // Rename detection is disabled in the status walk (it reads and hashes
+    // every untracked file, which dominates scan time on large repos), so a
+    // renamed file surfaces as an untracked/deleted pair rather than a single
+    // `FileChange::Renamed` entry.
     let repo = empty_git_repo();
     write_repo_file(repo.path(), "old-name.txt", "same content\n");
     create_commit(repo.path(), true);
@@ -235,11 +239,10 @@ fn for_each_changed_file_reports_renames() {
 
     let changes = changes.into_inner();
     assert!(changes.iter().any(|change| {
-        matches!(
-            change,
-            FileChange::Renamed { from_path, to_path }
-                if from_path.ends_with("old-name.txt") && to_path.ends_with("new-name.txt")
-        )
+        matches!(change, FileChange::Untracked { path } if path.ends_with("new-name.txt"))
+    }));
+    assert!(changes.iter().any(|change| {
+        matches!(change, FileChange::Deleted { path } if path.ends_with("old-name.txt"))
     }));
 }
 

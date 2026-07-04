@@ -18,15 +18,17 @@ use url::Url;
 
 use tui::{
     buffer::Buffer as Surface,
-    widgets::{Block, Paragraph, Widget},
+    widgets::{Block, Paragraph, Widget, Wrap},
 };
 
 /// Rendered lines scrolled per mouse-wheel notch.
 const WHEEL_LINES: usize = 3;
 
-/// A read-only side panel that renders a markdown document as styled text next
-/// to the source buffer, and follows it: keep navigating the source normally
-/// and the preview scrolls to keep the source cursor's region in view.
+/// A read-only full-screen overlay that renders a markdown document as styled
+/// text on top of the editor, and follows the (hidden) source buffer: keep
+/// navigating the source normally and the preview scrolls to keep the source
+/// cursor's region in view. Fills the whole screen so it's usable on small
+/// terminals where a side-by-side split would be too cramped.
 ///
 /// - Navigate the source (it stays focused) -> the preview follows.
 /// - Click a rendered line -> jump the source cursor to the matching source
@@ -225,16 +227,23 @@ impl Component for MarkdownPreview {
     }
 
     fn render(&mut self, area: Rect, surface: &mut Surface, cx: &mut Context) {
-        // Occupy the right half of the screen; the editor renders underneath and
-        // shows through on the left.
-        let panel_width = (area.width / 2).max(1);
-        let panel = Rect::new(area.right() - panel_width, area.y, panel_width, area.height);
+        // Fullscreen: cover the whole editor. Small screens don't have room for a
+        // useful side-by-side split, so the preview replaces the source view while
+        // it's up.
+        let panel = area;
 
-        // Re-read the source document each frame so the preview stays live.
-        let contents = cx
+        // Re-read the source document each frame so the preview stays live. Also
+        // pick up the source doc's soft-wrap setting so the preview honors it —
+        // long paragraphs in narrow terminals wrap instead of getting truncated.
+        let (contents, soft_wrap) = cx
             .editor
             .document(self.source_doc)
-            .map(|doc| doc.text().to_string())
+            .map(|doc| {
+                (
+                    doc.text().to_string(),
+                    doc.text_format(panel.width, Some(&cx.editor.theme)).soft_wrap,
+                )
+            })
             .unwrap_or_default();
         let markdown = Markdown::new(contents, cx.editor.syn_loader.clone());
         let (text, line_map, links) = markdown.parse_with_map(Some(&cx.editor.theme));
@@ -267,9 +276,19 @@ impl Component for MarkdownPreview {
         self.scroll = self.scroll.min(max_scroll);
         self.cursor_line = self.cursor_line.min(self.total_lines.saturating_sub(1));
 
-        // v1 renders without wrapping so a clicked screen row maps directly to a
-        // rendered line (screen_row = rendered_line - scroll).
-        let paragraph = Paragraph::new(&text).scroll((self.scroll as u16, 0));
+        // When soft-wrap is off, one rendered line == one screen row, so a clicked
+        // row maps directly to a rendered line (`screen_row = rendered_line -
+        // scroll`) and the cursor-line highlight lands exactly.
+        //
+        // When soft-wrap is on, Paragraph interprets `scroll.0` as an output-row
+        // offset (post-wrap) while we still track scroll/cursor in rendered-line
+        // units — click and highlight positions can drift by the number of wrap
+        // segments above them. That's an accepted tradeoff for readable output on
+        // narrow terminals; wrap-aware mapping can come later if needed.
+        let mut paragraph = Paragraph::new(&text).scroll((self.scroll as u16, 0));
+        if soft_wrap {
+            paragraph = paragraph.wrap(Wrap { trim: false });
+        }
         paragraph.render(inner, surface);
 
         // Highlight the active line.

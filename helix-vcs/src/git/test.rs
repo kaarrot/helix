@@ -215,7 +215,11 @@ fn for_each_changed_file_reports_untracked_files() {
 }
 
 #[test]
-fn for_each_changed_file_reports_renames() {
+fn for_each_changed_file_reports_renames_as_untracked_plus_deleted() {
+    // Rename detection is disabled in the status walk (it reads and hashes
+    // every untracked file, which dominates scan time on large repos), so a
+    // renamed file surfaces as an untracked/deleted pair rather than a single
+    // `FileChange::Renamed` entry.
     let repo = empty_git_repo();
     write_repo_file(repo.path(), "old-name.txt", "same content\n");
     create_commit(repo.path(), true);
@@ -235,12 +239,39 @@ fn for_each_changed_file_reports_renames() {
 
     let changes = changes.into_inner();
     assert!(changes.iter().any(|change| {
-        matches!(
-            change,
-            FileChange::Renamed { from_path, to_path }
-                if from_path.ends_with("old-name.txt") && to_path.ends_with("new-name.txt")
-        )
+        matches!(change, FileChange::Untracked { path } if path.ends_with("new-name.txt"))
     }));
+    assert!(changes.iter().any(|change| {
+        matches!(change, FileChange::Deleted { path } if path.ends_with("old-name.txt"))
+    }));
+}
+
+#[test]
+fn for_each_untracked_file_matches_git_semantics() {
+    let repo = empty_git_repo();
+    write_repo_file(repo.path(), "tracked.txt", "tracked\n");
+    write_repo_file(repo.path(), "ignored-dir/.gitignore", "*.log\n");
+    create_commit(repo.path(), true);
+
+    // A genuinely untracked file, plus an ignored one that must NOT appear.
+    write_repo_file(repo.path(), "untracked.txt", "new\n");
+    write_repo_file(repo.path(), "nested/also-new.txt", "new\n");
+    write_repo_file(repo.path(), "ignored-dir/debug.log", "noise\n");
+
+    let found = std::sync::Mutex::new(Vec::new());
+    git::for_each_untracked_file(repo.path(), |change| {
+        if let FileChange::Untracked { path } = change {
+            found.lock().unwrap().push(path);
+        }
+    })
+    .unwrap();
+
+    let found = found.into_inner().unwrap();
+    let has = |name: &str| found.iter().any(|p| p.ends_with(name));
+    assert!(has("untracked.txt"), "expected untracked.txt: {found:?}");
+    assert!(has("nested/also-new.txt"), "expected nested file: {found:?}");
+    assert!(!has("tracked.txt"), "tracked file must not appear");
+    assert!(!has("debug.log"), "ignored file must not appear");
 }
 
 #[test]

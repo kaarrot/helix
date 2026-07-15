@@ -3,7 +3,7 @@ use crate::{
     DocumentId, ViewId,
 };
 use helix_vcs::FileChange;
-use std::{collections::HashMap, path::PathBuf};
+use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
 /// All diff/merge runtime state aggregated into one Editor field.
 #[derive(Debug, Default)]
@@ -32,7 +32,10 @@ pub struct DiffSession {
 pub struct ChangedFileCache {
     pub base_ref: String,
     pub target_ref: Option<String>,
-    pub files: Vec<FileChange>,
+    /// Shared, not `Vec`: the listing is handed out as a picker seed (twice on
+    /// the `:diff-files` path) and stored back on every refresh, so a plain
+    /// `Vec` would deep-clone every `PathBuf` at each of those points.
+    pub files: Arc<[FileChange]>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

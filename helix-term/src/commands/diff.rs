@@ -21,6 +21,11 @@ pub struct FileChangeData {
 /// Collect the full changed-file listing for a diff range into a `Vec`.
 /// This is the expensive part (a tree diff and/or a working-tree scan), so it
 /// is run off the main thread by `changed_file_picker`.
+///
+/// Tracked changes and untracked files are gathered separately: tracked changes
+/// come from gix (fast index<->worktree pass), untracked files from a parallel
+/// walker. [`spawn_changed_file_refresh`] uses the same two-phase split to
+/// stream tracked changes into the picker before the untracked walk finishes.
 #[cfg(feature = "git")]
 fn collect_changed_files(
     cwd: &std::path::Path,
@@ -28,26 +33,39 @@ fn collect_changed_files(
     target_ref: Option<&str>,
 ) -> Vec<FileChange> {
     use helix_vcs::git;
-    // `for_each_changed_file_between_refs` takes an `Fn`, so accumulate through
-    // a `RefCell` rather than capturing the `Vec` mutably.
+    // The callbacks take an `Fn`, so accumulate through interior mutability
+    // rather than capturing the `Vec` mutably.
     let files = std::cell::RefCell::new(Vec::new());
-    let _ = git::for_each_changed_file_between_refs(cwd, base_ref, target_ref, |change| {
+    let _ = git::for_each_tracked_change(cwd, base_ref, target_ref, |change| {
         if let Ok(change) = change {
             files.borrow_mut().push(change);
         }
         true
     });
     let mut files = files.into_inner();
-    // gix emits untracked entries interleaved with tracked changes, and the
-    // picker shows items in insertion order for an empty query. Sort so the
-    // tracked changes the user is usually after (conflicts, modifications,
-    // renames, deletions) sit above the untracked noise, then by path.
+    // Untracked files only exist when comparing against the working tree.
+    if target_ref.is_none() {
+        let untracked = std::sync::Mutex::new(Vec::new());
+        let _ = git::for_each_untracked_file(cwd, |change| {
+            untracked.lock().unwrap().push(change);
+        });
+        files.extend(untracked.into_inner().unwrap());
+    }
+    sort_changes(&mut files);
+    files
+}
+
+/// Sort a changed-file listing so the tracked changes the user is usually after
+/// (conflicts, modifications, renames, deletions) sit above the untracked
+/// noise, then by path. The picker shows items in insertion order for an empty
+/// query, so this ordering is what the user sees on open.
+#[cfg(feature = "git")]
+fn sort_changes(files: &mut [FileChange]) {
     files.sort_by(|a, b| {
         change_sort_rank(a)
             .cmp(&change_sort_rank(b))
             .then_with(|| a.path().cmp(b.path()))
     });
-    files
 }
 
 /// Ordering key for the changed-file picker: tracked changes before untracked.
@@ -73,11 +91,11 @@ pub(crate) fn changed_file_seed(
     cwd: &std::path::Path,
     base_ref: &str,
     target_ref: Option<&str>,
-) -> Vec<FileChange> {
+) -> std::sync::Arc<[FileChange]> {
     #[cfg(feature = "integration")]
     {
         let _ = editor;
-        collect_changed_files(cwd, base_ref, target_ref)
+        collect_changed_files(cwd, base_ref, target_ref).into()
     }
     #[cfg(not(feature = "integration"))]
     {
@@ -96,14 +114,21 @@ pub(crate) fn changed_file_seed(
 /// by `space g` (`changed_file_picker`) and `:diff-files` so the two stay a
 /// single implementation. Must run on the main thread: it reads the theme and
 /// the current file, and the picker it returns is not `Send`.
+///
+/// Also returns the picker's injector so that on a cache miss (empty seed) the
+/// background scan can stream files in as they are discovered, instead of the
+/// picker staying empty until the whole scan finishes.
 #[cfg(feature = "git")]
 pub(crate) fn changed_file_picker_component(
     editor: &mut Editor,
     cwd: PathBuf,
     base_ref: String,
     target_ref: Option<String>,
-    seed: Vec<FileChange>,
-) -> Box<dyn Component> {
+    seed: std::sync::Arc<[FileChange]>,
+) -> (
+    Box<dyn Component>,
+    crate::ui::picker::Injector<FileChange, FileChangeData>,
+) {
     let current_file_path = {
         let (_, doc) = current_ref!(editor);
         doc.path().map(|p| p.to_path_buf())
@@ -149,7 +174,7 @@ pub(crate) fn changed_file_picker_component(
     let picker = Picker::new(
         columns,
         1, // path
-        seed,
+        seed.iter().cloned(),
         FileChangeData {
             cwd,
             style_untracked: added,
@@ -186,55 +211,99 @@ pub(crate) fn changed_file_picker_component(
             .map_or(false, |p| file_change.path() == p)
     });
 
-    Box::new(overlaid(picker))
+    let injector = picker.injector();
+    (Box::new(overlaid(picker)), injector)
 }
 
-/// Recompute the changed-file listing off the main thread, then on the main
-/// thread refresh the cache and — if the listing actually changed and this is
-/// still the most recent picker — swap the open picker's contents in place.
+/// Recompute the changed-file listing on a background thread, then on the main
+/// thread refresh the cache and reconcile the open picker.
+///
+/// `injector` selects how the picker learns about the fresh listing:
+/// - `Some` (cache miss — the picker opened empty): tracked changes are scanned
+///   first and streamed in immediately (the fast index<->worktree pass), then
+///   untracked files are enumerated with the parallel walker and streamed in
+///   below them. So a modified file shows in milliseconds even when the
+///   untracked walk takes seconds. Pushes are best-effort; the scan runs to
+///   completion regardless so the cache is filled for the next open.
+/// - `None` (cache hit — the cached listing is already on screen): the fresh
+///   listing is swapped in only at the end, and only if it actually differs,
+///   keeping the user's query and selection stable while they filter.
 #[cfg(all(feature = "git", not(feature = "integration")))]
 pub(crate) fn spawn_changed_file_refresh(
-    jobs: &mut Jobs,
     cwd: PathBuf,
     base_ref: String,
     target_ref: Option<String>,
-    seed: Vec<FileChange>,
+    seed: std::sync::Arc<[FileChange]>,
     request: u64,
+    injector: Option<crate::ui::picker::Injector<FileChange, FileChangeData>>,
 ) {
-    jobs.callback(async move {
-        let fresh = {
-            let base = base_ref.clone();
-            let target = target_ref.clone();
-            tokio::task::spawn_blocking(move || {
-                collect_changed_files(&cwd, &base, target.as_deref())
-            })
-            .await?
+    std::thread::spawn(move || {
+        let streamed = injector.is_some();
+        let fresh: std::sync::Arc<[FileChange]> = match injector {
+            Some(injector) => {
+                use helix_vcs::git;
+                // Phase 1: tracked changes — fast, streamed in as discovered.
+                let files = std::cell::RefCell::new(Vec::new());
+                let _ = git::for_each_tracked_change(
+                    &cwd,
+                    &base_ref,
+                    target_ref.as_deref(),
+                    |change| {
+                        if let Ok(change) = change {
+                            let _ = injector.push(change.clone());
+                            files.borrow_mut().push(change);
+                        }
+                        true
+                    },
+                );
+                let mut files = files.into_inner();
+                // Phase 2: untracked files (working-tree comparisons only),
+                // enumerated in parallel, then sorted by path and streamed in
+                // below the tracked changes.
+                if target_ref.is_none() {
+                    let untracked = std::sync::Mutex::new(Vec::new());
+                    let _ = git::for_each_untracked_file(&cwd, |change| {
+                        untracked.lock().unwrap().push(change);
+                    });
+                    let mut untracked = untracked.into_inner().unwrap();
+                    untracked.sort_by(|a, b| a.path().cmp(b.path()));
+                    for change in &untracked {
+                        let _ = injector.push(change.clone());
+                    }
+                    files.append(&mut untracked);
+                }
+                sort_changes(&mut files);
+                files.into()
+            }
+            None => collect_changed_files(&cwd, &base_ref, target_ref.as_deref()).into(),
         };
 
-        Ok(job::Callback::EditorCompositor(Box::new(
-            move |editor: &mut Editor, compositor: &mut Compositor| {
-                editor.diff.changed_file_cache = Some(helix_view::diff_view::ChangedFileCache {
-                    base_ref,
-                    target_ref,
-                    files: fresh.clone(),
-                });
+        job::dispatch_blocking(move |editor, compositor| {
+            editor.diff.changed_file_cache = Some(helix_view::diff_view::ChangedFileCache {
+                base_ref,
+                target_ref,
+                files: fresh.clone(),
+            });
 
-                // A newer picker has opened since; don't disturb it.
-                if editor.diff.changed_file_request != request {
-                    return;
-                }
-                // Nothing changed since the cached seed; leave the picker (and
-                // the user's selection/query) untouched.
-                if fresh == seed {
-                    return;
-                }
-                if let Some(overlay) = compositor
-                    .find::<crate::ui::overlay::Overlay<Picker<FileChange, FileChangeData>>>()
-                {
-                    overlay.content.replace_options(fresh);
-                }
-            },
-        )))
+            // Streamed results are already in the picker.
+            if streamed {
+                return;
+            }
+            // A newer picker has opened since; don't disturb it.
+            if editor.diff.changed_file_request != request {
+                return;
+            }
+            // Nothing changed since the cached seed; leave the picker (and the
+            // user's selection/query) untouched.
+            if fresh == seed {
+                return;
+            }
+            if let Some(overlay) = compositor
+                .find::<crate::ui::overlay::Overlay<Picker<FileChange, FileChangeData>>>()
+            {
+                overlay.content.replace_options(fresh.iter().cloned());
+            }
+        });
     });
 }
 
@@ -269,27 +338,29 @@ pub fn changed_file_picker(cx: &mut Context) {
         let request = cx.editor.diff.changed_file_request;
 
         let seed = changed_file_seed(cx.editor, &cwd, &base_ref, target_ref.as_deref());
-        #[cfg(not(feature = "integration"))]
-        let seed_for_refresh = seed.clone();
 
-        let component = changed_file_picker_component(
+        let (component, injector) = changed_file_picker_component(
             cx.editor,
             cwd.clone(),
             base_ref.clone(),
             target_ref.clone(),
-            seed,
+            seed.clone(),
         );
         cx.push_layer(component);
 
         #[cfg(not(feature = "integration"))]
         spawn_changed_file_refresh(
-            cx.jobs,
             cwd,
             base_ref,
             target_ref,
-            seed_for_refresh,
+            seed.clone(),
             request,
+            // Stream into the empty picker on a cache miss; reconcile the
+            // already-visible cached listing silently on a hit.
+            seed.is_empty().then_some(injector),
         );
+        #[cfg(feature = "integration")]
+        let _ = injector;
     }
 }
 

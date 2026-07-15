@@ -247,6 +247,34 @@ fn for_each_changed_file_reports_renames_as_untracked_plus_deleted() {
 }
 
 #[test]
+fn for_each_untracked_file_matches_git_semantics() {
+    let repo = empty_git_repo();
+    write_repo_file(repo.path(), "tracked.txt", "tracked\n");
+    write_repo_file(repo.path(), "ignored-dir/.gitignore", "*.log\n");
+    create_commit(repo.path(), true);
+
+    // A genuinely untracked file, plus an ignored one that must NOT appear.
+    write_repo_file(repo.path(), "untracked.txt", "new\n");
+    write_repo_file(repo.path(), "nested/also-new.txt", "new\n");
+    write_repo_file(repo.path(), "ignored-dir/debug.log", "noise\n");
+
+    let found = std::sync::Mutex::new(Vec::new());
+    git::for_each_untracked_file(repo.path(), |change| {
+        if let FileChange::Untracked { path } = change {
+            found.lock().unwrap().push(path);
+        }
+    })
+    .unwrap();
+
+    let found = found.into_inner().unwrap();
+    let has = |name: &str| found.iter().any(|p| p.ends_with(name));
+    assert!(has("untracked.txt"), "expected untracked.txt: {found:?}");
+    assert!(has("nested/also-new.txt"), "expected nested file: {found:?}");
+    assert!(!has("tracked.txt"), "tracked file must not appear");
+    assert!(!has("debug.log"), "ignored file must not appear");
+}
+
+#[test]
 fn for_each_changed_file_reports_conflicts_and_gets_merge_versions() {
     let repo = empty_git_repo();
     write_repo_file(repo.path(), "conflict.txt", "base\n");

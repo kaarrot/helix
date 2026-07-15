@@ -177,17 +177,45 @@ pub fn get_merge_versions(file: &Path) -> Result<(Vec<u8>, Vec<u8>)> {
 }
 
 pub fn for_each_changed_file(cwd: &Path, f: impl Fn(Result<FileChange>) -> bool) -> Result<()> {
-    status(&open_repo(cwd)?.to_thread_local(), f)
+    status(&open_repo(cwd)?.to_thread_local(), UntrackedFiles::Files, f)
 }
 
 /// Iterate over changed files between a git ref and the working tree, or between two refs.
 ///
 /// - `target_ref = None`: compare `base_ref` vs working tree (all changes since that ref)
 /// - `target_ref = Some(t)`: compare `base_ref` vs `t` (two-commit tree diff)
+///
+/// Untracked files are included (via gix's dirwalk). For the changed-file
+/// picker, prefer [`for_each_tracked_change`] + [`for_each_untracked_file`],
+/// which split the work so tracked changes appear instantly and untracked files
+/// are enumerated with a faster parallel walker.
 pub fn for_each_changed_file_between_refs(
     cwd: &Path,
     base_ref: &str,
     target_ref: Option<&str>,
+    f: impl Fn(Result<FileChange>) -> bool,
+) -> Result<()> {
+    for_each_change_impl(cwd, base_ref, target_ref, UntrackedFiles::Files, f)
+}
+
+/// Like [`for_each_changed_file_between_refs`] but reports only *tracked*
+/// changes (modified / deleted / conflicted), never untracked files. gix does
+/// no directory walk, so against the working tree this is just the fast
+/// index<->worktree modification pass.
+pub fn for_each_tracked_change(
+    cwd: &Path,
+    base_ref: &str,
+    target_ref: Option<&str>,
+    f: impl Fn(Result<FileChange>) -> bool,
+) -> Result<()> {
+    for_each_change_impl(cwd, base_ref, target_ref, UntrackedFiles::None, f)
+}
+
+fn for_each_change_impl(
+    cwd: &Path,
+    base_ref: &str,
+    target_ref: Option<&str>,
+    untracked: UntrackedFiles,
     f: impl Fn(Result<FileChange>) -> bool,
 ) -> Result<()> {
     let repo = open_repo(cwd)?.to_thread_local();
@@ -198,7 +226,7 @@ pub fn for_each_changed_file_between_refs(
             let head_commit = repo.head_commit()?;
 
             if base_commit.id == head_commit.id {
-                return status(&repo, f);
+                return status(&repo, untracked, f);
             }
 
             let work_dir = repo
@@ -249,7 +277,7 @@ pub fn for_each_changed_file_between_refs(
             )?;
 
             if !cancelled {
-                status(&repo, |change| match &change {
+                status(&repo, untracked, |change| match &change {
                     Ok(fc) if seen.contains(fc.path()) => true,
                     _ => f(change),
                 })?;
@@ -302,6 +330,60 @@ pub fn for_each_changed_file_between_refs(
             )?;
         }
     }
+
+    Ok(())
+}
+
+/// Enumerate untracked files in the working tree, invoking `f` for each.
+///
+/// This replaces gix's single-threaded status dirwalk with the parallel
+/// `ignore` walker: `f` is called concurrently from multiple threads (hence the
+/// `Sync` bound), which hides per-entry I/O latency on network filesystems. A
+/// file is untracked when it exists on disk, is not excluded by any git ignore
+/// source, and is not present in the index. Matches `git status -uall` (each
+/// untracked symlink is reported as an entry, like git).
+pub fn for_each_untracked_file(cwd: &Path, f: impl Fn(FileChange) + Sync) -> Result<()> {
+    let repo = open_repo(cwd)?.to_thread_local();
+    let work_dir = repo
+        .workdir()
+        .ok_or_else(|| anyhow::anyhow!("working tree not found"))?
+        .to_path_buf();
+
+    // Absolute paths of every entry in the index — everything git already
+    // tracks (including staged-but-uncommitted files, which are not untracked).
+    let index = repo.index_or_empty()?;
+    let tracked: std::collections::HashSet<PathBuf> = index
+        .entries()
+        .iter()
+        .map(|entry| work_dir.join(gix::path::from_bstr(entry.path(&index))))
+        .collect();
+
+    let walker = ignore::WalkBuilder::new(&work_dir)
+        .hidden(false) // git scans dotfiles; `.git` is pruned below
+        .parents(true)
+        .ignore(false) // honor only git ignore sources, not `.ignore` files
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .filter_entry(|entry| entry.file_name() != ".git")
+        .threads(0) // 0 = pick a sensible default based on CPUs
+        .build_parallel();
+
+    walker.run(|| {
+        Box::new(|result| {
+            if let Ok(entry) = result {
+                // Files and symlinks (anything that isn't a directory); git
+                // lists an untracked symlink as its own entry.
+                if entry.file_type().map_or(false, |ft| !ft.is_dir()) {
+                    let path = entry.into_path();
+                    if !tracked.contains(&path) {
+                        f(FileChange::Untracked { path });
+                    }
+                }
+            }
+            ignore::WalkState::Continue
+        })
+    });
 
     Ok(())
 }
@@ -451,7 +533,16 @@ fn open_repo(path: &Path) -> Result<ThreadSafeRepository> {
 }
 
 /// Emulates the result of running `git status` from the command line.
-fn status(repo: &Repository, f: impl Fn(Result<FileChange>) -> bool) -> Result<()> {
+///
+/// `untracked` selects how new files are reported. Callers that enumerate
+/// untracked files separately (via [`for_each_untracked_file`], which uses a
+/// parallel walker) pass [`UntrackedFiles::None`] so gix does no directory
+/// walk at all — leaving only the fast index<->worktree modification pass.
+fn status(
+    repo: &Repository,
+    untracked: UntrackedFiles,
+    f: impl Fn(Result<FileChange>) -> bool,
+) -> Result<()> {
     let work_dir = repo
         .workdir()
         .ok_or_else(|| anyhow::anyhow!("working tree not found"))?
@@ -463,13 +554,12 @@ fn status(repo: &Repository, f: impl Fn(Result<FileChange>) -> bool) -> Result<(
         // our case to not list new (untracked) files. We could have respected this config
         // if the default value weren't `Collapsed` though, as this default value would render
         // the feature unusable to many.
-        .untracked_files(UntrackedFiles::Files)
+        .untracked_files(untracked)
         // Rename detection between index and worktree is deliberately OFF: to
         // find content matches gix reads and hashes untracked files, which
-        // measured as half the total scan time on a large repo with a few
-        // thousand untracked files (4.2s -> 2.1s), worse still on network
-        // filesystems. A renamed file surfaces as an untracked + deleted pair
-        // instead of a single renamed entry.
+        // measured as roughly half the total scan time on a large repo with a
+        // few thousand untracked files, worse still on network filesystems. A
+        // renamed file surfaces as an untracked + deleted pair instead.
         .index_worktree_rewrites(None::<Rewrites>);
 
     // No filtering based on path

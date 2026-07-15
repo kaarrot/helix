@@ -21,6 +21,11 @@ pub struct FileChangeData {
 /// Collect the full changed-file listing for a diff range into a `Vec`.
 /// This is the expensive part (a tree diff and/or a working-tree scan), so it
 /// is run off the main thread by `changed_file_picker`.
+///
+/// Tracked changes and untracked files are gathered separately: tracked changes
+/// come from gix (fast index<->worktree pass), untracked files from a parallel
+/// walker. [`spawn_changed_file_refresh`] uses the same two-phase split to
+/// stream tracked changes into the picker before the untracked walk finishes.
 #[cfg(feature = "git")]
 fn collect_changed_files(
     cwd: &std::path::Path,
@@ -28,26 +33,39 @@ fn collect_changed_files(
     target_ref: Option<&str>,
 ) -> Vec<FileChange> {
     use helix_vcs::git;
-    // `for_each_changed_file_between_refs` takes an `Fn`, so accumulate through
-    // a `RefCell` rather than capturing the `Vec` mutably.
+    // The callbacks take an `Fn`, so accumulate through interior mutability
+    // rather than capturing the `Vec` mutably.
     let files = std::cell::RefCell::new(Vec::new());
-    let _ = git::for_each_changed_file_between_refs(cwd, base_ref, target_ref, |change| {
+    let _ = git::for_each_tracked_change(cwd, base_ref, target_ref, |change| {
         if let Ok(change) = change {
             files.borrow_mut().push(change);
         }
         true
     });
     let mut files = files.into_inner();
-    // gix emits untracked entries interleaved with tracked changes, and the
-    // picker shows items in insertion order for an empty query. Sort so the
-    // tracked changes the user is usually after (conflicts, modifications,
-    // renames, deletions) sit above the untracked noise, then by path.
+    // Untracked files only exist when comparing against the working tree.
+    if target_ref.is_none() {
+        let untracked = std::sync::Mutex::new(Vec::new());
+        let _ = git::for_each_untracked_file(cwd, |change| {
+            untracked.lock().unwrap().push(change);
+        });
+        files.extend(untracked.into_inner().unwrap());
+    }
+    sort_changes(&mut files);
+    files
+}
+
+/// Sort a changed-file listing so the tracked changes the user is usually after
+/// (conflicts, modifications, renames, deletions) sit above the untracked
+/// noise, then by path. The picker shows items in insertion order for an empty
+/// query, so this ordering is what the user sees on open.
+#[cfg(feature = "git")]
+fn sort_changes(files: &mut [FileChange]) {
     files.sort_by(|a, b| {
         change_sort_rank(a)
             .cmp(&change_sort_rank(b))
             .then_with(|| a.path().cmp(b.path()))
     });
-    files
 }
 
 /// Ordering key for the changed-file picker: tracked changes before untracked.
@@ -201,11 +219,12 @@ pub(crate) fn changed_file_picker_component(
 /// thread refresh the cache and reconcile the open picker.
 ///
 /// `injector` selects how the picker learns about the fresh listing:
-/// - `Some` (cache miss — the picker opened empty): every file is streamed in
-///   as the scan discovers it, so the first results are visible in
-///   milliseconds even when the full scan takes seconds. Pushes are
-///   best-effort; the scan runs to completion regardless so the cache is
-///   filled for the next open.
+/// - `Some` (cache miss — the picker opened empty): tracked changes are scanned
+///   first and streamed in immediately (the fast index<->worktree pass), then
+///   untracked files are enumerated with the parallel walker and streamed in
+///   below them. So a modified file shows in milliseconds even when the
+///   untracked walk takes seconds. Pushes are best-effort; the scan runs to
+///   completion regardless so the cache is filled for the next open.
 /// - `None` (cache hit — the cached listing is already on screen): the fresh
 ///   listing is swapped in only at the end, and only if it actually differs,
 ///   keeping the user's query and selection stable while they filter.
@@ -223,8 +242,9 @@ pub(crate) fn spawn_changed_file_refresh(
         let fresh: std::sync::Arc<[FileChange]> = match injector {
             Some(injector) => {
                 use helix_vcs::git;
+                // Phase 1: tracked changes — fast, streamed in as discovered.
                 let files = std::cell::RefCell::new(Vec::new());
-                let _ = git::for_each_changed_file_between_refs(
+                let _ = git::for_each_tracked_change(
                     &cwd,
                     &base_ref,
                     target_ref.as_deref(),
@@ -236,7 +256,24 @@ pub(crate) fn spawn_changed_file_refresh(
                         true
                     },
                 );
-                files.into_inner().into()
+                let mut files = files.into_inner();
+                // Phase 2: untracked files (working-tree comparisons only),
+                // enumerated in parallel, then sorted by path and streamed in
+                // below the tracked changes.
+                if target_ref.is_none() {
+                    let untracked = std::sync::Mutex::new(Vec::new());
+                    let _ = git::for_each_untracked_file(&cwd, |change| {
+                        untracked.lock().unwrap().push(change);
+                    });
+                    let mut untracked = untracked.into_inner().unwrap();
+                    untracked.sort_by(|a, b| a.path().cmp(b.path()));
+                    for change in &untracked {
+                        let _ = injector.push(change.clone());
+                    }
+                    files.append(&mut untracked);
+                }
+                sort_changes(&mut files);
+                files.into()
             }
             None => collect_changed_files(&cwd, &base_ref, target_ref.as_deref()).into(),
         };
@@ -256,8 +293,8 @@ pub(crate) fn spawn_changed_file_refresh(
             if editor.diff.changed_file_request != request {
                 return;
             }
-            // Nothing changed since the cached seed; leave the picker (and
-            // the user's selection/query) untouched.
+            // Nothing changed since the cached seed; leave the picker (and the
+            // user's selection/query) untouched.
             if fresh == seed {
                 return;
             }

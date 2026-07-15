@@ -88,15 +88,35 @@ pub fn diagnostic<'doc>(
 }
 
 pub fn diff<'doc>(
-    _editor: &'doc Editor,
+    editor: &'doc Editor,
     doc: &'doc Document,
-    _view: &View,
+    view: &View,
     theme: &Theme,
     _is_focused: bool,
 ) -> GutterFn<'doc> {
     let added = theme.get("diff.plus.gutter");
     let deleted = theme.get("diff.minus.gutter");
     let modified = theme.get("diff.delta.gutter");
+
+    // In a side-by-side diff/merge view the two panes diff against each other,
+    // so their hunks are mirror images: a line added between the two revisions
+    // is an insertion in the new pane but a removal in the old pane. Coloring
+    // purely by insertion/removal would therefore paint both panes with a mix
+    // of red and green and invert the old pane. Instead, key the whole pane off
+    // which side it is — old pane red, new pane green — matching the intraline
+    // char highlighting (which already keys off `char_diff_minus_side`). Only a
+    // genuine split (two distinct views) gets this treatment; single-pane diff
+    // views and the ordinary git gutter keep per-hunk coloring.
+    let side_style = editor.diff.views.get(&view.id).and_then(|state| {
+        (state.base_view_id != state.working_view_id).then(|| {
+            if state.is_base_view(view.id) {
+                deleted
+            } else {
+                added
+            }
+        })
+    });
+
     if let Some(diff_handle) = doc.diff_handle() {
         let hunks = diff_handle.load();
         let mut hunk_i = 0;
@@ -119,15 +139,18 @@ pub fn diff<'doc>(
                     return None;
                 }
 
+                // The icon still reflects the hunk shape (a pure removal draws
+                // a top-border marker on its first visual line), but the color
+                // follows the pane's side when this is a split diff view.
                 let (icon, style) = if hunk.is_pure_insertion() {
-                    ("▍", added)
+                    ("▍", side_style.unwrap_or(added))
                 } else if hunk.is_pure_removal() {
                     if !first_visual_line {
                         return None;
                     }
-                    ("▔", deleted)
+                    ("▔", side_style.unwrap_or(deleted))
                 } else {
-                    ("▍", modified)
+                    ("▍", side_style.unwrap_or(modified))
                 };
 
                 write!(out, "{}", icon).unwrap();

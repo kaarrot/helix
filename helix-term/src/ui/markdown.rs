@@ -7,7 +7,9 @@ use tui::{
 
 use std::sync::Arc;
 
-use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{
+    Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd,
+};
 
 use helix_core::{
     syntax::{self, HighlightEvent, OverlayHighlights},
@@ -28,6 +30,118 @@ pub struct MarkdownLink {
     pub line: usize,
     /// The link destination as written in the markdown (URL or path).
     pub dest: String,
+}
+
+/// Buffered contents of a GFM table while it is being parsed. The whole table
+/// is collected before emitting so per-column widths can be computed and each
+/// cell padded into an aligned column.
+struct TableCtx<'a> {
+    alignments: Vec<Alignment>,
+    rows: Vec<TableRowCtx<'a>>,
+    /// Row currently being filled (between a row Start and its End).
+    cur_row: Option<TableRowCtx<'a>>,
+    /// Cell currently being filled; inline text/code events append here instead
+    /// of the main span buffer.
+    cur_cell: Option<Vec<Span<'a>>>,
+}
+
+struct TableRowCtx<'a> {
+    cells: Vec<Vec<Span<'a>>>,
+    is_header: bool,
+    /// Source line this row starts on, for the preview's line mapping.
+    src: Option<usize>,
+}
+
+/// Total display width of a cell's spans.
+fn cells_width(spans: &[Span]) -> usize {
+    spans.iter().map(Span::width).sum()
+}
+
+/// Pad `cell` to `width` columns per `align`, styling the inserted spaces with
+/// `pad_style`.
+fn pad_cell(cell: Vec<Span<'_>>, width: usize, align: Alignment, pad_style: Style) -> Vec<Span<'_>> {
+    let pad = width.saturating_sub(cells_width(&cell));
+    let space = |n: usize| Span::styled(" ".repeat(n), pad_style);
+    let mut out = Vec::new();
+    match align {
+        Alignment::Right => {
+            out.push(space(pad));
+            out.extend(cell);
+        }
+        Alignment::Center => {
+            let left = pad / 2;
+            out.push(space(left));
+            out.extend(cell);
+            out.push(space(pad - left));
+        }
+        // Left and None both left-align.
+        Alignment::Left | Alignment::None => {
+            out.extend(cell);
+            out.push(space(pad));
+        }
+    }
+    out
+}
+
+/// Emit a buffered table as aligned rendered lines: cells padded to per-column
+/// widths and separated by ` │ `, with a `─┼─` divider under the header row.
+/// Appends to `lines`/`line_map` in lockstep so the preview's source mapping
+/// stays consistent.
+fn emit_table<'a>(
+    table: TableCtx<'a>,
+    text_style: Style,
+    border_style: Style,
+    lines: &mut Vec<Spans<'a>>,
+    line_map: &mut Vec<Option<usize>>,
+) {
+    let n_cols = table
+        .rows
+        .iter()
+        .map(|row| row.cells.len())
+        .max()
+        .unwrap_or(0)
+        .max(table.alignments.len());
+    if n_cols == 0 {
+        return;
+    }
+
+    // Column width = the widest cell in that column (at least 1 so the divider
+    // is visible for empty columns).
+    let mut widths = vec![1usize; n_cols];
+    for row in &table.rows {
+        for (i, cell) in row.cells.iter().enumerate() {
+            widths[i] = widths[i].max(cells_width(cell));
+        }
+    }
+    let align = |i: usize| table.alignments.get(i).copied().unwrap_or(Alignment::None);
+
+    let mut divider_emitted = false;
+    for row in table.rows {
+        let is_header = row.is_header;
+        let mut spans: Vec<Span> = Vec::new();
+        for (i, cell) in row.cells.into_iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::styled(" │ ", border_style));
+            }
+            spans.extend(pad_cell(cell, widths[i], align(i), text_style));
+        }
+        lines.push(Spans::from(spans));
+        line_map.push(row.src);
+
+        // Draw the header/body divider once, right after the header row.
+        if is_header && !divider_emitted {
+            divider_emitted = true;
+            let mut sep: Vec<Span> = Vec::new();
+            for (i, width) in widths.iter().enumerate() {
+                if i > 0 {
+                    sep.push(Span::styled("─┼─", border_style));
+                }
+                sep.push(Span::styled("─".repeat(*width), border_style));
+            }
+            lines.push(Spans::from(sep));
+            line_map.push(None);
+        }
+    }
 }
 
 fn styled_multiline_text<'a>(text: &str, style: Style) -> Text<'a> {
@@ -284,6 +398,7 @@ impl Markdown {
 
         let mut options = Options::empty();
         options.insert(Options::ENABLE_STRIKETHROUGH);
+        options.insert(Options::ENABLE_TABLES);
         // `into_offset_iter` yields the source byte range alongside each event so
         // we can map rendered lines back to source lines.
         let parser = Parser::new_ext(&self.contents, options).into_offset_iter();
@@ -300,6 +415,9 @@ impl Markdown {
         // Source line of the content currently being accumulated into `spans`.
         let mut src: Option<usize> = None;
         let mut list_stack = Vec::new();
+        // `Some` while inside a GFM table; cells buffer here until the table
+        // closes so columns can be aligned.
+        let mut table: Option<TableCtx> = None;
 
         let get_indent = |level: usize| {
             if level < 1 {
@@ -394,6 +512,39 @@ impl Markdown {
                     let prefix = get_indent(list_stack.len()) + bullet.as_str();
                     spans.push(Span::styled(prefix, bullet_style));
                 }
+                Event::Start(Tag::Table(alignments)) => {
+                    // Buffer the whole table; it's emitted with aligned columns
+                    // once we see its End.
+                    table = Some(TableCtx {
+                        alignments,
+                        rows: Vec::new(),
+                        cur_row: None,
+                        cur_cell: None,
+                    });
+                }
+                Event::Start(Tag::TableHead) => {
+                    if let Some(t) = table.as_mut() {
+                        t.cur_row = Some(TableRowCtx {
+                            cells: Vec::new(),
+                            is_header: true,
+                            src,
+                        });
+                    }
+                }
+                Event::Start(Tag::TableRow) => {
+                    if let Some(t) = table.as_mut() {
+                        t.cur_row = Some(TableRowCtx {
+                            cells: Vec::new(),
+                            is_header: false,
+                            src,
+                        });
+                    }
+                }
+                Event::Start(Tag::TableCell) => {
+                    if let Some(t) = table.as_mut() {
+                        t.cur_cell = Some(Vec::new());
+                    }
+                }
                 Event::Start(tag) => {
                     // Capture link/image destinations so the preview can offer
                     // goto-file on them. The link text itself flows through the
@@ -407,6 +558,29 @@ impl Markdown {
                         // the rest of the list.
                         spans.push(Span::from(get_indent(list_stack.len())));
                     }
+                }
+                Event::End(TagEnd::TableCell) => {
+                    if let Some(t) = table.as_mut() {
+                        let cell = t.cur_cell.take().unwrap_or_default();
+                        if let Some(row) = t.cur_row.as_mut() {
+                            row.cells.push(cell);
+                        }
+                    }
+                }
+                Event::End(TagEnd::TableHead) | Event::End(TagEnd::TableRow) => {
+                    if let Some(t) = table.as_mut() {
+                        if let Some(row) = t.cur_row.take() {
+                            t.rows.push(row);
+                        }
+                    }
+                }
+                Event::End(TagEnd::Table) => {
+                    if let Some(t) = table.take() {
+                        emit_table(t, text_style, rule_style, &mut lines, &mut line_map);
+                        blank(&mut lines, &mut line_map);
+                    }
+                    // Links inside table cells aren't anchored; drop any pending.
+                    cur_links.clear();
                 }
                 Event::End(tag) => {
                     tags.pop();
@@ -482,23 +656,35 @@ impl Markdown {
                             style = style.patch(link_style);
                             style.underline_style = Some(UnderlineStyle::Line);
                         }
-                        spans.push(Span::styled(text, style));
+                        let span = Span::styled(text, style);
+                        match table.as_mut().and_then(|t| t.cur_cell.as_mut()) {
+                            Some(cell) => cell.push(span),
+                            None => spans.push(span),
+                        }
                     }
                 }
                 Event::Code(text) => {
-                    spans.push(Span::styled(text, code_style));
+                    let span = Span::styled(text, code_style);
+                    match table.as_mut().and_then(|t| t.cur_cell.as_mut()) {
+                        Some(cell) => cell.push(span),
+                        None => spans.push(span),
+                    }
                 }
                 Event::Html(text) | Event::InlineHtml(text) => {
-                    push_html(
-                        &text,
-                        text_style,
-                        &mut spans,
-                        &mut lines,
-                        &mut line_map,
-                        &mut links,
-                        &mut cur_links,
-                        src,
-                    );
+                    if let Some(cell) = table.as_mut().and_then(|t| t.cur_cell.as_mut()) {
+                        cell.push(Span::styled(text, text_style));
+                    } else {
+                        push_html(
+                            &text,
+                            text_style,
+                            &mut spans,
+                            &mut lines,
+                            &mut line_map,
+                            &mut links,
+                            &mut cur_links,
+                            src,
+                        );
+                    }
                 }
                 Event::SoftBreak | Event::HardBreak => {
                     push_line(
@@ -572,5 +758,70 @@ impl Component for Markdown {
         let (width, height) = crate::ui::text::required_size(&contents, max_text_width);
 
         Some((width + padding, height + padding))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arc_swap::ArcSwap;
+
+    fn render_lines(md: &str) -> Vec<String> {
+        let loader = Arc::new(ArcSwap::from_pointee(syntax::Loader::default()));
+        let markdown = Markdown::new(md.to_string(), loader);
+        let text = markdown.parse(None);
+        text.lines
+            .iter()
+            .map(|spans| {
+                spans
+                    .0
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn table_columns_are_aligned() {
+        let md = "\
+| Name | Age | City |
+| --- | --- | --- |
+| Alice | 30 | New York |
+| Bob | 5 | LA |
+";
+        let lines = render_lines(md);
+        let table: Vec<&String> = lines.iter().filter(|l| !l.trim().is_empty()).collect();
+
+        // Header, divider, two body rows.
+        assert_eq!(table.len(), 4, "unexpected lines: {lines:?}");
+        assert_eq!(table[0], "Name  │ Age │ City    ");
+        assert_eq!(table[1], "──────┼─────┼─────────");
+        assert_eq!(table[2], "Alice │ 30  │ New York");
+        assert_eq!(table[3], "Bob   │ 5   │ LA      ");
+
+        // Every row renders to the same display width -> columns line up.
+        let widths: Vec<usize> = table.iter().map(|l| l.chars().count()).collect();
+        assert!(
+            widths.windows(2).all(|w| w[0] == w[1]),
+            "rows differ in width: {widths:?}"
+        );
+    }
+
+    #[test]
+    fn table_respects_column_alignment() {
+        let md = "\
+| Left | Mid | Right |
+| :-- | :-: | --: |
+| a | b | c |
+";
+        let lines = render_lines(md);
+        let row = lines
+            .iter()
+            .find(|l| l.contains('a'))
+            .expect("body row present");
+        // col0 width 4 (left), col1 width 3 (center), col2 width 5 (right):
+        // left stays flush-left, center pads both sides, right is flush-right.
+        assert_eq!(row, "a    │  b  │     c");
     }
 }

@@ -37,7 +37,29 @@ fn collect_changed_files(
         }
         true
     });
-    files.into_inner()
+    let mut files = files.into_inner();
+    // gix emits untracked entries interleaved with tracked changes, and the
+    // picker shows items in insertion order for an empty query. Sort so the
+    // tracked changes the user is usually after (conflicts, modifications,
+    // renames, deletions) sit above the untracked noise, then by path.
+    files.sort_by(|a, b| {
+        change_sort_rank(a)
+            .cmp(&change_sort_rank(b))
+            .then_with(|| a.path().cmp(b.path()))
+    });
+    files
+}
+
+/// Ordering key for the changed-file picker: tracked changes before untracked.
+#[cfg(feature = "git")]
+fn change_sort_rank(change: &FileChange) -> u8 {
+    match change {
+        FileChange::Conflict { .. } => 0,
+        FileChange::Modified { .. } => 1,
+        FileChange::Renamed { .. } => 2,
+        FileChange::Deleted { .. } => 3,
+        FileChange::Untracked { .. } => 4,
+    }
 }
 
 /// The list to seed the changed-file picker with on open. Under the

@@ -161,6 +161,41 @@ impl<'a> Paragraph<'a> {
     }
 }
 
+/// The number of terminal rows each input line of `text` occupies when
+/// word-wrapped to `width` (always `>= 1` per line).
+///
+/// This lets callers that scroll a wrapped [`Paragraph`] map input-line offsets
+/// to the post-wrap output-row offsets that [`Paragraph::scroll`] expects. It
+/// reuses the same [`WordWrapper`] that `Paragraph` renders with, so the counts
+/// match what actually gets drawn. Wrapping never crosses a line's `\n`, so
+/// measuring each input line independently equals the full-text composition.
+///
+/// `width == 0` yields all-`1` (the composer produces no lines at zero width).
+pub fn wrapped_rows_per_line(text: &Text, width: u16, trim: bool) -> Vec<u16> {
+    text.lines
+        .iter()
+        .map(|spans| {
+            if width == 0 {
+                return 1;
+            }
+            let mut styled = spans
+                .0
+                .iter()
+                .flat_map(|span| span.styled_graphemes(Style::default()))
+                .chain(iter::once(StyledGrapheme {
+                    symbol: "\n",
+                    style: Style::default(),
+                }));
+            let mut composer = WordWrapper::new(&mut styled, width, trim);
+            let mut rows = 0u16;
+            while composer.next_line().is_some() {
+                rows = rows.saturating_add(1);
+            }
+            rows.max(1)
+        })
+        .collect()
+}
+
 impl Widget for Paragraph<'_> {
     fn render(mut self, area: Rect, buf: &mut Buffer) {
         buf.set_style(area, self.style);
@@ -222,5 +257,28 @@ impl Widget for Paragraph<'_> {
                 break;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wrapped_rows_counts_wrapped_output_lines() {
+        // A line narrower than the width stays a single row; each input line is
+        // measured independently.
+        let text = Text::from("short\nalso short");
+        assert_eq!(wrapped_rows_per_line(&text, 20, false), vec![1, 1]);
+
+        // A line wider than the width wraps onto multiple rows.
+        let text = Text::from("one two three four five");
+        let rows = wrapped_rows_per_line(&text, 7, false);
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0] > 1, "expected the long line to wrap, got {rows:?}");
+
+        // Zero width can't wrap anything, so every line counts as one row.
+        let text = Text::from("anything at all\nsecond");
+        assert_eq!(wrapped_rows_per_line(&text, 0, false), vec![1, 1]);
     }
 }

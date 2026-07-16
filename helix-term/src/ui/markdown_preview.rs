@@ -18,11 +18,16 @@ use url::Url;
 
 use tui::{
     buffer::Buffer as Surface,
-    widgets::{Block, Paragraph, Widget, Wrap},
+    widgets::{wrapped_rows_per_line, Block, Paragraph, Widget, Wrap},
 };
 
-/// Rendered lines scrolled per mouse-wheel notch.
+/// Output rows scrolled per mouse-wheel notch.
 const WHEEL_LINES: usize = 3;
+
+/// When aligning the preview to the source cursor on open, keep the cursor's
+/// line this many rows below the top so a little context stays visible above it
+/// while most of the panel shows what follows.
+const TOP_MARGIN: usize = 3;
 
 /// A read-only full-screen overlay that renders a markdown document as styled
 /// text on top of the editor, and follows the (hidden) source buffer: keep
@@ -32,7 +37,7 @@ const WHEEL_LINES: usize = 3;
 ///
 /// - Navigate the source (it stays focused) -> the preview follows.
 /// - Click a rendered line -> jump the source cursor to the matching source
-///   line (which then re-centers the preview there).
+///   line (which then realigns the preview to that line).
 /// - Click a line carrying a markdown link -> follow it like goto-file.
 /// - Mouse wheel over the panel scrolls it locally until the source moves again.
 /// - `q`/`Esc` close it; all other keys pass through to the source editor.
@@ -43,7 +48,8 @@ pub struct MarkdownPreview {
     source_doc: DocumentId,
     /// Directory the source file lives in, used to resolve relative link paths.
     base_dir: PathBuf,
-    /// Vertical scroll offset into the rendered lines.
+    /// Vertical scroll offset, in post-wrap output rows (what `Paragraph`'s
+    /// scroll consumes). Equals the rendered-line index only when nothing wraps.
     scroll: usize,
     /// Highlighted rendered line (tracks the source cursor's mapped line).
     cursor_line: usize,
@@ -54,6 +60,11 @@ pub struct MarkdownPreview {
     // Recomputed every render, read back by event handling:
     /// Rendered-line -> source-line map (`None` for inserted blank lines).
     line_map: Vec<Option<usize>>,
+    /// Prefix sums of each rendered line's wrapped height, in output rows:
+    /// `row_starts[i]` is the first output row of rendered line `i`, and the
+    /// last entry is the total output-row count. Length `total_lines + 1`.
+    /// Maps rendered lines <-> output rows for scrolling and hit-testing.
+    row_starts: Vec<usize>,
     /// Links anchored to rendered lines.
     links: Vec<MarkdownLink>,
     /// Number of rendered lines.
@@ -74,6 +85,7 @@ impl MarkdownPreview {
             cursor_line: 0,
             last_source_line: None,
             line_map: Vec::new(),
+            row_starts: Vec::new(),
             links: Vec::new(),
             total_lines: 0,
             area: Rect::default(),
@@ -129,13 +141,33 @@ impl MarkdownPreview {
         None
     }
 
+    /// Total number of output rows across all rendered lines (post-wrap).
+    fn total_rows(&self) -> usize {
+        self.row_starts.last().copied().unwrap_or(0)
+    }
+
     fn scroll_lines(&mut self, delta: isize) {
-        let max = self.total_lines.saturating_sub(1) as isize;
+        let max = self.total_rows().saturating_sub(1) as isize;
         self.scroll = (self.scroll as isize + delta).clamp(0, max) as usize;
     }
 
+    /// The rendered line whose output-row span contains `output_row`. Uses the
+    /// strictly increasing `row_starts` (every line is >= 1 row) to binary
+    /// search; rows past the end clamp to the last line.
+    fn rendered_line_at_row(&self, output_row: usize) -> usize {
+        if self.total_lines == 0 {
+            return 0;
+        }
+        // `row_starts` has `total_lines + 1` entries; find the last start <= row.
+        let idx = match self.row_starts.binary_search(&output_row) {
+            Ok(i) => i,
+            Err(i) => i.saturating_sub(1),
+        };
+        idx.min(self.total_lines - 1)
+    }
+
     /// Jump the source view's cursor to the source line for the given rendered
-    /// line; the follow-up render re-centers the preview there.
+    /// line; the follow-up render realigns the preview to that line.
     fn goto_source(&self, rendered_line: usize) -> EventResult {
         match self.source_line_for_rendered(rendered_line) {
             Some(src_line) => {
@@ -200,10 +232,14 @@ impl MarkdownPreview {
                 EventResult::Consumed(None)
             }
             MouseEventKind::Down(MouseButton::Left) if within => {
-                let rendered_line = self.scroll + (event.row - self.area.y) as usize;
-                if rendered_line >= self.total_lines {
+                // The clicked screen row maps to an output row (scroll is in
+                // output rows), which maps back to a rendered line through the
+                // wrapped-height prefix sums.
+                let output_row = self.scroll + (event.row - self.area.y) as usize;
+                if output_row >= self.total_rows() {
                     return EventResult::Consumed(None);
                 }
+                let rendered_line = self.rendered_line_at_row(output_row);
                 self.cursor_line = rendered_line;
                 // A link on the clicked line takes priority over a plain jump.
                 self.follow_link(rendered_line)
@@ -258,50 +294,68 @@ impl Component for MarkdownPreview {
         block.render(panel, surface);
         self.area = inner;
 
-        // Follow the source cursor: when it moves to a different source line,
-        // highlight the matching rendered line and center the panel on it. Only
-        // on change, so mouse-wheel scrolling isn't immediately overridden.
+        // Measure how many output rows each rendered line takes so scrolling and
+        // hit-testing work in the same units `Paragraph` draws in. With soft-wrap
+        // off every line is one row, so this collapses to the rendered-line index.
+        let heights = if soft_wrap {
+            wrapped_rows_per_line(&text, inner.width, false)
+        } else {
+            vec![1u16; self.total_lines]
+        };
+        self.row_starts = std::iter::once(0)
+            .chain(heights.iter().scan(0usize, |acc, &h| {
+                *acc += h as usize;
+                Some(*acc)
+            }))
+            .collect();
+
+        // Align to the source cursor on open: the first render sees a fresh
+        // `last_source_line` (None) and scrolls the matching rendered line near
+        // the top. Guarded on change so later wheel-scrolling isn't overridden.
         if let Some(source_line) = self.source_cursor_line(cx.editor) {
             if self.last_source_line != Some(source_line) {
                 self.last_source_line = Some(source_line);
                 if let Some(rendered) = self.rendered_line_for_source(source_line) {
                     self.cursor_line = rendered;
-                    self.scroll = rendered.saturating_sub(inner.height as usize / 2);
+                    self.scroll = self.row_starts[rendered].saturating_sub(TOP_MARGIN);
                 }
             }
         }
 
-        // Clamp scroll/cursor now that we know the rendered length.
-        let max_scroll = self.total_lines.saturating_sub(inner.height as usize);
+        // Clamp scroll/cursor now that we know the output-row and rendered length.
+        let max_scroll = self.total_rows().saturating_sub(inner.height as usize);
         self.scroll = self.scroll.min(max_scroll);
         self.cursor_line = self.cursor_line.min(self.total_lines.saturating_sub(1));
 
-        // When soft-wrap is off, one rendered line == one screen row, so a clicked
-        // row maps directly to a rendered line (`screen_row = rendered_line -
-        // scroll`) and the cursor-line highlight lands exactly.
-        //
-        // When soft-wrap is on, Paragraph interprets `scroll.0` as an output-row
-        // offset (post-wrap) while we still track scroll/cursor in rendered-line
-        // units — click and highlight positions can drift by the number of wrap
-        // segments above them. That's an accepted tradeoff for readable output on
-        // narrow terminals; wrap-aware mapping can come later if needed.
+        // `scroll` is an output-row offset, matching `Paragraph`'s scroll units
+        // whether or not soft-wrap is on (row_starts accounts for wrapping), so
+        // clicks and the cursor-line highlight stay aligned with what's drawn.
         let mut paragraph = Paragraph::new(&text).scroll((self.scroll as u16, 0));
         if soft_wrap {
             paragraph = paragraph.wrap(Wrap { trim: false });
         }
         paragraph.render(inner, surface);
 
-        // Highlight the active line.
-        if self.cursor_line >= self.scroll
-            && self.cursor_line < self.scroll + inner.height as usize
-        {
-            let row = inner.y + (self.cursor_line - self.scroll) as u16;
+        // Highlight the active line across all the output rows it wraps onto.
+        // (`row_starts` has `total_lines + 1` entries, so `cursor_line + 1` is in
+        // range whenever the document is non-empty.)
+        let line_start = self.row_starts.get(self.cursor_line).copied().unwrap_or(0);
+        let line_end = self
+            .row_starts
+            .get(self.cursor_line + 1)
+            .copied()
+            .unwrap_or(line_start);
+        let visible_start = line_start.max(self.scroll);
+        let visible_end = line_end.min(self.scroll + inner.height as usize);
+        if visible_start < visible_end {
             let style = cx
                 .editor
                 .theme
                 .try_get("ui.cursorline.primary")
                 .unwrap_or_else(|| cx.editor.theme.get("ui.selection"));
-            surface.set_style(Rect::new(inner.x, row, inner.width, 1), style);
+            let row = inner.y + (visible_start - self.scroll) as u16;
+            let height = (visible_end - visible_start) as u16;
+            surface.set_style(Rect::new(inner.x, row, inner.width, height), style);
         }
     }
 

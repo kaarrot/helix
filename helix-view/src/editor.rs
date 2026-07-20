@@ -360,6 +360,10 @@ pub struct Config {
     /// Where completion suggestions are rendered: the vertical popup (default),
     /// the statusline (via the `completion-suggestions` statusline element), or both.
     pub completion_display: CompletionDisplay,
+    /// When `completion-display` is `statusline`, append a space after a completion
+    /// selected via mouse click. Skipped when the accepted item is a snippet with
+    /// remaining placeholders. Defaults to `false`.
+    pub completion_mouse_append_whitespace: bool,
     /// `true` if helix should automatically add a line comment token if you're currently in a comment
     /// and press `enter`.
     pub continue_comments: bool,
@@ -1332,6 +1336,7 @@ impl Default for Config {
             text_width: 80,
             completion_replace: false,
             completion_display: CompletionDisplay::default(),
+            completion_mouse_append_whitespace: false,
             continue_comments: true,
             workspace_lsp_roots: Vec::new(),
             default_line_ending: LineEndingConfig::default(),

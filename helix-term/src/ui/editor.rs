@@ -1185,6 +1185,30 @@ impl EditorView {
         completion.select(index, editor, event)
     }
 
+    /// Insert a single space after a mouse-selected statusline completion.
+    /// No-op unless `completion-mouse-append-whitespace` is enabled and the
+    /// active `completion-display` is `statusline`. Skipped when the accepted
+    /// item left an active snippet placeholder, since the cursor is inside
+    /// the snippet body rather than after the inserted text.
+    fn append_whitespace_after_statusline_completion(&self, editor: &mut Editor) {
+        use helix_view::editor::CompletionDisplay;
+        let config = editor.config();
+        if !config.completion_mouse_append_whitespace
+            || !matches!(config.completion_display, CompletionDisplay::Statusline)
+        {
+            return;
+        }
+        let (view, doc) = current!(editor);
+        if doc.active_snippet.is_some() {
+            return;
+        }
+        let selection = doc.selection(view.id).clone();
+        let cursors = selection.cursors(doc.text().slice(..));
+        let transaction =
+            Transaction::insert(doc.text(), &cursors, helix_core::Tendril::from(" "));
+        doc.apply(&transaction, view.id);
+    }
+
     fn cursor_overlaps_diagnostic(editor: &Editor) -> bool {
         let (view, doc) = current_ref!(editor);
         let text = doc.text().slice(..);
@@ -1425,6 +1449,7 @@ impl EditorView {
                         if let Some(cb) = self.clear_completion(cxt.editor) {
                             self.on_next_key = Some((cb, OnKeyCallbackKind::Fallback));
                         }
+                        self.append_whitespace_after_statusline_completion(cxt.editor);
                     }
 
                     return EventResult::Consumed(None);

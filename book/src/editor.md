@@ -45,6 +45,7 @@
 | `completion-trigger-len` | The min-length of word under cursor to trigger autocompletion | `2` |
 | `completion-replace` | Whether to make completions always replace the entire word and not just the part before the cursor | `false` |
 | `completion-display` | Where completion suggestions are rendered: `popup` (default vertical popup), `statusline` (horizontal strip inside the statusline, requires `completion-suggestions` in the statusline layout), or `both`. When the statusline is active, it replaces path elements to save space. | `popup` |
+| `completion-mouse-append-whitespace` | When `completion-display = "statusline"`, append a single space after a completion selected by mouse click. Skipped when the accepted item is a snippet with active placeholders. | `false` |
 | `auto-info` | Whether to display info boxes | `true` |
 | `true-color` | Whether to override automatic detection of terminal truecolor support in the event of a false negative | `false` |
 | `undercurl` | Whether to override automatic detection of terminal undercurl support in the event of a false negative | `false` |

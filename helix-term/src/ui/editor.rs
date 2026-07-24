@@ -33,9 +33,19 @@ use helix_view::{
     keyboard::{KeyCode, KeyModifiers},
     Document, Editor, Theme, View,
 };
-use std::{mem::take, num::NonZeroUsize, ops, path::PathBuf, rc::Rc};
+use std::{
+    mem::take,
+    num::NonZeroUsize,
+    ops,
+    path::PathBuf,
+    rc::Rc,
+    time::{Duration, Instant},
+};
 
 use tui::{buffer::Buffer as Surface, text::Span};
+
+/// Max gap between two left clicks at the same cell for them to count as a double-click.
+const DOUBLE_CLICK_TIMEOUT: Duration = Duration::from_millis(400);
 
 pub struct EditorView {
     pub keymaps: Keymaps,
@@ -45,6 +55,8 @@ pub struct EditorView {
     pub(crate) completion: Option<Completion>,
     statusline_completion_mouse_down: Option<usize>,
     popup_completion_mouse_down: Option<usize>,
+    /// Position and time of the last left click, used to detect double-clicks.
+    last_left_click: Option<(u16, u16, Instant)>,
     spinners: ProgressSpinners,
     /// Tracks if the terminal window is focused by reaction to terminal focus events
     terminal_focused: bool,
@@ -79,6 +91,7 @@ impl EditorView {
             completion: None,
             statusline_completion_mouse_down: None,
             popup_completion_mouse_down: None,
+            last_left_click: None,
             spinners: ProgressSpinners::default(),
             terminal_focused: true,
         }
@@ -1194,8 +1207,10 @@ impl EditorView {
     /// must be called whenever the editor processed input that
     /// is not a `KeyEvent`. In these cases any pending keys/on next
     /// key callbacks must be canceled.
-    fn handle_non_key_input(&mut self, cxt: &mut commands::Context) {
-        cxt.editor.status_msg = None;
+    fn handle_non_key_input(&mut self, cxt: &mut commands::Context, preserve_status: bool) {
+        if !preserve_status {
+            cxt.editor.status_msg = None;
+        }
         cxt.editor.reset_idle_timer();
         // HACKS: create a fake key event that will never trigger any actual map
         // and therefore simply acts as "dismiss"
@@ -1318,8 +1333,32 @@ impl EditorView {
         event: &MouseEvent,
         cxt: &mut commands::Context,
     ) -> EventResult {
+        let mut preserve_status = false;
+        if event.kind == MouseEventKind::Down(MouseButton::Left) {
+            let command_row = cxt.editor.tree.area().bottom();
+            if event.row == command_row && cxt.editor.dap_eval_result.is_some() {
+                let is_double_click = matches!(
+                    self.last_left_click,
+                    Some((r, c, t)) if r == event.row && c == event.column && t.elapsed() < DOUBLE_CLICK_TIMEOUT
+                );
+                if is_double_click {
+                    self.last_left_click = None;
+                    let text = cxt.editor.dap_eval_result.take().unwrap();
+                    match cxt.editor.registers.write('+', vec![text]) {
+                        Ok(()) => cxt
+                            .editor
+                            .set_status("yanked evaluate result to system clipboard"),
+                        Err(err) => cxt.editor.set_error(err.to_string()),
+                    }
+                    return EventResult::Consumed(None);
+                }
+                preserve_status = true;
+                self.last_left_click = Some((event.row, event.column, Instant::now()));
+            }
+        }
+
         if event.kind != MouseEventKind::Moved {
-            self.handle_non_key_input(cxt)
+            self.handle_non_key_input(cxt, preserve_status)
         }
 
         let config = cxt.editor.config();
@@ -1662,7 +1701,7 @@ impl Component for EditorView {
 
         match event {
             Event::Paste(contents) => {
-                self.handle_non_key_input(&mut cx);
+                self.handle_non_key_input(&mut cx, false);
                 cx.count = cx.editor.count;
                 commands::paste_bracketed_value(&mut cx, contents.clone());
                 cx.editor.count = None;

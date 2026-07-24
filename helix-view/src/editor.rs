@@ -1188,6 +1188,10 @@ pub struct Editor {
     pub last_selection: Option<Selection>,
 
     pub status_msg: Option<(Cow<'static, str>, Severity)>,
+    /// Full text of the most recent DAP "evaluate expression" result, kept independently
+    /// of `status_msg` so a double-click can still retrieve it after the first click of
+    /// the double-click clears the status line. Cleared on use or on a new/failed eval.
+    pub dap_eval_result: Option<String>,
     pub autoinfo: Option<Info>,
 
     pub config: Arc<dyn DynAccess<Config>>,
@@ -1326,6 +1330,7 @@ impl Editor {
                 |config: &Config| &config.clipboard_provider,
             ))),
             status_msg: None,
+            dap_eval_result: None,
             autoinfo: None,
             idle_timer: Box::pin(sleep(conf.idle_timeout)),
             redraw_timer: Box::pin(sleep(Duration::MAX)),

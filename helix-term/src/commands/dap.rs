@@ -738,8 +738,14 @@ pub fn dap_evaluate(cx: &mut Context) {
             let frame_id = debugger.stack_frames[&thread_id][frame].id;
             let result = block_on(debugger.eval(input.to_owned(), Some(frame_id)));
             match result {
-                Ok(response) => cx.editor.set_status(response.result),
-                Err(e) => cx.editor.set_error(format!("Failed to evaluate: {}", e)),
+                Ok(response) => {
+                    cx.editor.dap_eval_result = Some(response.result.clone());
+                    cx.editor.set_status(response.result);
+                }
+                Err(e) => {
+                    cx.editor.dap_eval_result = None;
+                    cx.editor.set_error(format!("Failed to evaluate: {}", e));
+                }
             }
         },
     );

@@ -64,6 +64,14 @@ impl Client {
         match (transport, port_arg) {
             ("tcp", Some(port_arg)) => Self::tcp_process(command, args, port_arg, id).await,
             ("stdio", _) => Self::stdio(command, args, id),
+            // Connect directly to an already-running DAP server (e.g. a process that
+            // called debugpy.listen()); `command` holds the "host:port" to connect to.
+            ("connect", _) => {
+                let addr = command.parse().map_err(|e| {
+                    Error::Other(anyhow!("Invalid connect address {:?}: {}", command, e))
+                })?;
+                Self::tcp(addr, id).await
+            }
             _ => Result::Err(Error::Other(anyhow!("Incorrect transport {}", transport))),
         }
     }

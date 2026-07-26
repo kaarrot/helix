@@ -6741,7 +6741,12 @@ fn prepare_stream_output_buffer(cx: &mut compositor::Context) {
     cx.editor.ensure_cursor_in_view(view_id);
 }
 
-fn shell_stream(cx: &mut compositor::Context, cmd: &str, behavior: &ShellBehavior) {
+fn shell_stream(
+    cx: &mut compositor::Context,
+    cmd: &str,
+    display_cmd: &str,
+    behavior: &ShellBehavior,
+) {
     // Check if a stream is already running
     let existing_stream = {
         let processes = STREAM_PROCESSES.lock().unwrap();
@@ -6751,6 +6756,7 @@ fn shell_stream(cx: &mut compositor::Context, cmd: &str, behavior: &ShellBehavio
     if let Some(buffer_name) = existing_stream {
         // There's already a stream running, prompt user to cancel it
         let cmd = cmd.to_string();
+        let display_cmd = display_cmd.to_string();
         let behavior = *behavior;
 
         let callback = Box::pin(async move {
@@ -6776,7 +6782,7 @@ fn shell_stream(cx: &mut compositor::Context, cmd: &str, behavior: &ShellBehavio
                                 cancel_stream_command(cx);
                                 // Start the new stream - cx has access to jobs, so this should work
                                 log::info!("Calling shell_stream for command: {}", cmd);
-                                shell_stream(cx, &cmd, &behavior);
+                                shell_stream(cx, &cmd, &display_cmd, &behavior);
                                 log::info!("shell_stream returned");
                             } else {
                                 cx.editor.set_status("Stream start cancelled");
@@ -6820,11 +6826,12 @@ fn shell_stream(cx: &mut compositor::Context, cmd: &str, behavior: &ShellBehavio
     let doc_id = doc.id();
     let buffer_name = doc.display_name().to_string();
     let cmd = cmd.to_string();
+    let display_cmd = display_cmd.to_string();
     let behavior_copy = *behavior;
 
     // Show status message that stream is starting
     cx.editor
-        .set_status(format!("Starting stream in '{}': {}", buffer_name, cmd));
+        .set_status(format!("Starting stream in '{}': {}", buffer_name, display_cmd));
 
     log::info!("shell_stream: Scheduling async callback for cmd: {}", cmd);
 
@@ -6955,7 +6962,7 @@ fn shell_stream(cx: &mut compositor::Context, cmd: &str, behavior: &ShellBehavio
         let mut error_message = String::new();
 
         // Insert the command as the first line
-        let command_line = format!("{}\n", cmd);
+        let command_line = format!("{}\n", display_cmd);
         let command_output = Tendril::from(command_line);
         let (current_pos_tx, current_pos_rx) = tokio::sync::oneshot::channel();
 
@@ -6972,10 +6979,10 @@ fn shell_stream(cx: &mut compositor::Context, cmd: &str, behavior: &ShellBehavio
             // If this is a scratch buffer (no path), set its name to the command
             if doc.path().is_none() {
                 // Limit the name to the first 50 characters for readability
-                let name = if cmd.len() > 50 {
-                    format!("{}...", &cmd[..47])
+                let name = if display_cmd.len() > 50 {
+                    format!("{}...", &display_cmd[..47])
                 } else {
-                    cmd.clone()
+                    display_cmd.clone()
                 };
                 doc.set_scratch_buffer_name(Some(name));
             }

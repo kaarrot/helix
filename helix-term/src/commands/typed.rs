@@ -2599,14 +2599,15 @@ fn insert_stream_output(
     // No stream running - start a new stream
     let selection_arg = primary_selection_stream_arg(cx);
     prepare_stream_output_buffer(cx);
-    let mut command = args.join(" ");
+    let display_cmd = args.join(" ");
+    let mut command = display_cmd.clone();
     if let Some(selection_arg) = selection_arg {
         if !command.is_empty() {
             command.push(' ');
         }
         command.push_str(&selection_arg);
     }
-    shell_stream(cx, &command, &ShellBehavior::Insert);
+    shell_stream(cx, &command, &display_cmd, &ShellBehavior::Insert);
     Ok(())
 }
 

@@ -527,6 +527,37 @@ async fn test_insert_stream_output_empty_selection_does_not_append_arg() -> anyh
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
+async fn test_insert_stream_output_spinner_runs_then_clears() -> anyhow::Result<()> {
+    let _lock = Arc::clone(&STREAM_TEST_LOCK).lock_owned().await;
+    let mut app = AppBuilder::new().build()?;
+
+    let doc_id = doc!(app.editor).id();
+    assert!(
+        helix_term::commands::stream_spinner_frame(doc_id).is_none(),
+        "no spinner should be shown before a stream starts"
+    );
+
+    // `cat` keeps the stream alive after the initial output, so the spinner is
+    // observably running rather than racing the end of the command.
+    send_key_sequence(&mut app, ":insert-stream-output printf ready; cat<ret>").await?;
+    wait_for_condition(&mut app, "spinner while stream runs", |app| {
+        doc!(app.editor).text().to_string().contains("ready")
+            && helix_term::commands::stream_spinner_frame(doc_id).is_some()
+    })
+    .await?;
+
+    send_key_sequence(&mut app, ":cancel-stream<ret>").await?;
+    wait_for_condition(&mut app, "spinner cleared after cancellation", |_app| {
+        helix_term::commands::stream_spinner_frame(doc_id).is_none()
+    })
+    .await?;
+
+    close_app(&mut app).await?;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_insert_stream_output_sends_input_without_selection_arg() -> anyhow::Result<()> {
     let _lock = Arc::clone(&STREAM_TEST_LOCK).lock_owned().await;
     let mut app = AppBuilder::new().build()?;

@@ -290,7 +290,7 @@ where
 {
     match element_id {
         helix_view::editor::StatusLineElement::Mode => render_mode,
-        helix_view::editor::StatusLineElement::Spinner => render_lsp_spinner,
+        helix_view::editor::StatusLineElement::Spinner => render_spinner,
         helix_view::editor::StatusLineElement::FileBaseName => render_file_base_name,
         helix_view::editor::StatusLineElement::FileName => render_file_name,
         helix_view::editor::StatusLineElement::FileAbsolutePath => render_file_absolute_path,
@@ -356,23 +356,27 @@ where
 }
 
 // TODO think about handling multiple language servers
-fn render_lsp_spinner<'a, F>(context: &mut RenderContext<'a>, write: F)
+fn render_spinner<'a, F>(context: &mut RenderContext<'a>, write: F)
 where
     F: Fn(&mut RenderContext<'a>, Span<'a>) + Copy,
 {
-    let language_server = context.doc.language_servers().next();
+    let frame = context
+        .doc
+        .language_servers()
+        .next()
+        .and_then(|srv| {
+            context
+                .spinners
+                .get(srv.id())
+                .and_then(|spinner| spinner.frame())
+        })
+        // Fall back to the activity spinner of a running `:insert-stream-output`.
+        .or_else(|| crate::commands::stream_spinner_frame(context.doc.id()));
+
     write(
         context,
-        language_server
-            .and_then(|srv| {
-                context
-                    .spinners
-                    .get(srv.id())
-                    .and_then(|spinner| spinner.frame())
-            })
-            // Even if there's no spinner; reserve its space to avoid elements frequently shifting.
-            .unwrap_or(" ")
-            .into(),
+        // Even if there's no spinner; reserve its space to avoid elements frequently shifting.
+        frame.unwrap_or(" ").into(),
     );
 }
 

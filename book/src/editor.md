@@ -134,7 +134,7 @@ The following statusline elements can be configured:
 | Key    | Description |
 | ------ | ----------- |
 | `mode` | The current editor mode (`mode.normal`/`mode.insert`/`mode.select`) |
-| `spinner` | A progress spinner indicating LSP activity |
+| `spinner` | A progress spinner indicating LSP activity, or a running `:insert-stream-output` command |
 | `file-name` | The path/name of the opened file |
 | `file-absolute-path` | The absolute path/name of the opened file |
 | `file-base-name` | The basename of the opened file |

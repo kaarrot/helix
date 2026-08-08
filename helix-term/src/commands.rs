@@ -80,6 +80,7 @@ use std::{
     future::Future,
     io::Read,
     num::NonZeroUsize,
+    time::Duration,
 };
 
 use std::{
@@ -112,6 +113,49 @@ static STREAM_PROCESSES: Lazy<Arc<Mutex<Option<StreamProcess>>>> =
 static LAST_STREAM_DOC_ID: Lazy<Arc<Mutex<Option<DocumentId>>>> =
     Lazy::new(|| Arc::new(Mutex::new(None)));
 static STREAM_INPUT_HISTORY_LOADED: Lazy<Mutex<bool>> = Lazy::new(|| Mutex::new(false));
+
+/// Frame interval for the stream activity spinner, matching `Spinner::dots`' default.
+const STREAM_SPINNER_INTERVAL_MS: u64 = 80;
+
+/// The activity spinner shown in the statusline of the buffer a stream writes to.
+struct StreamSpinner {
+    doc_id: DocumentId,
+    spinner: ui::Spinner,
+}
+
+static STREAM_SPINNER: Lazy<Mutex<Option<StreamSpinner>>> = Lazy::new(|| Mutex::new(None));
+
+/// The current spinner frame for `doc_id`, or `None` if no stream is running in it.
+pub fn stream_spinner_frame(doc_id: DocumentId) -> Option<&'static str> {
+    let guard = STREAM_SPINNER.lock().unwrap();
+    let state = guard.as_ref()?;
+    if state.doc_id != doc_id {
+        return None;
+    }
+    state.spinner.frame()
+}
+
+/// Keeps the stream spinner alive for as long as the guard is held, so it can't
+/// outlive the stream on any exit path (EOF, cancellation, error, or panic).
+struct StreamSpinnerGuard;
+
+impl StreamSpinnerGuard {
+    fn start(doc_id: DocumentId) -> Self {
+        let mut spinner = ui::Spinner::dots(STREAM_SPINNER_INTERVAL_MS);
+        spinner.start();
+        *STREAM_SPINNER.lock().unwrap() = Some(StreamSpinner { doc_id, spinner });
+        helix_event::request_redraw();
+        Self
+    }
+}
+
+impl Drop for StreamSpinnerGuard {
+    fn drop(&mut self) {
+        *STREAM_SPINNER.lock().unwrap() = None;
+        // Paint the frame that clears the glyph.
+        helix_event::request_redraw();
+    }
+}
 
 const STREAM_INPUT_HISTORY_REGISTER: char = '>';
 const STREAM_INPUT_HISTORY_FILE: &str = "stream-input-history";
@@ -6767,8 +6811,26 @@ fn send_stream_input(
 
 #[cfg(test)]
 mod stream_tests {
-    use super::stream_insert_transaction;
+    use super::{stream_insert_transaction, stream_spinner_frame, StreamSpinnerGuard};
     use helix_core::{Rope, Tendril};
+    use helix_view::DocumentId;
+
+    // `request_redraw` reads a `runtime_local!`, which needs a current tokio
+    // runtime handle under the `integration` feature.
+    #[tokio::test]
+    async fn stream_spinner_is_absent_until_started_and_cleared_on_drop() {
+        let doc_id = DocumentId::default();
+        assert_eq!(stream_spinner_frame(doc_id), None);
+
+        {
+            let _guard = StreamSpinnerGuard::start(doc_id);
+            let frame = stream_spinner_frame(doc_id).expect("spinner should be running");
+            const DOTS: [&str; 8] = ["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"];
+            assert!(DOTS.contains(&frame), "unexpected spinner frame: {}", frame);
+        }
+
+        assert_eq!(stream_spinner_frame(doc_id), None);
+    }
 
     #[test]
     fn stream_insert_transaction_clamps_out_of_bounds_positions() {
@@ -7152,6 +7214,10 @@ fn shell_stream(
             });
         }
 
+        // Show an activity spinner in the target buffer's statusline until this
+        // task ends, however it ends.
+        let _spinner_guard = StreamSpinnerGuard::start(doc_id);
+
         {
             let mut last_doc = LAST_STREAM_DOC_ID.lock().unwrap();
             *last_doc = Some(doc_id);
@@ -7233,8 +7299,19 @@ fn shell_stream(
         let mut cancelled = false;
         let mut stdout_closed = false;
         let mut stderr_closed = false;
+
+        // Helix only repaints when a redraw is requested, and `Spinner::frame`
+        // advances off wall-clock time, so the spinner would freeze whenever the
+        // command goes quiet. Tick a redraw for as long as the stream runs.
+        let mut spinner_tick =
+            tokio::time::interval(Duration::from_millis(STREAM_SPINNER_INTERVAL_MS));
+        spinner_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
         loop {
             tokio::select! {
+                _ = spinner_tick.tick() => {
+                    helix_event::request_redraw();
+                }
                 _ = &mut cancel_rx => {
                     // Cancellation requested
                     cancelled = true;

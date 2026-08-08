@@ -55,7 +55,7 @@ impl Spinner {
         self.start = Some(Instant::now());
     }
 
-    pub fn frame(&self) -> Option<&str> {
+    pub fn frame(&self) -> Option<&'static str> {
         let idx = (self
             .start
             .map(|time| Instant::now().duration_since(time))?

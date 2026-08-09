@@ -23,6 +23,7 @@ mod test {
     mod completion;
     mod diff_merge;
     mod languages;
+    mod long_lines;
     mod movement;
     mod splits;
 }

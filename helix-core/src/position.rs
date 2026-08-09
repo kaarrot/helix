@@ -421,7 +421,9 @@ pub fn char_idx_at_visual_block_offset(
     let mut last_char_idx = formatter.next_char_pos();
     let mut found_non_virtual_on_row = false;
     let mut last_row = 0;
-    for grapheme in &mut formatter {
+    // NOTE: `for grapheme in &mut formatter` would hold the mutable borrow across the
+    // whole body, which forbids calling `skip_to_next_line` below.
+    while let Some(grapheme) = formatter.next() {
         match grapheme.visual_pos.row.cmp(&row) {
             Ordering::Equal => {
                 if grapheme.visual_pos.col + grapheme.width() > column {
@@ -441,6 +443,14 @@ pub fn char_idx_at_visual_block_offset(
                 if !grapheme.is_virtual() {
                     last_row = grapheme.visual_pos.row;
                     last_char_idx = grapheme.char_idx;
+                }
+                // Rows before the target one contribute nothing but their last
+                // non-virtual grapheme, which is always the line break. Jump straight to
+                // it instead of walking the line: this is what keeps scrolling past long
+                // lines independent of how long they are.
+                if let Some(skipped) = formatter.skip_to_next_line() {
+                    last_row = skipped.row;
+                    last_char_idx = skipped.line_end_char_idx;
                 }
             }
         }
@@ -931,5 +941,277 @@ mod test {
             .0,
             0
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Horizontal clipping differentials
+    //
+    // `char_idx_at_visual_block_offset` skips whole lines when soft wrap is
+    // off. The verbatim pre-change loop is kept here so the optimised version
+    // can be asserted to be indistinguishable from it, rather than merely
+    // spot-checked. If the real implementation is ever restructured, this copy
+    // is the specification it has to keep matching.
+    // -----------------------------------------------------------------------
+
+    fn char_idx_at_visual_block_offset_reference(
+        text: RopeSlice,
+        anchor: usize,
+        row: usize,
+        column: usize,
+        text_fmt: &TextFormat,
+        annotations: &TextAnnotations,
+    ) -> (usize, usize) {
+        let mut formatter =
+            DocumentFormatter::new_at_prev_checkpoint(text, text_fmt, annotations, anchor);
+        let mut last_char_idx = formatter.next_char_pos();
+        let mut found_non_virtual_on_row = false;
+        let mut last_row = 0;
+        for grapheme in &mut formatter {
+            match grapheme.visual_pos.row.cmp(&row) {
+                Ordering::Equal => {
+                    if grapheme.visual_pos.col + grapheme.width() > column {
+                        if !grapheme.is_virtual() {
+                            return (grapheme.char_idx, 0);
+                        } else if found_non_virtual_on_row {
+                            return (last_char_idx, 0);
+                        }
+                    } else if !grapheme.is_virtual() {
+                        found_non_virtual_on_row = true;
+                        last_char_idx = grapheme.char_idx;
+                    }
+                }
+                Ordering::Greater if found_non_virtual_on_row => return (last_char_idx, 0),
+                Ordering::Greater => return (last_char_idx, row - last_row),
+                Ordering::Less => {
+                    if !grapheme.is_virtual() {
+                        last_row = grapheme.visual_pos.row;
+                        last_char_idx = grapheme.char_idx;
+                    }
+                }
+            }
+        }
+
+        (formatter.next_char_pos(), 0)
+    }
+
+    /// Documents mixing line lengths, line endings and grapheme widths.
+    fn clip_fixtures() -> Vec<(&'static str, String)> {
+        vec![
+            ("short lines", "foo\nbar\nbaz\nqux\n".to_string()),
+            (
+                "mixed lengths",
+                format!("short\n{}\nshort\n{}\n", "a".repeat(80), "b".repeat(120)),
+            ),
+            (
+                "no trailing newline",
+                format!("{}\nshort\n{}", "a".repeat(50), "b".repeat(50)),
+            ),
+            (
+                "empty lines",
+                format!("{}\n\n\n{}\n", "a".repeat(40), "b".repeat(40)),
+            ),
+            (
+                "crlf",
+                format!("{}\r\nshort\r\n{}\r\n", "a".repeat(40), "b".repeat(40)),
+            ),
+            ("cjk", format!("{}\nfoo\n", "\u{4f60}\u{597d}".repeat(20))),
+            ("tabs", format!("\t\t{}\n\tfoo\n", "a".repeat(40))),
+            ("single line", format!("{}\n", "a".repeat(200))),
+            ("empty", String::new()),
+        ]
+    }
+
+    #[test]
+    fn char_idx_at_visual_block_offset_matches_reference() {
+        let text_fmt = TextFormat {
+            soft_wrap: false,
+            ..TextFormat::default()
+        };
+        for (name, text) in clip_fixtures() {
+            let rope = Rope::from(text.as_str());
+            let slice = rope.slice(..);
+            let anchors = [
+                0,
+                slice.len_chars() / 2,
+                slice.len_chars().saturating_sub(1),
+                slice.len_chars(),
+            ];
+            for anchor in anchors {
+                for row in 0..6usize {
+                    for column in [0usize, 1, 3, 17, 100, usize::MAX] {
+                        let want = char_idx_at_visual_block_offset_reference(
+                            slice,
+                            anchor,
+                            row,
+                            column,
+                            &text_fmt,
+                            &TextAnnotations::default(),
+                        );
+                        let got = char_idx_at_visual_block_offset(
+                            slice,
+                            anchor,
+                            row,
+                            column,
+                            &text_fmt,
+                            &TextAnnotations::default(),
+                        );
+                        assert_eq!(
+                            want, got,
+                            "{name:?} diverged at anchor={anchor} row={row} column={column}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn char_idx_at_visual_block_offset_matches_reference_with_annotations() {
+        let text_fmt = TextFormat {
+            soft_wrap: false,
+            ..TextFormat::default()
+        };
+        for (name, text) in clip_fixtures() {
+            let rope = Rope::from(text.as_str());
+            let slice = rope.slice(..);
+            if slice.len_lines() < 2 {
+                continue;
+            }
+            // anchored on the first char of the second line: the boundary a
+            // sloppy annotation cursor advance would consume too eagerly
+            let annotations = [InlineAnnotation {
+                text: "VIRT".into(),
+                char_idx: slice.line_to_char(1),
+            }];
+            for anchor in [0, slice.len_chars() / 2] {
+                for row in 0..5usize {
+                    for column in [0usize, 2, 17] {
+                        let want = char_idx_at_visual_block_offset_reference(
+                            slice,
+                            anchor,
+                            row,
+                            column,
+                            &text_fmt,
+                            TextAnnotations::default().add_inline_annotations(&annotations, None),
+                        );
+                        let got = char_idx_at_visual_block_offset(
+                            slice,
+                            anchor,
+                            row,
+                            column,
+                            &text_fmt,
+                            TextAnnotations::default().add_inline_annotations(&annotations, None),
+                        );
+                        assert_eq!(
+                            want, got,
+                            "{name:?} diverged at anchor={anchor} row={row} column={column}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Not an assertion, a stopwatch. Run with:
+    ///
+    /// ```text
+    /// cargo test -p helix-core --release -- --ignored --nocapture bench_
+    /// ```
+    #[test]
+    #[ignore = "timing measurement, not a correctness test"]
+    fn bench_char_idx_at_visual_offset_long_lines() {
+        use std::time::Instant;
+
+        let line: String = "a".repeat(2000);
+        let text: String = std::iter::repeat(line.as_str())
+            .take(5000)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let rope = Rope::from(text.as_str());
+        let slice = rope.slice(..);
+        let text_fmt = TextFormat {
+            soft_wrap: false,
+            ..TextFormat::default()
+        };
+        let annotations = TextAnnotations::default();
+
+        // scroll a screenful at a time, the `Ctrl-d` shape. Time the retained verbatim
+        // copy of the pre-change loop against the real one, so the comparison needs no
+        // source mutation and cannot drift.
+        let iterations = 1000u32;
+
+        let start = Instant::now();
+        for i in 0..iterations as usize {
+            let anchor = slice.line_to_char(i % 4000);
+            std::hint::black_box(char_idx_at_visual_block_offset_reference(
+                slice,
+                anchor,
+                50,
+                0,
+                &text_fmt,
+                &annotations,
+            ));
+        }
+        let before = start.elapsed();
+
+        let start = Instant::now();
+        for i in 0..iterations as usize {
+            let anchor = slice.line_to_char(i % 4000);
+            std::hint::black_box(char_idx_at_visual_block_offset(
+                slice,
+                anchor,
+                50,
+                0,
+                &text_fmt,
+                &annotations,
+            ));
+        }
+        let after = start.elapsed();
+
+        println!(
+            "char_idx_at_visual_block_offset, 50 rows over 2000-char lines:\n  \
+             before {:?}/call\n  after  {:?}/call\n  speedup {:.1}x",
+            before / iterations,
+            after / iterations,
+            before.as_secs_f64() / after.as_secs_f64()
+        );
+    }
+
+    /// Soft wrap must be completely unaffected: the skip declines to run.
+    #[test]
+    fn char_idx_at_visual_block_offset_softwrap_unchanged() {
+        let text_fmt = TextFormat {
+            soft_wrap: true,
+            ..TextFormat::default()
+        };
+        for (name, text) in clip_fixtures() {
+            let rope = Rope::from(text.as_str());
+            let slice = rope.slice(..);
+            for anchor in [0, slice.len_chars() / 2] {
+                for row in 0..6usize {
+                    for column in [0usize, 3, 17] {
+                        assert_eq!(
+                            char_idx_at_visual_block_offset_reference(
+                                slice,
+                                anchor,
+                                row,
+                                column,
+                                &text_fmt,
+                                &TextAnnotations::default(),
+                            ),
+                            char_idx_at_visual_block_offset(
+                                slice,
+                                anchor,
+                                row,
+                                column,
+                                &text_fmt,
+                                &TextAnnotations::default(),
+                            ),
+                            "{name:?} diverged under soft wrap at anchor={anchor} row={row} column={column}"
+                        );
+                    }
+                }
+            }
+        }
     }
 }

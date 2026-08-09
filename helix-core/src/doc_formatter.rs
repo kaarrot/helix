@@ -170,11 +170,30 @@ impl Default for TextFormat {
     }
 }
 
+/// Describes the document line that [`DocumentFormatter::skip_to_next_line`] discarded.
+///
+/// The fields describe the state the formatter *would* have reached had the remainder of
+/// the line been iterated normally, so callers that track the last traversed grapheme can
+/// keep their bookkeeping exact across a skip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SkippedLine {
+    /// The visual row the skipped line occupied, relative to the start of the block.
+    pub row: usize,
+    /// The char index of the line break that terminated the skipped line. This is the
+    /// `char_idx` that the line's last non-virtual `FormattedGrapheme` would have carried.
+    pub line_end_char_idx: usize,
+    /// The document line index of the skipped line.
+    pub line_idx: usize,
+}
+
 #[derive(Debug)]
 pub struct DocumentFormatter<'t> {
     text_fmt: &'t TextFormat,
     annotations: &'t TextAnnotations<'t>,
 
+    /// The document text. Only needed to re-seed `graphemes` in
+    /// [`DocumentFormatter::skip_to_next_line`].
+    text: RopeSlice<'t>,
     /// The visual position at the end of the last yielded word boundary
     visual_pos: Position,
     graphemes: RopeGraphemes<'t>,
@@ -220,6 +239,7 @@ impl<'t> DocumentFormatter<'t> {
         DocumentFormatter {
             text_fmt,
             annotations,
+            text,
             visual_pos: Position { row: 0, col: 0 },
             graphemes: text.slice(block_char_idx..).graphemes(),
             char_pos: block_char_idx,
@@ -418,6 +438,84 @@ impl<'t> DocumentFormatter<'t> {
                 return;
             }
         }
+    }
+
+    /// Discards the remainder of the current document line and repositions the formatter
+    /// at the start of the next one, exactly as if every remaining grapheme (including the
+    /// line break) had been yielded and thrown away.
+    ///
+    /// This is `O(log N)` rather than `O(remaining line length)`, which is what makes
+    /// rendering and vertical motion independent of line length when soft wrap is off.
+    /// Callers must only use it where the discarded graphemes provably cannot affect the
+    /// result — because they are past the right edge of the viewport, or on a visual row
+    /// that is not the one being searched for.
+    ///
+    /// Returns `None`, leaving the formatter completely untouched, when the skip does not
+    /// apply:
+    ///
+    /// * soft wrap is enabled — `word_buf`/`peeked_grapheme`/`indent_level` cannot be
+    ///   reconstructed, and one document line is not one visual row
+    /// * the formatter is exhausted, or is on the last line and so has no line break left
+    /// * an [`crate::text_annotations::Overlay`] replaces the line break grapheme.
+    ///   `advance_grapheme` substitutes the overlay for *any* char including the line
+    ///   feed, and `next` then does not run its line break bookkeeping at all, so skipping
+    ///   would desync `visual_pos`.
+    ///
+    /// # Approximation
+    ///
+    /// The `line_end_visual_pos` handed to
+    /// [`crate::text_annotations::LineAnnotation::insert_virtual_lines`] has an exact
+    /// `row` but a `col` equal to the column the caller stopped at rather than the true
+    /// width of the line. See the note on that trait method.
+    pub fn skip_to_next_line(&mut self) -> Option<SkippedLine> {
+        if self.text_fmt.soft_wrap || self.exhausted {
+            return None;
+        }
+
+        let line_idx = self.line_pos;
+        // the last line has no line break to skip over
+        if line_idx + 1 >= self.text.len_lines() {
+            return None;
+        }
+
+        let next_line_char_idx = self.text.line_to_char(line_idx + 1);
+        let line_end_char_idx = crate::line_ending::line_end_char_index(&self.text, line_idx);
+        // never skip backwards
+        if line_end_char_idx < self.char_pos {
+            return None;
+        }
+        if self.annotations.has_overlay_at(line_end_char_idx) {
+            return None;
+        }
+
+        let row = self.visual_pos.row;
+
+        // Stand in for the `process_virtual_text_anchors` calls that `next` would have
+        // made for the discarded graphemes. This must happen before `virtual_lines_at`,
+        // matching the order that normal iteration produces.
+        self.annotations.skip_to(next_line_char_idx);
+
+        // Reproduce the line break bookkeeping of `Iterator::next`.
+        let line_end_visual_pos = Position::new(row, self.visual_pos.col + 1);
+        let virtual_lines =
+            self.annotations
+                .virtual_lines_at(next_line_char_idx, line_end_visual_pos, line_idx);
+        self.visual_pos.row = row + 1 + virtual_lines;
+        self.visual_pos.col = 0;
+        self.line_pos = line_idx + 1;
+
+        // Re-seed the grapheme iterator the same way `new_at_prev_checkpoint` does, so
+        // there is no chance of a cluster boundary behaving differently.
+        self.char_pos = next_line_char_idx;
+        self.graphemes = self.text.slice(next_line_char_idx..).graphemes();
+        self.inline_annotation_graphemes = None;
+        self.indent_level = None;
+
+        Some(SkippedLine {
+            row,
+            line_end_char_idx,
+            line_idx,
+        })
     }
 
     /// returns the char index at the end of the last yielded grapheme

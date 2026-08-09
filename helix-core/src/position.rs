@@ -206,6 +206,12 @@ pub fn visual_offset_from_anchor(
         return Err(VisualOffsetError::PosBeforeAnchorRow);
     }
 
+    let can_skip = !text_fmt.soft_wrap;
+    // char index at which the document line currently being traversed ends, refreshed
+    // only on a line transition
+    let mut current_line_idx = usize::MAX;
+    let mut current_line_end = 0usize;
+
     while let Some(grapheme) = formatter.next() {
         last_pos = grapheme.visual_pos;
 
@@ -233,6 +239,30 @@ pub fn visual_offset_from_anchor(
         if let Some(anchor_line) = anchor_line {
             if grapheme.visual_pos.row >= anchor_line + max_rows {
                 return Err(VisualOffsetError::PosAfterMaxRow);
+            }
+        }
+
+        // Lines before the one containing `pos` contribute nothing but their row advance.
+        // Walking them grapheme by grapheme is what makes `ensure_cursor_in_view`, and so
+        // every cursor movement, scale with line length rather than with rows crossed.
+        //
+        // Requiring `anchor_line` to be known also keeps the `unwrap_or(last_pos.row)`
+        // fall-through below on the unskipped path, where `last_pos` must be the final
+        // grapheme rather than whatever line a skip left it on.
+        if can_skip && anchor_line.is_some() {
+            if grapheme.line_idx != current_line_idx {
+                current_line_idx = grapheme.line_idx;
+                // Refreshed per line, not per grapheme: a `line_to_char` on every
+                // character would be an O(log N) rope search added to ordinary editing,
+                // taxing every keystroke to speed up the long-line case.
+                current_line_end = if grapheme.line_idx + 1 < text.len_lines() {
+                    text.line_to_char(grapheme.line_idx + 1)
+                } else {
+                    usize::MAX
+                };
+            }
+            if current_line_end <= pos {
+                formatter.skip_to_next_line();
             }
         }
     }
@@ -1175,6 +1205,161 @@ mod test {
             after / iterations,
             before.as_secs_f64() / after.as_secs_f64()
         );
+    }
+
+    /// Stands in for "no row limit". Not `usize::MAX`: `anchor_line + max_rows`
+    /// in both the reference and the real implementation would overflow in debug
+    /// builds. No caller passes an unbounded value -- they pass a viewport
+    /// height -- so this is a latent quirk of the existing code, not something
+    /// the skip introduces.
+    const LARGE_MAX_ROWS: usize = 1 << 20;
+
+    fn visual_offset_from_anchor_reference(
+        text: RopeSlice,
+        anchor: usize,
+        pos: usize,
+        text_fmt: &TextFormat,
+        annotations: &TextAnnotations,
+        max_rows: usize,
+    ) -> Result<(Position, usize), VisualOffsetError> {
+        let mut formatter =
+            DocumentFormatter::new_at_prev_checkpoint(text, text_fmt, annotations, anchor);
+        let mut anchor_line = None;
+        let mut found_pos = None;
+        let mut last_pos = Position::default();
+
+        let block_start = formatter.next_char_pos();
+        if pos < block_start {
+            return Err(VisualOffsetError::PosBeforeAnchorRow);
+        }
+
+        while let Some(grapheme) = formatter.next() {
+            last_pos = grapheme.visual_pos;
+
+            if formatter.next_char_pos() > pos {
+                if let Some(anchor_line) = anchor_line {
+                    last_pos.row -= anchor_line;
+                    return Ok((last_pos, block_start));
+                } else {
+                    found_pos = Some(last_pos);
+                }
+            }
+            if formatter.next_char_pos() > anchor && anchor_line.is_none() {
+                if let Some(mut found_pos) = found_pos {
+                    return if found_pos.row == last_pos.row {
+                        found_pos.row = 0;
+                        Ok((found_pos, block_start))
+                    } else {
+                        Err(VisualOffsetError::PosBeforeAnchorRow)
+                    };
+                } else {
+                    anchor_line = Some(last_pos.row);
+                }
+            }
+
+            if let Some(anchor_line) = anchor_line {
+                if grapheme.visual_pos.row >= anchor_line + max_rows {
+                    return Err(VisualOffsetError::PosAfterMaxRow);
+                }
+            }
+        }
+
+        let anchor_line = anchor_line.unwrap_or(last_pos.row);
+        last_pos.row -= anchor_line;
+
+        Ok((last_pos, block_start))
+    }
+
+    #[test]
+    fn visual_offset_from_anchor_matches_reference() {
+        for soft_wrap in [false, true] {
+            let text_fmt = TextFormat {
+                soft_wrap,
+                ..TextFormat::default()
+            };
+            for (name, text) in clip_fixtures() {
+                let rope = Rope::from(text.as_str());
+                let slice = rope.slice(..);
+                let len = slice.len_chars();
+                let anchors = [0, len / 4, len / 2, len.saturating_sub(1), len];
+                // `usize::MAX` is what `View::last_visual_line` passes, and is the case
+                // that runs entirely through the fall-through return
+                let positions = [0, len / 4, len / 2, len.saturating_sub(1), len, usize::MAX];
+                for anchor in anchors {
+                    for pos in positions {
+                        for max_rows in [1usize, 5, LARGE_MAX_ROWS] {
+                            let want = visual_offset_from_anchor_reference(
+                                slice,
+                                anchor,
+                                pos,
+                                &text_fmt,
+                                &TextAnnotations::default(),
+                                max_rows,
+                            );
+                            let got = visual_offset_from_anchor(
+                                slice,
+                                anchor,
+                                pos,
+                                &text_fmt,
+                                &TextAnnotations::default(),
+                                max_rows,
+                            );
+                            assert_eq!(
+                                want, got,
+                                "{name:?} diverged at soft_wrap={soft_wrap} anchor={anchor} \
+                                 pos={pos} max_rows={max_rows}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn visual_offset_from_anchor_matches_reference_with_annotations() {
+        let text_fmt = TextFormat {
+            soft_wrap: false,
+            ..TextFormat::default()
+        };
+        for (name, text) in clip_fixtures() {
+            let rope = Rope::from(text.as_str());
+            let slice = rope.slice(..);
+            if slice.len_lines() < 2 {
+                continue;
+            }
+            let annotations = [InlineAnnotation {
+                text: "VIRT".into(),
+                char_idx: slice.line_to_char(1),
+            }];
+            let len = slice.len_chars();
+            for anchor in [0, len / 2] {
+                for pos in [0, len / 2, len, usize::MAX] {
+                    for max_rows in [1usize, 5, LARGE_MAX_ROWS] {
+                        let want = visual_offset_from_anchor_reference(
+                            slice,
+                            anchor,
+                            pos,
+                            &text_fmt,
+                            TextAnnotations::default().add_inline_annotations(&annotations, None),
+                            max_rows,
+                        );
+                        let got = visual_offset_from_anchor(
+                            slice,
+                            anchor,
+                            pos,
+                            &text_fmt,
+                            TextAnnotations::default().add_inline_annotations(&annotations, None),
+                            max_rows,
+                        );
+                        assert_eq!(
+                            want, got,
+                            "{name:?} diverged at anchor={anchor} pos={pos} max_rows={max_rows}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// Soft wrap must be completely unaffected: the skip declines to run.

@@ -397,6 +397,14 @@ impl EditorView {
         overlay_highlights: &mut Vec<OverlayHighlights>,
     ) {
         use helix_core::diagnostic::{DiagnosticTag, Range, Severity};
+
+        // Without this, a document with no diagnostics still pays six theme lookups and
+        // seven `Vec` allocations on every frame. `Overlay::new` discards empty
+        // `OverlayHighlights`, so returning early here is behaviour preserving.
+        if doc.diagnostics().is_empty() {
+            return;
+        }
+
         let get_scope_of = |scope| {
             theme
                 .find_highlight_exact(scope)

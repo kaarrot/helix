@@ -1,5 +1,9 @@
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use crate::doc_formatter::{DocumentFormatter, TextFormat};
-use crate::text_annotations::{InlineAnnotation, Overlay, TextAnnotations};
+use crate::text_annotations::{InlineAnnotation, LineAnnotation, Overlay, TextAnnotations};
+use crate::Position;
 
 impl TextFormat {
     fn new_test(softwrap: bool) -> Self {
@@ -210,4 +214,312 @@ fn annotation_and_overlay() {
         .collect_to_str(),
         "fooo  bar "
     );
+}
+
+// ---------------------------------------------------------------------------
+// `skip_to_next_line` differential tests
+//
+// Skipping the off-screen tail of a line must be indistinguishable from
+// iterating it and throwing the graphemes away. These tests assert that
+// equivalence rather than pinning specific output, so fixtures can be added
+// without anyone having to hand-compute expected strings.
+// ---------------------------------------------------------------------------
+
+/// A grapheme as observed by a caller that only cares about what it renders.
+type Observed = (usize, Position, String);
+
+/// Iterate the whole document, discarding graphemes at or past `clip`.
+fn unclipped_graphemes(
+    text: &str,
+    text_fmt: &TextFormat,
+    annotations: &TextAnnotations,
+    clip: usize,
+) -> Vec<Observed> {
+    let mut formatter =
+        DocumentFormatter::new_at_prev_checkpoint(text.into(), text_fmt, annotations, 0);
+    let mut res = Vec::new();
+    while let Some(g) = formatter.next() {
+        if g.visual_pos.col < clip {
+            res.push((g.char_idx, g.visual_pos, g.raw.to_string()));
+        }
+    }
+    res
+}
+
+/// Iterate the same document, but skip the remainder of a line as soon as
+/// `clip` is reached. Mirrors the structure of the renderer's clip.
+fn clipped_graphemes(
+    text: &str,
+    text_fmt: &TextFormat,
+    annotations: &TextAnnotations,
+    clip: usize,
+) -> Vec<Observed> {
+    let mut formatter =
+        DocumentFormatter::new_at_prev_checkpoint(text.into(), text_fmt, annotations, 0);
+    let mut res = Vec::new();
+    let mut last_row = usize::MAX;
+    let mut can_skip = true;
+    while let Some(g) = formatter.next() {
+        if g.visual_pos.row != last_row {
+            last_row = g.visual_pos.row;
+            can_skip = true;
+        }
+        if g.visual_pos.col < clip {
+            res.push((g.char_idx, g.visual_pos, g.raw.to_string()));
+            continue;
+        }
+        if can_skip {
+            if formatter.skip_to_next_line().is_some() {
+                continue;
+            }
+            // this line refuses to be skipped, fall back to iterating it
+            can_skip = false;
+        }
+    }
+    res
+}
+
+fn assert_clip_equivalent(name: &str, text: &str, annotations: &TextAnnotations) {
+    for clip in [1, 2, 3, 5, 17] {
+        let text_fmt = TextFormat::new_test(false);
+        // annotation cursors are shared through `Cell`, so re-seed between runs
+        annotations.reset_pos(0);
+        let expected = unclipped_graphemes(text, &text_fmt, annotations, clip);
+        annotations.reset_pos(0);
+        let got = clipped_graphemes(text, &text_fmt, annotations, clip);
+        annotations.reset_pos(0);
+        assert_eq!(
+            expected, got,
+            "clipped iteration diverged for {name:?} at clip={clip}"
+        );
+    }
+}
+
+/// Documents exercising the grapheme, line-ending and boundary cases the skip
+/// has to reproduce exactly.
+fn fixtures() -> Vec<(&'static str, String)> {
+    vec![
+        ("plain", "hello world\nsecond line\nthird\n".to_string()),
+        // two consecutive skippable lines: catches a wedged `Layer` cursor,
+        // which only manifests from the second skip onwards
+        (
+            "two long lines",
+            format!("{}\n{}\n", "a".repeat(60), "b".repeat(60)),
+        ),
+        (
+            "no trailing newline",
+            format!("{}\n{}", "a".repeat(60), "b".repeat(60)),
+        ),
+        (
+            "empty line between",
+            format!("{}\n\n{}\n", "a".repeat(60), "b".repeat(60)),
+        ),
+        // a tab straddling the clip column
+        ("tabs", format!("a\t{}\nx\ty\n", "b".repeat(40))),
+        // CJK is double width, so a grapheme can straddle the clip boundary
+        ("cjk", format!("{}\nplain\n", "\u{4f60}\u{597d}".repeat(30))),
+        (
+            "crlf",
+            format!("{}\r\n{}\r\n", "a".repeat(60), "b".repeat(60)),
+        ),
+        (
+            "lone cr",
+            format!("{}\r{}\r", "a".repeat(60), "b".repeat(60)),
+        ),
+        ("combining", format!("{}\nplain\n", "e\u{0301}".repeat(30))),
+        ("single long line", format!("{}\n", "a".repeat(200))),
+        ("empty", String::new()),
+        ("only newline", "\n".to_string()),
+    ]
+}
+
+/// Char indices at which an annotation may legally be anchored.
+///
+/// Annotations anchored *inside* a multi-char grapheme cluster are never
+/// consumed - `char_pos` advances by whole graphemes - which leaves the layer
+/// cursor behind and trips the `debug_assert` in `Layer::consume`. That is a
+/// pre-existing invariant of `TextAnnotations`, unrelated to clipping, so the
+/// fixtures below have to respect it.
+fn grapheme_boundaries(text: &str) -> Vec<usize> {
+    use helix_stdx::rope::RopeSliceExt;
+    let rope = crate::Rope::from_str(text);
+    let slice = rope.slice(..);
+    let mut boundaries = Vec::new();
+    let mut char_idx = 0;
+    for grapheme in slice.graphemes() {
+        boundaries.push(char_idx);
+        char_idx += grapheme.len_chars();
+    }
+    boundaries
+}
+
+/// Anchors spread across the document, all at grapheme boundaries, including
+/// the first char of the second line - the `partition_point` boundary that a
+/// sloppy cursor advance would consume too eagerly.
+fn annotation_anchors(text: &str) -> Vec<usize> {
+    let boundaries = grapheme_boundaries(text);
+    let mut anchors: Vec<usize> = [0usize, 1, 2, 5, 18]
+        .iter()
+        .filter_map(|&i| boundaries.get(i).copied())
+        .collect();
+
+    let rope = crate::Rope::from_str(text);
+    if rope.len_lines() > 1 {
+        let second_line = rope.line_to_char(1);
+        if second_line < rope.len_chars() {
+            anchors.push(second_line);
+        }
+    }
+
+    anchors.sort_unstable();
+    anchors.dedup();
+    anchors
+}
+
+#[test]
+fn skip_to_next_line_matches_unclipped() {
+    for (name, text) in fixtures() {
+        assert_clip_equivalent(name, &text, &TextAnnotations::default());
+    }
+}
+
+#[test]
+fn skip_to_next_line_with_inline_annotations() {
+    for (name, text) in fixtures() {
+        let len = text.chars().count();
+        if len < 4 {
+            continue;
+        }
+        // annotations before, at and after the clip column, plus one anchored on
+        // the first char of the second line
+        let annotations: Vec<_> = annotation_anchors(&text)
+            .iter()
+            .map(|&idx| InlineAnnotation::new(idx, "VIRT"))
+            .collect();
+        let mut text_annotations = TextAnnotations::default();
+        text_annotations.add_inline_annotations(&annotations, None);
+        assert_clip_equivalent(
+            &format!("{name} + inline annotations"),
+            &text,
+            &text_annotations,
+        );
+    }
+}
+
+#[test]
+fn skip_to_next_line_with_overlays() {
+    for (name, text) in fixtures() {
+        let len = text.chars().count();
+        if len < 4 {
+            continue;
+        }
+        let boundaries = grapheme_boundaries(&text);
+        let mut overlays: Vec<Overlay> = [0usize, 2]
+            .iter()
+            .filter_map(|&i| boundaries.get(i).copied())
+            .map(|idx| Overlay::new(idx, "X"))
+            .collect();
+
+        // An overlay *on the line break* must suppress the skip entirely: the
+        // formatter does not run its line break bookkeeping for an overlaid
+        // newline, so skipping would desync `visual_pos`. This is the case that
+        // proves `has_overlay_at` guards the right char index.
+        let rope = crate::Rope::from_str(&text);
+        if rope.len_lines() > 1 {
+            overlays.push(Overlay::new(
+                crate::line_ending::line_end_char_index(&rope.slice(..), 0),
+                "N",
+            ));
+        }
+        overlays.sort_by_key(|o| o.char_idx);
+        overlays.dedup_by_key(|o| o.char_idx);
+
+        let mut text_annotations = TextAnnotations::default();
+        text_annotations.add_overlay(&overlays, None);
+        assert_clip_equivalent(&format!("{name} + overlays"), &text, &text_annotations);
+    }
+}
+
+/// Records every call a `LineAnnotation` receives, and inserts a virtual line
+/// after every other document line so the row arithmetic of a skip is actually
+/// exercised.
+#[derive(Default)]
+struct RecordingLineAnnotation {
+    /// `(line_end_char_idx, line_end_visual_pos, doc_line)`
+    virt_line_calls: Rc<RefCell<Vec<(usize, Position, usize)>>>,
+    anchors_processed: Rc<RefCell<Vec<usize>>>,
+}
+
+impl LineAnnotation for RecordingLineAnnotation {
+    fn insert_virtual_lines(
+        &mut self,
+        line_end_char_idx: usize,
+        line_end_visual_pos: Position,
+        doc_line: usize,
+    ) -> Position {
+        self.virt_line_calls
+            .borrow_mut()
+            .push((line_end_char_idx, line_end_visual_pos, doc_line));
+        Position::new(doc_line % 2, 0)
+    }
+
+    fn process_anchor(&mut self, grapheme: &crate::doc_formatter::FormattedGrapheme) -> usize {
+        self.anchors_processed.borrow_mut().push(grapheme.char_idx);
+        usize::MAX
+    }
+}
+
+#[test]
+fn skip_to_next_line_preserves_virtual_line_rows() {
+    for (name, text) in fixtures() {
+        if text.chars().count() < 4 {
+            continue;
+        }
+
+        let run = |clip: usize, skip: bool| {
+            let calls = Rc::new(RefCell::new(Vec::new()));
+            let anchors = Rc::new(RefCell::new(Vec::new()));
+            let annotation = RecordingLineAnnotation {
+                virt_line_calls: Rc::clone(&calls),
+                anchors_processed: Rc::clone(&anchors),
+            };
+            let mut text_annotations = TextAnnotations::default();
+            text_annotations.add_line_annotation(Box::new(annotation));
+            let text_fmt = TextFormat::new_test(false);
+            let observed = if skip {
+                clipped_graphemes(&text, &text_fmt, &text_annotations, clip)
+            } else {
+                unclipped_graphemes(&text, &text_fmt, &text_annotations, clip)
+            };
+            let calls = calls.borrow().clone();
+            (observed, calls)
+        };
+
+        for clip in [1, 2, 3, 5, 17] {
+            let (want_graphemes, want_calls) = run(clip, false);
+            let (got_graphemes, got_calls) = run(clip, true);
+
+            assert_eq!(
+                want_graphemes, got_graphemes,
+                "visible graphemes diverged for {name:?} at clip={clip} with virtual lines"
+            );
+
+            // `insert_virtual_lines` must be called once per line, for the same
+            // line, at the same char index and on the same *row*. Only the
+            // column is allowed to differ - that is the documented
+            // approximation of the horizontal clip.
+            assert_eq!(
+                want_calls.len(),
+                got_calls.len(),
+                "virtual line call count diverged for {name:?} at clip={clip}"
+            );
+            for (want, got) in want_calls.iter().zip(got_calls.iter()) {
+                assert_eq!(
+                    (want.0, want.1.row, want.2),
+                    (got.0, got.1.row, got.2),
+                    "virtual line call diverged for {name:?} at clip={clip}"
+                );
+            }
+        }
+    }
 }

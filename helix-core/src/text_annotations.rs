@@ -165,6 +165,12 @@ pub trait LineAnnotation {
     /// the height of the text and "align" two different documents (like for side
     /// by side diffs).  These annotations that want to "align" two documents should
     /// therefore be added last so that other virtual text is also considered while aligning
+    ///
+    /// When the caller clips a line horizontally (see
+    /// [`crate::doc_formatter::DocumentFormatter::skip_to_next_line`]) the `col` component
+    /// of `line_end_visual_pos` is the column the caller stopped at rather than the true
+    /// width of the line. The `row` component is always exact. Implementations that need
+    /// the real line width must not rely on `col`.
     fn insert_virtual_lines(
         &mut self,
         line_end_char_idx: usize,
@@ -302,6 +308,14 @@ impl<'a> TextAnnotations<'a> {
 
     pub fn collect_overlay_highlights(&self, char_range: Range<usize>) -> OverlayHighlights {
         let mut highlights = Vec::new();
+        // The loop below is `O(chars in the viewport)`. Overlays are only ever registered
+        // while jump labels are on screen (`View::text_annotations`), so without this the
+        // whole viewport is walked character by character every frame to produce nothing.
+        // That is pathological for files with very long lines and soft wrap disabled,
+        // where the viewport can span the entire document.
+        if self.overlays.is_empty() {
+            return OverlayHighlights::Heterogenous { highlights };
+        }
         self.reset_pos(char_range.start);
         for char_idx in char_range {
             if let Some((_, Some(highlight))) = self.overlay_at(char_idx) {
@@ -377,6 +391,45 @@ impl<'a> TextAnnotations<'a> {
         self.inline_annotations.iter().find_map(|layer| {
             let annotation = layer.consume(char_idx, |annot| annot.char_idx)?;
             Some((annotation, layer.metadata))
+        })
+    }
+
+    /// Advances every annotation cursor to `char_idx`, as if all graphemes before it had
+    /// been traversed but concealed. Used by [`crate::doc_formatter::DocumentFormatter::skip_to_next_line`].
+    ///
+    /// This is deliberately *not* [`Self::reset_pos`]. That drives
+    /// `LineAnnotation::reset_pos`, whose only implementation discards the diagnostics it
+    /// has already accumulated for the line currently being traversed. Skipping must
+    /// preserve that state, so line annotations are advanced with `skip_concealed_anchors`
+    /// — which is specified for exactly this case — instead.
+    ///
+    /// `char_idx` must not be before the position the annotations are currently at.
+    pub(crate) fn skip_to(&self, char_idx: usize) {
+        // `Layer::reset_pos` is a `partition_point`, so it is direction agnostic and safe
+        // to use to move forwards. Advancing these is not optional: `Layer::consume` only
+        // steps `current_index` on an exact match, so a layer that is jumped over without
+        // being advanced stays wedged for the rest of the document.
+        reset_pos(&self.inline_annotations, char_idx, |annot| annot.char_idx);
+        reset_pos(&self.overlays, char_idx, |annot| annot.char_idx);
+        for (next_anchor, layer) in &self.line_annotations {
+            while next_anchor.get() < char_idx {
+                next_anchor.set(unsafe { layer.get().skip_concealed_anchors(char_idx) });
+            }
+        }
+    }
+
+    /// Whether any overlay layer replaces the grapheme at `char_idx`.
+    ///
+    /// Does not disturb any cursor state, and is free when there are no overlays.
+    pub(crate) fn has_overlay_at(&self, char_idx: usize) -> bool {
+        self.overlays.iter().any(|layer| {
+            let idx = layer
+                .annotations
+                .partition_point(|annot| annot.char_idx < char_idx);
+            layer
+                .annotations
+                .get(idx)
+                .is_some_and(|annot| annot.char_idx == char_idx)
         })
     }
 

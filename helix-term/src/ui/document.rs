@@ -91,6 +91,17 @@ pub fn render_text(
     let mut last_line_indent_level = 0;
     let mut reached_view_top = false;
 
+    // Nothing at or past this column can be visible. `draw_grapheme` discards such
+    // graphemes anyway, but only after they have been segmented, looked up in every
+    // annotation layer, advanced through both highlighters, styled and passed to every
+    // decoration. Skipping the rest of the line instead makes a frame cost
+    // `O(viewport area)` rather than `O(length of every visible line)`.
+    let clip_col = renderer.offset.col + renderer.viewport.width as usize;
+    let can_clip = !text_fmt.soft_wrap && renderer.viewport.width != 0;
+    // cleared for lines that refuse to be skipped, so a line does not re-probe on every
+    // one of its remaining graphemes
+    let mut clip_current_line = can_clip;
+
     loop {
         let Some(mut grapheme) = formatter.next() else {
             break;
@@ -129,6 +140,29 @@ pub fn render_text(
                 visual_line: grapheme.visual_pos.row as u16,
             };
             decorations.decorate_line(renderer, last_line_pos);
+            clip_current_line = can_clip;
+        }
+
+        // Discard the off-screen tail of this line. Safe to test here because
+        // `visual_pos.col` only grows within a visual line and every line starts at
+        // column 0, so the line transition above has always run first.
+        if clip_current_line
+            && grapheme.visual_pos.col >= clip_col
+            // `last_line_indent_level` is only updated inside `draw_grapheme`, so if the
+            // visible part of the line is still all indentation we would draw the wrong
+            // number of indent guides. Free in the default config.
+            && !(renderer.draw_indent_guides && is_in_indent_area)
+        {
+            if formatter.skip_to_next_line().is_some() {
+                // `render_virtual_lines` hands this to `draw_eol_diagnostic` as the anchor
+                // column. Reporting the last drawn column instead would let an end of line
+                // diagnostic be squeezed against the right edge of an over-wide line,
+                // where the unclipped path draws nothing. `clip_col` keeps it suppressed
+                // and keeps the `col - offset.col` subtraction from underflowing.
+                last_line_end = clip_col;
+                continue;
+            }
+            clip_current_line = false;
         }
 
         // acquire the correct grapheme style

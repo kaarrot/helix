@@ -440,6 +440,52 @@ fn skip_to_next_line_with_overlays() {
     }
 }
 
+/// The guard that stops a skip from discarding a fresh line must not
+/// over-refuse: if it did, every differential test above would still pass while
+/// the optimisation silently did nothing. These pin when a skip actually fires.
+#[test]
+fn skip_to_next_line_contract() {
+    let text_fmt = TextFormat::new_test(false);
+    let annotations = TextAnnotations::default();
+    let text = "hello world\nsecond line\nthird\n";
+
+    // mid-line: skips, and reports the line it discarded
+    let mut formatter =
+        DocumentFormatter::new_at_prev_checkpoint(text.into(), &text_fmt, &annotations, 0);
+    formatter.next().unwrap(); // 'h', now mid-line
+    let skipped = formatter.skip_to_next_line().expect("should skip mid-line");
+    assert_eq!(skipped.line_idx, 0);
+    assert_eq!(skipped.row, 0);
+    assert_eq!(skipped.line_end_char_idx, 11); // the '\n' of line 0
+    assert_eq!(formatter.next_visual_pos(), Position::new(1, 0));
+    assert_eq!(formatter.next_char_pos(), 12);
+
+    // immediately afterwards we are at a line start, so a second skip is refused
+    assert_eq!(formatter.skip_to_next_line(), None);
+
+    // ... but resumes once a grapheme of the new line has been consumed
+    formatter.next().unwrap();
+    assert!(formatter.skip_to_next_line().is_some());
+
+    // a freshly constructed formatter is at a line start too
+    let mut formatter =
+        DocumentFormatter::new_at_prev_checkpoint(text.into(), &text_fmt, &annotations, 0);
+    assert_eq!(formatter.skip_to_next_line(), None);
+
+    // the last line has no line break to skip over
+    let mut formatter =
+        DocumentFormatter::new_at_prev_checkpoint("only line".into(), &text_fmt, &annotations, 0);
+    formatter.next().unwrap();
+    assert_eq!(formatter.skip_to_next_line(), None);
+
+    // soft wrap is never skipped
+    let soft = TextFormat::new_test(true);
+    let mut formatter =
+        DocumentFormatter::new_at_prev_checkpoint(text.into(), &soft, &annotations, 0);
+    formatter.next().unwrap();
+    assert_eq!(formatter.skip_to_next_line(), None);
+}
+
 /// Records every call a `LineAnnotation` receives, and inserts a virtual line
 /// after every other document line so the row arithmetic of a skip is actually
 /// exercised.

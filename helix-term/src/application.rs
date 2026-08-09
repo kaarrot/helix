@@ -303,6 +303,22 @@ impl Application {
         self.terminal.draw(pos, kind).unwrap();
     }
 
+    /// The rendered surface, so integration tests can assert on what was actually drawn
+    /// rather than on editor state alone.
+    #[cfg(feature = "integration")]
+    pub fn rendered_text(&self) -> Vec<String> {
+        let buffer = self.terminal.backend().buffer();
+        let width = buffer.area.width;
+        buffer
+            .content
+            .chunks(width as usize)
+            .map(|row| {
+                let line: String = row.iter().map(|cell| cell.symbol.as_str()).collect();
+                line.trim_end().to_string()
+            })
+            .collect()
+    }
+
     pub async fn event_loop<S>(&mut self, input_stream: &mut S)
     where
         S: Stream<Item = std::io::Result<TerminalEvent>> + Unpin,

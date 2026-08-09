@@ -456,6 +456,9 @@ impl<'t> DocumentFormatter<'t> {
     /// * soft wrap is enabled — `word_buf`/`peeked_grapheme`/`indent_level` cannot be
     ///   reconstructed, and one document line is not one visual row
     /// * the formatter is exhausted, or is on the last line and so has no line break left
+    /// * the formatter is already at the start of a line — the caller has just consumed a
+    ///   line break, and skipping would discard the *following* line rather than the tail
+    ///   of the one it was looking at
     /// * an [`crate::text_annotations::Overlay`] replaces the line break grapheme.
     ///   `advance_grapheme` substitutes the overlay for *any* char including the line
     ///   feed, and `next` then does not run its line break bookkeeping at all, so skipping
@@ -475,6 +478,14 @@ impl<'t> DocumentFormatter<'t> {
         let line_idx = self.line_pos;
         // the last line has no line break to skip over
         if line_idx + 1 >= self.text.len_lines() {
+            return None;
+        }
+
+        // Refuse when the formatter already sits at the start of a line. The caller has
+        // just consumed a line break, so `line_pos` has moved on and the line that would
+        // be skipped is a fresh one the caller has not looked at yet. Skipping here would
+        // silently discard a whole line of content rather than an off-screen tail.
+        if self.char_pos == self.text.line_to_char(line_idx) {
             return None;
         }
 

@@ -98,7 +98,24 @@ pub fn coords_at_pos(text: RopeSlice, pos: usize) -> Position {
 
     let line_start = text.line_to_char(line);
     let pos = ensure_grapheme_boundary_prev(text, pos);
-    let col = text.slice(line_start..pos).graphemes().count();
+    let slice = text.slice(line_start..pos);
+
+    // Grapheme segmentation costs tens of nanoseconds per char, so on a multi-megabyte
+    // line this is the single most expensive thing a frame does -- the status line asks
+    // for the cursor's column on every redraw, making it the dominant cost of holding
+    // `j` down.
+    //
+    // Outside of CRLF every ASCII char is a grapheme cluster of its own, so the column
+    // is just the char count. Establishing that is a byte scan the compiler vectorises,
+    // roughly two orders of magnitude cheaper than segmenting, and it is the common case.
+    let col = if slice
+        .chunks()
+        .all(|chunk| chunk.is_ascii() && !chunk.contains('\r'))
+    {
+        slice.len_chars()
+    } else {
+        slice.graphemes().count()
+    };
 
     Position::new(line, col)
 }
@@ -138,9 +155,9 @@ pub fn visual_coords_at_pos(text: RopeSlice, pos: usize, tab_width: usize) -> Po
 /// Returns the visual offset from the start of the first visual line
 /// in the block that contains anchor.
 /// Text is always wrapped at blocks, they usually correspond to
-/// actual line breaks but for very long lines
-/// softwrapping positions are estimated with an O(1) algorithm
-/// to ensure consistent performance for large lines (currently unimplemented)
+/// actual line breaks but very long softwrapped lines are additionally
+/// divided at cheaply computed intervals, so that this is bounded by the
+/// block size rather than by the length of the line.
 ///
 /// Usually you want to use `visual_offset_from_anchor` instead but this function
 /// can be useful (and faster) if
@@ -1360,6 +1377,315 @@ mod test {
                 }
             }
         }
+    }
+
+    /// `coords_at_pos` takes an ASCII fast path instead of segmenting graphemes.
+    /// It has to be indistinguishable from segmenting, including around CRLF,
+    /// combining marks, wide chars and chunk boundaries -- so this compares it
+    /// against the segmenting version at every position of every fixture.
+    #[test]
+    fn coords_at_pos_ascii_fast_path_matches_segmentation() {
+        fn reference(text: RopeSlice, pos: usize) -> Position {
+            let line = text.char_to_line(pos);
+            let line_start = text.line_to_char(line);
+            let pos = ensure_grapheme_boundary_prev(text, pos);
+            Position::new(line, text.slice(line_start..pos).graphemes().count())
+        }
+
+        let fixtures = [
+            ("ascii", "hello world\nsecond line\nthird\n".to_string()),
+            ("crlf", "hello world\r\nsecond\r\nthird\r\n".to_string()),
+            ("lone cr", "a\rb\rc\n".to_string()),
+            (
+                "combining",
+                "a\u{310}e\u{301}o\u{332} xyz\nplain\n".to_string(),
+            ),
+            (
+                "cjk",
+                "\u{4f60}\u{597d}\u{4e16}\u{754c}\nplain\n".to_string(),
+            ),
+            (
+                "flags",
+                "\u{1F1E6}\u{1F1E7}\u{1F1E8}\u{1F1E9}\nplain\n".to_string(),
+            ),
+            ("tabs", "\t\tfoo\tbar\n".to_string()),
+            ("empty", String::new()),
+            ("no trailing newline", "abc\ndef".to_string()),
+            // long enough to span several rope chunks, with a non-ASCII char
+            // late in the line so the fast path is taken then abandoned
+            (
+                "multi chunk ascii",
+                format!("{}\n", "abcdefghij".repeat(5000)),
+            ),
+            (
+                "multi chunk tail non ascii",
+                format!("{}\u{4f60}tail\n", "abcdefghij".repeat(5000)),
+            ),
+            (
+                "multi chunk crlf",
+                format!("{}\r\nnext\r\n", "abcdefghij".repeat(5000)),
+            ),
+        ];
+
+        for (name, text) in fixtures {
+            let rope = Rope::from(text.as_str());
+            let slice = rope.slice(..);
+            // every position for the small fixtures, sampled for the big ones
+            let step = if slice.len_chars() > 2000 { 997 } else { 1 };
+            for pos in (0..=slice.len_chars()).step_by(step) {
+                assert_eq!(
+                    coords_at_pos(slice, pos),
+                    reference(slice, pos),
+                    "{name}: fast path diverged at {pos}"
+                );
+            }
+            // and always the very end, which the stride can miss
+            let end = slice.len_chars();
+            assert_eq!(
+                coords_at_pos(slice, end),
+                reference(slice, end),
+                "{name}: fast path diverged at the end"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Sub-line blocks, from the caller side
+    //
+    // `doc_formatter`'s tests pin the formatter invariant (starting at a block
+    // equals iterating through it). These pin what the functions built on top of
+    // it must still do once a line spans several blocks -- in particular that
+    // `char_idx_at_visual_offset`'s backward walk still stitches blocks together.
+    // -----------------------------------------------------------------------
+
+    fn multi_block_text() -> String {
+        "lorem ipsum dolor sit amet consectetur ".repeat(30)
+    }
+
+    /// Moving down a visual row and back up must land where it started, including
+    /// across a forced block break.
+    #[test]
+    fn vertical_motion_round_trips_across_blocks() {
+        use crate::doc_formatter::block_size;
+        use crate::movement::{move_vertically_visual, Direction, Movement};
+        use crate::Range;
+
+        for size in [7usize, 16, 61] {
+            block_size::with(size, || {
+                let text = multi_block_text();
+                let rope = Rope::from(text.as_str());
+                let slice = rope.slice(..);
+                let text_fmt = TextFormat {
+                    soft_wrap: true,
+                    viewport_width: 40,
+                    ..TextFormat::default()
+                };
+
+                for pos in (0..slice.len_chars()).step_by(3) {
+                    let start = Range::point(pos);
+                    let mut annotations = TextAnnotations::default();
+                    let down = move_vertically_visual(
+                        slice,
+                        start,
+                        Direction::Forward,
+                        1,
+                        Movement::Move,
+                        &text_fmt,
+                        &mut annotations,
+                    );
+                    let up = move_vertically_visual(
+                        slice,
+                        down,
+                        Direction::Backward,
+                        1,
+                        Movement::Move,
+                        &text_fmt,
+                        &mut annotations,
+                    );
+
+                    // The last visual row has nothing below it, so `j` is a no-op
+                    // there and there is nothing to come back from.
+                    if down.cursor(slice) == start.cursor(slice) {
+                        continue;
+                    }
+                    assert_eq!(
+                        up.cursor(slice),
+                        start.cursor(slice),
+                        "j then k did not return to {pos} with block size {size}"
+                    );
+                }
+            });
+        }
+    }
+
+    /// `move_vertically` (the `g j`/`g k` path) anchors at a document line start,
+    /// so it never starts mid-block -- but it computes rows on the *truncated*
+    /// slice `slice.slice(..new_line_end)`. Block boundaries derive from the line
+    /// start and line end, which are the same char indices in both, so the two
+    /// must agree. If they ever stop agreeing, `g j` lands on the wrong column.
+    #[test]
+    fn document_line_motion_round_trips_across_blocks() {
+        use crate::doc_formatter::block_size;
+        use crate::movement::{move_vertically, Direction, Movement};
+        use crate::Range;
+
+        for size in [7usize, 16, 61] {
+            block_size::with(size, || {
+                let line = "lorem ipsum dolor sit amet consectetur ".repeat(20);
+                let text = format!("{line}\n{line}\n{line}\n");
+                let rope = Rope::from(text.as_str());
+                let slice = rope.slice(..);
+                let text_fmt = TextFormat {
+                    soft_wrap: true,
+                    viewport_width: 40,
+                    ..TextFormat::default()
+                };
+
+                // positions on the middle line, so both directions have a target
+                let second = slice.line_to_char(1);
+                let third = slice.line_to_char(2);
+                for pos in (second..third).step_by(7) {
+                    let start = Range::point(pos);
+                    let mut annotations = TextAnnotations::default();
+                    let down = move_vertically(
+                        slice,
+                        start,
+                        Direction::Forward,
+                        1,
+                        Movement::Move,
+                        &text_fmt,
+                        &mut annotations,
+                    );
+                    let up = move_vertically(
+                        slice,
+                        down,
+                        Direction::Backward,
+                        1,
+                        Movement::Move,
+                        &text_fmt,
+                        &mut annotations,
+                    );
+                    assert_eq!(
+                        slice.char_to_line(down.cursor(slice)),
+                        2,
+                        "g j from {pos} left the next document line (block {size})"
+                    );
+                    assert_eq!(
+                        up.cursor(slice),
+                        pos,
+                        "g j then g k did not return to {pos} (block {size})"
+                    );
+                }
+            });
+        }
+    }
+
+    /// `char_idx_at_visual_offset` walks backwards a block at a time via
+    /// `anchor -= 1`. With sub-blocks that walk crosses forced breaks, and the
+    /// `block_char_offset == 0` stop condition must still only fire at the start
+    /// of the document.
+    #[test]
+    fn visual_offset_round_trips_across_blocks() {
+        use crate::doc_formatter::block_size;
+
+        for size in [7usize, 16, 61] {
+            block_size::with(size, || {
+                let text = multi_block_text();
+                let rope = Rope::from(text.as_str());
+                let slice = rope.slice(..);
+                let text_fmt = TextFormat {
+                    soft_wrap: true,
+                    viewport_width: 40,
+                    ..TextFormat::default()
+                };
+                let annotations = TextAnnotations::default();
+
+                for pos in (0..slice.len_chars()).step_by(3) {
+                    let (visual, _) =
+                        visual_offset_from_block(slice, pos, pos, &text_fmt, &annotations);
+                    // asking for row 0 relative to `pos`'s own visual line, at the
+                    // column `pos` sits on, has to name `pos` again
+                    let (back, virt) = char_idx_at_visual_offset(
+                        slice,
+                        pos,
+                        0,
+                        visual.col,
+                        &text_fmt,
+                        &annotations,
+                    );
+                    assert_eq!(virt, 0, "unexpected virtual rows at {pos} (block {size})");
+                    assert_eq!(back, pos, "round trip failed at {pos} (block {size})");
+                }
+            });
+        }
+    }
+
+    /// The whole point of sub-line blocks: vertical motion on a soft wrapped line must
+    /// cost the same wherever the cursor sits in that line. Not an assertion, a stopwatch:
+    ///
+    /// ```text
+    /// cargo test -p helix-core --release -- --ignored --nocapture bench_softwrap
+    /// ```
+    ///
+    /// The "before" number needs no retained copy of the old code -- setting the block size
+    /// to `usize::MAX` means no line is ever divided, which *is* the pre-change behaviour.
+    #[test]
+    #[ignore = "timing measurement, not a correctness test"]
+    fn bench_softwrap_vertical_motion_long_line() {
+        use crate::doc_formatter::block_size;
+        use crate::movement::{move_vertically_visual, Direction, Movement};
+        use crate::Selection;
+        use std::time::Instant;
+
+        // one line, no line breaks at all: the pathological shape
+        let text: String = "lorem ipsum dolor sit amet ".repeat(80_000);
+        let rope = Rope::from(text.as_str());
+        let slice = rope.slice(..);
+        let text_fmt = TextFormat {
+            soft_wrap: true,
+            viewport_width: 100,
+            ..TextFormat::default()
+        };
+
+        let iterations = 50u32;
+        let measure = |label: &str| {
+            // deep inside the line, which is where the cost used to be
+            let cursor = slice.len_chars() / 2;
+            let start = Instant::now();
+            for i in 0..iterations {
+                let mut annotations = TextAnnotations::default();
+                let range = Selection::point(cursor + i as usize).primary();
+                let dir = if i % 2 == 0 {
+                    Direction::Forward
+                } else {
+                    Direction::Backward
+                };
+                std::hint::black_box(move_vertically_visual(
+                    slice,
+                    range,
+                    dir,
+                    1,
+                    Movement::Move,
+                    &text_fmt,
+                    &mut annotations,
+                ));
+            }
+            let elapsed = start.elapsed();
+            println!("  {label:<28} {:?}/keypress", elapsed / iterations);
+            elapsed
+        };
+
+        println!(
+            "j/k with soft wrap, cursor at char {} of a single {}-char line:",
+            slice.len_chars() / 2,
+            slice.len_chars()
+        );
+        let before = block_size::with(usize::MAX, || measure("without blocks (before)"));
+        let after = measure("with blocks (after)");
+        println!(
+            "  speedup                      {:.1}x",
+            before.as_secs_f64() / after.as_secs_f64()
+        );
     }
 
     /// Soft wrap must be completely unaffected: the skip declines to run.

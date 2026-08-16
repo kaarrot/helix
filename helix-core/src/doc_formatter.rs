@@ -8,6 +8,14 @@
 //! it is generally not possible to find the start of the previous visual line.
 //! Instead the `DocumentFormatter` starts at the last "checkpoint" (usually a linebreak)
 //! called a "block" and the caller must advance it as needed.
+//!
+//! A block is usually a whole document line. Soft wrapped lines longer than
+//! [`BLOCK_CHARS`] are additionally divided into blocks of roughly that size, so that
+//! starting anywhere in such a line costs a bounded traversal instead of one proportional
+//! to how far into the line the position sits. Each of those boundaries is a forced visual
+//! line break, which is what makes the layout produced by *starting* at a boundary
+//! identical to the layout produced by *iterating through* it -- the invariant the whole
+//! scheme rests on.
 
 use std::borrow::Cow;
 use std::cmp::Ordering;
@@ -21,7 +29,8 @@ use unicode_segmentation::{Graphemes, UnicodeSegmentation};
 
 use helix_stdx::rope::{RopeGraphemes, RopeSliceExt};
 
-use crate::graphemes::{Grapheme, GraphemeStr};
+use crate::chars::char_is_word;
+use crate::graphemes::{self, Grapheme, GraphemeStr};
 use crate::syntax::Highlight;
 use crate::text_annotations::TextAnnotations;
 use crate::{Position, RopeSlice};
@@ -147,6 +156,12 @@ pub struct TextFormat {
     pub soft_wrap: bool,
     pub tab_width: u16,
     pub max_wrap: u16,
+    /// How much of a line's indentation soft wrapped rows carry over.
+    ///
+    /// Carry over is dropped after the first block of a line (see [`BLOCK_CHARS`]): a
+    /// formatter starting mid-line cannot recover the indentation without walking back to
+    /// the line start, so both paths pin it to 0 instead. Only affects lines long enough to
+    /// be divided, which are generated or minified content.
     pub max_indent_retain: u16,
     pub wrap_indicator: Box<str>,
     pub wrap_indicator_highlight: Option<Highlight>,
@@ -186,6 +201,115 @@ pub struct SkippedLine {
     pub line_idx: usize,
 }
 
+/// The number of document chars after which a soft wrapped line is split into a new block.
+///
+/// A block is the unit the formatter can start iterating at, so this is the worst case
+/// number of graphemes any position query has to walk. Without it a query for a position
+/// deep inside a line walks the whole line prefix, which is what makes vertical motion on
+/// multi-megabyte lines lag.
+///
+/// The cost of a block is one forced visual line break, so this trades a layout artifact
+/// (one short row every `BLOCK_CHARS` chars) against that worst case. Only lines longer
+/// than this are affected at all.
+const BLOCK_CHARS: usize = 4096;
+
+/// How far past the arithmetic block boundary [`block_boundary`] looks for a word boundary
+/// before giving up and breaking mid-word.
+///
+/// Must be smaller than the block size so that boundaries stay strictly increasing in `k`,
+/// which [`boundary_search_window`] enforces.
+const BOUNDARY_SEARCH_WINDOW: usize = 64;
+
+#[cfg(not(test))]
+#[inline(always)]
+fn block_chars() -> usize {
+    BLOCK_CHARS
+}
+
+/// Tests shrink the block size so that boundaries fall every few chars and every alignment
+/// against tabs, wide graphemes, cluster breaks and annotations can be covered exhaustively
+/// by small fixtures. In a real build this is a plain constant.
+#[cfg(test)]
+pub(crate) mod block_size {
+    use std::cell::Cell;
+
+    thread_local! {
+        static OVERRIDE: Cell<usize> = const { Cell::new(super::BLOCK_CHARS) };
+    }
+
+    pub(crate) fn get() -> usize {
+        OVERRIDE.with(|size| size.get())
+    }
+
+    /// Runs `f` with the block size set to `size`, restoring it afterwards.
+    pub(crate) fn with<R>(size: usize, f: impl FnOnce() -> R) -> R {
+        assert!(size >= 2, "a block must be able to hold a grapheme");
+        let previous = OVERRIDE.with(|current| current.replace(size));
+        let result = f();
+        OVERRIDE.with(|current| current.set(previous));
+        result
+    }
+}
+
+#[cfg(test)]
+fn block_chars() -> usize {
+    block_size::get()
+}
+
+/// The search window, clamped so it can never reach the next block. Without the clamp a
+/// boundary could overtake its successor and `boundary_after` would stop making progress.
+fn boundary_search_window() -> usize {
+    BOUNDARY_SEARCH_WINDOW.min(block_chars() / 2)
+}
+
+/// The char index at which the `k`th block of the line starting at `line_start` begins.
+///
+/// This is a pure function of its arguments, which is what lets
+/// [`DocumentFormatter::new_at_prev_checkpoint`] jump straight to a boundary and the
+/// iteration path force a break at the same char without the two ever disagreeing. Every
+/// property the formatter relies on comes from that:
+///
+/// * `k == 0` is the line start, so short lines behave exactly as they did before blocks.
+/// * strictly increasing in `k` (because `BOUNDARY_SEARCH_WINDOW < BLOCK_CHARS`), so
+///   advancing to the next boundary always makes progress.
+/// * always on a grapheme cluster boundary, so re-seeding the grapheme iterator there
+///   cannot split a cluster.
+/// * clamped to `line_end`, so a boundary never lands on or past the line break. The line
+///   break already ends the block.
+///
+/// It must also depend on nothing but the raw document text. In particular it must not
+/// consult [`TextAnnotations`]: `advance_grapheme` substitutes overlays for document
+/// graphemes, so a boundary derived from formatted graphemes would move when jump labels
+/// appear and the layout would shift under the user. Hence the raw `char_is_word` below
+/// rather than `FormattedGrapheme::is_word_boundary`.
+fn block_boundary(text: RopeSlice, line_start: usize, line_end: usize, k: usize) -> Option<usize> {
+    if k == 0 {
+        return Some(line_start);
+    }
+    let base = line_start + k * block_chars();
+    if base >= line_end {
+        return None;
+    }
+
+    // Break at a word boundary rather than mid-word so the forced break reads as an
+    // ordinary short row. `char_is_word` is the same predicate behind
+    // `Grapheme::is_word_boundary`, so whitespace *and* punctuation qualify -- even
+    // minified JSON finds a boundary within a few chars.
+    let limit = (base + boundary_search_window()).min(line_end);
+    // `chars_at` rather than `text.char(idx)` per step: the latter is a rope descent each
+    // time, and this runs on every formatter construction on a long line.
+    let mut chars = text.chars_at(base);
+    let mut idx = base;
+    while idx < limit && chars.next().is_some_and(char_is_word) {
+        idx += 1;
+    }
+
+    // Snapping forward can push the boundary onto the line break, where it would force a
+    // second break for a line that already ends there.
+    let boundary = graphemes::ensure_grapheme_boundary_next(text, idx);
+    (boundary < line_end).then_some(boundary)
+}
+
 #[derive(Debug)]
 pub struct DocumentFormatter<'t> {
     text_fmt: &'t TextFormat,
@@ -217,23 +341,42 @@ pub struct DocumentFormatter<'t> {
     word_buf: Vec<GraphemeWithSource<'t>>,
     /// The index of the next grapheme that will be yielded from the `word_buf`
     word_i: usize,
+    /// The char index at which the current document line starts. Cached so
+    /// [`block_boundary`] does not re-derive it per grapheme; refreshed on line transitions.
+    line_start: usize,
+    /// Where the current document line ends, or `None` when it provably has no block
+    /// boundary. See [`DocumentFormatter::block_line_end`].
+    line_end: Option<usize>,
+    /// The char index of the next forced block break, or `usize::MAX` when there is none
+    /// (soft wrap off, or the current line has no further boundary) so the hot path check
+    /// is a single compare.
+    next_block_boundary: usize,
+    /// Set when the formatter was constructed *at* a block boundary rather than at a line
+    /// start. The first call to `advance_to_next_word` then reproduces the forced break
+    /// that continuous iteration would have performed, minus the row advance -- the block
+    /// it is starting is row 0.
+    pending_block_start: bool,
 }
 
 impl<'t> DocumentFormatter<'t> {
     /// Creates a new formatter at the last block before `char_idx`.
     /// A block is a chunk which always ends with a linebreak.
     /// This is usually just a normal line break.
-    /// However very long lines are always wrapped at constant intervals that can be cheaply calculated
-    /// to avoid pathological behaviour.
+    /// However very long lines are always wrapped at constant intervals that can be cheaply
+    /// calculated to avoid pathological behaviour -- see [`BLOCK_CHARS`].
     pub fn new_at_prev_checkpoint(
         text: RopeSlice<'t>,
         text_fmt: &'t TextFormat,
         annotations: &'t TextAnnotations,
         char_idx: usize,
     ) -> Self {
-        // TODO divide long lines into blocks to avoid bad performance for long lines
-        let block_line_idx = text.char_to_line(char_idx.min(text.len_chars()));
-        let block_char_idx = text.line_to_char(block_line_idx);
+        let char_idx = char_idx.min(text.len_chars());
+        let block_line_idx = text.char_to_line(char_idx);
+        let line_start = text.line_to_char(block_line_idx);
+        let line_end = Self::block_line_end(text, text_fmt, line_start, block_line_idx);
+        let block_char_idx = Self::block_start_in(text, line_start, line_end, char_idx);
+        let pending_block_start = block_char_idx != line_start;
+
         annotations.reset_pos(block_char_idx);
 
         DocumentFormatter {
@@ -244,12 +387,119 @@ impl<'t> DocumentFormatter<'t> {
             graphemes: text.slice(block_char_idx..).graphemes(),
             char_pos: block_char_idx,
             exhausted: false,
-            indent_level: None,
+            // A block after the first in a line does not carry the line's indentation
+            // over: reconstructing it would mean walking back to the line start, and
+            // virtual text there would make that walk disagree with what continuous
+            // iteration computed. `advance_to_next_word` drops it on the iterating path
+            // too, so both agree on `Some(0)`.
+            indent_level: pending_block_start.then_some(0),
             peeked_grapheme: None,
             word_buf: Vec::with_capacity(64),
             word_i: 0,
             line_pos: block_line_idx,
             inline_annotation_graphemes: None,
+            line_start,
+            line_end,
+            next_block_boundary: Self::boundary_after(text, line_start, line_end, block_char_idx),
+            pending_block_start,
+        }
+    }
+
+    /// The char index at which [`DocumentFormatter::new_at_prev_checkpoint`] would start
+    /// iterating for `char_idx`.
+    ///
+    /// Useful to callers that need to bound work by the same block the formatter will
+    /// traverse, such as the syntax highlight range of a frame.
+    pub fn block_start(text: RopeSlice, text_fmt: &TextFormat, char_idx: usize) -> usize {
+        let char_idx = char_idx.min(text.len_chars());
+        let line_idx = text.char_to_line(char_idx);
+        let line_start = text.line_to_char(line_idx);
+        let line_end = Self::block_line_end(text, text_fmt, line_start, line_idx);
+        Self::block_start_in(text, line_start, line_end, char_idx)
+    }
+
+    /// Soft wrapped lines longer than a block are divided so that starting at `char_idx`
+    /// costs `O(BLOCK_CHARS)` rather than `O(char_idx - line_start)`. With soft wrap off a
+    /// line is a single block: there is nothing to gain, since a line is one visual row and
+    /// the callers already skip whole lines.
+    fn block_start_in(
+        text: RopeSlice,
+        line_start: usize,
+        line_end: Option<usize>,
+        char_idx: usize,
+    ) -> usize {
+        let Some(line_end) = line_end else {
+            return line_start;
+        };
+        if char_idx - line_start < block_chars() {
+            return line_start;
+        }
+        // The boundary is snapped forward to a word boundary and dropped when it would land
+        // on the line break, so the `k`th one can be past `char_idx` or absent. Walk back
+        // until the block actually contains `char_idx`.
+        let mut k = (char_idx - line_start) / block_chars();
+        loop {
+            if k == 0 {
+                return line_start;
+            }
+            match block_boundary(text, line_start, line_end, k) {
+                Some(boundary) if boundary <= char_idx => return boundary,
+                _ => k -= 1,
+            }
+        }
+    }
+
+    /// Where the document line `line_idx` ends, or `None` when it provably contains no
+    /// block boundary and the block machinery can be skipped entirely.
+    ///
+    /// `len_chars() - line_start` is an `O(1)` upper bound on the length of the line, so
+    /// ordinary documents never pay for the rope query.
+    fn block_line_end(
+        text: RopeSlice,
+        text_fmt: &TextFormat,
+        line_start: usize,
+        line_idx: usize,
+    ) -> Option<usize> {
+        if !text_fmt.soft_wrap || text.len_chars() - line_start < block_chars() {
+            return None;
+        }
+        Some(crate::line_ending::line_end_char_index(&text, line_idx))
+    }
+
+    /// Refreshes the cached per line state after a line transition. `line_idx` must be the
+    /// line the formatter has just moved onto, with `char_pos` at its first char.
+    fn enter_line(&mut self, line_idx: usize) {
+        self.line_pos = line_idx;
+        self.line_start = self.char_pos;
+        self.line_end = Self::block_line_end(self.text, self.text_fmt, self.line_start, line_idx);
+        self.next_block_boundary =
+            Self::boundary_after(self.text, self.line_start, self.line_end, self.char_pos);
+    }
+
+    /// The first block boundary strictly after `char_idx` within the line spanning
+    /// `line_start..=line_end`, or `usize::MAX` when the line has none left.
+    fn boundary_after(
+        text: RopeSlice,
+        line_start: usize,
+        line_end: Option<usize>,
+        char_idx: usize,
+    ) -> usize {
+        let Some(line_end) = line_end else {
+            return usize::MAX;
+        };
+        // Walk forward from the arithmetic block `char_idx` falls in. Boundaries are
+        // snapped forward to a word boundary, so `block_boundary(k)` can still be at or
+        // before `char_idx`; it is strictly increasing and gains at least `BLOCK_CHARS`
+        // per step, so this terminates after a couple of iterations.
+        let mut k = (char_idx - line_start) / block_chars();
+        loop {
+            match block_boundary(text, line_start, line_end, k) {
+                Some(boundary) if boundary > char_idx => return boundary,
+                // at or before `char_idx`: this block has already been entered
+                Some(_) => k += 1,
+                // the line has no `k`th block, and none beyond it either
+                None => return usize::MAX,
+            }
         }
     }
 
@@ -311,9 +561,17 @@ impl<'t> DocumentFormatter<'t> {
         Some(grapheme)
     }
 
-    /// Move a word to the next visual line
-    fn wrap_word(&mut self) -> usize {
-        // softwrap this word to the next line
+    /// Start a new soft wrapped visual row: apply the indent carry over, account for any
+    /// virtual lines, and prepend the wrap indicator to `word_buf`.
+    ///
+    /// Returns the width the indicator occupies, i.e. the column the buffered word now
+    /// starts at, and the number of indicator graphemes that were prepended.
+    ///
+    /// `advance_row` is false only when [`DocumentFormatter::new_at_prev_checkpoint`]
+    /// constructed the formatter *at* a block boundary. The row it is starting is row 0 of
+    /// that block, and the virtual lines belong to the preceding block -- the same way the
+    /// virtual lines after a line break are accounted to the block that contained it.
+    fn begin_wrapped_row(&mut self, advance_row: bool) -> (usize, usize) {
         let indent_carry_over = if let Some(indent) = self.indent_level {
             if indent as u16 <= self.text_fmt.max_indent_retain {
                 indent as u16
@@ -326,11 +584,14 @@ impl<'t> DocumentFormatter<'t> {
             0
         };
 
-        let virtual_lines =
-            self.annotations
-                .virtual_lines_at(self.char_pos, self.visual_pos, self.line_pos);
+        if advance_row {
+            let virtual_lines =
+                self.annotations
+                    .virtual_lines_at(self.char_pos, self.visual_pos, self.line_pos);
+            self.visual_pos.row += 1 + virtual_lines;
+        }
         self.visual_pos.col = indent_carry_over as usize;
-        self.visual_pos.row += 1 + virtual_lines;
+
         let mut i = 0;
         let mut word_width = 0;
         let wrap_indicator = UnicodeSegmentation::graphemes(&*self.text_fmt.wrap_indicator, true)
@@ -348,6 +609,14 @@ impl<'t> DocumentFormatter<'t> {
                 grapheme
             });
         self.word_buf.splice(0..0, wrap_indicator);
+
+        (word_width, i)
+    }
+
+    /// Move a word to the next visual line
+    fn wrap_word(&mut self) -> usize {
+        // softwrap this word to the next line
+        let (mut word_width, i) = self.begin_wrapped_row(true);
 
         for grapheme in &mut self.word_buf[i..] {
             let visual_x = self.visual_pos.col + word_width;
@@ -386,9 +655,51 @@ impl<'t> DocumentFormatter<'t> {
             return;
         }
 
+        if self.pending_block_start {
+            // This formatter was constructed *at* a block boundary. Reproduce the break
+            // that continuous iteration performs there, minus the row advance: the block
+            // being started is row 0, and the virtual lines at the boundary belong to the
+            // preceding block.
+            self.pending_block_start = false;
+            word_width = self.begin_wrapped_row(false).0;
+        } else if self.char_pos == self.next_block_boundary {
+            // Long lines are divided into blocks so that a formatter can be constructed
+            // near any position instead of walking there from the line start. That is only
+            // sound if the layout is identical whether a boundary is iterated through or
+            // jumped to, which means the boundary has to force a break on both paths.
+            //
+            // `wrap_word` rather than `begin_wrapped_row` so a forced break is byte for
+            // byte an ordinary soft wrap.
+            //
+            // The word buffer was just cleared, and `peeked_grapheme` is always spent by
+            // the time a boundary is reached: the only path that leaves one set is the
+            // `word_width > max_wrap` arm below, which pops a grapheme from *before* the
+            // boundary, so the following call consumes it before reaching the boundary.
+            debug_assert!(self.word_buf.is_empty());
+            debug_assert!(self.peeked_grapheme.is_none());
+            self.indent_level = Some(0);
+            self.next_block_boundary =
+                Self::boundary_after(self.text, self.line_start, self.line_end, self.char_pos);
+            word_width = self.wrap_word();
+        }
+
         loop {
             let mut col = self.visual_pos.col + word_width;
             let char_pos = self.char_pos + word_chars;
+
+            // End the word on the block boundary so the next call starts exactly on it and
+            // takes the forced break above. Swallowing the boundary into this word would
+            // move the break to wherever the word happened to end -- and only formatters
+            // *started* at the boundary would then emit a wrap indicator, drifting the
+            // cursor a couple of columns away from what was rendered.
+            if char_pos == self.next_block_boundary {
+                // Never on the first iteration: the entry check above consumed a boundary
+                // at `self.char_pos` and moved `next_block_boundary` past it. Returning
+                // with nothing buffered would end the iterator.
+                debug_assert!(word_chars != 0 || !self.word_buf.is_empty());
+                return;
+            }
+
             match col.cmp(&(self.text_fmt.viewport_width as usize)) {
                 // The EOF char and newline chars are always selectable in helix. That means
                 // that wrapping happens "too-early" if a word fits a line perfectly. This
@@ -521,6 +832,10 @@ impl<'t> DocumentFormatter<'t> {
         self.graphemes = self.text.slice(next_line_char_idx..).graphemes();
         self.inline_annotation_graphemes = None;
         self.indent_level = None;
+        // keeps the cached line state in step with `Iterator::next`. A no-op in practice
+        // -- this path only runs with soft wrap off, where there are no blocks -- but the
+        // two line transitions must not be allowed to drift apart.
+        self.enter_line(line_idx + 1);
 
         Some(SkippedLine {
             row,
@@ -579,7 +894,9 @@ impl<'t> Iterator for DocumentFormatter<'t> {
             self.visual_pos.row += 1 + virtual_lines;
             self.visual_pos.col = 0;
             if !grapheme.is_virtual() {
-                self.line_pos += 1;
+                // `char_pos` was advanced past the line break above, so it is the first
+                // char of the new line -- exactly what `enter_line` expects.
+                self.enter_line(self.line_pos + 1);
             }
         } else {
             self.visual_pos.col += grapheme.width();

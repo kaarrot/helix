@@ -235,10 +235,10 @@ fn unclipped_graphemes(
     annotations: &TextAnnotations,
     clip: usize,
 ) -> Vec<Observed> {
-    let mut formatter =
+    let formatter =
         DocumentFormatter::new_at_prev_checkpoint(text.into(), text_fmt, annotations, 0);
     let mut res = Vec::new();
-    while let Some(g) = formatter.next() {
+    for g in formatter {
         if g.visual_pos.col < clip {
             res.push((g.char_idx, g.visual_pos, g.raw.to_string()));
         }
@@ -568,4 +568,282 @@ fn skip_to_next_line_preserves_virtual_line_rows() {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Sub-line blocks
+//
+// Long soft wrapped lines are divided into blocks so a formatter can start near
+// any position instead of walking there from the line start. That is only sound
+// if the layout is the same either way, so the tests below assert exactly that:
+// a formatter constructed anywhere must yield the identical tail of what one
+// full traversal produced.
+//
+// The block size is shrunk to a handful of chars so small fixtures cover every
+// alignment of a boundary against tabs, wide graphemes, cluster breaks and
+// annotations.
+// ---------------------------------------------------------------------------
+
+use crate::doc_formatter::block_size;
+
+/// Everything about a yielded grapheme that callers can observe, except the
+/// visual row -- which is block relative and so compared separately.
+type Traced = (usize, usize, usize, String, bool);
+
+fn trace(
+    text: &str,
+    text_fmt: &TextFormat,
+    annotations: &TextAnnotations,
+    start: usize,
+) -> (Vec<Traced>, Vec<usize>) {
+    let formatter =
+        DocumentFormatter::new_at_prev_checkpoint(text.into(), text_fmt, annotations, start);
+    let mut observed = Vec::new();
+    let mut rows = Vec::new();
+    for g in formatter {
+        observed.push((
+            g.char_idx,
+            g.line_idx,
+            g.visual_pos.col,
+            g.raw.to_string(),
+            g.is_virtual(),
+        ));
+        rows.push(g.visual_pos.row);
+    }
+    (observed, rows)
+}
+
+/// A formatter started at `start` must produce the exact tail of a full
+/// traversal, with visual rows shifted by a single constant -- the row the
+/// block begins on.
+fn assert_blocks_agree(
+    name: &str,
+    text: &str,
+    text_fmt: &TextFormat,
+    annotations: &TextAnnotations,
+) {
+    let (full, full_rows) = trace(text, text_fmt, annotations, 0);
+    let len_chars = text.chars().count();
+
+    for start in 0..=len_chars {
+        let (tail, tail_rows) = trace(text, text_fmt, annotations, start);
+        assert!(
+            tail.len() <= full.len(),
+            "{name}: starting at {start} produced more graphemes than a full traversal"
+        );
+        let offset = full.len() - tail.len();
+
+        assert_eq!(
+            &full[offset..],
+            &tail[..],
+            "{name}: starting at {start} diverged from a full traversal (block starts at \
+             char {:?})",
+            tail.first().map(|g| g.0)
+        );
+
+        // Rows are relative to the start of the block, so the two traversals may
+        // disagree by a constant -- but only by a constant. Deriving the shift from
+        // the alignment point rather than asserting the block starts at row 0: a
+        // block that begins with a word too wide for the viewport legitimately
+        // opens on row 1, since `wrap_word` moves the whole word down.
+        let Some(&first_tail_row) = tail_rows.first() else {
+            continue;
+        };
+        let shift = full_rows[offset]
+            .checked_sub(first_tail_row)
+            .unwrap_or_else(|| {
+                panic!(
+                    "{name}: block starting at {start} opens on row {first_tail_row}, past its \
+                 row {} in a full traversal",
+                    full_rows[offset]
+                )
+            });
+        for (i, (&want, &got)) in full_rows[offset..].iter().zip(tail_rows.iter()).enumerate() {
+            assert_eq!(
+                want,
+                got + shift,
+                "{name}: row diverged at grapheme {i} when starting at {start}"
+            );
+        }
+    }
+}
+
+fn block_fixtures() -> Vec<(&'static str, String)> {
+    vec![
+        (
+            "ascii words",
+            "foo bar baz qux quux corge grault ".repeat(4),
+        ),
+        // no whitespace at all: every boundary falls back to punctuation, and
+        // for `nowrap` to nothing at all -- the mid-word break path
+        ("minified", "{\"a\":1,\"bb\":22,\"ccc\":333}".repeat(6)),
+        ("nowrap", "a".repeat(120)),
+        // double width, so a boundary can land between the two cells of a cell pair
+        ("cjk", "\u{4f60}\u{597d}".repeat(40)),
+        // multi-char clusters, the case where snapping to a cluster boundary moves
+        ("combining", "a\u{310}e\u{301}o\u{332} ".repeat(24)),
+        // regional indicators: cluster breaks depend on the parity of preceding
+        // RI codepoints, so re-segmenting from a mid-line boundary is the risk
+        ("flags", "\u{1F1E6}\u{1F1E7}\u{1F1E8}\u{1F1E9} ".repeat(16)),
+        ("tabs", "\tfoo\tbar\t".repeat(16)),
+        ("indented", format!("        {}", "word ".repeat(30))),
+        ("multi line", "alpha beta gamma delta\n".repeat(12)),
+        ("crlf", "alpha beta gamma delta\r\n".repeat(12)),
+        (
+            "empty lines",
+            format!("{}\n\n\n{}\n", "x y ".repeat(20), "z w ".repeat(20)),
+        ),
+        (
+            "no trailing newline",
+            format!("{}{}", "alpha beta gamma\n".repeat(8), "tail ".repeat(20)),
+        ),
+    ]
+}
+
+#[test]
+fn blocks_agree_with_full_traversal() {
+    for size in [3usize, 5, 13] {
+        block_size::with(size, || {
+            for (name, text) in block_fixtures() {
+                for wrap_indicator in ["", ".", "\u{21aa} "] {
+                    for viewport_width in [5u16, 17] {
+                        let text_fmt = TextFormat {
+                            wrap_indicator: wrap_indicator.into(),
+                            viewport_width,
+                            ..TextFormat::new_test(true)
+                        };
+                        assert_blocks_agree(
+                            &format!(
+                                "{name} (block={size}, indicator={wrap_indicator:?}, \
+                                 width={viewport_width})"
+                            ),
+                            &text,
+                            &text_fmt,
+                            &TextAnnotations::default(),
+                        );
+                    }
+                }
+            }
+        });
+    }
+}
+
+#[test]
+fn blocks_agree_with_varied_wrap_settings() {
+    for size in [4usize, 9] {
+        block_size::with(size, || {
+            for (name, text) in block_fixtures() {
+                // `max_wrap` below a grapheme's width trips a pre-existing bug in
+                // `advance_to_next_word` (it pops its only buffered grapheme and returns
+                // an empty buffer, ending the iterator) -- unrelated to blocks.
+                for max_wrap in [3u16, 20] {
+                    for max_indent_retain in [0u16, 4, 40] {
+                        for soft_wrap_at_text_width in [false, true] {
+                            let text_fmt = TextFormat {
+                                max_wrap,
+                                max_indent_retain,
+                                soft_wrap_at_text_width,
+                                ..TextFormat::new_test(true)
+                            };
+                            assert_blocks_agree(
+                                &format!(
+                                    "{name} (block={size}, max_wrap={max_wrap}, \
+                                     indent_retain={max_indent_retain}, \
+                                     at_text_width={soft_wrap_at_text_width})"
+                                ),
+                                &text,
+                                &text_fmt,
+                                &TextAnnotations::default(),
+                            );
+                        }
+                    }
+                }
+            }
+        });
+    }
+}
+
+#[test]
+fn blocks_agree_with_annotations() {
+    for size in [4usize, 7, 11] {
+        block_size::with(size, || {
+            for (name, text) in block_fixtures() {
+                let len = text.chars().count();
+                if len < 3 * size {
+                    continue;
+                }
+                // anchor annotations either side of, and exactly on, a boundary
+                let rope = crate::Rope::from(text.as_str());
+                for delta in [-1i64, 0, 1] {
+                    let at = (2 * size) as i64 + delta;
+                    let at = at.clamp(0, len as i64 - 1) as usize;
+                    // Annotations must sit on a grapheme cluster boundary. `Layer::consume`
+                    // only advances on an exact `char_idx` match, so one anchored inside a
+                    // cluster is never consumed and its layer stays wedged -- a pre-existing
+                    // constraint on annotation producers, not something blocks introduce.
+                    let at = crate::graphemes::ensure_grapheme_boundary_next(rope.slice(..), at);
+
+                    let inline = [
+                        InlineAnnotation::new(at, "VIRT"),
+                        InlineAnnotation::new(at, "MORE VIRTUAL TEXT"),
+                    ];
+                    let text_fmt = TextFormat::new_test(true);
+                    assert_blocks_agree(
+                        &format!("{name} (block={size}, inline at {at})"),
+                        &text,
+                        &text_fmt,
+                        TextAnnotations::default().add_inline_annotations(&inline, None),
+                    );
+
+                    // An overlay replacing a line break stops `Iterator::next` running its
+                    // line break bookkeeping at all, so `line_idx` stops advancing -- the
+                    // same case `skip_to_next_line` refuses to handle. Pre-existing, and
+                    // not what overlays are used for. `at` must therefore land on the
+                    // line's text, not inside its terminator (which is two chars for CRLF).
+                    let at_line = rope.char_to_line(at);
+                    let at_line_end =
+                        crate::line_ending::line_end_char_index(&rope.slice(..), at_line);
+                    if at < at_line_end {
+                        let overlay = [Overlay::new(at, "#")];
+                        assert_blocks_agree(
+                            &format!("{name} (block={size}, overlay at {at})"),
+                            &text,
+                            &text_fmt,
+                            TextAnnotations::default().add_overlay(&overlay, None),
+                        );
+                    }
+                }
+            }
+        });
+    }
+}
+
+/// Blocks exist only under soft wrap. With it off a document line is one visual
+/// row, so a forced sub-line break would create a second row for a single line
+/// and silently break `skip_to_next_line` and the renderer's horizontal clip.
+#[test]
+fn no_blocks_without_soft_wrap() {
+    block_size::with(4, || {
+        for (name, text) in block_fixtures() {
+            let text_fmt = TextFormat::new_test(false);
+            let annotations = TextAnnotations::default();
+            let (full, _) = trace(&text, &text_fmt, &annotations, 0);
+            for start in 0..=text.chars().count() {
+                let (tail, _) = trace(&text, &text_fmt, &annotations, start);
+                let offset = full.len() - tail.len();
+                assert_eq!(&full[offset..], &tail[..], "{name}: diverged at {start}");
+                // the block must still be the whole document line
+                let line_start: usize = text
+                    .char_indices()
+                    .take_while(|(i, _)| *i < start)
+                    .filter(|(_, c)| *c == '\n')
+                    .count();
+                assert_eq!(
+                    tail.first().map(|g| g.1),
+                    Some(line_start).filter(|_| !tail.is_empty()),
+                    "{name}: block at {start} is not a whole line"
+                );
+            }
+        }
+    });
 }

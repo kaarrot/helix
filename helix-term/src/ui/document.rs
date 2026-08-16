@@ -5,7 +5,7 @@ use helix_core::graphemes::Grapheme;
 use helix_core::str_utils::char_to_byte_idx;
 use helix_core::syntax::{self, HighlightEvent, Highlighter, OverlayHighlights};
 use helix_core::text_annotations::TextAnnotations;
-use helix_core::{visual_offset_from_block, Position, RopeSlice};
+use helix_core::{Position, RopeSlice};
 use helix_stdx::rope::RopeSliceExt;
 use helix_view::editor::{WhitespaceConfig, WhitespaceRenderValue};
 use helix_view::graphics::Rect;
@@ -71,12 +71,36 @@ pub fn render_text(
     theme: &Theme,
     mut decorations: DecorationManager,
 ) {
-    let row_off = visual_offset_from_block(text, anchor, anchor, text_fmt, text_annotations)
-        .0
-        .row;
-
     let mut formatter =
         DocumentFormatter::new_at_prev_checkpoint(text, text_fmt, text_annotations, anchor);
+
+    // Seek to the visual row the anchor lands on. The rows of the block above it are off
+    // screen, but the part of the anchor's own row that precedes the anchor still has to be
+    // drawn, so that row is buffered rather than discarded -- it is at most a viewport wide.
+    //
+    // Doing this on the render formatter rather than through a second
+    // `visual_offset_from_block` call is what stops a frame formatting the block prefix
+    // twice, and stops both highlighters being driven across it twice.
+    //
+    // With soft wrap off there is nothing to seek: a block is one document line, rows only
+    // advance on a line break, and the anchor precedes this block's line break.
+    let mut buffered = Vec::new();
+    let mut row_off = 0;
+    if text_fmt.soft_wrap {
+        while let Some(grapheme) = formatter.next() {
+            if grapheme.visual_pos.row != row_off {
+                buffered.clear();
+                row_off = grapheme.visual_pos.row;
+            }
+            let reached_anchor = formatter.next_char_pos() > anchor;
+            buffered.push(grapheme);
+            if reached_anchor {
+                break;
+            }
+        }
+    }
+    let mut buffered = buffered.into_iter();
+
     let mut syntax_highlighter =
         SyntaxHighlighter::new(syntax_highlighter, text, theme, renderer.text_style);
     let mut overlay_highlighter = OverlayHighlighter::new(overlay_highlights, theme);
@@ -103,14 +127,12 @@ pub fn render_text(
     let mut clip_current_line = can_clip;
 
     loop {
-        let Some(mut grapheme) = formatter.next() else {
+        // the buffered graphemes are the head of the anchor's row and go through the whole
+        // body below exactly as if they had come from the formatter
+        let Some(mut grapheme) = buffered.next().or_else(|| formatter.next()) else {
             break;
         };
 
-        // skip any graphemes on visual lines before the block start
-        if grapheme.visual_pos.row < row_off {
-            continue;
-        }
         grapheme.visual_pos.row -= row_off;
         if !reached_view_top {
             decorations.prepare_for_rendering(grapheme.char_idx);

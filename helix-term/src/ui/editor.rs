@@ -15,6 +15,7 @@ use crate::{
 
 use helix_core::{
     diagnostic::NumberOrString,
+    doc_formatter::{DocumentFormatter, TextFormat},
     graphemes::{next_grapheme_boundary, prev_grapheme_boundary},
     movement::Direction,
     syntax::{self, OverlayHighlights},
@@ -116,14 +117,22 @@ impl EditorView {
             decorations.add_decoration(line_decoration);
         }
 
-        let syntax_highlighter =
-            Self::doc_syntax_highlighter(doc, view_offset.anchor, inner.height, &loader);
+        let syntax_highlighter = Self::doc_syntax_highlighter(
+            doc,
+            view_offset.anchor,
+            inner.height,
+            inner.width,
+            view_offset.horizontal_offset,
+            &loader,
+        );
         let mut overlays = Vec::new();
 
         overlays.push(Self::overlay_syntax_highlights(
             doc,
             view_offset.anchor,
             inner.height,
+            inner.width,
+            view_offset.horizontal_offset,
             &text_annotations,
         ));
 
@@ -132,9 +141,15 @@ impl EditorView {
             .and_then(|config| config.rainbow_brackets)
             .unwrap_or(config.rainbow_brackets)
         {
-            if let Some(overlay) =
-                Self::doc_rainbow_highlights(doc, view_offset.anchor, inner.height, theme, &loader)
-            {
+            if let Some(overlay) = Self::doc_rainbow_highlights(
+                doc,
+                view_offset.anchor,
+                inner.height,
+                inner.width,
+                view_offset.horizontal_offset,
+                theme,
+                &loader,
+            ) {
                 overlays.push(overlay);
             }
         }
@@ -267,17 +282,51 @@ impl EditorView {
             .for_each(|area| surface.set_style(area, ruler_theme))
     }
 
+    /// Chars a rendered column can consume, generously over-estimated: a column holds at
+    /// least one char, but a grapheme cluster of combining marks can be many.
+    const MAX_CHARS_PER_COLUMN: usize = 16;
+
+    /// The range of the document a frame can possibly display, as bytes.
+    ///
+    /// Measured in document lines this would be `O(length of the longest visible line)` --
+    /// a single multi-megabyte line means handing the entire line to tree-sitter, the
+    /// rainbow query and the overlay collector on *every frame*, no matter how small the
+    /// viewport. So the range is additionally clamped by how many chars can be on screen.
+    ///
+    /// The consequence, when one enormous line fills the viewport, is that document lines
+    /// below it can lose syntax colour. That only arises once a single line already
+    /// exhausts a whole screen's worth of characters.
     fn viewport_byte_range(
         text: helix_core::RopeSlice,
-        row: usize,
+        anchor: usize,
         height: u16,
+        width: u16,
+        horizontal_offset: usize,
+        text_fmt: &TextFormat,
     ) -> std::ops::Range<usize> {
+        // The renderer formats from the start of the anchor's block, so highlights have to
+        // be available from there -- not merely from the anchor.
+        let start_char = DocumentFormatter::block_start(text, text_fmt, anchor);
+        let row = text.char_to_line(start_char);
+
         // Calculate viewport byte ranges:
         // Saturating subs to make it inclusive zero indexing.
         let last_line = text.len_lines().saturating_sub(1);
         let last_visible_line = (row + height as usize).saturating_sub(1).min(last_line);
-        let start = text.line_to_byte(row.min(last_line));
-        let end = text.line_to_byte(last_visible_line + 1);
+        let start = text.char_to_byte(start_char);
+
+        // With soft wrap off the renderer walks each line up to the clip column, so the
+        // horizontal offset counts too.
+        let visible_chars = (horizontal_offset + width as usize)
+            .saturating_mul(height as usize)
+            .saturating_mul(Self::MAX_CHARS_PER_COLUMN)
+            .saturating_add(anchor - start_char);
+        let end_char = start_char
+            .saturating_add(visible_chars)
+            .min(text.len_chars());
+        let end = text
+            .line_to_byte(last_visible_line + 1)
+            .min(text.char_to_byte(end_char));
 
         start..end
     }
@@ -289,12 +338,15 @@ impl EditorView {
         doc: &'editor Document,
         anchor: usize,
         height: u16,
+        width: u16,
+        horizontal_offset: usize,
         loader: &'editor syntax::Loader,
     ) -> Option<syntax::Highlighter<'editor>> {
         let syntax = doc.syntax()?;
         let text = doc.text().slice(..);
-        let row = text.char_to_line(anchor.min(text.len_chars()));
-        let range = Self::viewport_byte_range(text, row, height);
+        let text_fmt = doc.text_format(width, None);
+        let range =
+            Self::viewport_byte_range(text, anchor, height, width, horizontal_offset, &text_fmt);
         let range = range.start as u32..range.end as u32;
 
         let highlighter = syntax.highlighter(text, loader, range);
@@ -305,12 +357,15 @@ impl EditorView {
         doc: &Document,
         anchor: usize,
         height: u16,
+        width: u16,
+        horizontal_offset: usize,
         text_annotations: &TextAnnotations,
     ) -> OverlayHighlights {
         let text = doc.text().slice(..);
-        let row = text.char_to_line(anchor.min(text.len_chars()));
+        let text_fmt = doc.text_format(width, None);
 
-        let mut range = Self::viewport_byte_range(text, row, height);
+        let mut range =
+            Self::viewport_byte_range(text, anchor, height, width, horizontal_offset, &text_fmt);
         range = text.byte_to_char(range.start)..text.byte_to_char(range.end);
 
         text_annotations.collect_overlay_highlights(range)
@@ -320,13 +375,16 @@ impl EditorView {
         doc: &Document,
         anchor: usize,
         height: u16,
+        width: u16,
+        horizontal_offset: usize,
         theme: &Theme,
         loader: &syntax::Loader,
     ) -> Option<OverlayHighlights> {
         let syntax = doc.syntax()?;
         let text = doc.text().slice(..);
-        let row = text.char_to_line(anchor.min(text.len_chars()));
-        let visible_range = Self::viewport_byte_range(text, row, height);
+        let text_fmt = doc.text_format(width, None);
+        let visible_range =
+            Self::viewport_byte_range(text, anchor, height, width, horizontal_offset, &text_fmt);
         let start = syntax::child_for_byte_range(
             &syntax.tree().root_node(),
             visible_range.start as u32..visible_range.end as u32,

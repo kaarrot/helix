@@ -215,6 +215,9 @@ The list of supported features is:
 
 ## Debugger configuration
 
+See the [debugger](./debugger.md) documentation for using a debug session once
+it is configured.
+
 A language's debug adapter is configured in a `[language.debugger]` table on the
 `[[language]]` section. Individual debug configurations (what to launch or
 attach to) are listed as `[[language.debugger.templates]]`; these are what the

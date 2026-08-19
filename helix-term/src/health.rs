@@ -1,5 +1,6 @@
 use crate::config::{Config, ConfigLoadError};
 use helix_core::config::{default_lang_config, user_lang_config};
+use helix_core::syntax::config::DebugAdapterConfig;
 use helix_loader::grammar::load_runtime_file;
 use std::{
     collections::HashSet,
@@ -337,10 +338,7 @@ pub fn language(lang_str: String) -> std::io::Result<()> {
         }),
     )?;
 
-    probe_protocol(
-        "debug adapter",
-        lang.debugger.as_ref().map(|dap| dap.command.to_string()),
-    )?;
+    probe_dap(lang.debugger.as_ref())?;
 
     probe_protocol(
         "formatter",
@@ -416,6 +414,22 @@ fn probe_protocol(protocol_name: &str, server_cmd: Option<String>) -> std::io::R
     writeln!(stdout, "  {} {}", icon, diag)?;
 
     Ok(())
+}
+
+/// Display diagnostics about the debug adapter.
+fn probe_dap(config: Option<&DebugAdapterConfig>) -> std::io::Result<()> {
+    match config {
+        // The `connect` transport dials an already-running adapter instead of
+        // spawning one, so `command` is an address with nothing to find in $PATH.
+        Some(dap) if dap.transport == "connect" => {
+            let stdout = std::io::stdout();
+            let mut stdout = stdout.lock();
+
+            writeln!(stdout, "Configured debug adapter:")?;
+            writeln!(stdout, "  connects to {}", dap.command.as_str().green())
+        }
+        config => probe_protocol("debug adapter", config.map(|dap| dap.command.to_string())),
+    }
 }
 
 /// Display diagnostics about a feature that requires tree-sitter

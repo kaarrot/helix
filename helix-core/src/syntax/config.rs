@@ -456,6 +456,9 @@ pub enum DebugArgumentValue {
 pub struct DebugTemplate {
     pub name: String,
     pub request: String,
+    /// Dial this `host:port` instead of starting the adapter from `command`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connect: Option<String>,
     #[serde(default)]
     pub completion: Vec<DebugConfigCompletion>,
     pub args: HashMap<String, DebugArgumentValue>,
@@ -629,4 +632,42 @@ where
 
 fn default_timeout() -> u64 {
     20
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn debug_template_connect_is_optional() {
+        let without: DebugTemplate = toml::from_str(
+            r#"
+            name = "Attach to PID"
+            request = "attach"
+            args = { processId = "{0}" }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(without.connect, None);
+
+        let with: DebugTemplate = toml::from_str(
+            r#"
+            name = "Attach to port"
+            request = "attach"
+            connect = "127.0.0.1:{0}"
+            completion = [{ name = "port", default = "5678" }]
+            args = { justMyCode = false }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(with.connect.as_deref(), Some("127.0.0.1:{0}"));
+        assert_eq!(
+            with.completion,
+            vec![DebugConfigCompletion::Advanced(AdvancedCompletion {
+                name: Some("port".to_string()),
+                completion: None,
+                default: Some("5678".to_string()),
+            })]
+        );
+    }
 }

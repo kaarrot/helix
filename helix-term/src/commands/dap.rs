@@ -2,7 +2,7 @@ use super::{Context, Editor};
 use crate::{
     compositor::{self, Compositor},
     job::{Callback, Jobs},
-    ui::{self, overlay::overlaid, Picker, Popup, Prompt, PromptEvent, Text},
+    ui::{self, overlay::overlaid, Picker, Prompt, PromptEvent},
 };
 use dap::{StackFrame, Thread, ThreadStates};
 use helix_core::syntax::config::{DebugArgumentValue, DebugConfigCompletion, DebugTemplate};
@@ -13,9 +13,9 @@ use helix_lsp::block_on;
 use helix_view::editor::Breakpoint;
 
 use serde_json::{to_value, Value};
-use tui::text::Spans;
 
 use std::collections::HashMap;
+use std::fmt;
 use std::future::Future;
 use std::path::PathBuf;
 
@@ -98,7 +98,9 @@ fn resolve_process_name(name: &str) -> anyhow::Result<u32> {
         };
         // The `comm` field is wrapped in `(...)` and may contain spaces and
         // parens; split at the last `)` to skip over it safely.
-        let Some(last_paren) = stat.rfind(')') else { return 0 };
+        let Some(last_paren) = stat.rfind(')') else {
+            return 0;
+        };
         // After `)`: state ppid pgrp session tty_nr tpgid flags minflt cminflt
         // majflt cmajflt utime stime cutime cstime priority nice num_threads
         // itrealvalue starttime ...    (starttime is the 20th token)
@@ -127,7 +129,9 @@ fn resolve_process_name(name: &str) -> anyhow::Result<u32> {
             .map(|s| s.trim().to_owned())
             .unwrap_or_default();
 
-        let cmdline_bytes = fs::read(entry.path().join("cmdline")).ok().unwrap_or_default();
+        let cmdline_bytes = fs::read(entry.path().join("cmdline"))
+            .ok()
+            .unwrap_or_default();
         let cmdline_parts: Vec<&str> = cmdline_bytes
             .split(|&c| c == 0)
             .filter_map(|seg| std::str::from_utf8(seg).ok())
@@ -148,12 +152,10 @@ fn resolve_process_name(name: &str) -> anyhow::Result<u32> {
             .skip(1)
             .find(|s| !s.starts_with('-'))
             .copied();
-        let script_basename = script_arg.and_then(|s| {
-            Path::new(s).file_name().and_then(|n| n.to_str())
-        });
-        let script_stem = script_arg.and_then(|s| {
-            Path::new(s).file_stem().and_then(|n| n.to_str())
-        });
+        let script_basename =
+            script_arg.and_then(|s| Path::new(s).file_name().and_then(|n| n.to_str()));
+        let script_stem =
+            script_arg.and_then(|s| Path::new(s).file_stem().and_then(|n| n.to_str()));
 
         let is_match = comm == name
             || arg0_basename == name
@@ -184,7 +186,11 @@ fn resolve_process_name(name: &str) -> anyhow::Result<u32> {
                 .take(8)
                 .map(|(_, p, d)| {
                     let snippet: String = d.chars().take(PER_ENTRY).collect();
-                    let ellipsis = if d.chars().count() > PER_ENTRY { "…" } else { "" };
+                    let ellipsis = if d.chars().count() > PER_ENTRY {
+                        "…"
+                    } else {
+                        ""
+                    };
                     format!("{}: {}{}", p, snippet, ellipsis)
                 })
                 .collect();
@@ -205,7 +211,9 @@ fn resolve_process_name(name: &str) -> anyhow::Result<u32> {
 
 #[cfg(not(target_os = "linux"))]
 fn resolve_process_name(_name: &str) -> anyhow::Result<u32> {
-    anyhow::bail!("Process name resolution is only implemented on Linux; please enter a numeric PID")
+    anyhow::bail!(
+        "Process name resolution is only implemented on Linux; please enter a numeric PID"
+    )
 }
 
 fn get_breakpoint_at_current_line(editor: &mut Editor) -> Option<(usize, Breakpoint)> {
@@ -260,7 +268,9 @@ fn resolve_parameter(
             .and_then(|pb| pb.into_os_string().into_string().ok())
             .unwrap_or_else(|| value.to_owned()),
         // Numeric → keep as PID. Non-numeric → look up by name.
-        Some("process") if value.parse::<u32>().is_err() => resolve_process_name(value)?.to_string(),
+        Some("process") if value.parse::<u32>().is_err() => {
+            resolve_process_name(value)?.to_string()
+        }
         _ => value.to_owned(),
     })
 }
@@ -816,7 +826,10 @@ fn history_to_file(values: impl Iterator<Item = String>) -> String {
     entries.reverse();
     entries.drain(..entries.len().saturating_sub(EVAL_HISTORY_LIMIT));
 
-    entries.iter().map(|entry| entry.to_string() + "\n").collect()
+    entries
+        .iter()
+        .map(|entry| entry.to_string() + "\n")
+        .collect()
 }
 
 /// Seed the history register from disk, so the prompt recalls expressions from
@@ -978,9 +991,13 @@ pub fn dap_evaluate(cx: &mut Context) {
                 Ok(response) => {
                     // The status line can only ever show a screenful, so hand the
                     // whole value to the clipboard for pasting elsewhere.
-                    if let Err(err) = cx.editor.registers.write('+', vec![response.result.clone()])
+                    if let Err(err) = cx
+                        .editor
+                        .registers
+                        .write('+', vec![response.result.clone()])
                     {
-                        cx.editor.set_error(format!("Failed to yank result: {}", err));
+                        cx.editor
+                            .set_error(format!("Failed to yank result: {}", err));
                     }
 
                     let status = status_line_value(&response.result);
@@ -1001,38 +1018,118 @@ pub fn dap_evaluate(cx: &mut Context) {
     cx.push_layer(Box::new(prompt));
 }
 
-pub fn dap_variables(cx: &mut Context) {
-    let debugger = debugger!(cx.editor);
+#[derive(Clone)]
+struct VariableItem {
+    scope: String,
+    name: String,
+    ty: Option<String>,
+    value: String,
+    evaluate_name: Option<String>,
+    attributes: Vec<String>,
+    container_reference: usize,
+    frame_id: usize,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum SetTarget {
+    Expression {
+        expression: String,
+        frame_id: usize,
+    },
+    Variable {
+        variables_reference: usize,
+        name: String,
+    },
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum SetRefuse {
+    ReadOnly,
+    ReturnValue,
+    Unsupported,
+}
+
+impl fmt::Display for SetRefuse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ReadOnly => write!(f, "Variable is read-only"),
+            Self::ReturnValue => write!(f, "Cannot change return value"),
+            Self::Unsupported => write!(f, "Adapter does not support setting variables"),
+        }
+    }
+}
+
+/// Which DAP request to use for a row in the variables picker.
+/// Prefers `setExpression` when the adapter supports it and the variable has an
+/// evaluate name; otherwise `setVariable` against the parent scope.
+fn set_target(
+    name: &str,
+    evaluate_name: Option<&str>,
+    attributes: &[String],
+    container_reference: usize,
+    frame_id: usize,
+    supports_set_expression: bool,
+    supports_set_variable: bool,
+) -> Result<SetTarget, SetRefuse> {
+    if name.starts_with("(return) ") {
+        return Err(SetRefuse::ReturnValue);
+    }
+    if attributes.iter().any(|attr| attr == "readOnly") {
+        return Err(SetRefuse::ReadOnly);
+    }
+
+    if supports_set_expression {
+        if let Some(expression) = evaluate_name.filter(|name| !name.is_empty()) {
+            return Ok(SetTarget::Expression {
+                expression: expression.to_string(),
+                frame_id,
+            });
+        }
+    }
+    if supports_set_variable {
+        return Ok(SetTarget::Variable {
+            variables_reference: container_reference,
+            name: name.to_string(),
+        });
+    }
+    Err(SetRefuse::Unsupported)
+}
+
+fn collect_variable_items(editor: &mut Editor) -> Option<Vec<VariableItem>> {
+    let debugger = match editor.debug_adapters.get_active_client() {
+        Some(debugger) => debugger,
+        None => {
+            editor.set_error("Debugger is not running");
+            return None;
+        }
+    };
 
     if debugger.thread_id.is_none() {
-        cx.editor
-            .set_status("Cannot access variables while target is running.");
-        return;
+        editor.set_status("Cannot access variables while target is running.");
+        return None;
     }
     let (frame, thread_id) = match (debugger.active_frame, debugger.thread_id) {
         (Some(frame), Some(thread_id)) => (frame, thread_id),
         _ => {
-            cx.editor
-                .set_status("Cannot find current stack frame to access variables.");
-            return;
+            editor.set_status("Cannot find current stack frame to access variables.");
+            return None;
         }
     };
 
     let thread_frame = match debugger.stack_frames.get(&thread_id) {
         Some(thread_frame) => thread_frame,
         None => {
-            cx.editor
-                .set_error(format!("Failed to get stack frame for thread: {thread_id}"));
-            return;
+            editor.set_error(format!("Failed to get stack frame for thread: {thread_id}"));
+            return None;
         }
     };
     let stack_frame = match thread_frame.get(frame) {
         Some(stack_frame) => stack_frame,
         None => {
-            cx.editor.set_error(format!(
+            editor.set_error(format!(
                 "Failed to get stack frame for thread {thread_id} and frame {frame}."
             ));
-            return;
+            return None;
         }
     };
 
@@ -1040,49 +1137,148 @@ pub fn dap_variables(cx: &mut Context) {
     let scopes = match block_on(debugger.scopes(frame_id)) {
         Ok(s) => s,
         Err(e) => {
-            cx.editor.set_error(format!("Failed to get scopes: {}", e));
-            return;
+            editor.set_error(format!("Failed to get scopes: {}", e));
+            return None;
         }
     };
 
     // TODO: allow expanding variables into sub-fields
-    let mut variables = Vec::new();
-
-    let theme = &cx.editor.theme;
-    let scope_style = theme.get("ui.linenr.selected");
-    let type_style = theme.get("ui.text");
-    let text_style = theme.get("ui.text.focus");
-
-    for scope in scopes.iter() {
-        // use helix_view::graphics::Style;
-        use tui::text::Span;
+    let mut items = Vec::new();
+    for scope in scopes {
         let response = block_on(debugger.variables(scope.variables_reference));
-
-        variables.push(Spans::from(Span::styled(
-            format!("▸ {}", scope.name),
-            scope_style,
-        )));
-
-        if let Ok(vars) = response {
-            variables.reserve(vars.len());
-            for var in vars {
-                let mut spans = Vec::with_capacity(5);
-
-                spans.push(Span::styled(var.name.to_owned(), text_style));
-                if let Some(ty) = var.ty {
-                    spans.push(Span::raw(": "));
-                    spans.push(Span::styled(ty.to_owned(), type_style));
-                }
-                spans.push(Span::raw(" = "));
-                spans.push(Span::styled(var.value.to_owned(), text_style));
-                variables.push(Spans::from(spans));
-            }
+        let Ok(vars) = response else {
+            continue;
+        };
+        items.reserve(vars.len());
+        for var in vars {
+            items.push(VariableItem {
+                scope: scope.name.clone(),
+                name: var.name,
+                ty: var.ty,
+                value: var.value,
+                evaluate_name: var.evaluate_name,
+                attributes: var
+                    .presentation_hint
+                    .and_then(|hint| hint.attributes)
+                    .unwrap_or_default(),
+                container_reference: scope.variables_reference,
+                frame_id,
+            });
         }
     }
 
-    let contents = Text::from(tui::text::Text::from(variables));
-    let popup = Popup::new("dap-variables", contents);
-    cx.replace_or_push_layer("dap-variables", popup);
+    Some(items)
+}
+
+fn variables_picker(items: Vec<VariableItem>) -> Picker<VariableItem, ()> {
+    let columns = [
+        ui::PickerColumn::new("scope", |item: &VariableItem, _| item.scope.as_str().into()),
+        ui::PickerColumn::new("name", |item: &VariableItem, _| item.name.as_str().into()),
+        ui::PickerColumn::new("type", |item: &VariableItem, _| {
+            item.ty.as_deref().unwrap_or("").into()
+        }),
+        ui::PickerColumn::new("value", |item: &VariableItem, _| item.value.as_str().into()),
+    ];
+
+    Picker::new(columns, 1, items, (), |cx, item, _action| {
+        prompt_set_variable(cx, item.clone());
+    })
+    // Paths truncate at the start so the filename stays visible; values should
+    // keep the start so a long list shows `[0, 1, 2, …` rather than `…, 98, 99]`.
+    .truncate_start(false)
+}
+
+fn prompt_set_variable(cx: &mut compositor::Context, item: VariableItem) {
+    let callback = Box::pin(async move {
+        let call: Callback = Callback::EditorCompositor(Box::new(move |editor, compositor| {
+            let current = item.value.clone();
+            let mut prompt = Prompt::new(
+                "value: ".into(),
+                None,
+                ui::completers::none,
+                move |cx, input: &str, event: PromptEvent| {
+                    if event != PromptEvent::Validate {
+                        return;
+                    }
+                    apply_set(cx, &item, input);
+                },
+            );
+            prompt.insert_str(&current, editor);
+            compositor.push(Box::new(prompt));
+        }));
+        Ok(call)
+    });
+    cx.jobs.callback(callback);
+}
+
+fn apply_set(cx: &mut compositor::Context, item: &VariableItem, value: &str) {
+    let debugger = match cx.editor.debug_adapters.get_active_client() {
+        Some(debugger) => debugger,
+        None => {
+            cx.editor.set_error("Debugger is not running");
+            return;
+        }
+    };
+
+    let target = match set_target(
+        &item.name,
+        item.evaluate_name.as_deref(),
+        &item.attributes,
+        item.container_reference,
+        item.frame_id,
+        debugger.supports_set_expression(),
+        debugger.supports_set_variable(),
+    ) {
+        Ok(target) => target,
+        Err(reason) => {
+            cx.editor.set_error(reason.to_string());
+            return;
+        }
+    };
+
+    let result = match target {
+        SetTarget::Expression {
+            expression,
+            frame_id,
+        } => block_on(debugger.set_expression(expression, value.to_owned(), Some(frame_id)))
+            .map(|response| response.value),
+        SetTarget::Variable {
+            variables_reference,
+            name,
+        } => block_on(debugger.set_variable(variables_reference, name, value.to_owned()))
+            .map(|response| response.value),
+    };
+
+    match result {
+        Ok(new_value) => {
+            cx.editor.set_status(new_value);
+            reopen_variables_picker(cx);
+        }
+        Err(e) => {
+            cx.editor
+                .set_error(format!("Failed to set variable: {}", e));
+        }
+    }
+}
+
+fn reopen_variables_picker(cx: &mut compositor::Context) {
+    let Some(items) = collect_variable_items(cx.editor) else {
+        return;
+    };
+    let callback = Box::pin(async move {
+        let call: Callback = Callback::EditorCompositor(Box::new(move |_editor, compositor| {
+            compositor.push(Box::new(variables_picker(items)));
+        }));
+        Ok(call)
+    });
+    cx.jobs.callback(callback);
+}
+
+pub fn dap_variables(cx: &mut Context) {
+    let Some(items) = collect_variable_items(cx.editor) else {
+        return;
+    };
+    cx.push_layer(Box::new(variables_picker(items)));
 }
 
 pub fn dap_terminate(cx: &mut Context) {
@@ -1315,14 +1511,20 @@ mod tests {
             Some("repr(xs)".to_string())
         );
         // A complete value is left alone.
-        assert_eq!(full_value_expression("[0, 1, 2]", "xs", template, true), None);
+        assert_eq!(
+            full_value_expression("[0, 1, 2]", "xs", template, true),
+            None
+        );
         // Without a template, asking again only helps if the adapter honors the
         // clipboard context.
         assert_eq!(
             full_value_expression("[0, 1, ...]", "xs", None, true),
             Some("xs".to_string())
         );
-        assert_eq!(full_value_expression("[0, 1, ...]", "xs", None, false), None);
+        assert_eq!(
+            full_value_expression("[0, 1, ...]", "xs", None, false),
+            None
+        );
     }
 
     #[test]
@@ -1369,6 +1571,56 @@ mod tests {
         let kept = history_from_file(&history_to_file(many));
         assert_eq!(kept.len(), EVAL_HISTORY_LIMIT);
         assert_eq!(kept[0], "0", "the newest entry survives");
-        assert_eq!(kept[EVAL_HISTORY_LIMIT - 1], (EVAL_HISTORY_LIMIT - 1).to_string());
+        assert_eq!(
+            kept[EVAL_HISTORY_LIMIT - 1],
+            (EVAL_HISTORY_LIMIT - 1).to_string()
+        );
+    }
+
+    #[test]
+    fn set_target_prefers_expression_when_named() {
+        assert_eq!(
+            set_target("x", Some("x"), &[], 7, 3, true, true),
+            Ok(SetTarget::Expression {
+                expression: "x".to_string(),
+                frame_id: 3,
+            })
+        );
+        // No evaluate name: fall back to setVariable on the parent scope.
+        assert_eq!(
+            set_target("x", None, &[], 7, 3, true, true),
+            Ok(SetTarget::Variable {
+                variables_reference: 7,
+                name: "x".to_string(),
+            })
+        );
+        // Only setVariable is advertised.
+        assert_eq!(
+            set_target("x", Some("x"), &[], 7, 3, false, true),
+            Ok(SetTarget::Variable {
+                variables_reference: 7,
+                name: "x".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn set_target_refuses_readonly_return_and_missing_capability() {
+        assert_eq!(
+            set_target("x", Some("x"), &["readOnly".into()], 7, 3, true, true),
+            Err(SetRefuse::ReadOnly)
+        );
+        assert_eq!(
+            set_target("(return) x", Some("x"), &[], 7, 3, true, true),
+            Err(SetRefuse::ReturnValue)
+        );
+        assert_eq!(
+            set_target("x", None, &[], 7, 3, true, false),
+            Err(SetRefuse::Unsupported)
+        );
+        assert_eq!(
+            set_target("x", Some("x"), &[], 7, 3, false, false),
+            Err(SetRefuse::Unsupported)
+        );
     }
 }

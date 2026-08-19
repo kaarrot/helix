@@ -65,8 +65,12 @@ have selected.
 
 ### Inspecting and changing state
 
-`<space>G v` lists the variables of the current frame in a popup, grouped by
-scope. Long lists scroll a line at a time.
+`<space>G v` lists the variables of the current frame in a picker, grouped by
+scope. Looking does not require Enter. Enter opens a `value:` prompt, pre-filled
+with the current value, and assigns it through the adapter (`setExpression` when
+the variable has an evaluate name, otherwise `setVariable`). The picker then
+reopens with the new value. This only edits names that already exist in the
+frame; creating a new name, or running any other statement, is what eval is for.
 
 `<space>G p` opens the `eval:` prompt, which evaluates an expression in the
 current frame. It is the most useful key in the mode, and it does a little more

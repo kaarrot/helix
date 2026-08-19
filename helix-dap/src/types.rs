@@ -769,6 +769,75 @@ pub mod requests {
 
     #[derive(Debug, PartialEq, Eq, Clone, Deserialize, Serialize)]
     #[serde(rename_all = "camelCase")]
+    pub struct SetVariableArguments {
+        pub variables_reference: usize,
+        pub name: String,
+        pub value: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub format: Option<ValueFormat>,
+    }
+
+    #[derive(Debug, PartialEq, Eq, Clone, Deserialize, Serialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct SetVariableResponse {
+        pub value: String,
+        #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+        pub ty: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub variables_reference: Option<usize>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub named_variables: Option<usize>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub indexed_variables: Option<usize>,
+    }
+
+    #[derive(Debug)]
+    pub enum SetVariable {}
+
+    impl Request for SetVariable {
+        type Arguments = SetVariableArguments;
+        type Result = SetVariableResponse;
+        const COMMAND: &'static str = "setVariable";
+    }
+
+    #[derive(Debug, PartialEq, Eq, Clone, Deserialize, Serialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct SetExpressionArguments {
+        pub expression: String,
+        pub value: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub frame_id: Option<usize>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub format: Option<ValueFormat>,
+    }
+
+    #[derive(Debug, PartialEq, Eq, Clone, Deserialize, Serialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct SetExpressionResponse {
+        pub value: String,
+        #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+        pub ty: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub presentation_hint: Option<VariablePresentationHint>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub variables_reference: Option<usize>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub named_variables: Option<usize>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub indexed_variables: Option<usize>,
+    }
+
+    #[derive(Debug)]
+    pub enum SetExpression {}
+
+    impl Request for SetExpression {
+        type Arguments = SetExpressionArguments;
+        type Result = SetExpressionResponse;
+        const COMMAND: &'static str = "setExpression";
+    }
+
+    #[derive(Debug, PartialEq, Eq, Clone, Deserialize, Serialize)]
+    #[serde(rename_all = "camelCase")]
     pub struct SetExceptionBreakpointsArguments {
         pub filters: Vec<String>,
         // pub filterOptions: Option<Vec<ExceptionFilterOptions>>, // needs capability

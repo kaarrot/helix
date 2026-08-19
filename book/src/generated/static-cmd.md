@@ -287,7 +287,7 @@
 | `dap_step_in` | Step in | normal: `` <space>Gi ``, select: `` <space>Gi `` |
 | `dap_step_out` | Step out | normal: `` <space>Go ``, select: `` <space>Go `` |
 | `dap_next` | Step to next | normal: `` <space>Gn ``, select: `` <space>Gn `` |
-| `dap_variables` | List variables | normal: `` <space>Gv ``, select: `` <space>Gv `` |
+| `dap_variables` | List and set variables | normal: `` <space>Gv ``, select: `` <space>Gv `` |
 | `dap_terminate` | End debug session | normal: `` <space>Gt ``, select: `` <space>Gt `` |
 | `dap_edit_condition` | Edit breakpoint condition on current line | normal: `` <space>G<C-c> ``, select: `` <space>G<C-c> `` |
 | `dap_edit_log` | Edit breakpoint log message on current line | normal: `` <space>G<C-l> ``, select: `` <space>G<C-l> `` |

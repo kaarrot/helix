@@ -787,6 +787,80 @@ fn expression_from(text: RopeSlice, range: Range) -> String {
     }
 }
 
+/// Register backing the eval prompt's history. `=` mirrors vim's expression
+/// register and is not otherwise used by Helix.
+const EVAL_HISTORY_REGISTER: char = '=';
+/// How many past expressions to keep on disk.
+const EVAL_HISTORY_LIMIT: usize = 500;
+
+fn eval_history_file() -> PathBuf {
+    helix_loader::cache_dir().join("dap-eval-history")
+}
+
+/// Parse the history file, whose entries run oldest first, into the newest-first
+/// order `Registers::write` expects.
+fn history_from_file(contents: &str) -> Vec<String> {
+    contents
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .rev()
+        .map(str::to_string)
+        .collect()
+}
+
+/// Render newest-first history, as `Registers::read` yields it, into the file's
+/// oldest-first order, capped at the most recent `EVAL_HISTORY_LIMIT` entries.
+/// A pasted newline would corrupt the line-per-entry format, so drop those.
+fn history_to_file(values: impl Iterator<Item = String>) -> String {
+    let mut entries: Vec<String> = values.filter(|value| !value.contains('\n')).collect();
+    entries.reverse();
+    entries.drain(..entries.len().saturating_sub(EVAL_HISTORY_LIMIT));
+
+    entries.iter().map(|entry| entry.to_string() + "\n").collect()
+}
+
+/// Seed the history register from disk, so the prompt recalls expressions from
+/// earlier sessions. Only fills an empty register, i.e. once per session.
+fn load_eval_history(editor: &mut Editor) {
+    let loaded = editor
+        .registers
+        .read(EVAL_HISTORY_REGISTER, editor)
+        .is_some_and(|values| values.len() > 0);
+    if loaded {
+        return;
+    }
+
+    let Ok(contents) = std::fs::read_to_string(eval_history_file()) else {
+        return;
+    };
+
+    let entries = history_from_file(&contents);
+    if entries.is_empty() {
+        return;
+    }
+
+    if let Err(err) = editor.registers.write(EVAL_HISTORY_REGISTER, entries) {
+        log::error!("Failed to restore debug eval history: {}", err);
+    }
+}
+
+/// Mirror the history register to disk. The prompt pushes the new expression
+/// before invoking us, so the file always matches what the prompt recalls.
+fn save_eval_history(editor: &Editor) {
+    let Some(values) = editor.registers.read(EVAL_HISTORY_REGISTER, editor) else {
+        return;
+    };
+
+    let contents = history_to_file(values.map(|value| value.to_string()));
+
+    let path = eval_history_file();
+    let written = std::fs::create_dir_all(helix_loader::cache_dir())
+        .and_then(|_| std::fs::write(&path, contents));
+    if let Err(err) = written {
+        log::error!("Failed to save debug eval history to {:?}: {}", path, err);
+    }
+}
+
 pub fn dap_evaluate(cx: &mut Context) {
     if cx.editor.debug_adapters.get_active_client().is_none() {
         cx.editor.set_error("Debugger is not running");
@@ -798,14 +872,18 @@ pub fn dap_evaluate(cx: &mut Context) {
         expression_from(doc.text().slice(..), doc.selection(view.id).primary())
     };
 
+    load_eval_history(cx.editor);
+
     let prompt = Prompt::new(
         "eval: ".into(),
-        None,
+        Some(EVAL_HISTORY_REGISTER),
         ui::completers::none,
         |cx, input: &str, event: PromptEvent| {
             if event != PromptEvent::Validate || input.is_empty() {
                 return;
             }
+
+            save_eval_history(cx.editor);
 
             let debugger = match cx.editor.debug_adapters.get_active_client() {
                 Some(debugger) => debugger,
@@ -1146,5 +1224,28 @@ mod tests {
 
         // Spanning a line break gives nothing to evaluate.
         assert_eq!(expression_from(text, Range::new(0, 20)), "");
+    }
+
+    #[test]
+    fn history_round_trips_newest_first() {
+        // `Registers::read` hands back the newest entry first.
+        let contents = history_to_file(["x + 1", "len(items)"].map(String::from).into_iter());
+        // The file reads oldest first, like a log.
+        assert_eq!(contents, "len(items)\nx + 1\n");
+        assert_eq!(history_from_file(&contents), vec!["x + 1", "len(items)"]);
+
+        // Entries that would break the line-per-entry format are dropped.
+        assert_eq!(
+            history_to_file(["a\nb", "c"].map(String::from).into_iter()),
+            "c\n"
+        );
+        assert!(history_from_file("\n\n").is_empty());
+
+        // Only the most recent entries are kept.
+        let many = (0..EVAL_HISTORY_LIMIT + 10).map(|i| i.to_string());
+        let kept = history_from_file(&history_to_file(many));
+        assert_eq!(kept.len(), EVAL_HISTORY_LIMIT);
+        assert_eq!(kept[0], "0", "the newest entry survives");
+        assert_eq!(kept[EVAL_HISTORY_LIMIT - 1], (EVAL_HISTORY_LIMIT - 1).to_string());
     }
 }

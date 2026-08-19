@@ -33,6 +33,11 @@ These registers are used as defaults:
 | `:`                | Last executed command |
 | `"`                | Last yanked text      |
 | `@`                | Last recorded macro   |
+| `=`                | Debugger expressions evaluated from the `eval:` prompt |
+
+The `=` register is also mirrored to `dap-eval-history` in Helix's cache
+directory, so the `eval:` prompt recalls expressions from earlier sessions with
+the up arrow. The most recent 500 are kept.
 
 ### Special registers
 

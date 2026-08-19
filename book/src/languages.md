@@ -225,12 +225,35 @@ These are the available options for a debugger:
 | Key          | Description                                                                                  |
 | ----         | -----------                                                                                  |
 | `name`       | The name of the debug adapter                                                                |
-| `transport`  | How Helix talks to the adapter: `"stdio"` or `"tcp"`                                         |
-| `command`    | The name or path of the debug adapter binary to execute                                      |
+| `transport`  | How Helix talks to the adapter: `"stdio"`, `"tcp"` or `"connect"`                            |
+| `command`    | The name or path of the debug adapter binary to execute. For the `connect` transport this is the `host:port` of the already-running adapter to dial instead |
 | `args`       | A list of arguments to pass to the adapter binary                                            |
 | `port-arg`   | For TCP transport, the argument used to pass the port the adapter should listen on           |
 | `templates`  | A list of debug configurations. **Required** — see the note on overriding below             |
 | `quirks`     | Adapter-specific workarounds, e.g. `{ absolute-paths = true }`                               |
+
+Each entry of `templates` takes these keys:
+
+| Key          | Description                                                                                  |
+| ----         | -----------                                                                                  |
+| `name`       | The name shown in the debug menu and accepted by `:debug-start`                              |
+| `request`    | `"launch"` or `"attach"`                                                                     |
+| `completion` | A list of parameters to prompt for before starting, see below                                |
+| `args`       | The arguments sent to the adapter with the `launch`/`attach` request                         |
+
+Every value the user is prompted for is available as `{0}`, `{1}`, … numbered by
+its position in `completion`. These placeholders are substituted into the
+template's `args` as well as into the debugger's `command` and `args`, so the
+port of a `connect` transport can be prompted for too.
+
+An entry of `completion` is either a plain string (used as the prompt label) or a
+table with these keys:
+
+| Key          | Description                                                                                  |
+| ----         | -----------                                                                                  |
+| `name`       | The label shown in the prompt                                                                |
+| `completion` | The kind of value being asked for, which enables completion and post-processing: `filename` and `directory` complete paths and are canonicalized, `process` accepts a PID or a process name that is resolved to a PID |
+| `default`    | The value the prompt is pre-filled with; accepted as-is by pressing `<ret>`                  |
 
 > 💡 Overriding the built-in debugger replaces it wholesale. When you redefine
 > `[language.debugger]` for a language that already ships with a default
@@ -270,6 +293,27 @@ args = { justMyCode = false }
 Only the `name` field and the `[language.debugger]` table are needed here; the
 rest of Python's configuration (file types, language servers, grammar, …) is
 inherited from the built-in defaults.
+
+To attach straight to a `debugpy.listen()` server without going through
+`:debug-remote`, use the `connect` transport and let the address come from a
+prompted parameter. The prompt opens pre-filled with `default`, so pressing
+`<ret>` attaches to port 5678 and typing over it attaches somewhere else:
+
+```toml
+[[language]]
+name = "python"
+
+[language.debugger]
+name = "debugpy"
+transport = "connect"
+command = "127.0.0.1:{0}"
+
+[[language.debugger.templates]]
+name = "attach to port"
+request = "attach"
+completion = [{ name = "port", default = "5678" }]
+args = { justMyCode = false }
+```
 
 ## Tree-sitter grammar configuration
 

@@ -242,77 +242,108 @@ fn dap_callback<T, F>(
     jobs.callback(callback);
 }
 
+/// Resolves a single template parameter: paths are canonicalized and process
+/// names are mapped onto their PID.
+fn resolve_parameter(
+    completion: Option<&DebugConfigCompletion>,
+    value: &str,
+) -> Result<String, anyhow::Error> {
+    let Some(DebugConfigCompletion::Advanced(cfg)) = completion else {
+        return Ok(value.to_owned());
+    };
+
+    Ok(match cfg.completion.as_deref() {
+        Some("filename" | "directory") => std::fs::canonicalize(value)
+            .ok()
+            .and_then(|pb| pb.into_os_string().into_string().ok())
+            .unwrap_or_else(|| value.to_owned()),
+        // Numeric → keep as PID. Non-numeric → look up by name.
+        Some("process") if value.parse::<u32>().is_err() => resolve_process_name(value)?.to_string(),
+        _ => value.to_owned(),
+    })
+}
+
+/// Replaces `{0}`, `{1}`, ... with the corresponding parameter.
+fn substitute_params(value: &str, params: &[String]) -> String {
+    params
+        .iter()
+        .enumerate()
+        .fold(value.to_owned(), |value, (i, param)| {
+            value.replace(&format!("{{{}}}", i), param)
+        })
+}
+
 pub fn dap_start_impl(
     cx: &mut compositor::Context,
     name: Option<&str>,
     socket: Option<std::net::SocketAddr>,
     params: Option<Vec<std::borrow::Cow<str>>>,
 ) -> Result<(), anyhow::Error> {
-    let doc = doc!(cx.editor);
-    let config = doc
-        .language_config()
-        .and_then(|config| config.debugger.as_ref())
-        .ok_or_else(|| anyhow!("No debug adapter available for language"))?;
+    // TODO: avoid refetching all of this... pass a config in
+    let (mut config, template) = {
+        let doc = doc!(cx.editor);
+        let config = doc
+            .language_config()
+            .and_then(|config| config.debugger.as_ref())
+            .ok_or_else(|| anyhow!("No debug adapter available for language"))?;
+
+        let template = match name {
+            Some(name) => config.templates.iter().find(|t| t.name == name),
+            None => config.templates.first(),
+        }
+        .ok_or_else(|| anyhow!("No debug config with given name"))?
+        .clone();
+
+        (config.clone(), template)
+    };
+
+    // Resolve every parameter once so the same value ends up in the adapter
+    // command and in the request arguments.
+    let params: Vec<String> = params
+        .unwrap_or_default()
+        .iter()
+        .enumerate()
+        .map(|(i, x)| resolve_parameter(template.completion.get(i), x))
+        .collect::<Result<_, anyhow::Error>>()?;
+
+    // `{0}`, `{1}`, ... are substituted into the adapter command and args too, so
+    // that e.g. the "host:port" a `connect` transport dials can be prompted for.
+    if !params.is_empty() {
+        config.command = substitute_params(&config.command, &params);
+        for arg in &mut config.args {
+            *arg = substitute_params(arg, &params);
+        }
+    }
 
     let id = cx
         .editor
         .debug_adapters
-        .start_client(socket, config)
+        .start_client(socket, &config)
         .map_err(|e| anyhow!("Failed to start debug client: {}", e))?;
-
-    // TODO: avoid refetching all of this... pass a config in
-    let template = match name {
-        Some(name) => config.templates.iter().find(|t| t.name == name),
-        None => config.templates.first(),
-    }
-    .ok_or_else(|| anyhow!("No debug config with given name"))?;
 
     let mut args: HashMap<&str, Value> = HashMap::new();
 
     for (k, t) in &template.args {
-        let mut value = t.clone();
-        if let Some(ref params) = params {
-            for (i, x) in params.iter().enumerate() {
-                let mut param = x.to_string();
-                if let Some(DebugConfigCompletion::Advanced(cfg)) = template.completion.get(i) {
-                    match cfg.completion.as_deref() {
-                        Some("filename" | "directory") => {
-                            param = std::fs::canonicalize(x.as_ref())
-                                .ok()
-                                .and_then(|pb| pb.into_os_string().into_string().ok())
-                                .unwrap_or_else(|| x.to_string());
-                        }
-                        Some("process") => {
-                            // Numeric → keep as PID. Non-numeric → look up by name.
-                            if param.parse::<u32>().is_err() {
-                                let pid = resolve_process_name(&param)?;
-                                param = pid.to_string();
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                // For param #0 replace {0} in args
-                let pattern = format!("{{{}}}", i);
-                value = match value {
-                    // TODO: just use toml::Value -> json::Value
-                    DebugArgumentValue::String(v) => {
-                        DebugArgumentValue::String(v.replace(&pattern, &param))
-                    }
-                    DebugArgumentValue::Array(arr) => DebugArgumentValue::Array(
-                        arr.iter().map(|v| v.replace(&pattern, &param)).collect(),
-                    ),
-                    DebugArgumentValue::Boolean(_) => value,
-                    DebugArgumentValue::Table(map) => DebugArgumentValue::Table(
-                        map.into_iter()
-                            .map(|(mk, mv)| {
-                                (mk.replace(&pattern, &param), mv.replace(&pattern, &param))
-                            })
-                            .collect(),
-                    ),
-                };
+        let value = match t.clone() {
+            // TODO: just use toml::Value -> json::Value
+            DebugArgumentValue::String(v) => {
+                DebugArgumentValue::String(substitute_params(&v, &params))
             }
-        }
+            DebugArgumentValue::Array(arr) => DebugArgumentValue::Array(
+                arr.iter().map(|v| substitute_params(v, &params)).collect(),
+            ),
+            value @ DebugArgumentValue::Boolean(_) => value,
+            DebugArgumentValue::Table(map) => DebugArgumentValue::Table(
+                map.into_iter()
+                    .map(|(mk, mv)| {
+                        (
+                            substitute_params(&mk, &params),
+                            substitute_params(&mv, &params),
+                        )
+                    })
+                    .collect(),
+            ),
+        };
 
         match value {
             DebugArgumentValue::String(string) => {
@@ -410,8 +441,9 @@ pub fn dap_launch(cx: &mut Context) {
                 let name = template.name.clone();
                 let callback = Box::pin(async move {
                     let call: Callback =
-                        Callback::EditorCompositor(Box::new(move |_editor, compositor| {
-                            let prompt = debug_parameter_prompt(completions, name, Vec::new());
+                        Callback::EditorCompositor(Box::new(move |editor, compositor| {
+                            let prompt =
+                                debug_parameter_prompt(editor, completions, name, Vec::new());
                             compositor.push(Box::new(prompt));
                         }));
                     Ok(call)
@@ -463,6 +495,7 @@ pub fn dap_restart(cx: &mut Context) {
 }
 
 fn debug_parameter_prompt(
+    editor: &Editor,
     completions: Vec<DebugConfigCompletion>,
     config_name: String,
     mut params: Vec<String>,
@@ -477,11 +510,12 @@ fn debug_parameter_prompt(
         DebugConfigCompletion::Advanced(cfg) => cfg.name.as_deref().unwrap_or(field_type),
         DebugConfigCompletion::Named(name) => name.as_str(),
     };
-    let default_val = match completion {
+    let default = match completion {
         DebugConfigCompletion::Advanced(cfg) => cfg.default.as_deref().unwrap_or(""),
         _ => "",
     }
     .to_owned();
+    let default_val = default.clone();
 
     let completer = match field_type {
         "filename" => |editor: &Editor, input: &str| {
@@ -493,7 +527,9 @@ fn debug_parameter_prompt(
         _ => ui::completers::none,
     };
 
-    Prompt::new(
+    // Pre-fill the prompt with the configured default so it is visible (and
+    // editable) instead of the user having to guess what an empty input means.
+    let prompt = Prompt::new(
         format!("{}: ", name).into(),
         None,
         completer,
@@ -514,8 +550,9 @@ fn debug_parameter_prompt(
                 let params = params.clone();
                 let callback = Box::pin(async move {
                     let call: Callback =
-                        Callback::EditorCompositor(Box::new(move |_editor, compositor| {
-                            let prompt = debug_parameter_prompt(completions, config_name, params);
+                        Callback::EditorCompositor(Box::new(move |editor, compositor| {
+                            let prompt =
+                                debug_parameter_prompt(editor, completions, config_name, params);
                             compositor.push(Box::new(prompt));
                         }));
                     Ok(call)
@@ -530,7 +567,13 @@ fn debug_parameter_prompt(
                 cx.editor.set_error(err.to_string());
             }
         },
-    )
+    );
+
+    if default.is_empty() {
+        prompt
+    } else {
+        prompt.with_line(default, editor)
+    }
 }
 
 pub fn dap_toggle_breakpoint(cx: &mut Context) {

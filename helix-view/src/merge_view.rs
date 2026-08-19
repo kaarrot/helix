@@ -11,6 +11,24 @@ pub struct LastResolution {
     pub ours: String,
     pub theirs: String,
     pub both: String,
+    /// `Document::version()` after the accept that produced this range.
+    /// Any later RESULT edit invalidates the switch-side shortcut.
+    pub doc_version: i32,
+}
+
+impl LastResolution {
+    /// Whether `cursor` is still inside the last inserted replacement.
+    ///
+    /// `end_char` is exclusive, so a cursor sitting on the first character
+    /// after the replacement (including an immediately following conflict)
+    /// is *not* treated as still inside it. An empty replacement is a point.
+    pub fn contains_cursor(&self, cursor: usize) -> bool {
+        if self.start_char == self.end_char {
+            cursor == self.start_char
+        } else {
+            cursor >= self.start_char && cursor < self.end_char
+        }
+    }
 }
 
 /// Parse `<<<<<<<` / `=======` / `>>>>>>>` conflict markers from a rope
@@ -178,5 +196,36 @@ mod tests {
         let conflicts = find_conflicts(&text);
         assert_eq!(conflicts.len(), 1);
         assert!(extract_sides(&text, &conflicts[0]).is_none());
+    }
+
+    #[test]
+    fn last_resolution_contains_cursor_is_exclusive() {
+        let prior = LastResolution {
+            start_char: 10,
+            end_char: 20,
+            ours: String::new(),
+            theirs: String::new(),
+            both: String::new(),
+            doc_version: 1,
+        };
+        assert!(prior.contains_cursor(10));
+        assert!(prior.contains_cursor(19));
+        assert!(!prior.contains_cursor(20));
+        assert!(!prior.contains_cursor(9));
+    }
+
+    #[test]
+    fn last_resolution_empty_replacement_is_a_point() {
+        let prior = LastResolution {
+            start_char: 5,
+            end_char: 5,
+            ours: String::new(),
+            theirs: String::new(),
+            both: String::new(),
+            doc_version: 1,
+        };
+        assert!(prior.contains_cursor(5));
+        assert!(!prior.contains_cursor(4));
+        assert!(!prior.contains_cursor(6));
     }
 }

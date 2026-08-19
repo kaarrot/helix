@@ -2266,12 +2266,21 @@ impl Editor {
     }
 
     pub fn close(&mut self, id: ViewId) {
+        if !self.tree.contains(id) {
+            return;
+        }
         // Clean up any diff/merge session that owns this view.
         if self.diff.views.contains_key(&id) {
             self.close_diff_view(id);
         }
         if self.diff.merge_views.contains_key(&id) {
             self.close_merge_view(id);
+        }
+        // Session teardown may already have removed this view (e.g. closing the
+        // virtual base/OURS/THEIRS pane closes the document, which closes the view).
+        if !self.tree.contains(id) {
+            self._refresh();
+            return;
         }
         // Remove selections for the closed view on all documents.
         for doc in self.documents_mut() {
@@ -2949,6 +2958,37 @@ impl Editor {
         })
     }
 
+    /// Share one differ worker between a minus-side (base) doc and a plus-side
+    /// (working/target) doc. Edits to either side then update both gutters.
+    fn link_shared_diff_handles(&mut self, base_doc_id: DocumentId, working_doc_id: DocumentId) {
+        let base_text = self
+            .documents
+            .get(&base_doc_id)
+            .map(|doc| doc.text().clone())
+            .unwrap();
+        let working_text = self
+            .documents
+            .get(&working_doc_id)
+            .map(|doc| doc.text().clone())
+            .unwrap();
+        let working_handle = helix_vcs::DiffHandle::new(base_text, working_text);
+        let mut base_handle = working_handle.clone();
+        base_handle.invert();
+
+        if let Some(doc) = self.documents.get_mut(&working_doc_id) {
+            doc.linked_diff_doc = Some(base_doc_id);
+            doc.char_diff_enabled = true;
+            doc.char_diff_minus_side = false;
+            doc.set_diff_handle(working_handle);
+        }
+        if let Some(doc) = self.documents.get_mut(&base_doc_id) {
+            doc.linked_diff_doc = Some(working_doc_id);
+            doc.char_diff_enabled = true;
+            doc.char_diff_minus_side = true;
+            doc.set_diff_handle(base_handle);
+        }
+    }
+
     pub fn open_diff_view(
         &mut self,
         path: &Path,
@@ -2985,31 +3025,14 @@ impl Editor {
             .map_err(|e| anyhow::anyhow!("Failed to fetch git revision: {}", e))?;
 
         let base_doc = Document::from_git_revision(
-            base_content.clone(),
+            base_content,
             &base_path,
             git_ref,
             self.config.clone(),
             self.syn_loader.clone(),
         )?;
         let base_doc_id = self.new_document(base_doc);
-
-        let mut working_content: Option<Vec<u8>> = None;
-        if let Some(doc) = self.documents.get_mut(&working_doc_id) {
-            doc.linked_diff_doc = Some(base_doc_id);
-            doc.char_diff_enabled = true;
-            doc.char_diff_minus_side = false;
-            doc.set_diff_base(base_content.clone());
-            let text: String = doc.text().slice(..).chunks().collect();
-            working_content = Some(text.into_bytes());
-        }
-        if let Some(doc) = self.documents.get_mut(&base_doc_id) {
-            doc.linked_diff_doc = Some(working_doc_id);
-            if let Some(content) = &working_content {
-                doc.set_diff_base(content.clone());
-                doc.char_diff_enabled = true;
-                doc.char_diff_minus_side = true;
-            }
-        }
+        self.link_shared_diff_handles(base_doc_id, working_doc_id);
 
         let split_view_override = split_view_override.or(self.diff.split_view_override);
         let split_view = split_view_override.unwrap_or_else(|| self.config().diff.split_view);
@@ -3108,10 +3131,9 @@ impl Editor {
                     .map_err(|e| anyhow::anyhow!("Failed to fetch '{}': {}", base_ref, e))?;
                 let target_content = Self::get_diff_content_or_empty(&target_path, target)
                     .map_err(|e| anyhow::anyhow!("Failed to fetch '{}': {}", target, e))?;
-                let target_content_for_diff = target_content.clone();
 
                 let base_doc = Document::from_git_revision(
-                    base_content.clone(),
+                    base_content,
                     &base_path,
                     base_ref,
                     self.config.clone(),
@@ -3127,19 +3149,7 @@ impl Editor {
                     self.syn_loader.clone(),
                 )?;
                 let target_doc_id = self.new_document(target_doc);
-
-                if let Some(doc) = self.documents.get_mut(&base_doc_id) {
-                    doc.linked_diff_doc = Some(target_doc_id);
-                    doc.char_diff_enabled = true;
-                    doc.char_diff_minus_side = true;
-                    doc.set_diff_base(target_content_for_diff);
-                }
-                if let Some(doc) = self.documents.get_mut(&target_doc_id) {
-                    doc.linked_diff_doc = Some(base_doc_id);
-                    doc.char_diff_enabled = true;
-                    doc.char_diff_minus_side = false;
-                    doc.set_diff_base(base_content);
-                }
+                self.link_shared_diff_handles(base_doc_id, target_doc_id);
 
                 let split_view =
                     split_view_override.unwrap_or_else(|| self.config().diff.split_view);
@@ -3224,33 +3234,7 @@ impl Editor {
             self.close_diff_view(focused_view);
         }
 
-        let base_text = self
-            .documents
-            .get(&base_doc_id)
-            .map(|doc| doc.text().clone())
-            .unwrap();
-        let working_text = self
-            .documents
-            .get(&working_doc_id)
-            .map(|doc| doc.text().clone())
-            .unwrap();
-
-        let working_diff_handle = helix_vcs::DiffHandle::new(base_text, working_text);
-        let mut base_diff_handle = working_diff_handle.clone();
-        base_diff_handle.invert();
-
-        if let Some(doc) = self.documents.get_mut(&base_doc_id) {
-            doc.linked_diff_doc = Some(working_doc_id);
-            doc.char_diff_enabled = true;
-            doc.char_diff_minus_side = true;
-            doc.set_diff_handle(base_diff_handle);
-        }
-        if let Some(doc) = self.documents.get_mut(&working_doc_id) {
-            doc.linked_diff_doc = Some(base_doc_id);
-            doc.char_diff_enabled = true;
-            doc.char_diff_minus_side = false;
-            doc.set_diff_handle(working_diff_handle);
-        }
+        self.link_shared_diff_handles(base_doc_id, working_doc_id);
 
         let split_view_override = split_view_override.or(self.diff.split_view_override);
         let split_view = split_view_override.unwrap_or_else(|| self.config().diff.split_view);
@@ -3363,6 +3347,14 @@ impl Editor {
 
             let path = helix_stdx::path::canonicalize(path);
 
+            let focused_view = self.tree.focus;
+            if self.diff.merge_views.contains_key(&focused_view) {
+                self.close_merge_view(focused_view);
+            }
+            if self.diff.views.contains_key(&focused_view) {
+                self.close_diff_view(focused_view);
+            }
+
             // 1. Open the conflicted file as the editable RESULT doc.
             let result_doc_id = if let Some(id) = self.non_virtual_document_id_by_path(&path) {
                 id
@@ -3385,14 +3377,14 @@ impl Editor {
 
             // 4. Create virtual read-only documents.
             let ours_doc = Document::from_git_revision(
-                ours_bytes.clone(),
+                ours_bytes,
                 &path,
                 "HEAD",
                 self.config.clone(),
                 self.syn_loader.clone(),
             )?;
             let theirs_doc = Document::from_git_revision(
-                theirs_bytes.clone(),
+                theirs_bytes,
                 &path,
                 "incoming",
                 self.config.clone(),
@@ -3403,16 +3395,7 @@ impl Editor {
             let theirs_doc_id = self.new_document(theirs_doc);
 
             // 5. Wire char-diff: OURS shows diff vs THEIRS and vice-versa.
-            if let Some(doc) = self.documents.get_mut(&ours_doc_id) {
-                doc.set_diff_base(theirs_bytes.clone());
-                doc.char_diff_enabled = true;
-                doc.char_diff_minus_side = true;
-            }
-            if let Some(doc) = self.documents.get_mut(&theirs_doc_id) {
-                doc.set_diff_base(ours_bytes);
-                doc.char_diff_enabled = true;
-                doc.char_diff_minus_side = false;
-            }
+            self.link_shared_diff_handles(ours_doc_id, theirs_doc_id);
 
             // 6. Build layout: close non-focused panes, then split.
             let views_to_close: Vec<ViewId> = self

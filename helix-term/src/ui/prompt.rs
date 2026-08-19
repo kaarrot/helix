@@ -3,7 +3,7 @@ use crate::{alt, ctrl, key, shift, ui};
 use arc_swap::ArcSwap;
 use helix_core::syntax;
 use helix_view::document::Mode;
-use helix_view::input::KeyEvent;
+use helix_view::input::{KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use helix_view::keyboard::KeyCode;
 use std::sync::Arc;
 use std::{borrow::Cow, ops::RangeFrom};
@@ -678,6 +678,18 @@ impl Component for Prompt {
             Event::Paste(data) => {
                 self.insert_str(data, cx.editor);
                 self.recalculate_completion(cx.editor);
+                return EventResult::Consumed(None);
+            }
+            // Paste the primary selection, as the editor does. Without this the
+            // click falls through and pastes into the document behind us.
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Up(MouseButton::Middle),
+                ..
+            }) if cx.editor.config().middle_click_paste => {
+                if let Some(contents) = cx.editor.registers.first('*', cx.editor) {
+                    let contents = contents.into_owned();
+                    self.insert_str(&contents, cx.editor);
+                }
                 return EventResult::Consumed(None);
             }
             Event::Key(event) => *event,

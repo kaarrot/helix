@@ -583,20 +583,45 @@ impl Client {
         expression: String,
         frame_id: Option<usize>,
     ) -> Result<requests::EvaluateResponse> {
-        // Adapters trim the value they hand back -- pydevd, for one, cuts long
-        // strings and collections down with an ellipsis. The "clipboard" context
-        // asks for the whole thing, for adapters that support it.
-        let context = self
-            .caps
+        // "repl" is what lets an adapter run statements rather than only
+        // expressions -- pydevd falls back to exec for this context alone, which
+        // is what makes `x = 1` update the frame instead of raising SyntaxError.
+        self.eval_with_context(expression, frame_id, "repl").await
+    }
+
+    /// Evaluate asking for the value in full. Adapters trim what they hand back
+    /// -- pydevd caps strings at 64K -- and the "clipboard" context asks for the
+    /// whole thing. It cannot run statements, so it is only for reading values.
+    pub async fn eval_full(
+        &self,
+        expression: String,
+        frame_id: Option<usize>,
+    ) -> Result<requests::EvaluateResponse> {
+        let context = match self.supports_clipboard_context() {
+            true => "clipboard",
+            false => "repl",
+        };
+
+        self.eval_with_context(expression, frame_id, context).await
+    }
+
+    pub fn supports_clipboard_context(&self) -> bool {
+        self.caps
             .as_ref()
             .and_then(|caps| caps.supports_clipboard_context)
             .unwrap_or_default()
-            .then(|| "clipboard".to_string());
+    }
 
+    async fn eval_with_context(
+        &self,
+        expression: String,
+        frame_id: Option<usize>,
+        context: &str,
+    ) -> Result<requests::EvaluateResponse> {
         let args = requests::EvaluateArguments {
             expression,
             frame_id,
-            context,
+            context: Some(context.to_string()),
             format: None,
         };
 

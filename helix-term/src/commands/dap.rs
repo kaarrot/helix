@@ -865,12 +865,22 @@ fn save_eval_history(editor: &Editor) {
 /// entries of a collection it renders, and no DAP capability lifts that. When
 /// the adapter config says how to ask for the whole value, this returns the
 /// expression to evaluate instead. Note it runs the expression a second time.
-fn full_value_expression(result: &str, expression: &str, template: Option<&str>) -> Option<String> {
+fn full_value_expression(
+    result: &str,
+    expression: &str,
+    template: Option<&str>,
+    supports_clipboard_context: bool,
+) -> Option<String> {
     if !result.contains("...") {
         return None;
     }
 
-    Some(template?.replace("{}", expression))
+    match template {
+        Some(template) => Some(template.replace("{}", expression)),
+        // Without a template there is only something to gain if asking in the
+        // "clipboard" context lifts the adapter's own limits.
+        None => supports_clipboard_context.then(|| expression.to_string()),
+    }
 }
 
 /// Re-requesting a value as text hands back a quoted string, e.g. `repr(xs)`
@@ -947,16 +957,24 @@ pub fn dap_evaluate(cx: &mut Context) {
                     &response.result,
                     input,
                     debugger.quirks.full_value_expression.as_deref(),
+                    debugger.supports_clipboard_context(),
                 )
             });
             if let Some(expression) = retry {
-                if let Ok(mut response) = block_on(debugger.eval(expression, Some(frame_id))) {
+                if let Ok(mut response) = block_on(debugger.eval_full(expression, Some(frame_id))) {
                     response.result = unquote(&response.result).to_string();
                     result = Ok(response);
                 }
             }
 
             match result {
+                Ok(response) if response.result.is_empty() => {
+                    // Statements evaluate to nothing. Say so rather than leaving
+                    // the previous result on the status line, which reads as if
+                    // nothing had happened.
+                    cx.editor.dap_eval_result = None;
+                    cx.editor.set_status("evaluated");
+                }
                 Ok(response) => {
                     // The status line can only ever show a screenful, so hand the
                     // whole value to the clipboard for pasting elsewhere.
@@ -1293,13 +1311,18 @@ mod tests {
         let template = Some("repr({})");
 
         assert_eq!(
-            full_value_expression("[0, 1, ...]", "xs", template),
+            full_value_expression("[0, 1, ...]", "xs", template, true),
             Some("repr(xs)".to_string())
         );
         // A complete value is left alone.
-        assert_eq!(full_value_expression("[0, 1, 2]", "xs", template), None);
-        // As is any adapter that was not told how to ask for more.
-        assert_eq!(full_value_expression("[0, 1, ...]", "xs", None), None);
+        assert_eq!(full_value_expression("[0, 1, 2]", "xs", template, true), None);
+        // Without a template, asking again only helps if the adapter honors the
+        // clipboard context.
+        assert_eq!(
+            full_value_expression("[0, 1, ...]", "xs", None, true),
+            Some("xs".to_string())
+        );
+        assert_eq!(full_value_expression("[0, 1, ...]", "xs", None, false), None);
     }
 
     #[test]

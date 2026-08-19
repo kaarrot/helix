@@ -293,7 +293,7 @@ This layer is a kludge of mappings, mostly pickers.
 | `b`     | Open buffer picker                                                      | `buffer_picker`                            |
 | `j`     | Open jumplist picker                                                    | `jumplist_picker`                          |
 | `g`     | Open changed file picker                                                | `changed_file_picker`                      |
-| `G`     | Debug (experimental)                                                    | N/A                                        |
+| `G`     | Enter [debug mode](#debug-mode) (experimental)                          | N/A                                        |
 | `k`     | Show documentation for item under cursor in a [popup](#popup) (**LSP**) | `hover`                                    |
 | `s`     | Open document symbol picker (**LSP**)                                   | `symbol_picker`                            |
 | `S`     | Open workspace symbol picker (**LSP**)                                  | `workspace_symbol_picker`                  |
@@ -347,6 +347,33 @@ Displays the signature of the selected completion item. Remapping currently not 
 | ----    | -----------        |
 | `Alt-p` | Previous signature |
 | `Alt-n` | Next signature     |
+
+#### Debug mode
+
+Accessed by typing `G` in [space mode](#space-mode). This mode is **sticky**: it
+stays active until `Esc`, and while it is up other keys do not reach normal
+mode. See the [debugger](./debugger.md) documentation for what these do.
+
+| Key      | Description                                        | Command                    |
+| -----    | -----------                                        | -------                    |
+| `l`      | Launch debug target                                | `dap_launch`               |
+| `r`      | Restart debugging session                          | `dap_restart`              |
+| `b`      | Toggle breakpoint                                  | `dap_toggle_breakpoint`    |
+| `c`      | Continue program execution                         | `dap_continue`             |
+| `h`      | Pause program execution                            | `dap_pause`                |
+| `i`      | Step in                                            | `dap_step_in`              |
+| `o`      | Step out                                           | `dap_step_out`             |
+| `n`      | Step to next                                       | `dap_next`                 |
+| `j`      | Jump execution to current line                     | `dap_goto_line`            |
+| `p`      | Evaluate expression                                | `dap_evaluate`             |
+| `v`      | List variables                                     | `dap_variables`            |
+| `t`      | End debug session                                  | `dap_terminate`            |
+| `Ctrl-c` | Edit breakpoint condition on current line          | `dap_edit_condition`       |
+| `Ctrl-l` | Edit breakpoint log message on current line        | `dap_edit_log`             |
+| `s` `t`  | Switch current thread                              | `dap_switch_thread`        |
+| `s` `f`  | Switch stack frame                                 | `dap_switch_stack_frame`   |
+| `e`      | Enable exception breakpoints                       | `dap_enable_exceptions`    |
+| `E`      | Disable exception breakpoints                      | `dap_disable_exceptions`   |
 
 #### Unimpaired
 
@@ -493,6 +520,7 @@ Keys to use within prompt, Remapping currently not supported.
 | `Ctrl-p`, `Up`                              | Select previous history                                                 |
 | `Ctrl-n`, `Down`                            | Select next history                                                     |
 | `Ctrl-r`                                    | Insert the content of the register selected by following input char     |
+| `Middle click`                              | Insert the primary selection                                            |
 | `Tab`                                       | Select next completion item                                             |
 | `BackTab`                                   | Select previous completion item                                         |
 | `Enter`                                     | Open selected                                                           |

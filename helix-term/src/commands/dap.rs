@@ -6,6 +6,8 @@ use crate::{
 };
 use dap::{StackFrame, Thread, ThreadStates};
 use helix_core::syntax::config::{DebugArgumentValue, DebugConfigCompletion, DebugTemplate};
+use helix_core::textobject::{textobject_word, TextObject};
+use helix_core::{Range, RopeSlice};
 use helix_dap::{self as dap, requests::TerminateArguments};
 use helix_lsp::block_on;
 use helix_view::editor::Breakpoint;
@@ -766,11 +768,35 @@ pub fn dap_goto_line(cx: &mut Context) {
     );
 }
 
+/// The expression to seed the eval prompt with: the primary selection when it
+/// spans more than the cursor, otherwise the word under it. Getting at the
+/// buffer is otherwise awkward mid-session, since the debug menu is sticky and
+/// swallows the motion keys needed to select and yank.
+fn expression_from(text: RopeSlice, range: Range) -> String {
+    let range = if range.len() > 1 {
+        range
+    } else {
+        textobject_word(text, range, TextObject::Inside, 1, false)
+    };
+
+    let expression = range.fragment(text);
+    // A multi-line fragment is never a useful expression.
+    match expression.contains('\n') {
+        true => String::new(),
+        false => expression.trim().to_string(),
+    }
+}
+
 pub fn dap_evaluate(cx: &mut Context) {
     if cx.editor.debug_adapters.get_active_client().is_none() {
         cx.editor.set_error("Debugger is not running");
         return;
     }
+
+    let expression = {
+        let (view, doc) = current_ref!(cx.editor);
+        expression_from(doc.text().slice(..), doc.selection(view.id).primary())
+    };
 
     let prompt = Prompt::new(
         "eval: ".into(),
@@ -810,6 +836,10 @@ pub fn dap_evaluate(cx: &mut Context) {
             }
         },
     );
+    let prompt = match expression.is_empty() {
+        true => prompt,
+        false => prompt.with_line(expression, cx.editor),
+    };
     cx.push_layer(Box::new(prompt));
 }
 
@@ -1099,5 +1129,22 @@ mod tests {
         // Unreferenced placeholders and plain text are left alone.
         assert_eq!(substitute_params("{2}", &params), "{2}");
         assert_eq!(substitute_params("python3", &[]), "python3");
+    }
+
+    #[test]
+    fn seeds_expression_from_selection_or_word() {
+        let rope = helix_core::Rope::from("total = count + 1\nnext()\n");
+        let text = rope.slice(..);
+
+        // A selection wider than the cursor is taken as-is, trimmed.
+        assert_eq!(expression_from(text, Range::new(8, 13)), "count");
+        assert_eq!(expression_from(text, Range::new(7, 14)), "count");
+
+        // A cursor-sized range falls back to the word under it.
+        assert_eq!(expression_from(text, Range::point(9)), "count");
+        assert_eq!(expression_from(text, Range::point(1)), "total");
+
+        // Spanning a line break gives nothing to evaluate.
+        assert_eq!(expression_from(text, Range::new(0, 20)), "");
     }
 }

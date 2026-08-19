@@ -315,6 +315,24 @@ pub fn dap_start_impl(
         }
     }
 
+    // A template may dial an already-running adapter itself, the same way
+    // `:debug-remote` does -- an address passed on the command line wins.
+    let socket = match (socket, template.connect.as_deref()) {
+        (Some(socket), _) => Some(socket),
+        (None, Some(addr)) => {
+            let addr = substitute_params(addr, &params);
+            Some(addr.parse().map_err(|e| {
+                anyhow!(
+                    "Invalid connect address {:?} in template {:?}: {}",
+                    addr,
+                    template.name,
+                    e
+                )
+            })?)
+        }
+        (None, None) => None,
+    };
+
     let id = cx
         .editor
         .debug_adapters
@@ -1063,4 +1081,23 @@ pub fn dap_switch_stack_frame(cx: &mut Context) {
             })
     });
     cx.push_layer(Box::new(picker))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn substitutes_numbered_params() {
+        let params = vec!["5678".to_string(), "127.0.0.1".to_string()];
+
+        assert_eq!(substitute_params("{1}:{0}", &params), "127.0.0.1:5678");
+        // A template address with the port filled in must be a valid socket.
+        assert!(substitute_params("127.0.0.1:{0}", &params)
+            .parse::<std::net::SocketAddr>()
+            .is_ok());
+        // Unreferenced placeholders and plain text are left alone.
+        assert_eq!(substitute_params("{2}", &params), "{2}");
+        assert_eq!(substitute_params("python3", &[]), "python3");
+    }
 }

@@ -238,13 +238,14 @@ Each entry of `templates` takes these keys:
 | ----         | -----------                                                                                  |
 | `name`       | The name shown in the debug menu and accepted by `:debug-start`                              |
 | `request`    | `"launch"` or `"attach"`                                                                     |
+| `connect`    | A `host:port` to dial for this template instead of starting the adapter from `command`, for adapters that are already running |
 | `completion` | A list of parameters to prompt for before starting, see below                                |
 | `args`       | The arguments sent to the adapter with the `launch`/`attach` request                         |
 
 Every value the user is prompted for is available as `{0}`, `{1}`, … numbered by
 its position in `completion`. These placeholders are substituted into the
-template's `args` as well as into the debugger's `command` and `args`, so the
-port of a `connect` transport can be prompted for too.
+template's `args` and `connect` as well as into the debugger's `command` and
+`args`, so an address to dial can be prompted for rather than hardcoded.
 
 An entry of `completion` is either a plain string (used as the prompt label) or a
 table with these keys:
@@ -277,16 +278,18 @@ args = ["-m", "debugpy.adapter"]
 
 # Attach to a running process by PID or process name.
 [[language.debugger.templates]]
-name = "outer-in"
+name = "Attach to PID"
 request = "attach"
 completion = [{ name = "pid or process name", completion = "process" }]
 args = { processId = "{0}", justMyCode = false }
 
 # Connect to a debugpy server the script already started with
-# `debugpy.listen(("127.0.0.1", 5678))`, via `:debug-remote 127.0.0.1:5678 inner-out`.
+# `debugpy.listen(("127.0.0.1", 5678))`.
 [[language.debugger.templates]]
-name = "inner-out"
+name = "Attach to port"
 request = "attach"
+connect = "127.0.0.1:{0}"
+completion = [{ name = "port", default = "5678" }]
 args = { justMyCode = false }
 ```
 
@@ -294,25 +297,22 @@ Only the `name` field and the `[language.debugger]` table are needed here; the
 rest of Python's configuration (file types, language servers, grammar, …) is
 inherited from the built-in defaults.
 
-To attach straight to a `debugpy.listen()` server without going through
-`:debug-remote`, use the `connect` transport and let the address come from a
-prompted parameter. The prompt opens pre-filled with `default`, so pressing
-`<ret>` attaches to port 5678 and typing over it attaches somewhere else:
+The two templates above reach their target in different ways. "Attach to PID"
+starts the adapter from `command` and asks it to inject itself into the target
+process, while "Attach to port" dials the address in its `connect` key, leaving
+the adapter command unused. Because `transport` is a property of the adapter
+rather than of a template, a per-template `connect` is what lets both live in
+one `[language.debugger]` table.
+
+`transport = "connect"` does the same dialing one level up, for an adapter that
+is *always* reached over the network — then `command` holds the address and
+every template connects to it:
 
 ```toml
-[[language]]
-name = "python"
-
 [language.debugger]
 name = "debugpy"
 transport = "connect"
 command = "127.0.0.1:{0}"
-
-[[language.debugger.templates]]
-name = "attach to port"
-request = "attach"
-completion = [{ name = "port", default = "5678" }]
-args = { justMyCode = false }
 ```
 
 ## Tree-sitter grammar configuration

@@ -1065,27 +1065,30 @@ transport = "stdio"
 command = "python3"
 args = ["-m", "debugpy.adapter"]
 
-# outer-in: attach to a running Python process by PID or by name.
+# Attach to PID: attach to a running Python process by PID or by name.
 # Helix spawns debugpy.adapter; the adapter injects debugpy into the target.
 # Requires `pip install debugpy` and ptrace permission on Linux
 # (kernel.yama.ptrace_scope = 0, or CAP_SYS_PTRACE).
-# Use: `space G l` -> outer-in -> enter PID (e.g. 12345) or name (e.g. gunicorn).
+# Use: `space G l` -> Attach to PID -> enter PID (e.g. 12345) or name (e.g. gunicorn).
 # Name lookup matches /proc/<pid>/comm or basename of argv[0]; ambiguous names
 # (multiple matches) are rejected with a list of candidate PIDs.
 [[language.debugger.templates]]
-name = "outer-in"
+name = "Attach to PID"
 request = "attach"
 completion = [{ name = "pid or process name", completion = "process" }]
 args = { processId = "{0}", justMyCode = false }
 
-# inner-out: connect to a debugpy server the source already started.
+# Attach to port: connect to a debugpy server the source already started.
 # Instrument the script with:
 #   import debugpy; debugpy.listen(("127.0.0.1", 5678)); debugpy.wait_for_client()
-# then in Helix run:  :debug-remote 127.0.0.1:5678 inner-out
-# (Helix connects directly to the listening port; the adapter command above is unused for this template.)
+# then in Helix use: `space G l` -> Attach to port -> accept 5678 or type another port.
+# `connect` makes Helix dial that address directly, so the adapter command above
+# is unused here. `:debug-remote <host:port> "Attach to port"` overrides it.
 [[language.debugger.templates]]
-name = "inner-out"
+name = "Attach to port"
 request = "attach"
+connect = "127.0.0.1:{0}"
+completion = [{ name = "port", default = "5678" }]
 args = { justMyCode = false }
 
 [[grammar]]

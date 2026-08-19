@@ -481,9 +481,15 @@ pub struct DebugAdapterConfig {
 
 // Different workarounds for adapters' differences
 #[derive(Debug, Default, PartialEq, Eq, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub struct DebuggerQuirks {
     #[serde(default)]
     pub absolute_paths: bool,
+    /// How to ask the adapter for a value it folded down with an ellipsis, e.g.
+    /// `"repr({})"` for debugpy. `{}` stands for the original expression, which
+    /// is evaluated a second time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub full_value_expression: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -637,6 +643,21 @@ fn default_timeout() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quirks_use_kebab_case() {
+        let quirks: DebuggerQuirks = toml::from_str(
+            r#"
+            absolute-paths = true
+            full-value-expression = "repr({})"
+            "#,
+        )
+        .unwrap();
+
+        assert!(quirks.absolute_paths);
+        assert_eq!(quirks.full_value_expression.as_deref(), Some("repr({})"));
+        assert_eq!(DebuggerQuirks::default().full_value_expression, None);
+    }
 
     #[test]
     fn debug_template_connect_is_optional() {

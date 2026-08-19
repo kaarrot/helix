@@ -861,6 +861,44 @@ fn save_eval_history(editor: &Editor) {
     }
 }
 
+/// Adapters fold long values down with an ellipsis -- pydevd caps how many
+/// entries of a collection it renders, and no DAP capability lifts that. When
+/// the adapter config says how to ask for the whole value, this returns the
+/// expression to evaluate instead. Note it runs the expression a second time.
+fn full_value_expression(result: &str, expression: &str, template: Option<&str>) -> Option<String> {
+    if !result.contains("...") {
+        return None;
+    }
+
+    Some(template?.replace("{}", expression))
+}
+
+/// Re-requesting a value as text hands back a quoted string, e.g. `repr(xs)`
+/// evaluates to `'[1, 2, 3]'`. Peel those quotes so what lands in the clipboard
+/// is the value itself.
+fn unquote(value: &str) -> &str {
+    let mut chars = value.chars();
+    match (chars.next(), chars.next_back()) {
+        (Some(first), Some(last)) if first == last && (first == '\'' || first == '"') => {
+            &value[first.len_utf8()..value.len() - last.len_utf8()]
+        }
+        _ => value,
+    }
+}
+
+/// What of an evaluated value to park on the status line. Rendering measures the
+/// status message on every frame, so a multi-megabyte repr would be walked over
+/// and over -- and only a screenful of it is ever visible anyway. The complete
+/// value stays in the clipboard and in `Editor::dap_eval_result`.
+fn status_line_value(result: &str) -> String {
+    const STATUS_LINE_LIMIT: usize = 2048;
+
+    match result.char_indices().nth(STATUS_LINE_LIMIT) {
+        Some((end, _)) => result[..end].to_string(),
+        None => result.to_string(),
+    }
+}
+
 pub fn dap_evaluate(cx: &mut Context) {
     if cx.editor.debug_adapters.get_active_client().is_none() {
         cx.editor.set_error("Debugger is not running");
@@ -901,11 +939,35 @@ pub fn dap_evaluate(cx: &mut Context) {
                 }
             };
             let frame_id = debugger.stack_frames[&thread_id][frame].id;
-            let result = block_on(debugger.eval(input.to_owned(), Some(frame_id)));
+            let mut result = block_on(debugger.eval(input.to_owned(), Some(frame_id)));
+
+            // A truncated value is useless to copy, so ask for it again in full.
+            let retry = result.as_ref().ok().and_then(|response| {
+                full_value_expression(
+                    &response.result,
+                    input,
+                    debugger.quirks.full_value_expression.as_deref(),
+                )
+            });
+            if let Some(expression) = retry {
+                if let Ok(mut response) = block_on(debugger.eval(expression, Some(frame_id))) {
+                    response.result = unquote(&response.result).to_string();
+                    result = Ok(response);
+                }
+            }
+
             match result {
                 Ok(response) => {
-                    cx.editor.dap_eval_result = Some(response.result.clone());
-                    cx.editor.set_status(response.result);
+                    // The status line can only ever show a screenful, so hand the
+                    // whole value to the clipboard for pasting elsewhere.
+                    if let Err(err) = cx.editor.registers.write('+', vec![response.result.clone()])
+                    {
+                        cx.editor.set_error(format!("Failed to yank result: {}", err));
+                    }
+
+                    let status = status_line_value(&response.result);
+                    cx.editor.dap_eval_result = Some(response.result);
+                    cx.editor.set_status(status);
                 }
                 Err(e) => {
                     cx.editor.dap_eval_result = None;
@@ -1224,6 +1286,44 @@ mod tests {
 
         // Spanning a line break gives nothing to evaluate.
         assert_eq!(expression_from(text, Range::new(0, 20)), "");
+    }
+
+    #[test]
+    fn retries_only_truncated_values() {
+        let template = Some("repr({})");
+
+        assert_eq!(
+            full_value_expression("[0, 1, ...]", "xs", template),
+            Some("repr(xs)".to_string())
+        );
+        // A complete value is left alone.
+        assert_eq!(full_value_expression("[0, 1, 2]", "xs", template), None);
+        // As is any adapter that was not told how to ask for more.
+        assert_eq!(full_value_expression("[0, 1, ...]", "xs", None), None);
+    }
+
+    #[test]
+    fn unquotes_re_requested_values() {
+        assert_eq!(unquote("'[0, 1, 2]'"), "[0, 1, 2]");
+        assert_eq!(unquote("\"[0, 1, 2]\""), "[0, 1, 2]");
+        // Values that are not wrapped, or too short to be, stay as they are.
+        assert_eq!(unquote("[0, 1, 2]"), "[0, 1, 2]");
+        assert_eq!(unquote("'"), "'");
+        assert_eq!(unquote(""), "");
+    }
+
+    #[test]
+    fn status_line_value_is_clamped() {
+        assert_eq!(status_line_value("[1, 2, 3]"), "[1, 2, 3]");
+
+        // Long values are cut well past any terminal width, and only for the
+        // status line -- never for the clipboard.
+        let long = "x".repeat(10_000);
+        assert_eq!(status_line_value(&long).len(), 2048);
+
+        // Cutting happens on character boundaries.
+        let wide = "\u{e9}".repeat(4096);
+        assert_eq!(status_line_value(&wide).chars().count(), 2048);
     }
 
     #[test]

@@ -583,10 +583,20 @@ impl Client {
         expression: String,
         frame_id: Option<usize>,
     ) -> Result<requests::EvaluateResponse> {
+        // Adapters trim the value they hand back -- pydevd, for one, cuts long
+        // strings and collections down with an ellipsis. The "clipboard" context
+        // asks for the whole thing, for adapters that support it.
+        let context = self
+            .caps
+            .as_ref()
+            .and_then(|caps| caps.supports_clipboard_context)
+            .unwrap_or_default()
+            .then(|| "clipboard".to_string());
+
         let args = requests::EvaluateArguments {
             expression,
             frame_id,
-            context: None,
+            context,
             format: None,
         };
 

@@ -642,3 +642,300 @@ async fn merge_workflow_resolves_conflicts_and_stages_file() -> anyhow::Result<(
 
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn diff_base_compares_against_ref_without_reloading() -> anyhow::Result<()> {
+    let repo = GitRepoFixture::new()?;
+    repo.write_file("tracked.txt", "version one\n")?;
+    repo.commit_all("initial")?;
+    repo.write_file("tracked.txt", "version two\n")?;
+    repo.commit_all("second")?;
+
+    let _cwd = CwdGuard::enter(repo.path()).await?;
+    let mut app = AppBuilder::new()
+        .with_file(repo.file("tracked.txt"), None)
+        .build()?;
+
+    let mut harness = AppTestHarness::new();
+    assert!(
+        harness
+            .send_keys(&mut app, "iversion two dirty<esc>")
+            .await?
+    );
+    assert!(harness.send_keys(&mut app, ":diff-base HEAD^<ret>").await?);
+    assert!(harness.wait_for_idle(&mut app).await?);
+
+    {
+        let view = app.editor.tree.get(app.editor.tree.focus);
+        let doc = app.editor.document(view.doc).unwrap();
+        assert_eq!(doc.diff_base_ref(), Some("HEAD^"));
+        assert!(
+            doc.text().to_string().contains("version two dirty"),
+            "unsaved buffer must not be reloaded from disk"
+        );
+        let diff_base = doc
+            .diff_handle()
+            .expect("differ should be set")
+            .load()
+            .diff_base()
+            .to_string();
+        assert!(
+            diff_base.contains("version one"),
+            "gutter base should be HEAD^, got {diff_base:?}"
+        );
+        assert!(
+            !diff_base.contains("version two"),
+            "gutter base should not be HEAD, got {diff_base:?}"
+        );
+    }
+
+    harness.close(&mut app).await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn git_split_diff_stays_in_sync_after_edits() -> anyhow::Result<()> {
+    let repo = GitRepoFixture::new()?;
+    repo.write_file("tracked.txt", "before\n")?;
+    repo.commit_all("initial")?;
+    repo.write_file("tracked.txt", "after\n")?;
+
+    let _cwd = CwdGuard::enter(repo.path()).await?;
+    let tracked_path = repo.file("tracked.txt");
+    let mut app = AppBuilder::new().with_file(&tracked_path, None).build()?;
+    let mut harness = AppTestHarness::new();
+
+    assert!(harness.send_keys(&mut app, "<space>g").await?);
+    assert!(harness.wait_for_idle(&mut app).await?);
+    assert!(harness.send_keys(&mut app, "<ret>").await?);
+    assert!(harness.send_keys(&mut app, "<space>mv").await?);
+    assert!(harness.wait_for_idle(&mut app).await?);
+
+    let diff_state = main_diff_state(&app);
+    assert!(app
+        .editor
+        .document(diff_state.base_doc_id)
+        .unwrap()
+        .path()
+        .is_none());
+    assert!(
+        app.editor
+            .document(diff_state.base_doc_id)
+            .unwrap()
+            .readonly
+    );
+
+    app.editor.focus(diff_state.working_view_id);
+    assert!(harness.send_keys(&mut app, "Goedited<esc>").await?);
+    assert!(harness.wait_for_idle(&mut app).await?);
+
+    let expected_working = app
+        .editor
+        .document(diff_state.working_doc_id)
+        .unwrap()
+        .text()
+        .to_string();
+    let actual_from_base = app
+        .editor
+        .document(diff_state.base_doc_id)
+        .unwrap()
+        .diff_handle()
+        .unwrap()
+        .load()
+        .diff_base()
+        .to_string();
+    assert_eq!(actual_from_base, expected_working);
+
+    harness.close(&mut app).await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn closing_diff_base_pane_does_not_panic() -> anyhow::Result<()> {
+    let repo = GitRepoFixture::new()?;
+    repo.write_file("tracked.txt", "before\n")?;
+    repo.commit_all("initial")?;
+    repo.write_file("tracked.txt", "after\n")?;
+
+    let _cwd = CwdGuard::enter(repo.path()).await?;
+    let tracked_path = repo.file("tracked.txt");
+    let mut app = AppBuilder::new().with_file(&tracked_path, None).build()?;
+    let mut harness = AppTestHarness::new();
+
+    assert!(harness.send_keys(&mut app, "<space>g").await?);
+    assert!(harness.wait_for_idle(&mut app).await?);
+    assert!(harness.send_keys(&mut app, "<ret>").await?);
+    assert!(harness.send_keys(&mut app, "<space>mv").await?);
+
+    let diff_state = main_diff_state(&app);
+    app.editor.focus(diff_state.base_view_id);
+    assert!(harness.send_keys(&mut app, "<C-w>q").await?);
+
+    assert!(app.editor.diff.views.is_empty());
+    assert_eq!(app.editor.tree.views().count(), 1);
+    assert_current_doc_path(&app, &tracked_path);
+
+    harness.close(&mut app).await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn merge_commands_target_result_from_ours_pane() -> anyhow::Result<()> {
+    let repo = GitRepoFixture::new()?;
+    repo.write_file("conflict.txt", "base\n")?;
+    repo.commit_all("base")?;
+
+    repo.checkout_new_branch("feature")?;
+    repo.write_file("conflict.txt", "theirs\n")?;
+    repo.commit_all("feature change")?;
+
+    repo.checkout("main")?;
+    repo.write_file("conflict.txt", "ours\n")?;
+    repo.commit_all("main change")?;
+    repo.merge_expect_conflict("feature")?;
+
+    let _cwd = CwdGuard::enter(repo.path()).await?;
+    let conflict_path = repo.file("conflict.txt");
+    let mut app = AppBuilder::new().with_file(&conflict_path, None).build()?;
+
+    test_key_sequences(
+        &mut app,
+        vec![
+            (
+                Some(":merge<ret>"),
+                Some(&|app| {
+                    assert_eq!(app.editor.diff.merge_views.len(), 3);
+                    let state = app
+                        .editor
+                        .diff
+                        .merge_views
+                        .get(&app.editor.tree.focus)
+                        .cloned()
+                        .expect("merge session");
+                    assert!(app
+                        .editor
+                        .document(state.ours_doc_id)
+                        .unwrap()
+                        .path()
+                        .is_none());
+                    assert!(app
+                        .editor
+                        .document(state.theirs_doc_id)
+                        .unwrap()
+                        .path()
+                        .is_none());
+                    assert!(app.editor.document(state.ours_doc_id).unwrap().readonly);
+                }),
+            ),
+            (
+                Some("<C-w>w"),
+                Some(&|app| {
+                    let state = app
+                        .editor
+                        .diff
+                        .merge_views
+                        .get(&app.editor.tree.focus)
+                        .cloned()
+                        .expect("merge session");
+                    assert_ne!(
+                        app.editor.tree.focus, state.result_view_id,
+                        "expected to leave the RESULT pane"
+                    );
+                }),
+            ),
+            (
+                Some("<space>mo"),
+                Some(&|app| {
+                    assert_status(app, "Accepted HEAD version", Severity::Info);
+                    let state = app
+                        .editor
+                        .diff
+                        .merge_views
+                        .values()
+                        .next()
+                        .cloned()
+                        .expect("merge session");
+                    let result_text = app
+                        .editor
+                        .document(state.result_doc_id)
+                        .unwrap()
+                        .text()
+                        .to_string();
+                    assert!(
+                        result_text.contains("ours"),
+                        "accept from OURS pane must edit RESULT, got {result_text:?}"
+                    );
+                    assert!(
+                        !result_text.contains("<<<<<<<"),
+                        "RESULT should have no markers, got {result_text:?}"
+                    );
+                }),
+            ),
+            (
+                Some("<space>mf"),
+                Some(&|app| {
+                    assert!(
+                        !app.editor.is_err(),
+                        "status: {:?}",
+                        app.editor.get_status()
+                    );
+                }),
+            ),
+            (
+                Some("<space>mq"),
+                Some(&|app| {
+                    assert!(app.editor.diff.merge_views.is_empty());
+                }),
+            ),
+        ],
+        false,
+    )
+    .await?;
+
+    assert_eq!(
+        std::fs::read_to_string(&conflict_path)?,
+        LineFeedHandling::Native.apply("ours\n"),
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn closing_merge_ours_pane_does_not_panic() -> anyhow::Result<()> {
+    let repo = GitRepoFixture::new()?;
+    repo.write_file("conflict.txt", "base\n")?;
+    repo.commit_all("base")?;
+
+    repo.checkout_new_branch("feature")?;
+    repo.write_file("conflict.txt", "theirs\n")?;
+    repo.commit_all("feature change")?;
+
+    repo.checkout("main")?;
+    repo.write_file("conflict.txt", "ours\n")?;
+    repo.commit_all("main change")?;
+    repo.merge_expect_conflict("feature")?;
+
+    let _cwd = CwdGuard::enter(repo.path()).await?;
+    let conflict_path = repo.file("conflict.txt");
+    let mut app = AppBuilder::new().with_file(&conflict_path, None).build()?;
+    let mut harness = AppTestHarness::new();
+
+    assert!(harness.send_keys(&mut app, ":merge<ret>").await?);
+    let state = app
+        .editor
+        .diff
+        .merge_views
+        .get(&app.editor.tree.focus)
+        .cloned()
+        .expect("merge session");
+
+    app.editor.focus(state.ours_view_id);
+    assert!(harness.send_keys(&mut app, "<C-w>q").await?);
+
+    assert!(app.editor.diff.merge_views.is_empty());
+    assert_eq!(app.editor.tree.views().count(), 1);
+    assert_current_doc_path(&app, &conflict_path);
+
+    harness.close(&mut app).await?;
+    Ok(())
+}

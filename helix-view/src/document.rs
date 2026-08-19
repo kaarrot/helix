@@ -983,6 +983,10 @@ impl Document {
             self.path().map(|path| path.to_string_lossy())
         );
 
+        if self.is_virtual_base {
+            bail!("Cannot save a git revision document");
+        }
+
         // we clone and move text + path into the future so that we asynchronously save the current
         // state without blocking any further edits.
         let text = self.text().clone();
@@ -1225,6 +1229,12 @@ impl Document {
 
     // Detect if the file is readonly and change the readonly field if necessary (unix only)
     pub fn detect_readonly(&mut self) {
+        // Virtual git revisions stay read-only even when they have no path
+        // (or if a caller later attaches a path for language detection).
+        if self.is_virtual_base {
+            self.readonly = true;
+            return;
+        }
         // Allows setting the flag for files the user cannot modify, like root files
         self.readonly = match &self.path {
             None => false,
@@ -1572,6 +1582,10 @@ impl Document {
         view_id: ViewId,
         emit_lsp_notification: bool,
     ) -> bool {
+        if self.readonly && !transaction.changes().is_empty() {
+            return false;
+        }
+
         // store the state just before any changes are made. This allows us to undo to the
         // state just before a transaction was applied.
         if self.changes.is_empty() && !transaction.changes().is_empty() {
@@ -1897,8 +1911,6 @@ impl Document {
         let (text, encoding, has_bom) = from_reader(&mut content.as_slice(), None)
             .map_err(|e| anyhow::anyhow!("decode git revision content: {e}"))?;
         let mut doc = Self::from(text, Some((encoding, has_bom)), config, syn_loader.clone());
-        doc.path = Some(real_path.to_path_buf());
-        doc.relative_path = OnceCell::new();
         doc.is_virtual_base = true;
         doc.readonly = true;
         let filename = real_path
@@ -1906,7 +1918,11 @@ impl Document {
             .and_then(|n| n.to_str())
             .unwrap_or("unknown");
         doc.display_name_override = Some(format!("{filename} @ {git_ref}"));
+        // Detect language from the real filename without claiming the working-tree path.
+        doc.path = Some(real_path.to_path_buf());
         doc.detect_language(&syn_loader.load());
+        doc.path = None;
+        doc.relative_path = OnceCell::new();
         Ok(doc)
     }
 

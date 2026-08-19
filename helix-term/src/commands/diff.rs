@@ -298,8 +298,8 @@ pub(crate) fn spawn_changed_file_refresh(
             if fresh == seed {
                 return;
             }
-            if let Some(overlay) = compositor
-                .find::<crate::ui::overlay::Overlay<Picker<FileChange, FileChangeData>>>()
+            if let Some(overlay) =
+                compositor.find::<crate::ui::overlay::Overlay<Picker<FileChange, FileChangeData>>>()
             {
                 overlay.content.replace_options(fresh.iter().cloned());
             }
@@ -408,50 +408,65 @@ pub fn merge_accept_both(cx: &mut Context) {
     merge_accept_impl(cx, AcceptSide::Both);
 }
 
+/// The document/view merge commands should edit. Inside a merge session this
+/// is always RESULT, even when OURS/THEIRS is focused.
+fn merge_target(editor: &Editor) -> (ViewId, DocumentId) {
+    let view_id = view!(editor).id;
+    if let Some(state) = editor.diff.merge_views.get(&view_id) {
+        (state.result_view_id, state.result_doc_id)
+    } else {
+        (view_id, doc!(editor).id())
+    }
+}
+
 fn merge_accept_impl(cx: &mut Context, side: AcceptSide) {
     use helix_view::merge_view::{extract_sides, find_conflicts, LastResolution};
 
-    let view_id = view!(cx.editor).id;
-    let doc_id = doc!(cx.editor).id();
-
-    // 1. If we just resolved a conflict and the cursor is still inside the
-    //    inserted replacement, replace it again with the new side instead of
-    //    hunting for markers that no longer exist.
+    let current_view_id = view!(cx.editor).id;
+    let (target_view_id, target_doc_id) = merge_target(cx.editor);
     let prior = cx
         .editor
         .diff
         .merge_views
-        .get(&view_id)
+        .get(&current_view_id)
         .and_then(|s| s.last_resolution.clone());
+
+    // 1. If we just resolved a conflict and the RESULT cursor is still inside
+    //    the inserted replacement (and RESULT has not been edited since),
+    //    replace it again with the new side instead of hunting for markers.
     if let Some(prior) = prior {
-        let (view, doc) = current!(cx.editor);
-        let cursor = doc
-            .selection(view.id)
-            .primary()
-            .cursor(doc.text().slice(..));
-        if cursor >= prior.start_char && cursor <= prior.end_char {
+        let reuse = cx.editor.document(target_doc_id).is_some_and(|doc| {
+            doc.selections().contains_key(&target_view_id)
+                && prior.contains_cursor(
+                    doc.selection(target_view_id)
+                        .primary()
+                        .cursor(doc.text().slice(..)),
+                )
+                && prior.doc_version == doc.version()
+        });
+        if reuse {
             let replacement = side.pick(&prior.ours, &prior.theirs, &prior.both);
             let new_end = prior.start_char + replacement.chars().count();
-            let text = doc.text();
+            let doc = doc_mut!(cx.editor, &target_doc_id);
             let tx = helix_core::Transaction::change(
-                text,
-                std::iter::once((
-                    prior.start_char,
-                    prior.end_char,
-                    Some(replacement.clone().into()),
-                )),
+                doc.text(),
+                std::iter::once((prior.start_char, prior.end_char, Some(replacement.into()))),
             );
-            doc.apply(&tx, view_id);
+            if !doc.apply(&tx, target_view_id) {
+                cx.editor.set_error("Cannot apply resolution");
+                return;
+            }
             let new_resolution = LastResolution {
                 start_char: prior.start_char,
                 end_char: new_end,
                 ours: prior.ours,
                 theirs: prior.theirs,
                 both: prior.both,
+                doc_version: doc.version(),
             };
             update_last_resolutions(
                 &mut cx.editor.diff.merge_views,
-                doc_id,
+                target_doc_id,
                 Some(new_resolution),
             );
             cx.editor
@@ -460,13 +475,20 @@ fn merge_accept_impl(cx: &mut Context, side: AcceptSide) {
         }
     }
 
-    // 2. Otherwise find a real conflict at cursor and resolve it.
-    let text = doc!(cx.editor).text().clone();
-    let cursor_line = {
-        let (view, doc) = current_ref!(cx.editor);
-        doc.selection(view.id)
+    // 2. Otherwise find a real conflict at the RESULT cursor and resolve it.
+    let (text, cursor_line) = {
+        let Some(doc) = cx.editor.document(target_doc_id) else {
+            return;
+        };
+        if !doc.selections().contains_key(&target_view_id) {
+            cx.editor.set_status("No conflict at cursor");
+            return;
+        }
+        let cursor_line = doc
+            .selection(target_view_id)
             .primary()
-            .cursor_line(doc.text().slice(..))
+            .cursor_line(doc.text().slice(..));
+        (doc.text().clone(), cursor_line)
     };
 
     let Some(region) = find_conflicts(&text)
@@ -484,7 +506,7 @@ fn merge_accept_impl(cx: &mut Context, side: AcceptSide) {
     let both = format!("{}{}", ours, theirs);
     let replacement = side.pick(&ours, &theirs, &both);
 
-    let (view, doc) = current!(cx.editor);
+    let doc = doc_mut!(cx.editor, &target_doc_id);
     let text = doc.text();
     let start_char = text.line_to_char(region.start_line);
     let end_char = if region.end_line + 1 < text.len_lines() {
@@ -495,19 +517,23 @@ fn merge_accept_impl(cx: &mut Context, side: AcceptSide) {
     let new_end = start_char + replacement.chars().count();
     let tx = helix_core::Transaction::change(
         text,
-        std::iter::once((start_char, end_char, Some(replacement.clone().into()))),
+        std::iter::once((start_char, end_char, Some(replacement.into()))),
     );
-    doc.apply(&tx, view.id);
+    if !doc.apply(&tx, target_view_id) {
+        cx.editor.set_error("Cannot apply resolution");
+        return;
+    }
     let new_resolution = LastResolution {
         start_char,
         end_char: new_end,
         ours,
         theirs,
         both,
+        doc_version: doc.version(),
     };
     update_last_resolutions(
         &mut cx.editor.diff.merge_views,
-        doc_id,
+        target_doc_id,
         Some(new_resolution),
     );
     cx.editor
@@ -538,14 +564,20 @@ pub fn merge_prev_conflict(cx: &mut Context) {
 
 fn merge_jump_impl(cx: &mut Context, direction: Direction) {
     use helix_view::merge_view::find_conflicts;
-    let (view, doc) = current!(cx.editor);
-    let view_id = view.id;
-    let doc_id = doc.id();
-    let cursor_line = doc
-        .selection(view_id)
-        .primary()
-        .cursor_line(doc.text().slice(..));
-    let text = doc.text().clone();
+    let (view_id, doc_id) = merge_target(cx.editor);
+    let (cursor_line, text) = {
+        let Some(doc) = cx.editor.document(doc_id) else {
+            return;
+        };
+        if !doc.selections().contains_key(&view_id) {
+            return;
+        }
+        let cursor_line = doc
+            .selection(view_id)
+            .primary()
+            .cursor_line(doc.text().slice(..));
+        (cursor_line, doc.text().clone())
+    };
     let conflicts = find_conflicts(&text);
 
     // Moving to a new conflict invalidates the switch-without-undo shortcut.
@@ -572,10 +604,17 @@ fn merge_jump_impl(cx: &mut Context, direction: Direction) {
     };
 
     if let Some(start_line) = target_start {
-        let pos = doc.text().line_to_char(start_line);
-        let (view, doc) = current!(cx.editor);
-        let view_id = view.id;
-        doc.set_selection(view_id, helix_core::Selection::point(pos));
+        let pos = {
+            let Some(doc) = cx.editor.document(doc_id) else {
+                return;
+            };
+            doc.text().line_to_char(start_line)
+        };
+        {
+            let doc = doc_mut!(cx.editor, &doc_id);
+            doc.set_selection(view_id, helix_core::Selection::point(pos));
+        }
+        cx.editor.focus(view_id);
         cx.editor.ensure_cursor_in_view(view_id);
 
         let current_idx = conflicts
@@ -590,17 +629,22 @@ fn merge_jump_impl(cx: &mut Context, direction: Direction) {
 
 pub fn merge_finish(cx: &mut Context) {
     use helix_view::merge_view::conflict_count;
-    let (_, doc) = current!(cx.editor);
-    let remaining = conflict_count(doc.text());
+    let (_view_id, doc_id) = merge_target(cx.editor);
+    let (remaining, path) = {
+        let Some(doc) = cx.editor.document(doc_id) else {
+            return;
+        };
+        (
+            conflict_count(doc.text()),
+            doc.path().map(|p| p.to_path_buf()),
+        )
+    };
 
     if remaining > 0 {
         cx.editor
             .set_error(format!("{} conflict(s) still unresolved", remaining));
         return;
     }
-
-    let doc_id = doc.id();
-    let path = doc.path().map(|p| p.to_path_buf());
 
     if let Err(e) = cx.editor.save::<PathBuf>(doc_id, None, false) {
         cx.editor.set_error(format!("Failed to save: {e}"));

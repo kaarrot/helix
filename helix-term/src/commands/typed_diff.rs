@@ -29,9 +29,7 @@ pub(crate) fn diff_base(
         return Ok(());
     }
 
-    doc.reload(view, &cx.editor.diff_providers).map(|_| {
-        view.ensure_cursor_in_view(doc, scrolloff);
-    })?;
+    view.ensure_cursor_in_view(doc, scrolloff);
 
     let msg = if let Some(ref commit) = commit_ref {
         format!("Diff base set to: {}", commit)
@@ -39,6 +37,7 @@ pub(crate) fn diff_base(
         "Diff base reset to HEAD".to_string()
     };
     cx.editor.set_status(msg);
+    cx.editor.clear_idle_timer();
 
     Ok(())
 }

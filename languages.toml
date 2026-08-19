@@ -1064,6 +1064,10 @@ name = "debugpy"
 transport = "stdio"
 command = "python3"
 args = ["-m", "debugpy.adapter"]
+# debugpy renders only the first ~60 entries of a collection and ends the value
+# with an ellipsis. Asking for `repr(...)` of the same expression returns the
+# whole thing, since that is a plain string.
+quirks = { full-value-expression = "repr({})" }
 
 # Attach to PID: attach to a running Python process by PID or by name.
 # Helix spawns debugpy.adapter; the adapter injects debugpy into the target.

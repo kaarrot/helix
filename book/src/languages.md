@@ -230,7 +230,7 @@ These are the available options for a debugger:
 | `args`       | A list of arguments to pass to the adapter binary                                            |
 | `port-arg`   | For TCP transport, the argument used to pass the port the adapter should listen on           |
 | `templates`  | A list of debug configurations. **Required** — see the note on overriding below             |
-| `quirks`     | Adapter-specific workarounds, e.g. `{ absolute-paths = true }`                               |
+| `quirks`     | Adapter-specific workarounds, see below                                                      |
 
 Each entry of `templates` takes these keys:
 
@@ -255,6 +255,13 @@ table with these keys:
 | `name`       | The label shown in the prompt                                                                |
 | `completion` | The kind of value being asked for, which enables completion and post-processing: `filename` and `directory` complete paths and are canonicalized, `process` accepts a PID or a process name that is resolved to a PID |
 | `default`    | The value the prompt is pre-filled with; accepted as-is by pressing `<ret>`                  |
+
+`quirks` compensates for adapter behavior that the protocol does not cover:
+
+| Key                     | Description                                                                       |
+| ----                    | -----------                                                                       |
+| `absolute-paths`        | Send absolute rather than workspace-relative paths                                |
+| `full-value-expression` | How to re-request a value the adapter shortened with an ellipsis, `{}` standing for the original expression. Python uses `repr({})`, since debugpy renders only the first entries of a collection. Only used when a result comes back truncated, and it evaluates the expression a second time |
 
 > 💡 Overriding the built-in debugger replaces it wholesale. When you redefine
 > `[language.debugger]` for a language that already ships with a default

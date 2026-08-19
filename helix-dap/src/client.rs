@@ -612,6 +612,20 @@ impl Client {
             .unwrap_or_default()
     }
 
+    pub fn supports_set_variable(&self) -> bool {
+        self.caps
+            .as_ref()
+            .and_then(|caps| caps.supports_set_variable)
+            .unwrap_or_default()
+    }
+
+    pub fn supports_set_expression(&self) -> bool {
+        self.caps
+            .as_ref()
+            .and_then(|caps| caps.supports_set_expression)
+            .unwrap_or_default()
+    }
+
     async fn eval_with_context(
         &self,
         expression: String,
@@ -626,6 +640,38 @@ impl Client {
         };
 
         self.request::<requests::Evaluate>(args).await
+    }
+
+    pub async fn set_variable(
+        &self,
+        variables_reference: usize,
+        name: String,
+        value: String,
+    ) -> Result<requests::SetVariableResponse> {
+        let args = requests::SetVariableArguments {
+            variables_reference,
+            name,
+            value,
+            format: None,
+        };
+
+        self.request::<requests::SetVariable>(args).await
+    }
+
+    pub async fn set_expression(
+        &self,
+        expression: String,
+        value: String,
+        frame_id: Option<usize>,
+    ) -> Result<requests::SetExpressionResponse> {
+        let args = requests::SetExpressionArguments {
+            expression,
+            value,
+            frame_id,
+            format: None,
+        };
+
+        self.request::<requests::SetExpression>(args).await
     }
 
     pub fn set_exception_breakpoints(

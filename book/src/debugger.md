@@ -77,10 +77,10 @@ current frame. It is the most useful key in the mode, and it does a little more
 than it looks:
 
 - **It starts from what you are pointing at.** The prompt opens pre-filled with
-  the selection, or with the word under the cursor when nothing is selected.
-  Since the sticky menu swallows motions, the mouse is the way to point at
-  something without leaving the menu — drag over an expression, or click a word,
-  then press `p`.
+  the selection, when there is one. Since the sticky menu swallows motions, the
+  mouse is the way to point at something without leaving the menu — drag over an
+  expression, then press `p`. With no selection the prompt opens empty, ready
+  for `Up`.
 - **It remembers.** `Up` and `Down` walk previously evaluated expressions, and
   the history outlives the editor: it is kept in the `=` register and mirrored to
   `dap-eval-history` in Helix's cache directory, holding the most recent 500
@@ -90,8 +90,9 @@ than it looks:
   evaluation. Double-clicking the result on the status line copies it again.
 - **It runs statements, not just expressions.** `count = 0`, `items.append(x)`
   or an import all work, and they change the frame you are stopped in — execution
-  continues with the new values. A statement evaluates to nothing, so the status
-  line reports `evaluated` rather than a value.
+  continues with the new values. An assignment evaluates to nothing, so its
+  target is read back and reported instead: `count = 0` shows `0`. Any other
+  statement leaves the status line reporting `evaluated`.
 
 `:debug-eval <expression>` does the same from the command line.
 

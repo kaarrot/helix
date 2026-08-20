@@ -6,7 +6,6 @@ use crate::{
 };
 use dap::{StackFrame, Thread, ThreadStates};
 use helix_core::syntax::config::{DebugArgumentValue, DebugConfigCompletion, DebugTemplate};
-use helix_core::textobject::{textobject_word, TextObject};
 use helix_core::{Range, RopeSlice};
 use helix_dap::{self as dap, requests::TerminateArguments};
 use helix_lsp::block_on;
@@ -778,16 +777,15 @@ pub fn dap_goto_line(cx: &mut Context) {
     );
 }
 
-/// The expression to seed the eval prompt with: the primary selection when it
-/// spans more than the cursor, otherwise the word under it. Getting at the
-/// buffer is otherwise awkward mid-session, since the debug menu is sticky and
-/// swallows the motion keys needed to select and yank.
+/// The expression to seed the eval prompt with: the primary selection, when
+/// there is one. Getting at the buffer is otherwise awkward mid-session, since
+/// the debug menu is sticky and swallows the motion keys needed to select and
+/// yank. A bare cursor is not a selection, so it seeds nothing and leaves `Up`
+/// reaching straight for the history.
 fn expression_from(text: RopeSlice, range: Range) -> String {
-    let range = if range.len() > 1 {
-        range
-    } else {
-        textobject_word(text, range, TextObject::Inside, 1, false)
-    };
+    if range.len() <= 1 {
+        return String::new();
+    }
 
     let expression = range.fragment(text);
     // A multi-line fragment is never a useful expression.
@@ -909,6 +907,71 @@ fn unquote(value: &str) -> &str {
     }
 }
 
+/// The target of an assignment, i.e. `xs[0]` in `xs[0] += 1`. An assignment
+/// evaluates to nothing, so the target is what the prompt evaluates afterwards
+/// to report the value that was just stored. `None` for anything that is not a
+/// plain assignment statement.
+fn assignment_target(expression: &str) -> Option<&str> {
+    let mut depth = 0usize;
+    let mut quote: Option<char> = None;
+
+    for (i, ch) in expression.char_indices() {
+        match (quote, ch) {
+            (Some(open), ch) if ch == open => quote = None,
+            (Some(_), _) => (),
+            (None, '\'' | '"') => quote = Some(ch),
+            (None, '(' | '[' | '{') => depth += 1,
+            (None, ')' | ']' | '}') => depth = depth.saturating_sub(1),
+            (None, '=') if depth == 0 => {
+                let before = &expression[..i];
+                let prev = before.chars().next_back();
+                // `==` is a comparison, and so is a `=` preceded by one of
+                // `!<>:` -- except in `<<=` and `>>=`, which do assign.
+                let comparison = expression[i + 1..].starts_with('=')
+                    || match prev {
+                        Some('!') | Some('=') | Some(':') => true,
+                        Some(ch @ ('<' | '>')) => !before[..before.len() - ch.len_utf8()]
+                            .ends_with(ch),
+                        _ => false,
+                    };
+                if comparison {
+                    continue;
+                }
+
+                // Peel the operator of an augmented assignment off the target.
+                let target = before
+                    .trim_end_matches(|ch| "+-*/%&|^@<>~".contains(ch))
+                    .trim();
+                return (!target.is_empty()).then_some(target);
+            }
+            _ => (),
+        }
+    }
+
+    None
+}
+
+/// Evaluate `expression` in the current frame, asking again for the whole value
+/// when the adapter hands back an elided one.
+fn eval_complete(debugger: &dap::Client, expression: &str, frame_id: usize) -> dap::Result<String> {
+    let mut result = block_on(debugger.eval(expression.to_owned(), Some(frame_id)))?.result;
+
+    // A truncated value is useless to copy, so ask for it again in full.
+    let retry = full_value_expression(
+        &result,
+        expression,
+        debugger.quirks.full_value_expression.as_deref(),
+        debugger.supports_clipboard_context(),
+    );
+    if let Some(expression) = retry {
+        if let Ok(response) = block_on(debugger.eval_full(expression, Some(frame_id))) {
+            result = unquote(&response.result).to_string();
+        }
+    }
+
+    Ok(result)
+}
+
 /// What of an evaluated value to park on the status line. Rendering measures the
 /// status message on every frame, so a multi-megabyte repr would be walked over
 /// and over -- and only a screenful of it is ever visible anyway. The complete
@@ -962,46 +1025,38 @@ pub fn dap_evaluate(cx: &mut Context) {
                 }
             };
             let frame_id = debugger.stack_frames[&thread_id][frame].id;
-            let mut result = block_on(debugger.eval(input.to_owned(), Some(frame_id)));
+            let mut result = eval_complete(debugger, input, frame_id);
 
-            // A truncated value is useless to copy, so ask for it again in full.
-            let retry = result.as_ref().ok().and_then(|response| {
-                full_value_expression(
-                    &response.result,
-                    input,
-                    debugger.quirks.full_value_expression.as_deref(),
-                    debugger.supports_clipboard_context(),
-                )
-            });
-            if let Some(expression) = retry {
-                if let Ok(mut response) = block_on(debugger.eval_full(expression, Some(frame_id))) {
-                    response.result = unquote(&response.result).to_string();
-                    result = Ok(response);
+            // An assignment evaluates to nothing, so read the target back to
+            // report what was stored rather than a bare "evaluated".
+            if matches!(&result, Ok(value) if value.is_empty()) {
+                if let Some(target) = assignment_target(input) {
+                    if let Ok(value) = eval_complete(debugger, target, frame_id) {
+                        if !value.is_empty() {
+                            result = Ok(value);
+                        }
+                    }
                 }
             }
 
             match result {
-                Ok(response) if response.result.is_empty() => {
+                Ok(value) if value.is_empty() => {
                     // Statements evaluate to nothing. Say so rather than leaving
                     // the previous result on the status line, which reads as if
                     // nothing had happened.
                     cx.editor.dap_eval_result = None;
                     cx.editor.set_status("evaluated");
                 }
-                Ok(response) => {
+                Ok(value) => {
                     // The status line can only ever show a screenful, so hand the
                     // whole value to the clipboard for pasting elsewhere.
-                    if let Err(err) = cx
-                        .editor
-                        .registers
-                        .write('+', vec![response.result.clone()])
-                    {
+                    if let Err(err) = cx.editor.registers.write('+', vec![value.clone()]) {
                         cx.editor
                             .set_error(format!("Failed to yank result: {}", err));
                     }
 
-                    let status = status_line_value(&response.result);
-                    cx.editor.dap_eval_result = Some(response.result);
+                    let status = status_line_value(&value);
+                    cx.editor.dap_eval_result = Some(value);
                     cx.editor.set_status(status);
                 }
                 Err(e) => {
@@ -1486,7 +1541,31 @@ mod tests {
     }
 
     #[test]
-    fn seeds_expression_from_selection_or_word() {
+    fn finds_the_target_of_an_assignment() {
+        // Plain, chained and augmented assignments all read back the target.
+        assert_eq!(assignment_target("x = 1"), Some("x"));
+        assert_eq!(assignment_target("a, b = 1, 2"), Some("a, b"));
+        assert_eq!(assignment_target("self.count += 1"), Some("self.count"));
+        assert_eq!(assignment_target("xs[0] //= 2"), Some("xs[0]"));
+        assert_eq!(assignment_target("bits <<= 1"), Some("bits"));
+        assert_eq!(assignment_target("s = \"a=b\""), Some("s"));
+
+        // Comparisons and expressions are not assignments.
+        assert_eq!(assignment_target("a == b"), None);
+        assert_eq!(assignment_target("a != b"), None);
+        assert_eq!(assignment_target("a >= b"), None);
+        assert_eq!(assignment_target("(n := 1)"), None);
+        assert_eq!(assignment_target("len(xs)"), None);
+        // A keyword argument is bracketed, and the call returns a value anyway.
+        assert_eq!(assignment_target("f(a=1)"), None);
+        // Nor is an `=` inside a string.
+        assert_eq!(assignment_target("\"a=b\""), None);
+        // Nothing to read back without a target.
+        assert_eq!(assignment_target("= 5"), None);
+    }
+
+    #[test]
+    fn seeds_expression_from_selection() {
         let rope = helix_core::Rope::from("total = count + 1\nnext()\n");
         let text = rope.slice(..);
 
@@ -1494,9 +1573,9 @@ mod tests {
         assert_eq!(expression_from(text, Range::new(8, 13)), "count");
         assert_eq!(expression_from(text, Range::new(7, 14)), "count");
 
-        // A cursor-sized range falls back to the word under it.
-        assert_eq!(expression_from(text, Range::point(9)), "count");
-        assert_eq!(expression_from(text, Range::point(1)), "total");
+        // A bare cursor seeds nothing, whatever it happens to sit on.
+        assert_eq!(expression_from(text, Range::point(9)), "");
+        assert_eq!(expression_from(text, Range::point(1)), "");
 
         // Spanning a line break gives nothing to evaluate.
         assert_eq!(expression_from(text, Range::new(0, 20)), "");

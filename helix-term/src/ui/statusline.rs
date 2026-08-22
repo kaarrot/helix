@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use helix_core::indent::IndentStyle;
 use helix_core::{coords_at_pos, encoding, unicode::width::UnicodeWidthStr, Position};
 use helix_lsp::lsp::DiagnosticSeverity;
@@ -370,13 +372,15 @@ where
                 .get(srv.id())
                 .and_then(|spinner| spinner.frame())
         })
-        // Fall back to the activity spinner of a running `:insert-stream-output`.
-        .or_else(|| crate::commands::stream_spinner_frame(context.doc.id()));
+        .map(Cow::Borrowed)
+        // Fall back to the activity spinner of a running `:insert-stream-output`,
+        // which also counts the commands queued behind it.
+        .or_else(|| crate::commands::stream_spinner_frame(context.doc.id()).map(Cow::Owned));
 
     write(
         context,
         // Even if there's no spinner; reserve its space to avoid elements frequently shifting.
-        frame.unwrap_or(" ").into(),
+        frame.unwrap_or(Cow::Borrowed(" ")).into(),
     );
 }
 

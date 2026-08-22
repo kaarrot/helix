@@ -537,9 +537,9 @@ async fn test_insert_stream_output_spinner_runs_then_clears() -> anyhow::Result<
         "no spinner should be shown before a stream starts"
     );
 
-    // `cat` keeps the stream alive after the initial output, so the spinner is
+    // `sleep` keeps the stream alive after the initial output, so the spinner is
     // observably running rather than racing the end of the command.
-    send_key_sequence(&mut app, ":insert-stream-output printf ready; cat<ret>").await?;
+    send_key_sequence(&mut app, ":insert-stream-output printf ready; sleep 5<ret>").await?;
     wait_for_condition(&mut app, "spinner while stream runs", |app| {
         doc!(app.editor).text().to_string().contains("ready")
             && helix_term::commands::stream_spinner_frame(doc_id).is_some()
@@ -558,42 +558,100 @@ async fn test_insert_stream_output_spinner_runs_then_clears() -> anyhow::Result<
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
-async fn test_insert_stream_output_sends_input_without_selection_arg() -> anyhow::Result<()> {
+async fn test_insert_stream_output_queues_commands_behind_a_running_one() -> anyhow::Result<()> {
     let _lock = Arc::clone(&STREAM_TEST_LOCK).lock_owned().await;
     let mut app = AppBuilder::new().build()?;
 
-    send_key_sequence(&mut app, ":insert-stream-output printf ready; cat<ret>").await?;
-    wait_for_condition(&mut app, "initial streamed output", |app| {
-        doc!(app.editor)
-            .text()
-            .to_string()
-            .contains("printf ready; cat\nready")
+    // `sleep` holds the stream open long enough for the next command to queue
+    // behind it rather than start a stream of its own.
+    send_key_sequence(&mut app, ":insert-stream-output printf one; sleep 5<ret>").await?;
+    wait_for_condition(&mut app, "first command streaming", |app| {
+        doc!(app.editor).text().to_string().contains("one")
     })
     .await?;
 
-    send_key_sequence(&mut app, "ggx:insert-stream-output hello<ret>").await?;
-    wait_for_condition(&mut app, "stream input echo", |app| {
+    send_key_sequence(&mut app, ":insert-stream-output echo two<ret>").await?;
+
+    {
         let text = doc!(app.editor).text().to_string();
-        text.contains(">>> hello\n") && text.matches("hello\n").count() >= 2
+        assert!(
+            !text.contains("two"),
+            "queued command should not run while the first is streaming: {text:?}"
+        );
+        assert_eq!(
+            app.editor.get_status().unwrap().0.as_ref(),
+            "Queued behind the stream in '[scratch]' (1 waiting): echo two"
+        );
+    }
+
+    // Cancelling is a full stop: the queued command is dropped, not promoted.
+    send_key_sequence(&mut app, ":cancel-stream<ret>").await?;
+    wait_for_condition(&mut app, "stream cancellation", |app| {
+        app.editor.get_status().is_some_and(|(status, _)| {
+            status.as_ref() == "Stream cancelled (buffer: [scratch], 1 queued command dropped)"
+        })
     })
     .await?;
 
     {
         let text = doc!(app.editor).text().to_string();
-        assert!(text.contains(">>> hello\n"));
         assert!(
-            !text.contains(">>> hello printf ready; cat"),
-            "running-stream input should not append the editor selection: {text:?}"
+            !text.contains("two"),
+            "cancelled queue should not run its pending commands: {text:?}"
         );
     }
 
-    send_key_sequence(&mut app, ":::<ret>").await?;
-    wait_for_condition(&mut app, "stream cancellation", |app| {
-        app.editor
-            .get_status()
-            .is_some_and(|(status, _)| status.as_ref() == "Stream cancelled (buffer: [scratch])")
+    close_app(&mut app).await?;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_insert_stream_output_runs_queued_commands_in_order() -> anyhow::Result<()> {
+    let _lock = Arc::clone(&STREAM_TEST_LOCK).lock_owned().await;
+    let mut app = AppBuilder::new().build()?;
+
+    // `send_key_sequence` runs the event loop for up to two seconds, so the
+    // first command has to outlive that for the second to queue behind it.
+    send_key_sequence(&mut app, ":insert-stream-output printf one; sleep 3<ret>").await?;
+    wait_for_condition(&mut app, "first command streaming", |app| {
+        doc!(app.editor).text().to_string().contains("one")
     })
     .await?;
+
+    // The "Queued behind..." status isn't asserted here: the event loop keeps
+    // running inside `send_key_sequence`, so the queued command has usually run
+    // by the time it returns. `..._queues_commands_behind_a_running_one` covers
+    // the queueing itself.
+    send_key_sequence(&mut app, ":insert-stream-output printf two<ret>").await?;
+    wait_for_condition(&mut app, "queued command output", |app| {
+        doc!(app.editor).text().to_string().contains("two")
+            && app
+                .editor
+                .get_status()
+                .is_some_and(|(status, _)| status.as_ref() == "Stream completed in '[scratch]'")
+    })
+    .await?;
+
+    {
+        let (view, doc) = current_ref!(app.editor);
+
+        // Each command heads its own output, and the queued one starts on a
+        // fresh line even though `printf one` left the cursor mid-line. The
+        // scratch buffer's own trailing newline ends up last, which a second
+        // session wouldn't do: it would have started writing after it.
+        let text = doc.text().to_string();
+        assert_eq!(text, "printf one; sleep 3\none\nprintf two\ntwo\n");
+
+        // The cursor is left right after the streamed output, which here is
+        // ahead of the scratch buffer's own trailing newline.
+        assert_eq!(
+            doc.selection(view.id)
+                .primary()
+                .cursor(doc.text().slice(..)),
+            text.trim_end_matches('\n').chars().count()
+        );
+    }
 
     close_app(&mut app).await?;
     Ok(())
@@ -632,36 +690,15 @@ async fn test_insert_stream_commands_and_aliases() -> anyhow::Result<()> {
     })
     .await?;
 
-    send_key_sequence(&mut app, ":insert-stream-output printf one; cat<ret>").await?;
+    send_key_sequence(&mut app, ":: printf one; sleep 5<ret>").await?;
     wait_for_condition(&mut app, "initial streamed output", |app| {
-        doc!(app.editor).text().to_string() == "printf one; cat\none\n"
+        doc!(app.editor).text().to_string() == "printf one; sleep 5\none\n"
     })
     .await?;
 
     {
         let doc = doc!(app.editor);
-        assert_eq!(doc.display_name().as_ref(), "printf one; cat");
-    }
-
-    send_key_sequence(&mut app, ":insert-stream-output hello<ret>").await?;
-    wait_for_condition(&mut app, "stream input echo", |app| {
-        let text = doc!(app.editor).text().to_string();
-        text.contains(">>> hello\n") && text.matches("hello\n").count() >= 2
-    })
-    .await?;
-
-    {
-        let doc = doc!(app.editor);
-        let text = doc.text().to_string();
-
-        assert_eq!(doc.display_name().as_ref(), "printf one; cat");
-        assert!(text.starts_with("printf one; cat\none"));
-        assert!(text.contains(">>> hello\n"));
-        assert!(text.matches("hello\n").count() >= 2);
-        assert_eq!(
-            app.editor.get_status().unwrap().0.as_ref(),
-            "Input sent to '[scratch]'"
-        );
+        assert_eq!(doc.display_name().as_ref(), "printf one; sleep 5");
     }
 
     send_key_sequence(&mut app, ":::<ret>").await?;
@@ -674,15 +711,8 @@ async fn test_insert_stream_commands_and_aliases() -> anyhow::Result<()> {
 
     {
         let doc = doc!(app.editor);
-        let text = doc.text().to_string();
-
-        assert_eq!(doc.display_name().as_ref(), "printf one; cat");
-        assert!(text.contains(">>> hello\n"));
-        assert!(text.matches("hello\n").count() >= 2);
-        assert_eq!(
-            app.editor.get_status().unwrap().0.as_ref(),
-            "Stream cancelled (buffer: [scratch])"
-        );
+        assert_eq!(doc.display_name().as_ref(), "printf one; sleep 5");
+        assert!(doc.text().to_string().contains("printf one; sleep 5\none"));
     }
 
     close_app(&mut app).await?;

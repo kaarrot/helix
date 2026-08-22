@@ -65,11 +65,23 @@ pub fn render(context: &mut RenderContext, viewport: Rect, surface: &mut Surface
 
     let config = context.editor.config();
 
+    let mut reserved = 0u16;
+
     for element_id in &config.statusline.left {
         let render = get_render_function(*element_id);
         (render)(context, |context, span| {
             append(&mut context.parts.left, span, base_style)
         });
+
+        // Keep the always-on indicators legible on a statusline too narrow to
+        // hold everything by reserving the columns up to and including the last
+        // of them.
+        if matches!(
+            element_id,
+            StatusLineElementID::Mode | StatusLineElementID::Spinner
+        ) {
+            reserved = context.parts.left.width() as u16;
+        }
     }
 
     surface.set_spans(
@@ -88,14 +100,14 @@ pub fn render(context: &mut RenderContext, viewport: Rect, surface: &mut Surface
         })
     }
 
+    let (right_x, right_width) =
+        right_section(viewport.width, context.parts.right.width() as u16, reserved);
+
     surface.set_spans(
-        viewport.x
-            + viewport
-                .width
-                .saturating_sub(context.parts.right.width() as u16),
+        viewport.x + right_x,
         viewport.y,
         &context.parts.right,
-        context.parts.right.width() as u16,
+        right_width,
     );
 
     // Center of the status line.
@@ -110,6 +122,8 @@ pub fn render(context: &mut RenderContext, viewport: Rect, surface: &mut Surface
     // Width of the empty space between the left and center area and between the center and right area.
     let spacing = 1u16;
 
+    // Bounding the center by twice the wider edge keeps it clear of both
+    // sections, so it can't cover the reserved columns either.
     let edge_width = context.parts.left.width().max(context.parts.right.width()) as u16;
     let center_max_width = viewport.width.saturating_sub(2 * edge_width + 2 * spacing);
     let center_width = center_max_width.min(context.parts.center.width() as u16);
@@ -120,6 +134,21 @@ pub fn render(context: &mut RenderContext, viewport: Rect, surface: &mut Surface
         &context.parts.center,
         center_width,
     );
+}
+
+/// Where the right section starts and how many columns it may use.
+///
+/// It is right-aligned, but on a statusline too narrow to hold both sections it
+/// would start left of `reserved` and paint over what is already there — at
+/// phone width that means the diagnostics and position cover the mode and the
+/// spinner, so a running command shows no activity at all. Keep it out of the
+/// reserved columns and let it lose its own tail instead.
+fn right_section(viewport_width: u16, right_width: u16, reserved: u16) -> (u16, u16) {
+    let x = viewport_width
+        .saturating_sub(right_width)
+        .max(reserved.min(viewport_width));
+
+    (x, viewport_width.saturating_sub(x))
 }
 
 fn append<'a>(buffer: &mut Spans<'a>, mut span: Span<'a>, base_style: Style) {
@@ -590,4 +619,27 @@ where
         .to_string_lossy()
         .to_string();
     write(context, cwd.into())
+}
+
+#[cfg(test)]
+mod test {
+    use super::right_section;
+
+    #[test]
+    fn right_section_is_right_aligned_when_it_fits() {
+        assert_eq!(right_section(80, 25, 6), (55, 25));
+    }
+
+    #[test]
+    fn right_section_stops_at_the_reserved_columns() {
+        // Narrow enough that a right-aligned section would start at column 2
+        // and paint over the mode and spinner.
+        assert_eq!(right_section(27, 25, 6), (6, 21));
+    }
+
+    #[test]
+    fn right_section_is_dropped_when_nothing_is_left_over() {
+        assert_eq!(right_section(6, 25, 6), (6, 0));
+        assert_eq!(right_section(4, 25, 6), (4, 0));
+    }
 }

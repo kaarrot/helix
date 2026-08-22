@@ -72,11 +72,21 @@ pub fn render(context: &mut RenderContext, viewport: Rect, surface: &mut Surface
     let config = context.editor.config();
 
     // Left side of the status line.
+    let mut reserved_spans = 0;
     for element_id in &config.statusline.left {
         let render = get_render_function(*element_id);
         (render)(context, |context, span| {
             append(&mut context.parts.left, span, base_style)
         });
+
+        // The mode and the spinner stay visible however narrow the statusline
+        // gets; the elements after them give up their columns first.
+        if matches!(
+            element_id,
+            StatusLineElementID::Mode | StatusLineElementID::Spinner
+        ) {
+            reserved_spans = context.parts.left.0.len();
+        }
     }
 
     // Right side of the status line.
@@ -93,22 +103,26 @@ pub fn render(context: &mut RenderContext, viewport: Rect, surface: &mut Surface
     } else {
         LeftSectionOverflow::PreserveEnd
     };
-    render_left_section(
+    let reserved_width = render_left_section(
         surface,
         viewport,
         &context.parts.left,
+        reserved_spans,
         right_reserved_width,
         left_overflow,
     );
 
+    let (right_x, right_width) = right_section(
+        viewport.width,
+        context.parts.right.width() as u16,
+        reserved_width,
+    );
+
     surface.set_spans(
-        viewport.x
-            + viewport
-                .width
-                .saturating_sub(context.parts.right.width() as u16),
+        viewport.x + right_x,
         viewport.y,
         &context.parts.right,
-        context.parts.right.width() as u16,
+        right_width,
     );
 
     // Center of the status line.
@@ -135,22 +149,66 @@ pub fn render(context: &mut RenderContext, viewport: Rect, surface: &mut Surface
     );
 }
 
+/// Draws the left section and returns the columns its reserved leading spans —
+/// the mode and the spinner — claimed at the left edge.
 fn render_left_section(
     surface: &mut Surface,
     viewport: Rect,
     left: &Spans<'_>,
+    reserved_spans: usize,
     right_reserved_width: u16,
     overflow: LeftSectionOverflow,
-) {
-    let left_max_width = left_available_width(viewport, right_reserved_width);
+) -> u16 {
+    let reserved_width = (left.0[..reserved_spans]
+        .iter()
+        .map(|span| span.content.width())
+        .sum::<usize>() as u16)
+        .min(viewport.width);
+
+    // The reserved columns are never given up, however little room is left over
+    // for the section as a whole.
+    let left_max_width = left_available_width(viewport, right_reserved_width).max(reserved_width);
+
+    if left.width() as u16 <= left_max_width {
+        surface.set_spans(viewport.x, viewport.y, left, left_max_width);
+        return reserved_width;
+    }
+
+    // Too narrow for the whole section: keep the reserved spans and truncate
+    // only what follows them. Truncating the section as one would drop either
+    // the mode and spinner (`PreserveEnd`) or the file name (`PreserveStart`).
+    let reserved = Spans(left.0[..reserved_spans].to_vec());
+    surface.set_spans(viewport.x, viewport.y, &reserved, reserved_width);
+
+    let rest = Spans(left.0[reserved_spans..].to_vec());
+    let rest_x = viewport.x + reserved_width;
+    let rest_width = left_max_width.saturating_sub(reserved_width);
+
     match overflow {
         LeftSectionOverflow::PreserveStart => {
-            surface.set_spans(viewport.x, viewport.y, left, left_max_width);
+            surface.set_spans(rest_x, viewport.y, &rest, rest_width);
         }
         LeftSectionOverflow::PreserveEnd => {
-            surface.set_spans_truncated(viewport.x, viewport.y, left, left_max_width);
+            surface.set_spans_truncated(rest_x, viewport.y, &rest, rest_width);
         }
     }
+
+    reserved_width
+}
+
+/// Where the right section starts and how many columns it may use.
+///
+/// It is right-aligned, but on a statusline too narrow to hold both sections it
+/// would start left of `reserved` and paint over what is already there — at
+/// phone width that means the diagnostics and position cover the mode and the
+/// spinner, so a running command shows no activity at all. Keep it out of the
+/// reserved columns and let it lose its own tail instead.
+fn right_section(viewport_width: u16, right_width: u16, reserved: u16) -> (u16, u16) {
+    let x = viewport_width
+        .saturating_sub(right_width)
+        .max(reserved.min(viewport_width));
+
+    (x, viewport_width.saturating_sub(x))
 }
 
 #[derive(Clone, Copy)]
@@ -927,9 +985,27 @@ mod tests {
     use tui::text::{Span, Spans};
 
     use super::{
-        completion_suggestion_index_at, render, render_left_section, LeftSectionOverflow,
-        RenderContext, Surface,
+        completion_suggestion_index_at, render, render_left_section, right_section,
+        LeftSectionOverflow, RenderContext, Surface,
     };
+
+    #[test]
+    fn right_section_is_right_aligned_when_it_fits() {
+        assert_eq!(right_section(80, 25, 6), (55, 25));
+    }
+
+    #[test]
+    fn right_section_stops_at_the_reserved_columns() {
+        // Narrow enough that a right-aligned section would start at column 2
+        // and paint over the mode and spinner.
+        assert_eq!(right_section(27, 25, 6), (6, 21));
+    }
+
+    #[test]
+    fn right_section_is_dropped_when_nothing_is_left_over() {
+        assert_eq!(right_section(6, 25, 6), (6, 0));
+        assert_eq!(right_section(4, 25, 6), (4, 0));
+    }
 
     #[test]
     fn long_left_section_is_truncated_from_the_left() {
@@ -941,6 +1017,7 @@ mod tests {
             &mut surface,
             viewport,
             &left,
+            0,
             0,
             LeftSectionOverflow::PreserveEnd,
         );

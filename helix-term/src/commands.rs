@@ -72,9 +72,9 @@ use crate::job::{self, Jobs};
 use std::{
     char::{ToLowercase, ToUppercase},
     cmp::Ordering,
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     error::Error,
-    fmt, fs,
+    fmt,
     future::Future,
     io::Read,
     num::NonZeroUsize,
@@ -94,70 +94,116 @@ use grep_regex::RegexMatcherBuilder;
 use grep_searcher::{sinks, BinaryDetection, SearcherBuilder};
 use ignore::{DirEntry, WalkBuilder, WalkState};
 
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::oneshot;
 
-// Global state to track running stream processes
-struct StreamProcess {
-    cancel_tx: oneshot::Sender<()>,
-    stdin_tx: mpsc::UnboundedSender<String>,
-    buffer_name: String,
-    doc_id: DocumentId,
-    view_id: ViewId,
+/// A shell command waiting to be streamed into a session's buffer.
+struct StreamCommand {
+    /// What the shell is asked to run; may carry the appended primary selection.
+    cmd: String,
+    /// What the buffer and the status messages show.
+    display_cmd: String,
 }
 
-static STREAM_PROCESSES: Lazy<Arc<Mutex<Option<StreamProcess>>>> =
-    Lazy::new(|| Arc::new(Mutex::new(None)));
+/// The buffer a stream session writes to.
+#[derive(Clone)]
+struct StreamTarget {
+    /// Tells this session apart from a later one, so a task that is winding
+    /// down can't clobber the session that replaced it.
+    generation: u64,
+    doc_id: DocumentId,
+    view_id: ViewId,
+    buffer_name: String,
+}
+
+/// A run of `:insert-stream-output` commands sharing one buffer. Only one
+/// command runs at a time and the rest wait in `queue`, so their output lands
+/// in the buffer in the order it was asked for instead of interleaving.
+struct StreamSession {
+    target: StreamTarget,
+    /// Cancels the running command's child process; `None` until it spawns.
+    cancel_tx: Option<oneshot::Sender<()>>,
+    queue: VecDeque<StreamCommand>,
+}
+
+static STREAM_SESSION: Lazy<Mutex<Option<StreamSession>>> = Lazy::new(|| Mutex::new(None));
+static NEXT_STREAM_GENERATION: AtomicU64 = AtomicU64::new(0);
 static LAST_STREAM_DOC_ID: Lazy<Arc<Mutex<Option<DocumentId>>>> =
     Lazy::new(|| Arc::new(Mutex::new(None)));
-static STREAM_INPUT_HISTORY_LOADED: Lazy<Mutex<bool>> = Lazy::new(|| Mutex::new(false));
 
 /// Frame interval for the stream activity spinner, matching `Spinner::dots`' default.
 const STREAM_SPINNER_INTERVAL_MS: u64 = 80;
 
 /// The activity spinner shown in the statusline of the buffer a stream writes to.
 struct StreamSpinner {
+    /// The session this spinner belongs to, so the task of a cancelled session
+    /// can't clear the spinner of the session that replaced it.
+    generation: u64,
     doc_id: DocumentId,
     spinner: ui::Spinner,
 }
 
 static STREAM_SPINNER: Lazy<Mutex<Option<StreamSpinner>>> = Lazy::new(|| Mutex::new(None));
 
-/// The current spinner frame for `doc_id`, or `None` if no stream is running in it.
-pub fn stream_spinner_frame(doc_id: DocumentId) -> Option<&'static str> {
-    let guard = STREAM_SPINNER.lock().unwrap();
-    let state = guard.as_ref()?;
-    if state.doc_id != doc_id {
-        return None;
-    }
-    state.spinner.frame()
+/// The current spinner frame for `doc_id`, or `None` if no stream is running in
+/// it. The frame carries a `+n` suffix while `n` commands wait in the queue.
+pub fn stream_spinner_frame(doc_id: DocumentId) -> Option<String> {
+    let frame = {
+        let guard = STREAM_SPINNER.lock().unwrap();
+        let state = guard.as_ref()?;
+        if state.doc_id != doc_id {
+            return None;
+        }
+        state.spinner.frame()?
+    };
+
+    let pending = STREAM_SESSION
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map_or(0, |session| session.queue.len());
+
+    Some(match pending {
+        0 => frame.to_string(),
+        pending => format!("{}+{}", frame, pending),
+    })
 }
 
 /// Keeps the stream spinner alive for as long as the guard is held, so it can't
-/// outlive the stream on any exit path (EOF, cancellation, error, or panic).
-struct StreamSpinnerGuard;
+/// outlive the session on any exit path (drained queue, cancellation, error, or
+/// panic).
+struct StreamSpinnerGuard {
+    generation: u64,
+}
 
 impl StreamSpinnerGuard {
-    fn start(doc_id: DocumentId) -> Self {
+    fn start(generation: u64, doc_id: DocumentId) -> Self {
         let mut spinner = ui::Spinner::dots(STREAM_SPINNER_INTERVAL_MS);
         spinner.start();
-        *STREAM_SPINNER.lock().unwrap() = Some(StreamSpinner { doc_id, spinner });
+        *STREAM_SPINNER.lock().unwrap() = Some(StreamSpinner {
+            generation,
+            doc_id,
+            spinner,
+        });
         helix_event::request_redraw();
-        Self
+        Self { generation }
     }
 }
 
 impl Drop for StreamSpinnerGuard {
     fn drop(&mut self) {
-        *STREAM_SPINNER.lock().unwrap() = None;
-        // Paint the frame that clears the glyph.
-        helix_event::request_redraw();
+        let mut spinner = STREAM_SPINNER.lock().unwrap();
+        if spinner
+            .as_ref()
+            .is_some_and(|spinner| spinner.generation == self.generation)
+        {
+            *spinner = None;
+            // Paint the frame that clears the glyph.
+            helix_event::request_redraw();
+        }
     }
 }
-
-const STREAM_INPUT_HISTORY_REGISTER: char = '>';
-const STREAM_INPUT_HISTORY_FILE: &str = "stream-input-history";
-const STREAM_INPUT_HISTORY_MAX_ENTRIES: usize = 200;
 
 pub type OnKeyCallback = Box<dyn FnOnce(&mut Context, KeyEvent)>;
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
@@ -6539,39 +6585,6 @@ fn stream_insert_transaction(
     (transaction, next_pos)
 }
 
-/// Send input to running stream process and echo to buffer
-fn send_stream_input(
-    stdin_tx: mpsc::UnboundedSender<String>,
-    input: String,
-    doc_id: DocumentId,
-    view_id: ViewId,
-    buffer_name: &str,
-    cx: &mut compositor::Context,
-) {
-    // Send to process stdin via channel
-    if stdin_tx.send(input.clone()).is_err() {
-        cx.editor
-            .set_error("Failed to send input - process may have exited");
-        return;
-    }
-
-    // Echo to buffer for visibility
-    if let Some(doc) = cx.editor.document_mut(doc_id) {
-        let text = doc.text();
-        let pos = text.len_chars();
-
-        let echo = format!(">>> {}\n", input);
-        let output = Tendril::from(echo);
-
-        let transaction = Transaction::change(doc.text(), [(pos, pos, Some(output))].into_iter());
-        doc.apply(&transaction, view_id);
-        cx.editor.ensure_cursor_in_view(view_id);
-    }
-
-    cx.editor
-        .set_status(format!("Input sent to '{}'", buffer_name));
-}
-
 #[cfg(test)]
 mod stream_tests {
     use super::{stream_insert_transaction, stream_spinner_frame, StreamSpinnerGuard};
@@ -6586,10 +6599,14 @@ mod stream_tests {
         assert_eq!(stream_spinner_frame(doc_id), None);
 
         {
-            let _guard = StreamSpinnerGuard::start(doc_id);
+            let _guard = StreamSpinnerGuard::start(0, doc_id);
             let frame = stream_spinner_frame(doc_id).expect("spinner should be running");
             const DOTS: [&str; 8] = ["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"];
-            assert!(DOTS.contains(&frame), "unexpected spinner frame: {}", frame);
+            assert!(
+                DOTS.contains(&frame.as_str()),
+                "unexpected spinner frame: {}",
+                frame
+            );
         }
 
         assert_eq!(stream_spinner_frame(doc_id), None);
@@ -6623,154 +6640,32 @@ mod stream_tests {
     }
 }
 
-fn stream_input_history_path() -> PathBuf {
-    helix_loader::config_dir().join(STREAM_INPUT_HISTORY_FILE)
-}
-
-fn load_stream_input_history(editor: &mut Editor) {
-    let mut loaded = STREAM_INPUT_HISTORY_LOADED.lock().unwrap();
-    if *loaded {
-        return;
-    }
-
-    let path = stream_input_history_path();
-    let contents = match fs::read_to_string(&path) {
-        Ok(contents) => contents,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            *loaded = true;
-            return;
-        }
-        Err(err) => {
-            log::warn!(
-                "Failed to read stream input history file '{}': {}",
-                path.display(),
-                err
-            );
-            *loaded = true;
-            return;
-        }
-    };
-
-    // Ensure we don't duplicate entries if history gets loaded again for any reason.
-    editor.registers.remove(STREAM_INPUT_HISTORY_REGISTER);
-
-    let mut entries: Vec<&str> = contents.lines().filter(|line| !line.is_empty()).collect();
-    if entries.len() > STREAM_INPUT_HISTORY_MAX_ENTRIES {
-        let keep_from = entries.len() - STREAM_INPUT_HISTORY_MAX_ENTRIES;
-        entries = entries.split_off(keep_from);
-    }
-
-    for value in entries {
-        if let Err(err) = editor
-            .registers
-            .push(STREAM_INPUT_HISTORY_REGISTER, value.to_string())
-        {
-            log::warn!("Failed to load stream input history entry: {}", err);
-            break;
-        }
-    }
-
-    *loaded = true;
-}
-
-fn save_stream_input_history(editor: &Editor) {
-    let Some(values) = editor.registers.read(STREAM_INPUT_HISTORY_REGISTER, editor) else {
-        return;
-    };
-
-    let mut entries: Vec<String> = values
-        .take(STREAM_INPUT_HISTORY_MAX_ENTRIES)
-        .map(|s| s.into_owned())
-        .collect();
-
-    if entries.is_empty() {
-        return;
-    }
-
-    // Register history is newest-first; store oldest-first for append-like readability.
-    entries.reverse();
-
-    let mut contents = entries.join("\n");
-    contents.push('\n');
-
-    let path = stream_input_history_path();
-    if let Some(parent) = path.parent() {
-        if let Err(err) = fs::create_dir_all(parent) {
-            log::warn!(
-                "Failed to create stream history directory '{}': {}",
-                parent.display(),
-                err
-            );
-            return;
-        }
-    }
-
-    if let Err(err) = fs::write(&path, contents) {
-        log::warn!(
-            "Failed to write stream input history file '{}': {}",
-            path.display(),
-            err
-        );
-    }
-}
-
-/// Show prompt to capture stream input
-fn show_stream_input_prompt(
-    cx: &mut compositor::Context,
-    stdin_tx: mpsc::UnboundedSender<String>,
-    doc_id: DocumentId,
-    view_id: ViewId,
-    buffer_name: String,
-) {
-    let callback = Box::pin(async move {
-        let call: job::Callback = Callback::EditorCompositor(Box::new(
-            move |editor: &mut Editor, compositor: &mut Compositor| {
-                load_stream_input_history(editor);
-                let prompt = Prompt::new(
-                    "Stream input: ".into(),
-                    Some(STREAM_INPUT_HISTORY_REGISTER),
-                    |_editor, _input| Vec::new(), // No completion
-                    move |cx, input, event| {
-                        if event != PromptEvent::Validate {
-                            return;
-                        }
-
-                        if input.trim().is_empty() {
-                            return;
-                        }
-
-                        save_stream_input_history(cx.editor);
-
-                        send_stream_input(
-                            stdin_tx.clone(),
-                            input.to_string(),
-                            doc_id,
-                            view_id,
-                            &buffer_name,
-                            cx,
-                        );
-                    },
-                );
-                compositor.push(Box::new(prompt));
-            },
-        ));
-        Ok(call)
-    });
-    cx.jobs.callback(callback);
-}
-
+/// Cancels the running command and drops everything queued behind it, so one
+/// `:cancel-stream` is a full stop rather than an advance to the next command.
 fn cancel_stream_command(cx: &mut compositor::Context) {
-    let mut processes = STREAM_PROCESSES.lock().unwrap();
-    if let Some(process) = processes.take() {
-        // Send cancellation signal
-        let _ = process.cancel_tx.send(());
-        cx.editor.set_status(format!(
-            "Stream cancelled (buffer: {})",
-            process.buffer_name
-        ));
-    } else {
+    let session = STREAM_SESSION.lock().unwrap().take();
+    let Some(session) = session else {
         cx.editor
             .set_error("No stream process is currently running");
+        return;
+    };
+
+    if let Some(cancel_tx) = session.cancel_tx {
+        let _ = cancel_tx.send(());
+    }
+
+    let pending = session.queue.len();
+    let buffer_name = session.target.buffer_name;
+    if pending == 0 {
+        cx.editor
+            .set_status(format!("Stream cancelled (buffer: {})", buffer_name));
+    } else {
+        cx.editor.set_status(format!(
+            "Stream cancelled (buffer: {}, {} queued command{} dropped)",
+            buffer_name,
+            pending,
+            if pending == 1 { "" } else { "s" }
+        ));
     }
 }
 
@@ -6803,405 +6698,401 @@ fn prepare_stream_output_buffer(cx: &mut compositor::Context) {
     cx.editor.ensure_cursor_in_view(view_id);
 }
 
-fn shell_stream(
-    cx: &mut compositor::Context,
-    cmd: &str,
-    display_cmd: &str,
-    behavior: &ShellBehavior,
-) {
-    // Check if a stream is already running
-    let existing_stream = {
-        let processes = STREAM_PROCESSES.lock().unwrap();
-        processes.as_ref().map(|p| p.buffer_name.clone())
-    };
+/// Queues `cmd` behind the running stream session, or starts a new session for
+/// it when nothing is streaming.
+///
+/// Commands never run concurrently. Two streams writing to one buffer would
+/// interleave their output, and because each tracks its own insertion position
+/// without remapping it through the other's edits, the second would splice its
+/// output into the middle of the first's.
+fn queue_stream_command(cx: &mut compositor::Context, cmd: String, display_cmd: String) {
+    match enqueue_stream_command(StreamCommand { cmd, display_cmd }) {
+        Ok(status) => cx.editor.set_status(status),
+        Err(command) => {
+            prepare_stream_output_buffer(cx);
+            start_stream_session(cx, command);
+        }
+    }
+}
 
-    if let Some(buffer_name) = existing_stream {
-        // There's already a stream running, prompt user to cancel it
-        let cmd = cmd.to_string();
-        let display_cmd = display_cmd.to_string();
-        let behavior = *behavior;
+/// Appends the command to the running session's queue, returning the status to
+/// report. The command is handed back when no session is running, so the caller
+/// can start one for it.
+fn enqueue_stream_command(command: StreamCommand) -> Result<String, StreamCommand> {
+    let mut session = STREAM_SESSION.lock().unwrap();
+    match session.as_mut() {
+        Some(session) => {
+            let status = format!(
+                "Queued behind the stream in '{}' ({} waiting): {}",
+                session.target.buffer_name,
+                session.queue.len() + 1,
+                command.display_cmd
+            );
+            session.queue.push_back(command);
+            Ok(status)
+        }
+        None => Err(command),
+    }
+}
 
-        let callback = Box::pin(async move {
-            let call: job::Callback = Callback::EditorCompositor(Box::new(
-                move |_editor: &mut Editor, compositor: &mut Compositor| {
-                    let prompt = Prompt::new(
-                        format!(
-                            "A stream is running in '{}'. Cancel it? (y/n): ",
-                            buffer_name
-                        )
-                        .into(),
-                        None,
-                        |_editor, _input| Vec::new(), // no completion
-                        move |cx, input, event| {
-                            if event != PromptEvent::Validate {
-                                return;
-                            }
+/// Opens a stream session in the current buffer and spawns the task that drains
+/// its queue.
+fn start_stream_session(cx: &mut compositor::Context, command: StreamCommand) {
+    let shell = cx.editor.config().shell.clone();
 
-                            let input = input.trim().to_lowercase();
-                            if input == "y" || input == "yes" {
-                                log::info!("User confirmed cancellation, starting new stream");
-                                // Cancel the existing stream
-                                cancel_stream_command(cx);
-                                // Start the new stream - cx has access to jobs, so this should work
-                                log::info!("Calling shell_stream for command: {}", cmd);
-                                shell_stream(cx, &cmd, &display_cmd, &behavior);
-                                log::info!("shell_stream returned");
-                            } else {
-                                cx.editor.set_status("Stream start cancelled");
-                            }
-                        },
-                    );
-                    compositor.push(Box::new(prompt));
-                },
-            ));
-            Ok(call)
-        });
-        cx.jobs.callback(callback);
-        return;
+    let (view, doc) = current!(cx.editor);
+    let view_id = view.id;
+    let doc_id = doc.id();
+    // Read before renaming below, so status messages keep naming the buffer the
+    // way it was named when the session started.
+    let buffer_name = doc.display_name().to_string();
+
+    // Name a scratch buffer after the command that opened the session.
+    if doc.path().is_none() {
+        let name = if command.display_cmd.chars().count() > 50 {
+            let head: String = command.display_cmd.chars().take(47).collect();
+            format!("{}...", head)
+        } else {
+            command.display_cmd.clone()
+        };
+        doc.set_scratch_buffer_name(Some(name));
     }
 
+    let target = StreamTarget {
+        generation: NEXT_STREAM_GENERATION.fetch_add(1, AtomicOrdering::Relaxed),
+        doc_id,
+        view_id,
+        buffer_name,
+    };
+
+    // Register the session synchronously, before the task starts: a second
+    // `:insert-stream-output` has to find it and queue up rather than race a
+    // second stream into the same buffer.
+    *STREAM_SESSION.lock().unwrap() = Some(StreamSession {
+        target: target.clone(),
+        cancel_tx: None,
+        queue: VecDeque::from([command]),
+    });
+    *LAST_STREAM_DOC_ID.lock().unwrap() = Some(doc_id);
+
+    cx.jobs.callback(async move {
+        if shell.is_empty() {
+            end_stream_session(target.generation);
+            bail!("No shell set");
+        }
+
+        // One spinner for the whole session, cleared however the session ends
+        // (drained queue, cancellation, error, or panic).
+        let _spinner_guard = StreamSpinnerGuard::start(target.generation, target.doc_id);
+
+        let mut pos = stream_start_position(target.doc_id, target.view_id).await;
+        while let Some(command) = next_stream_command(target.generation) {
+            pos = run_stream_command(&shell, command, &target, pos).await;
+        }
+
+        Ok(Callback::Editor(Box::new(|_editor| {})))
+    });
+}
+
+/// The position the session starts writing at, read when the task runs rather
+/// than when the command was typed.
+async fn stream_start_position(doc_id: DocumentId, view_id: ViewId) -> usize {
+    let (tx, rx) = oneshot::channel();
+    job::dispatch(move |editor, _compositor| {
+        let from = editor
+            .document(doc_id)
+            .and_then(|doc| doc.selections().get(&view_id))
+            .map_or(0, |selection| selection.primary().from());
+        let _ = tx.send(from);
+    })
+    .await;
+
+    rx.await.unwrap_or(0)
+}
+
+/// Takes the next command off the session's queue, ending the session once the
+/// queue is drained. `None` means the task should stop: either the queue is
+/// empty or the session was cancelled or replaced.
+fn next_stream_command(generation: u64) -> Option<StreamCommand> {
+    let mut session = STREAM_SESSION.lock().unwrap();
+    let command = session
+        .as_mut()
+        .filter(|session| session.target.generation == generation)?
+        .queue
+        .pop_front();
+
+    if command.is_none() {
+        *session = None;
+    }
+
+    command
+}
+
+/// How many commands are still waiting behind the running one.
+fn pending_stream_commands(generation: u64) -> usize {
+    STREAM_SESSION
+        .lock()
+        .unwrap()
+        .as_ref()
+        .filter(|session| session.target.generation == generation)
+        .map_or(0, |session| session.queue.len())
+}
+
+/// Publishes the handle that `:cancel-stream` uses to kill the command that
+/// just spawned. `false` means the session ended while it was starting, so the
+/// caller has to clean the child up itself.
+fn install_stream_cancel(generation: u64, cancel_tx: oneshot::Sender<()>) -> bool {
+    let mut session = STREAM_SESSION.lock().unwrap();
+    match session.as_mut() {
+        Some(session) if session.target.generation == generation => {
+            session.cancel_tx = Some(cancel_tx);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Ends the session if it is still the one `generation` started.
+fn end_stream_session(generation: u64) {
+    let mut session = STREAM_SESSION.lock().unwrap();
+    if session
+        .as_ref()
+        .is_some_and(|session| session.target.generation == generation)
+    {
+        *session = None;
+    }
+}
+
+/// Inserts the command line that heads a command's output, breaking the line
+/// first when the buffer doesn't already sit at the start of one. Commands that
+/// end without a trailing newline are common (`printf`), and without this the
+/// next command in the queue would run into the previous one's output.
+async fn insert_stream_command_line(target: &StreamTarget, pos: usize, display_cmd: &str) -> usize {
+    let (doc_id, view_id) = (target.doc_id, target.view_id);
+    let display_cmd = display_cmd.to_string();
+    let (tx, rx) = oneshot::channel();
+
+    job::dispatch(move |editor, _compositor| {
+        let Some(doc) = editor.document_mut(doc_id) else {
+            let _ = tx.send(pos);
+            return;
+        };
+
+        let text = doc.text();
+        let insert_pos = pos.min(text.len_chars());
+        let line_break = if insert_pos > 0 && text.char(insert_pos - 1) != '\n' {
+            "\n"
+        } else {
+            ""
+        };
+        let header = Tendril::from(format!("{}{}\n", line_break, display_cmd));
+
+        let (transaction, next_pos) = stream_insert_transaction(text, insert_pos, header);
+        doc.apply(&transaction, view_id);
+        editor.ensure_cursor_in_view(view_id);
+        let _ = tx.send(next_pos);
+    })
+    .await;
+
+    rx.await.unwrap_or(pos)
+}
+
+/// Inserts `text` into the session's buffer at `pos` and returns the position
+/// to continue from, as computed by the editor after the insert landed.
+async fn insert_stream_chunk(target: &StreamTarget, pos: usize, text: Tendril) -> usize {
+    let (doc_id, view_id) = (target.doc_id, target.view_id);
+    let (tx, rx) = oneshot::channel();
+
+    job::dispatch(move |editor, _compositor| {
+        let Some(doc) = editor.document_mut(doc_id) else {
+            let _ = tx.send(pos);
+            return;
+        };
+
+        let (transaction, next_pos) = stream_insert_transaction(doc.text(), pos, text);
+        doc.apply(&transaction, view_id);
+        editor.ensure_cursor_in_view(view_id);
+        let _ = tx.send(next_pos);
+    })
+    .await;
+
+    rx.await.unwrap_or(pos)
+}
+
+async fn stream_status(message: String) {
+    job::dispatch(move |editor, _compositor| editor.set_status(message)).await;
+}
+
+async fn stream_error(message: String) {
+    job::dispatch(move |editor, _compositor| editor.set_error(message)).await;
+}
+
+/// Runs one command to completion, streaming its output into the session's
+/// buffer from `from`, and returns the position the next command continues at.
+async fn run_stream_command(
+    shell: &[String],
+    command: StreamCommand,
+    target: &StreamTarget,
+    from: usize,
+) -> usize {
     use std::process::Stdio;
     use tokio::io::AsyncReadExt;
     use tokio::process::Command;
 
-    let pipe = match behavior {
-        ShellBehavior::Replace | ShellBehavior::Ignore => true,
-        ShellBehavior::Insert | ShellBehavior::Append => false,
+    let StreamCommand { cmd, display_cmd } = command;
+
+    stream_status(format!(
+        "Running in '{}': {}",
+        target.buffer_name, display_cmd
+    ))
+    .await;
+
+    let mut process = Command::new(&shell[0]);
+    process
+        .args(&shell[1..])
+        .arg(&cmd)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        // Nothing can answer a prompt, so hand the command EOF instead of
+        // letting it block the queue forever waiting for input.
+        .stdin(Stdio::null())
+        // Set PYTHONUNBUFFERED to force Python to use unbuffered output.
+        // This makes Python programs stream output line-by-line instead of
+        // buffering until the internal buffer (typically 4-8KB) is full.
+        .env("PYTHONUNBUFFERED", "1");
+
+    let mut child = match process.spawn() {
+        Ok(child) => child,
+        Err(err) => {
+            stream_error(format!("Failed to start '{}': {}", display_cmd, err)).await;
+            return from;
+        }
     };
 
-    let config = cx.editor.config();
-    let shell = config.shell.clone();
+    let (cancel_tx, mut cancel_rx) = oneshot::channel::<()>();
+    if !install_stream_cancel(target.generation, cancel_tx) {
+        // The session was cancelled while this command was starting.
+        let _ = child.kill().await;
+        return from;
+    }
 
-    let (view, doc) = current!(cx.editor);
-    let selection = doc.selection(view.id);
+    let mut stdout = child.stdout.take().unwrap();
+    let mut stderr = child.stderr.take().unwrap();
 
-    // Get the insertion point (we only support the primary selection for streaming)
-    let range = selection.primary();
-    let text = doc.text().slice(..);
-    let input = if pipe {
-        Some(range.slice(text).into())
-    } else {
-        None
-    };
+    // Use small buffers to read chunks as they become available, rather than
+    // waiting for newlines. This allows real-time streaming of output from
+    // commands that use printf or don't flush lines.
+    let mut stdout_buffer = vec![0u8; 1024];
+    let mut stderr_buffer = vec![0u8; 1024];
 
-    let view_id = view.id;
-    let doc_id = doc.id();
-    let buffer_name = doc.display_name().to_string();
-    let cmd = cmd.to_string();
-    let display_cmd = display_cmd.to_string();
-    let behavior_copy = *behavior;
+    // The command line heads its own output.
+    let mut pos = insert_stream_command_line(target, from, &display_cmd).await;
 
-    // Show status message that stream is starting
-    cx.editor
-        .set_status(format!("Starting stream in '{}': {}", buffer_name, display_cmd));
+    let mut cancelled = false;
+    let mut failure = None;
+    let mut stdout_closed = false;
+    let mut stderr_closed = false;
 
-    log::info!("shell_stream: Scheduling async callback for cmd: {}", cmd);
+    // Helix only repaints when a redraw is requested, and `Spinner::frame`
+    // advances off wall-clock time, so the spinner would freeze whenever the
+    // command goes quiet. Tick a redraw for as long as the command runs.
+    let mut spinner_tick = tokio::time::interval(Duration::from_millis(STREAM_SPINNER_INTERVAL_MS));
+    spinner_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-    cx.jobs.callback(async move {
-        log::info!(
-            "shell_stream async: Starting async execution for cmd: {}",
-            cmd
-        );
-        if shell.is_empty() {
-            bail!("No shell set");
-        }
-
-        // Get the insertion position NOW (when the job runs), not when shell_stream was called.
-        // This ensures we insert at the correct position even if other streams have modified the buffer.
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        job::dispatch(move |editor, _compositor| {
-            let from = if let Some(doc) = editor.document(doc_id) {
-                // Get current selection/cursor position
-                let selection = doc.selection(view_id);
-                let range = selection.primary();
-                match behavior_copy {
-                    ShellBehavior::Replace => range.from(),
-                    ShellBehavior::Insert => range.from(),
-                    ShellBehavior::Append => range.to(),
-                    _ => range.from(),
-                }
-            } else {
-                // If document doesn't exist, insert at position 0
-                0
-            };
-            let _ = tx.send(from);
-        })
-        .await;
-
-        let from = rx.await.unwrap_or(0);
-        log::info!(
-            "shell_stream async: Insertion position for cmd '{}' is: {}",
-            cmd,
-            from
-        );
-
-        // Create a cancellation channel
-        let (cancel_tx, mut cancel_rx) = oneshot::channel::<()>();
-
-        let mut process = Command::new(&shell[0]);
-        process
-            .args(&shell[1..])
-            .arg(&cmd)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            // Set PYTHONUNBUFFERED to force Python to use unbuffered output.
-            // This makes Python programs stream output line-by-line instead of
-            // buffering until the internal buffer (typically 4-8KB) is full.
-            .env("PYTHONUNBUFFERED", "1");
-
-        // Always pipe stdin to enable interactive input via :stream-input command
-        process.stdin(Stdio::piped());
-
-        log::info!(
-            "shell_stream async: About to spawn process for cmd: {}",
-            cmd
-        );
-        let mut child = process.spawn()?;
-        log::info!(
-            "shell_stream async: Process spawned successfully for cmd: {}",
-            cmd
-        );
-
-        // Create channel for interactive input
-        let (stdin_tx, mut stdin_rx) = mpsc::unbounded_channel::<String>();
-
-        // Store process state globally for :stream-input and :cancel-stream commands
-        {
-            let mut processes = STREAM_PROCESSES.lock().unwrap();
-            *processes = Some(StreamProcess {
-                cancel_tx,
-                stdin_tx: stdin_tx.clone(),
-                buffer_name: buffer_name.clone(),
-                doc_id,
-                view_id,
-            });
-        }
-
-        // Show an activity spinner in the target buffer's statusline until this
-        // task ends, however it ends.
-        let _spinner_guard = StreamSpinnerGuard::start(doc_id);
-
-        {
-            let mut last_doc = LAST_STREAM_DOC_ID.lock().unwrap();
-            *last_doc = Some(doc_id);
-        }
-
-        // Spawn stdin writer task for interactive input support
-        let mut stdin_handle = child.stdin.take().unwrap();
-        tokio::spawn(async move {
-            use tokio::io::AsyncWriteExt;
-
-            // First, write any initial input from selection (if pipe mode)
-            if let Some(input) = input {
-                let _ = helix_view::document::to_writer(
-                    &mut stdin_handle,
-                    (encoding::UTF_8, false),
-                    &input,
-                )
-                .await;
+    loop {
+        tokio::select! {
+            _ = spinner_tick.tick() => {
+                helix_event::request_redraw();
             }
-
-            // Then listen for interactive input from :stream-input command
-            while let Some(text) = stdin_rx.recv().await {
-                if stdin_handle.write_all(text.as_bytes()).await.is_err() {
-                    break;
-                }
-                if stdin_handle.write_all(b"\n").await.is_err() {
-                    break;
-                }
-                if stdin_handle.flush().await.is_err() {
-                    break;
-                }
+            _ = &mut cancel_rx => {
+                cancelled = true;
+                let _ = child.kill().await;
+                break;
             }
-        });
-
-        let mut stdout = child.stdout.take().unwrap();
-        let mut stderr = child.stderr.take().unwrap();
-
-        // Use small buffers to read chunks as they become available,
-        // rather than waiting for newlines. This allows real-time streaming
-        // of output from commands that use printf or don't flush lines.
-        let mut stdout_buffer = vec![0u8; 1024];
-        let mut stderr_buffer = vec![0u8; 1024];
-
-        let mut has_error = false;
-        let mut error_message = String::new();
-
-        // Insert the command as the first line
-        let command_line = format!("{}\n", display_cmd);
-        let command_output = Tendril::from(command_line);
-        let (current_pos_tx, current_pos_rx) = tokio::sync::oneshot::channel();
-
-        job::dispatch(move |editor, _compositor| {
-            let Some(doc) = editor.document_mut(doc_id) else {
-                let _ = current_pos_tx.send(from);
-                return;
-            };
-
-            let (transaction, next_pos) =
-                stream_insert_transaction(doc.text(), from, command_output);
-            doc.apply(&transaction, view_id);
-
-            // If this is a scratch buffer (no path), set its name to the command
-            if doc.path().is_none() {
-                // Limit the name to the first 50 characters for readability
-                let name = if display_cmd.len() > 50 {
-                    format!("{}...", &display_cmd[..47])
-                } else {
-                    display_cmd.clone()
-                };
-                doc.set_scratch_buffer_name(Some(name));
-            }
-
-            editor.ensure_cursor_in_view(view_id);
-            let _ = current_pos_tx.send(next_pos);
-        })
-        .await;
-        let mut current_pos = current_pos_rx.await.unwrap_or(from);
-
-        let mut cancelled = false;
-        let mut stdout_closed = false;
-        let mut stderr_closed = false;
-
-        // Helix only repaints when a redraw is requested, and `Spinner::frame`
-        // advances off wall-clock time, so the spinner would freeze whenever the
-        // command goes quiet. Tick a redraw for as long as the stream runs.
-        let mut spinner_tick =
-            tokio::time::interval(Duration::from_millis(STREAM_SPINNER_INTERVAL_MS));
-        spinner_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-
-        loop {
-            tokio::select! {
-                _ = spinner_tick.tick() => {
-                    helix_event::request_redraw();
-                }
-                _ = &mut cancel_rx => {
-                    // Cancellation requested
-                    cancelled = true;
-                    let _ = child.kill().await;
-                    break;
-                }
-                bytes_read = stdout.read(&mut stdout_buffer), if !stdout_closed => {
-                    match bytes_read {
-                        Ok(0) => {
-                            // EOF on stdout
-                            stdout_closed = true;
-                            if stderr_closed {
-                                break;
-                            }
-                        }
-                        Ok(n) => {
-                            // Convert bytes to string, handling invalid UTF-8
-                            let chunk = String::from_utf8_lossy(&stdout_buffer[..n]);
-                            let output = Tendril::from(chunk.as_ref());
-                            let requested_pos = current_pos;
-                            let (current_pos_tx, current_pos_rx) = tokio::sync::oneshot::channel();
-
-                            // Dispatch callback to insert the chunk
-                            job::dispatch(move |editor, _compositor| {
-                                let Some(doc) = editor.document_mut(doc_id) else {
-                                    let _ = current_pos_tx.send(requested_pos);
-                                    return;
-                                };
-
-                                let (transaction, next_pos) =
-                                    stream_insert_transaction(doc.text(), requested_pos, output);
-                                doc.apply(&transaction, view_id);
-
-                                // Update view to show new content
-                                editor.ensure_cursor_in_view(view_id);
-                                let _ = current_pos_tx.send(next_pos);
-                            }).await;
-                            current_pos = current_pos_rx.await.unwrap_or(requested_pos);
-                        }
-                        Err(e) => {
-                            error_message = format!("Error reading stdout: {}", e);
-                            has_error = true;
+            bytes_read = stdout.read(&mut stdout_buffer), if !stdout_closed => {
+                match bytes_read {
+                    Ok(0) => {
+                        stdout_closed = true;
+                        if stderr_closed {
                             break;
                         }
                     }
+                    Ok(n) => {
+                        let chunk = String::from_utf8_lossy(&stdout_buffer[..n]);
+                        pos = insert_stream_chunk(target, pos, Tendril::from(chunk.as_ref())).await;
+                    }
+                    Err(err) => {
+                        failure = Some(format!("Error reading stdout: {}", err));
+                        break;
+                    }
                 }
-                bytes_read = stderr.read(&mut stderr_buffer), if !stderr_closed => {
-                    match bytes_read {
-                        Ok(0) => {
-                            // EOF on stderr
-                            stderr_closed = true;
-                            if stdout_closed {
-                                break;
-                            }
-                        }
-                        Ok(n) => {
-                            // Convert bytes to string, handling invalid UTF-8
-                            let chunk = String::from_utf8_lossy(&stderr_buffer[..n]);
-                            let output = Tendril::from(chunk.as_ref());
-                            let requested_pos = current_pos;
-                            let (current_pos_tx, current_pos_rx) = tokio::sync::oneshot::channel();
-
-                            // Dispatch callback to insert the chunk
-                            job::dispatch(move |editor, _compositor| {
-                                let Some(doc) = editor.document_mut(doc_id) else {
-                                    let _ = current_pos_tx.send(requested_pos);
-                                    return;
-                                };
-
-                                let (transaction, next_pos) =
-                                    stream_insert_transaction(doc.text(), requested_pos, output);
-                                doc.apply(&transaction, view_id);
-
-                                editor.ensure_cursor_in_view(view_id);
-                                let _ = current_pos_tx.send(next_pos);
-                            }).await;
-                            current_pos = current_pos_rx.await.unwrap_or(requested_pos);
-                        }
-                        Err(e) => {
-                            error_message = format!("Error reading stderr: {}", e);
-                            has_error = true;
+            }
+            bytes_read = stderr.read(&mut stderr_buffer), if !stderr_closed => {
+                match bytes_read {
+                    Ok(0) => {
+                        stderr_closed = true;
+                        if stdout_closed {
                             break;
                         }
+                    }
+                    Ok(n) => {
+                        let chunk = String::from_utf8_lossy(&stderr_buffer[..n]);
+                        pos = insert_stream_chunk(target, pos, Tendril::from(chunk.as_ref())).await;
+                    }
+                    Err(err) => {
+                        failure = Some(format!("Error reading stderr: {}", err));
+                        break;
                     }
                 }
             }
         }
+    }
 
-        // Clean up the global cancellation handle
-        {
-            let mut processes = STREAM_PROCESSES.lock().unwrap();
-            *processes = None;
-        }
+    let status = child.wait().await;
 
-        // Wait for process to complete (if not already killed)
-        let status = child.wait().await?;
+    if cancelled {
+        return pos;
+    }
 
-        if cancelled {
-            return Ok(Callback::Editor(Box::new(|_editor| {})));
-        }
+    let outcome = match (failure, status) {
+        (Some(message), _) => Err(message),
+        (None, Err(err)) => Err(format!("Shell command failed: {}", err)),
+        (None, Ok(status)) if !status.success() => Err(match status.code() {
+            Some(code) => format!("Shell command failed: status {}", code),
+            None => "Shell command failed".to_string(),
+        }),
+        (None, Ok(_)) => Ok(()),
+    };
 
-        if has_error {
-            bail!(error_message);
-        }
+    finish_stream_command(target, pos, outcome).await;
+    pos
+}
 
-        if !status.success() {
-            match status.code() {
-                Some(code) => bail!("Shell command failed: status {}", code),
-                None => bail!("Shell command failed"),
-            }
-        }
+/// Leaves the cursor after the command's output and reports how it ended.
+async fn finish_stream_command(target: &StreamTarget, pos: usize, outcome: Result<(), String>) {
+    let pending = pending_stream_commands(target.generation);
+    let buffer_name = target.buffer_name.clone();
+    let (doc_id, view_id) = (target.doc_id, target.view_id);
 
-        Ok(Callback::Editor(Box::new(move |editor| {
-            // Update selection to end of inserted content
-            let Some(doc) = editor.document_mut(doc_id) else {
-                return;
-            };
-
-            let cursor = current_pos.min(doc.text().len_chars());
-            let new_range = Range::new(cursor, cursor);
-            let selection = Selection::new(SmallVec::from_buf([new_range]), 0);
-            doc.set_selection(view_id, selection);
-
+    job::dispatch(move |editor, _compositor| {
+        if let Some(doc) = editor.document_mut(doc_id) {
+            let cursor = pos.min(doc.text().len_chars());
+            doc.set_selection(view_id, Selection::point(cursor));
             editor.ensure_cursor_in_view(view_id);
-            editor.set_status(format!("Stream completed in '{}'", buffer_name));
-        })))
-    });
+        }
+
+        match outcome {
+            Err(message) => editor.set_error(message),
+            Ok(()) if pending == 0 => {
+                editor.set_status(format!("Stream completed in '{}'", buffer_name))
+            }
+            Ok(()) => editor.set_status(format!(
+                "Stream completed in '{}' ({} waiting)",
+                buffer_name, pending
+            )),
+        }
+    })
+    .await;
 }
 
 fn shell_prompt<F>(cx: &mut Context, prompt: Cow<'static, str>, mut callback_fn: F)

@@ -2444,44 +2444,21 @@ fn insert_stream_output(
         return Ok(());
     }
 
-    // Check if a stream is already running
-    let process_info = {
-        let processes = STREAM_PROCESSES.lock().unwrap();
-        processes.as_ref().map(|p| {
-            (
-                p.stdin_tx.clone(),
-                p.buffer_name.clone(),
-                p.doc_id,
-                p.view_id,
-            )
-        })
-    };
-
-    // If stream is running and args provided, send input to it
-    if let Some((stdin_tx, buffer_name, doc_id, view_id)) = process_info {
-        if !args.is_empty() {
-            let input = args.join(" ");
-            send_stream_input(stdin_tx, input, doc_id, view_id, &buffer_name, cx);
-            return Ok(());
-        } else {
-            // No args - show prompt for input
-            show_stream_input_prompt(cx, stdin_tx, doc_id, view_id, buffer_name);
-            return Ok(());
-        }
-    }
-
-    // No stream running - start a new stream
-    let selection_arg = primary_selection_stream_arg(cx);
-    prepare_stream_output_buffer(cx);
     let display_cmd = args.join(" ");
-    let mut command = display_cmd.clone();
-    if let Some(selection_arg) = selection_arg {
-        if !command.is_empty() {
-            command.push(' ');
-        }
-        command.push_str(&selection_arg);
+    ensure!(
+        !display_cmd.trim().is_empty(),
+        "A shell command is required"
+    );
+
+    // The command the shell runs may carry the selection; the buffer and the
+    // status messages show the command as it was typed.
+    let mut cmd = display_cmd.clone();
+    if let Some(selection_arg) = primary_selection_stream_arg(cx) {
+        cmd.push(' ');
+        cmd.push_str(&selection_arg);
     }
-    shell_stream(cx, &command, &display_cmd, &ShellBehavior::Insert);
+
+    queue_stream_command(cx, cmd, display_cmd);
     Ok(())
 }
 
@@ -3708,7 +3685,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     TypableCommand {
         name: "insert-stream-output",
         aliases: &[":"],
-        doc: "Run shell command, streaming output in real-time. When stream is running, send input to it.",
+        doc: "Run shell command, streaming output into the buffer as it arrives. Commands started while a stream is running are queued and run in order.",
         fun: insert_stream_output,
         completer: SHELL_COMPLETER,
         signature: SHELL_SIGNATURE,
@@ -3716,7 +3693,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     TypableCommand {
         name: "cancel-stream",
         aliases: &["::"],
-        doc: "Cancel the currently running stream process.",
+        doc: "Cancel the running stream and drop any commands queued behind it.",
         fun: cancel_stream,
         completer: CommandCompleter::none(),
         signature: Signature {

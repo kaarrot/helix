@@ -8,7 +8,7 @@ use crate::job::Job;
 use super::*;
 
 use helix_core::command_line::{Args, Flag, Signature, Token, TokenKind};
-use helix_core::fuzzy::fuzzy_match;
+use helix_core::fuzzy::{fuzzy_match, fuzzy_match_with_typos};
 use helix_core::indent::MAX_INDENT;
 use helix_core::line_ending;
 use helix_stdx::path::home_dir;
@@ -4306,10 +4306,9 @@ fn complete_command_line(editor: &Editor, input: &str) -> Vec<ui::prompt::Comple
     let (command, rest, complete_command) = command_line::split(input);
 
     if complete_command {
-        fuzzy_match(
+        fuzzy_match_with_typos(
             input,
             TYPABLE_COMMAND_LIST.iter().map(|command| command.name),
-            false,
         )
         .into_iter()
         .map(|(name, _)| (0.., name.into()))

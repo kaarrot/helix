@@ -365,8 +365,12 @@ Displays documentation for the selected completion item. Remapping currently not
 | ----                        | -----------                      |
 | `Shift-Tab`, `Ctrl-p`, `Up` | Previous entry                   |
 | `Tab`, `Ctrl-n`, `Down`     | Next entry                       |
+| `h`, `k`                    | Previous entry (normal/select mode, e.g. code action menu) |
+| `j`, `l`                    | Next entry (normal/select mode, e.g. code action menu) |
 | `Enter`                     | Close menu and accept completion |
 | `Ctrl-c`                    | Close menu and reject completion |
+
+`h`/`j`/`k`/`l` are unbound in insert mode so they remain insertable characters while completions are open.
 
 Any other keypresses result in the completion being accepted.
 

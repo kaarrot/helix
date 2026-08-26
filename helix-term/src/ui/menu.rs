@@ -6,7 +6,7 @@ use tui::{buffer::Buffer as Surface, widgets::Table};
 
 pub use tui::widgets::{Cell, Row};
 
-use helix_view::{editor::SmartTabConfig, graphics::Rect, Editor};
+use helix_view::{document::Mode, editor::SmartTabConfig, graphics::Rect, input::KeyEvent, Editor};
 use tui::layout::Constraint;
 
 pub trait Item: Sync + Send + 'static {
@@ -206,6 +206,24 @@ impl<T: Item + PartialEq> Menu<T> {
 
 use super::PromptEvent as MenuEvent;
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum MenuMove {
+    Previous,
+    Next,
+}
+
+/// `h`/`j`/`k`/`l` follow arrows outside insert mode (code-action menu).
+/// In insert mode they stay unbound so they remain insertable characters.
+fn menu_move(event: KeyEvent, mode: Mode) -> Option<MenuMove> {
+    match event {
+        shift!(Tab) | key!(Up) | ctrl!('p') => Some(MenuMove::Previous),
+        key!(Tab) | key!(Down) | ctrl!('n') => Some(MenuMove::Next),
+        key!('k') | key!('h') if mode != Mode::Insert => Some(MenuMove::Previous),
+        key!('j') | key!('l') if mode != Mode::Insert => Some(MenuMove::Next),
+        _ => None,
+    }
+}
+
 impl<T: Item + 'static> Component for Menu<T> {
     fn handle_event(&mut self, event: &Event, cx: &mut Context) -> EventResult {
         let event = match event {
@@ -239,18 +257,6 @@ impl<T: Item + 'static> Component for Menu<T> {
                 (self.callback_fn)(cx.editor, self.selection(), MenuEvent::Abort);
                 return EventResult::Consumed(close_fn);
             }
-            // arrow up/ctrl-p/shift-tab prev completion choice (including updating the doc)
-            shift!(Tab) | key!(Up) | ctrl!('p') => {
-                self.move_up();
-                (self.callback_fn)(cx.editor, self.selection(), MenuEvent::Update);
-                return EventResult::Consumed(None);
-            }
-            key!(Tab) | key!(Down) | ctrl!('n') => {
-                // arrow down/ctrl-n/tab advances completion choice (including updating the doc)
-                self.move_down();
-                (self.callback_fn)(cx.editor, self.selection(), MenuEvent::Update);
-                return EventResult::Consumed(None);
-            }
             key!(Enter) => {
                 if let Some(selection) = self.selection() {
                     (self.callback_fn)(cx.editor, Some(selection), MenuEvent::Validate);
@@ -259,21 +265,18 @@ impl<T: Item + 'static> Component for Menu<T> {
                     return EventResult::Ignored(close_fn);
                 }
             }
-            // KeyEvent {
-            //     code: KeyCode::Char(c),
-            //     modifiers: KeyModifiers::NONE,
-            // } => {
-            //     self.insert_char(c);
-            //     (self.callback_fn)(cx.editor, &self.line, MenuEvent::Update);
-            // }
-
-            // / -> edit_filter?
-            //
-            // enter confirms the match and closes the menu
-            // typing filters the menu
-            // if we run out of options the menu closes itself
             _ => (),
         }
+
+        if let Some(movement) = menu_move(event, cx.editor.mode()) {
+            match movement {
+                MenuMove::Previous => self.move_up(),
+                MenuMove::Next => self.move_down(),
+            }
+            (self.callback_fn)(cx.editor, self.selection(), MenuEvent::Update);
+            return EventResult::Consumed(None);
+        }
+
         // for some events, we want to process them but send ignore, specifically all input except
         // tab/enter/ctrl-k or whatever will confirm the selection/ ctrl-n/ctrl-p for scroll.
         // EventResult::Consumed(None)
@@ -373,5 +376,39 @@ impl<T: Item + 'static> Component for Menu<T> {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{ctrl, key, shift};
+
+    #[test]
+    fn hjkl_move_the_menu_outside_insert_mode() {
+        for mode in [Mode::Normal, Mode::Select] {
+            assert_eq!(menu_move(key!('k'), mode), Some(MenuMove::Previous));
+            assert_eq!(menu_move(key!('h'), mode), Some(MenuMove::Previous));
+            assert_eq!(menu_move(key!('j'), mode), Some(MenuMove::Next));
+            assert_eq!(menu_move(key!('l'), mode), Some(MenuMove::Next));
+        }
+
+        assert_eq!(menu_move(key!('h'), Mode::Insert), None);
+        assert_eq!(menu_move(key!('j'), Mode::Insert), None);
+        assert_eq!(menu_move(key!('k'), Mode::Insert), None);
+        assert_eq!(menu_move(key!('l'), Mode::Insert), None);
+
+        assert_eq!(menu_move(key!(Up), Mode::Insert), Some(MenuMove::Previous));
+        assert_eq!(menu_move(key!(Down), Mode::Insert), Some(MenuMove::Next));
+        assert_eq!(
+            menu_move(ctrl!('p'), Mode::Normal),
+            Some(MenuMove::Previous)
+        );
+        assert_eq!(menu_move(ctrl!('n'), Mode::Normal), Some(MenuMove::Next));
+        assert_eq!(
+            menu_move(shift!(Tab), Mode::Insert),
+            Some(MenuMove::Previous)
+        );
+        assert_eq!(menu_move(key!(Tab), Mode::Insert), Some(MenuMove::Next));
     }
 }

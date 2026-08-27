@@ -505,6 +505,33 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             .map(|item| item.data)
     }
 
+    /// Pull nucleo results into the current snapshot and clamp the cursor.
+    ///
+    /// Matching runs on worker threads; without a tick, `selection()` can be
+    /// empty even though items were injected. The picker used to tick only
+    /// while painting, so applying several keys before a redraw (typeahead
+    /// coalescing) would confirm against a stale snapshot.
+    fn tick_matcher(&mut self, timeout: u64) -> nucleo::Status {
+        let status = self.matcher.tick(timeout);
+        if status.changed {
+            self.cursor = self.cursor.min(
+                self.matcher
+                    .snapshot()
+                    .matched_item_count()
+                    .saturating_sub(1),
+            );
+        }
+        status
+    }
+
+    fn tick_matcher_until_idle(&mut self) {
+        for _ in 0..50 {
+            if !self.tick_matcher(10).running {
+                break;
+            }
+        }
+    }
+
     fn primary_query(&self) -> Arc<str> {
         self.query
             .get(&self.columns[self.primary_column].name)
@@ -682,13 +709,8 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
     }
 
     fn render_picker(&mut self, area: Rect, surface: &mut Surface, cx: &mut Context) {
-        let status = self.matcher.tick(10);
+        let status = self.tick_matcher(10);
         let snapshot = self.matcher.snapshot();
-        if status.changed {
-            self.cursor = self
-                .cursor
-                .min(snapshot.matched_item_count().saturating_sub(1))
-        }
 
         let text_style = cx.editor.theme.get("ui.text");
         let selected = cx.editor.theme.get("ui.text.focus");
@@ -1045,6 +1067,8 @@ impl<I: 'static + Send + Sync, D: 'static + Send + Sync> Component for Picker<I,
             _ => return EventResult::Ignored(None),
         };
 
+        self.tick_matcher(10);
+
         let close_fn = |picker: &mut Self| {
             // if the picker is very large don't store it as last_picker to avoid
             // excessive memory consumption
@@ -1089,11 +1113,13 @@ impl<I: 'static + Send + Sync, D: 'static + Send + Sync> Component for Picker<I,
             }
             key!(Esc) | ctrl!('c') => return close_fn(self),
             alt!(Enter) => {
+                self.tick_matcher_until_idle();
                 if let Some(option) = self.selection() {
                     (self.callback_fn)(ctx, option, self.default_action);
                 }
             }
             key!(Enter) => {
+                self.tick_matcher_until_idle();
                 // If the prompt has a history completion and is empty, use enter to accept
                 // that completion
                 if let Some(completion) = self

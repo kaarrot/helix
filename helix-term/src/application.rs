@@ -363,8 +363,7 @@ impl Application {
                     self.handle_terminal_events_batch(event, input_stream).await;
                 }
                 Some(callback) = self.jobs.callbacks.recv() => {
-                    self.jobs.handle_callback(&mut self.editor, &mut self.compositor, Ok(Some(callback)));
-                    self.render().await;
+                    self.handle_job_callbacks_batch(callback).await;
                 }
                 Some(msg) = self.jobs.status_messages.recv() => {
                     let severity = match msg.severity{
@@ -378,8 +377,7 @@ impl Application {
                     helix_event::request_redraw();
                 }
                 Some(callback) = self.jobs.wait_futures.next() => {
-                    self.jobs.handle_callback(&mut self.editor, &mut self.compositor, callback);
-                    self.render().await;
+                    self.handle_wait_futures_batch(callback).await;
                 }
                 event = self.editor.wait_event() => {
                     let _idle_handled = self.handle_editor_event(event).await;
@@ -768,6 +766,57 @@ impl Application {
                 _ => return,
             }
         }
+    }
+
+    /// Apply every already-queued job callback before painting.
+    ///
+    /// A single cursor movement can land several independently debounced results here —
+    /// inlay hints, document colors, pull diagnostics, cursorline diagnostics — and each one
+    /// used to force its own full frame. Drain what is ready, then paint once. This is the
+    /// counterpart of [`Self::handle_terminal_events_batch`] for the job queue.
+    async fn handle_job_callbacks_batch(&mut self, first: crate::job::Callback) {
+        self.jobs
+            .handle_callback(&mut self.editor, &mut self.compositor, Ok(Some(first)));
+        let mut batched = 1usize;
+        while let Ok(callback) = self.jobs.callbacks.try_recv() {
+            self.jobs
+                .handle_callback(&mut self.editor, &mut self.compositor, Ok(Some(callback)));
+            batched += 1;
+        }
+        if batched > 1 {
+            log::debug!("coalesced {batched} job callbacks before paint");
+        }
+        self.render().await;
+    }
+
+    /// Apply every already-completed job future before painting. See
+    /// [`Self::handle_job_callbacks_batch`].
+    async fn handle_wait_futures_batch(
+        &mut self,
+        first: anyhow::Result<Option<crate::job::Callback>>,
+    ) {
+        use std::{pin::Pin, task::Poll};
+
+        self.jobs
+            .handle_callback(&mut self.editor, &mut self.compositor, first);
+        let mut batched = 1usize;
+        while let Some(callback) = std::future::poll_fn(|cx| {
+            match Pin::new(&mut self.jobs.wait_futures).poll_next(cx) {
+                Poll::Ready(callback) => Poll::Ready(callback),
+                // Only take what has already completed; do not wait.
+                Poll::Pending => Poll::Ready(None),
+            }
+        })
+        .await
+        {
+            self.jobs
+                .handle_callback(&mut self.editor, &mut self.compositor, callback);
+            batched += 1;
+        }
+        if batched > 1 {
+            log::debug!("coalesced {batched} job futures before paint");
+        }
+        self.render().await;
     }
 
     async fn take_available_event<S>(

@@ -69,6 +69,12 @@ where
     current: usize,
     /// Kind of cursor (hidden or others)
     cursor_kind: CursorKind,
+    /// Where the cursor was left by the previous frame, so an unchanged position is not
+    /// re-sent.
+    cursor_position: Option<(u16, u16)>,
+    /// Set by [`Terminal::clear`], which stages an erase that the next frame has to flush even
+    /// if the diff turns out to be empty.
+    pending_output: bool,
     /// Viewport
     viewport: Viewport,
 }
@@ -110,6 +116,8 @@ where
             ],
             current: 0,
             cursor_kind: CursorKind::Block,
+            cursor_position: None,
+            pending_output: false,
             viewport: options.viewport,
         })
     }
@@ -192,21 +200,53 @@ where
         // // Terminal. Thus, we're taking the important data out of the Frame and dropping it.
         // let cursor_position = frame.cursor_position;
 
-        // Draw to stdout
-        self.flush()?;
+        let cursor_moved = cursor_position != self.cursor_position;
+        let kind_changed = cursor_kind != self.cursor_kind;
+        let updates = {
+            let previous_buffer = &self.buffers[1 - self.current];
+            let current_buffer = &self.buffers[self.current];
+            previous_buffer.diff(current_buffer)
+        };
+        let painted = !updates.is_empty();
 
+        // A frame that changes nothing should put nothing on the wire. Painting a no-op frame
+        // still costs a synchronized-output pair, a cursor reposition and a flush, and those
+        // add up when several handlers each request a redraw for the same keystroke.
+        if !painted && !self.pending_output && !cursor_moved && !kind_changed {
+            self.buffers[1 - self.current].reset();
+            self.current = 1 - self.current;
+            return Ok(());
+        }
+
+        // Everything below is staged in the backend and handed to the terminal by the single
+        // `flush` at the end, inside one synchronized-output block:
+        //   BSU, hide cursor, cells, cursor position, cursor style, show cursor, ESU.
+        self.backend.begin_frame()?;
+
+        if painted {
+            self.backend.draw(updates.into_iter())?;
+        }
+
+        // The cell painting leaves the terminal cursor wherever the last cell was written, so
+        // it has to be repositioned whenever anything was drawn, not only when it moved.
         if let Some((x, y)) = cursor_position {
-            self.set_cursor(x, y)?;
+            if painted || cursor_moved {
+                self.set_cursor(x, y)?;
+            }
         }
 
         match cursor_kind {
             CursorKind::Hidden => self.hide_cursor()?,
             kind => self.show_cursor(kind)?,
         }
+        self.cursor_position = cursor_position;
 
         // Swap buffers
         self.buffers[1 - self.current].reset();
         self.current = 1 - self.current;
+
+        self.backend.end_frame()?;
+        self.pending_output = false;
 
         // Flush
         self.backend.flush()?;
@@ -239,6 +279,8 @@ where
         self.backend.clear()?;
         // Reset the back buffer to make sure the next update will redraw everything.
         self.buffers[1 - self.current].reset();
+        self.cursor_position = None;
+        self.pending_output = true;
         Ok(())
     }
 

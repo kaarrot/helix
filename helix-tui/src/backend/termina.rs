@@ -76,6 +76,19 @@ pub struct TerminaBackend {
     capabilities: Capabilities,
     reset_cursor_command: String,
     is_synchronized_output_set: bool,
+    /// Staging buffer for the frame currently being painted.
+    ///
+    /// `PlatformTerminal` wraps the tty in a 4KiB `BufWriter`, so writing a frame straight
+    /// through it chops a full repaint into a dozen or more `write(2)` calls. Each one is a
+    /// separately relayed (and separately rendered) chunk on a WSL pty or an SSH pipe, which
+    /// is what produces progressive painting and tearing. Assemble the frame here instead and
+    /// hand it over in one `write_all`.
+    frame: Vec<u8>,
+    /// Whether the terminal cursor is currently visible, so redundant DECTCEM writes can be
+    /// skipped. `None` until we have set it once.
+    cursor_visible: Option<bool>,
+    /// The last cursor style written with DECSCUSR, so it is not re-sent every frame.
+    cursor_style: Option<CursorKind>,
 }
 
 impl TerminaBackend {
@@ -112,6 +125,9 @@ impl TerminaBackend {
             capabilities,
             reset_cursor_command,
             is_synchronized_output_set: false,
+            frame: Vec::with_capacity(64 * 1024),
+            cursor_visible: None,
+            cursor_style: None,
         })
     }
 
@@ -173,8 +189,14 @@ impl TerminaBackend {
                 Event::Csi(Csi::Device(csi::Device::DeviceAttributes(_)))
             )
         };
-        // TODO: tune this poll constant? Does it need to be longer when on an SSH connection?
-        let poll_duration = Duration::from_millis(100);
+        // 100ms is plenty for a local terminal. It is not always enough over a slow SSH link
+        // or a busy pty relay, and a timeout here silently costs us synchronized output --
+        // which is exactly the connection that needs it most. Allow overriding it.
+        let poll_duration = std::env::var("HELIX_TERM_QUERY_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .map(Duration::from_millis)
+            .unwrap_or_else(|| Duration::from_millis(100));
         if terminal.poll(device_attributes, Some(poll_duration))? {
             while terminal.poll(Event::is_escape, Some(Duration::ZERO))? {
                 match terminal.read(Event::is_escape)? {
@@ -204,12 +226,19 @@ impl TerminaBackend {
             }
 
             let end = Instant::now();
-            log::debug!(
+            // Logged at info: whether synchronized output was negotiated decides whether
+            // repaints tear on a slow connection, and that is the first thing worth checking
+            // when rendering looks wrong.
+            log::info!(
                 "Detected terminal capabilities in {:?}: {capabilities:?}",
                 end.duration_since(start)
             );
         } else {
-            log::debug!("Failed to detect terminal capabilities within {poll_duration:?}. Using default capabilities only");
+            log::warn!(
+                "Failed to detect terminal capabilities within {poll_duration:?}. Using default \
+                 capabilities only - synchronized output is off, so repaints may tear. Set \
+                 HELIX_TERM_QUERY_TIMEOUT_MS to allow the terminal longer to answer."
+            );
         }
 
         capabilities.extended_underlines |= config.force_enable_extended_underlines;
@@ -359,7 +388,7 @@ impl TerminaBackend {
 
     fn start_synchronized_render(&mut self) -> io::Result<()> {
         if self.capabilities.synchronized_output && !self.is_synchronized_output_set {
-            write!(self.terminal, "{}", decset!(SynchronizedOutput))?;
+            write!(self.frame, "{}", decset!(SynchronizedOutput))?;
             self.is_synchronized_output_set = true;
         }
         Ok(())
@@ -367,9 +396,22 @@ impl TerminaBackend {
 
     fn end_sychronized_render(&mut self) -> io::Result<()> {
         if self.is_synchronized_output_set {
-            write!(self.terminal, "{}", decreset!(SynchronizedOutput))?;
+            write!(self.frame, "{}", decreset!(SynchronizedOutput))?;
             self.is_synchronized_output_set = false;
         }
+        Ok(())
+    }
+
+    fn set_cursor_visible(&mut self, visible: bool) -> io::Result<()> {
+        if self.cursor_visible == Some(visible) {
+            return Ok(());
+        }
+        if visible {
+            write!(self.frame, "{}", decset!(ShowCursor))?;
+        } else {
+            write!(self.frame, "{}", decreset!(ShowCursor))?;
+        }
+        self.cursor_visible = Some(visible);
         Ok(())
     }
 }
@@ -391,6 +433,9 @@ impl Backend for TerminaBackend {
         )?;
         self.enable_mouse_capture()?;
         self.enable_extensions()?;
+        // Nothing is known about the cursor of a freshly claimed screen.
+        self.cursor_visible = None;
+        self.cursor_style = None;
 
         Ok(())
     }
@@ -409,6 +454,11 @@ impl Backend for TerminaBackend {
     }
 
     fn restore(&mut self) -> io::Result<()> {
+        // Anything staged for the next frame (notably the cursor reset that
+        // `Application::restore_term` writes) still has to reach the terminal.
+        self.flush()?;
+        self.end_sychronized_render()?;
+        self.flush()?;
         self.disable_extensions()?;
         self.disable_mouse_capture()?;
         write!(
@@ -424,12 +474,22 @@ impl Backend for TerminaBackend {
         Ok(())
     }
 
+    fn begin_frame(&mut self) -> io::Result<()> {
+        self.start_synchronized_render()?;
+        // Keep the cursor out of sight for the duration of the paint. Without this the
+        // terminal cursor tracks every cell written by `draw`, which reads as a lagging,
+        // skittering cursor wherever the byte stream is not delivered instantly.
+        self.set_cursor_visible(false)
+    }
+
+    fn end_frame(&mut self) -> io::Result<()> {
+        self.end_sychronized_render()
+    }
+
     fn draw<'a, I>(&mut self, content: I) -> io::Result<()>
     where
         I: Iterator<Item = (u16, u16, &'a Cell)>,
     {
-        self.start_synchronized_render()?;
-
         let mut fg = Color::Reset;
         let mut bg = Color::Reset;
         let mut underline_color = Color::Reset;
@@ -440,7 +500,7 @@ impl Backend for TerminaBackend {
             // Move the cursor if the previous location was not (x - 1, y)
             if !matches!(last_pos, Some(p) if x == p.0 + 1 && y == p.1) {
                 write!(
-                    self.terminal,
+                    self.frame,
                     "{}",
                     Csi::Cursor(csi::Cursor::Position {
                         col: OneBased::from_zero_based(x),
@@ -470,7 +530,7 @@ impl Backend for TerminaBackend {
             if self.capabilities.extended_underlines {
                 if cell.underline_color != underline_color {
                     write!(
-                        self.terminal,
+                        self.frame,
                         "{}",
                         Csi::Sgr(csi::Sgr::UnderlineColor(cell.underline_color.into()))
                     )?;
@@ -484,7 +544,7 @@ impl Backend for TerminaBackend {
             }
             if new_underline_style != underline_style {
                 write!(
-                    self.terminal,
+                    self.frame,
                     "{}",
                     Csi::Sgr(csi::Sgr::Underline(new_underline_style.into()))
                 )?;
@@ -495,26 +555,19 @@ impl Backend for TerminaBackend {
             // `SgrAttributes` behave the same as a `Sgr::Reset` rather than a 'no-op' though so
             // we should avoid writing them if they're empty.
             if !attributes.is_empty() {
-                write!(
-                    self.terminal,
-                    "{}",
-                    Csi::Sgr(csi::Sgr::Attributes(attributes))
-                )?;
+                write!(self.frame, "{}", Csi::Sgr(csi::Sgr::Attributes(attributes)))?;
             }
 
-            write!(self.terminal, "{}", &cell.symbol)?;
+            write!(self.frame, "{}", &cell.symbol)?;
         }
 
-        write!(self.terminal, "{}", Csi::Sgr(csi::Sgr::Reset))?;
-
-        self.end_sychronized_render()?;
+        write!(self.frame, "{}", Csi::Sgr(csi::Sgr::Reset))?;
 
         Ok(())
     }
 
     fn hide_cursor(&mut self) -> io::Result<()> {
-        write!(self.terminal, "{}", decreset!(ShowCursor))?;
-        self.flush()
+        self.set_cursor_visible(false)
     }
 
     fn show_cursor(&mut self, kind: CursorKind) -> io::Result<()> {
@@ -524,34 +577,40 @@ impl Backend for TerminaBackend {
             CursorKind::Underline => CursorStyle::SteadyUnderline,
             CursorKind::Hidden => unreachable!(),
         };
-        write!(
-            self.terminal,
-            "{}{}",
-            decset!(ShowCursor),
-            Csi::Cursor(csi::Cursor::CursorStyle(style)),
-        )?;
-        self.flush()
+        // Re-sending DECSCUSR every frame makes some terminals restart their cursor blink,
+        // so only write it when the shape actually changed.
+        if self.cursor_style != Some(kind) {
+            write!(
+                self.frame,
+                "{}",
+                Csi::Cursor(csi::Cursor::CursorStyle(style))
+            )?;
+            self.cursor_style = Some(kind);
+        }
+        self.set_cursor_visible(true)
     }
 
     fn set_cursor(&mut self, x: u16, y: u16) -> io::Result<()> {
         let col = OneBased::from_zero_based(x);
         let line = OneBased::from_zero_based(y);
         write!(
-            self.terminal,
+            self.frame,
             "{}",
             Csi::Cursor(csi::Cursor::Position { line, col })
         )?;
-        self.flush()
+        Ok(())
     }
 
     fn clear(&mut self) -> io::Result<()> {
+        // Opens a synchronized-output block that the next frame closes, so the erase and the
+        // repaint that follows it land together instead of flashing an empty screen.
         self.start_synchronized_render()?;
         write!(
-            self.terminal,
+            self.frame,
             "{}",
             Csi::Edit(csi::Edit::EraseInDisplay(csi::EraseInDisplay::EraseDisplay))
         )?;
-        self.flush()
+        Ok(())
     }
 
     fn size(&self) -> io::Result<Rect> {
@@ -560,6 +619,13 @@ impl Backend for TerminaBackend {
     }
 
     fn flush(&mut self) -> io::Result<()> {
+        if !self.frame.is_empty() {
+            // `write_all` of a slice larger than the inner `BufWriter`'s capacity bypasses the
+            // buffer entirely, so a full repaint goes out as one `write(2)` rather than one per
+            // 4KiB. A slow pipe can still chunk it at the kernel, which is unavoidable.
+            self.terminal.write_all(&self.frame)?;
+            self.frame.clear();
+        }
         self.terminal.flush()
     }
 

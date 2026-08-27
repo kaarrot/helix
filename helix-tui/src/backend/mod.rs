@@ -27,6 +27,18 @@ pub trait Backend {
     fn reconfigure(&mut self, config: Config) -> Result<(), io::Error>;
     /// Restores the terminal to a normal state, undoes `claim`
     fn restore(&mut self) -> Result<(), io::Error>;
+    /// Opens a frame: begins synchronized output (where supported) and hides the terminal
+    /// cursor so it does not visibly track across the screen while cells are painted.
+    ///
+    /// Everything written between `begin_frame` and [`Backend::flush`] should be buffered and
+    /// handed to the terminal as a single write.
+    fn begin_frame(&mut self) -> Result<(), io::Error> {
+        Ok(())
+    }
+    /// Closes a frame opened by [`Backend::begin_frame`], ending synchronized output.
+    fn end_frame(&mut self) -> Result<(), io::Error> {
+        Ok(())
+    }
     /// Draws styled text to the terminal
     fn draw<'a, I>(&mut self, content: I) -> Result<(), io::Error>
     where

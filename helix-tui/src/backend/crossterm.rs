@@ -100,6 +100,11 @@ pub struct CrosstermBackend<W: Write> {
     supports_keyboard_enhancement_protocol: OnceCell<bool>,
     mouse_capture_enabled: bool,
     supports_bracketed_paste: bool,
+    /// Whether the terminal cursor is currently visible, so redundant DECTCEM writes can be
+    /// skipped. `None` until we have set it once.
+    cursor_visible: Option<bool>,
+    /// The last cursor style written, so it is not re-sent every frame.
+    cursor_style: Option<CursorKind>,
 }
 
 impl<W> CrosstermBackend<W>
@@ -118,7 +123,22 @@ where
             supports_keyboard_enhancement_protocol: OnceCell::new(),
             mouse_capture_enabled: false,
             supports_bracketed_paste: true,
+            cursor_visible: None,
+            cursor_style: None,
         }
+    }
+
+    fn set_cursor_visible(&mut self, visible: bool) -> io::Result<()> {
+        if self.cursor_visible == Some(visible) {
+            return Ok(());
+        }
+        if visible {
+            queue!(self.buffer, Show)?;
+        } else {
+            queue!(self.buffer, Hide)?;
+        }
+        self.cursor_visible = Some(visible);
+        Ok(())
     }
 
     #[inline]
@@ -185,6 +205,9 @@ where
                 )
             )?;
         }
+        // Nothing is known about the cursor of a freshly claimed screen.
+        self.cursor_visible = None;
+        self.cursor_style = None;
         Ok(())
     }
 
@@ -288,8 +311,14 @@ where
         )
     }
 
+    fn begin_frame(&mut self) -> io::Result<()> {
+        // Keep the cursor out of sight for the duration of the paint so it does not track
+        // every cell written by `draw`.
+        self.set_cursor_visible(false)
+    }
+
     fn hide_cursor(&mut self) -> io::Result<()> {
-        execute!(self.buffer, Hide)
+        self.set_cursor_visible(false)
     }
 
     fn show_cursor(&mut self, kind: CursorKind) -> io::Result<()> {
@@ -299,15 +328,21 @@ where
             CursorKind::Underline => SetCursorStyle::SteadyUnderScore,
             CursorKind::Hidden => unreachable!(),
         };
-        execute!(self.buffer, Show, shape)
+        // Re-sending the cursor style every frame makes some terminals restart their cursor
+        // blink, so only write it when the shape actually changed.
+        if self.cursor_style != Some(kind) {
+            queue!(self.buffer, shape)?;
+            self.cursor_style = Some(kind);
+        }
+        self.set_cursor_visible(true)
     }
 
     fn set_cursor(&mut self, x: u16, y: u16) -> io::Result<()> {
-        execute!(self.buffer, MoveTo(x, y))
+        queue!(self.buffer, MoveTo(x, y))
     }
 
     fn clear(&mut self) -> io::Result<()> {
-        execute!(self.buffer, Clear(ClearType::All))
+        queue!(self.buffer, Clear(ClearType::All))
     }
 
     fn size(&self) -> io::Result<Rect> {

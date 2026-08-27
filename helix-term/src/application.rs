@@ -36,6 +36,9 @@ use std::{
     sync::Arc,
 };
 
+#[cfg(not(all(not(windows), not(feature = "integration"))))]
+use std::{pin::Pin, task::Poll};
+
 #[cfg_attr(windows, allow(unused_imports))]
 use anyhow::{Context, Error};
 
@@ -357,7 +360,7 @@ impl Application {
                     };
                 }
                 Some(event) = input_stream.next() => {
-                    self.handle_terminal_events(event).await;
+                    self.handle_terminal_events_batch(event, input_stream).await;
                 }
                 Some(callback) = self.jobs.callbacks.recv() => {
                     self.jobs.handle_callback(&mut self.editor, &mut self.compositor, Ok(Some(callback)));
@@ -723,7 +726,108 @@ impl Application {
         false
     }
 
-    pub async fn handle_terminal_events(&mut self, event: std::io::Result<TerminalEvent>) {
+    /// Apply already-queued input before painting.
+    ///
+    /// Key-repeat (holding `j`) can enqueue many events while a previous frame's
+    /// blocking stdout flush is still draining. Painting after every key turns
+    /// that into a backlog of full-screen frames; Neovim skips those intermediate
+    /// redraws. Drain only events that are readable right now, then paint once.
+    /// If more keys arrived during the flush, keep applying and paint again
+    /// without waiting in `select`.
+    ///
+    /// On a real tty, drain through termina's `EventReader` instead of
+    /// `EventStream`. The stream's helper thread holds the reader mutex in a
+    /// blocking poll, so a zero-timeout `poll_next` often reports "empty" even
+    /// when more keys are already parsed or sitting in the PTY.
+    async fn handle_terminal_events_batch<S>(
+        &mut self,
+        first: std::io::Result<TerminalEvent>,
+        input_stream: &mut S,
+    ) where
+        S: Stream<Item = std::io::Result<TerminalEvent>> + Unpin,
+    {
+        let mut event = first;
+        loop {
+            let mut batched = 1usize;
+            let mut need_redraw = self.handle_terminal_events(event);
+            while !self.editor.should_close() {
+                let Some(next) = self.take_available_event(input_stream).await else {
+                    break;
+                };
+                need_redraw |= self.handle_terminal_events(next);
+                batched += 1;
+            }
+            if batched > 1 {
+                log::debug!("coalesced {batched} terminal events before paint");
+            }
+            if need_redraw && !self.editor.should_close() {
+                self.render().await;
+            }
+            match self.take_available_event(input_stream).await {
+                Some(next) if !self.editor.should_close() => event = next,
+                _ => return,
+            }
+        }
+    }
+
+    async fn take_available_event<S>(
+        &mut self,
+        input_stream: &mut S,
+    ) -> Option<std::io::Result<TerminalEvent>>
+    where
+        S: Stream<Item = std::io::Result<TerminalEvent>> + Unpin,
+    {
+        // Unix tty: read the shared EventReader only. Do not poll EventStream
+        // here — that starts the helper thread, which holds the reader mutex
+        // and hides already-queued keys from a zero-timeout poll.
+        #[cfg(all(not(windows), not(feature = "integration")))]
+        {
+            let _ = input_stream;
+            return self.take_available_event_from_tty();
+        }
+        #[cfg(not(all(not(windows), not(feature = "integration"))))]
+        Self::poll_next_if_ready(input_stream).await
+    }
+
+    /// Take the next terminal event only if it is already queued on the stream.
+    ///
+    /// On pending, the current task waker is registered so termina can wake the
+    /// event loop when the next key arrives.
+    #[cfg(not(all(not(windows), not(feature = "integration"))))]
+    async fn poll_next_if_ready<S>(input_stream: &mut S) -> Option<std::io::Result<TerminalEvent>>
+    where
+        S: Stream<Item = std::io::Result<TerminalEvent>> + Unpin,
+    {
+        std::future::poll_fn(|cx| match Pin::new(&mut *input_stream).poll_next(cx) {
+            Poll::Ready(event) => Poll::Ready(event),
+            Poll::Pending => Poll::Ready(None),
+        })
+        .await
+    }
+
+    #[cfg(all(not(windows), not(feature = "integration")))]
+    fn accept_terminal_event(event: &termina::Event) -> bool {
+        use termina::escape::csi;
+        !event.is_escape()
+            || matches!(
+                event,
+                termina::Event::Csi(csi::Csi::Mode(csi::Mode::ReportTheme(_)))
+            )
+    }
+
+    #[cfg(all(not(windows), not(feature = "integration")))]
+    fn take_available_event_from_tty(&mut self) -> Option<std::io::Result<TerminalEvent>> {
+        use std::time::Duration;
+        use termina::Terminal as _;
+        let reader = self.terminal.backend().terminal().event_reader();
+        match reader.poll(Some(Duration::ZERO), Self::accept_terminal_event) {
+            Ok(true) => Some(reader.read(Self::accept_terminal_event)),
+            Ok(false) => None,
+            Err(err) => Some(Err(err)),
+        }
+    }
+
+    fn handle_terminal_events(&mut self, event: std::io::Result<TerminalEvent>) -> bool {
         #[cfg(not(windows))]
         use termina::escape::csi;
 
@@ -733,7 +837,7 @@ impl Application {
             scroll: None,
         };
         // Handle key events
-        let should_redraw = match event.unwrap() {
+        match event.unwrap() {
             #[cfg(not(windows))]
             termina::Event::WindowResized(termina::WindowSize { rows, cols, .. }) => {
                 self.terminal
@@ -783,10 +887,6 @@ impl Application {
                 ..
             }) => false,
             event => self.compositor.handle_event(&event.into(), &mut cx),
-        };
-
-        if should_redraw && !self.editor.should_close() {
-            self.render().await;
         }
     }
 

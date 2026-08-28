@@ -209,6 +209,21 @@ pub async fn send_keys(app: &mut Application, in_keys: &str) -> anyhow::Result<(
     Ok(())
 }
 
+/// Deliver `text` to `app` as a bracketed paste, the way a terminal does when
+/// the user pastes into it.
+pub async fn send_paste(app: &mut Application, text: &str) -> anyhow::Result<()> {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut rx_stream = UnboundedReceiverStream::new(rx);
+
+    tx.send(Ok(Event::Paste(text.to_string())))?;
+
+    if !app.event_loop_until_idle(&mut rx_stream).await {
+        bail!("application exited while pasting");
+    }
+
+    Ok(())
+}
+
 pub async fn test_key_sequence_with_input_text<T: Into<TestCase>>(
     app: Option<Application>,
     test_case: T,

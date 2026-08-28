@@ -273,3 +273,53 @@ async fn a_stale_completion_range_is_clamped() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+/// The console is an ordinary buffer, so ordinary editing works in it:
+/// selection, yank and paste.
+#[tokio::test(flavor = "multi_thread")]
+async fn supports_selection_yank_and_paste() -> anyhow::Result<()> {
+    let mut app = AppBuilder::new().build()?;
+    send_keys(&mut app, ":debug-console<ret>").await?;
+    let console = app.editor.dap_console.unwrap();
+
+    send_keys(&mut app, "ipayload<esc>").await?;
+    assert_eq!(
+        app.editor.document(console).unwrap().text().to_string(),
+        ">>> payload"
+    );
+
+    // Select the word with a textobject, yank it, and paste it back.
+    send_keys(&mut app, "miwy").await?;
+    send_keys(&mut app, "p").await?;
+
+    let text = app.editor.document(console).unwrap().text().to_string();
+    assert_eq!(
+        text.matches("payload").count(),
+        2,
+        "yank and paste should duplicate the word, got {:?}",
+        text
+    );
+
+    Ok(())
+}
+
+/// A bracketed paste -- what a terminal sends when you paste into it -- lands in
+/// the console like any other buffer, newlines and indentation intact, and the
+/// result is submittable as one block.
+#[tokio::test(flavor = "multi_thread")]
+async fn accepts_a_bracketed_paste() -> anyhow::Result<()> {
+    let mut app = AppBuilder::new().build()?;
+    send_keys(&mut app, ":debug-console<ret>").await?;
+    let console = app.editor.dap_console.unwrap();
+
+    send_keys(&mut app, "i").await?;
+    send_paste(&mut app, "for i in items:\n    print(i)").await?;
+
+    assert_eq!(
+        app.editor.document(console).unwrap().text().to_string(),
+        ">>> for i in items:\n    print(i)",
+        "a pasted block should arrive intact"
+    );
+
+    Ok(())
+}

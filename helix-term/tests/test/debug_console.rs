@@ -219,3 +219,57 @@ async fn submitting_outside_the_console_does_nothing() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+/// Accepting a completion replaces the qualifier the adapter reported and
+/// leaves the cursor after the new text, ready to keep typing.
+#[tokio::test(flavor = "multi_thread")]
+async fn accepting_a_completion_replaces_the_qualifier() -> anyhow::Result<()> {
+    let mut app = AppBuilder::new().build()?;
+    send_keys(&mut app, ":debug-console<ret>").await?;
+    let console = app.editor.dap_console.unwrap();
+    let view_id = app.editor.tree.focus;
+
+    send_keys(&mut app, "iitems.ap<esc>").await?;
+    assert_eq!(
+        app.editor.document(console).unwrap().text().to_string(),
+        ">>> items.ap"
+    );
+
+    // debugpy answers `items.ap` with start 6, length 2 -- offsets into the
+    // submitted line, which is anchored just past the 4-character prompt.
+    let anchor = 4;
+    assert!(app
+        .editor
+        .dap_console_insert(anchor + 6, anchor + 6 + 2, "append"));
+
+    let doc = app.editor.document(console).unwrap();
+    assert_eq!(doc.text().to_string(), ">>> items.append");
+    assert_eq!(
+        doc.selection(view_id).primary().anchor,
+        doc.text().len_chars(),
+        "the cursor should sit after the completion"
+    );
+    assert!(!doc.is_modified());
+
+    Ok(())
+}
+
+/// A stale range cannot panic the editor: the buffer may have moved on between
+/// asking for completions and accepting one.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stale_completion_range_is_clamped() -> anyhow::Result<()> {
+    let mut app = AppBuilder::new().build()?;
+    send_keys(&mut app, ":debug-console<ret>").await?;
+    let console = app.editor.dap_console.unwrap();
+
+    assert!(app.editor.dap_console_insert(999, 1200, "append"));
+    assert_eq!(
+        app.editor.document(console).unwrap().text().to_string(),
+        ">>> append"
+    );
+
+    // A reversed range is refused rather than applied.
+    assert!(!app.editor.dap_console_insert(8, 2, "nope"));
+
+    Ok(())
+}

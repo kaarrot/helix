@@ -802,6 +802,64 @@ pub mod requests {
 
     #[derive(Debug, PartialEq, Eq, Clone, Deserialize, Serialize)]
     #[serde(rename_all = "camelCase")]
+    pub struct CompletionsArguments {
+        /// The frame to complete against. Without one an adapter can only offer
+        /// globals; with one, debugpy completes against the frame's live locals.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub frame_id: Option<usize>,
+        /// The text being typed, which may span several lines.
+        pub text: String,
+        /// The cursor position within `text`, on the negotiated base -- Helix
+        /// asks for `columnsStartAt1`, so this is 1-based.
+        pub column: usize,
+        /// The line within `text`, 1-based, when it spans more than one.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub line: Option<usize>,
+    }
+
+    #[derive(Debug, PartialEq, Eq, Clone, Deserialize, Serialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct CompletionItem {
+        /// What to show in the list.
+        pub label: String,
+        /// What to insert, when it differs from the label.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub text: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub sort_text: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub detail: Option<String>,
+        #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+        pub ty: Option<String>,
+        /// Where the replaced region starts, in `CompletionsArguments::text`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub start: Option<usize>,
+        /// How much of the text the insertion replaces.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub length: Option<usize>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub selection_start: Option<usize>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub selection_length: Option<usize>,
+    }
+
+    #[derive(Debug, PartialEq, Eq, Clone, Deserialize, Serialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct CompletionsResponse {
+        pub targets: Vec<CompletionItem>,
+    }
+
+    #[derive(Debug)]
+    pub enum Completions {}
+
+    impl Request for Completions {
+        type Arguments = CompletionsArguments;
+        type Result = CompletionsResponse;
+        const COMMAND: &'static str = "completions";
+    }
+
+    #[derive(Debug, PartialEq, Eq, Clone, Deserialize, Serialize)]
+    #[serde(rename_all = "camelCase")]
     pub struct SetExpressionArguments {
         pub expression: String,
         pub value: String,

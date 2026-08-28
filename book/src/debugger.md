@@ -147,6 +147,12 @@ Statements evaluate to nothing, and debugpy echoes the value of anything that
 did evaluate as ordinary output, so the transcript fills in on its own. Errors
 arrive as the Python traceback.
 
+`Ctrl-x` completes the word before the cursor. In the console the answers come
+from the adapter, so they know the frame's live namespace -- debugpy can tell
+that `items` is a list *right now*, which nothing reading a scratch buffer
+could. Everywhere else `Ctrl-x` is ordinary language-server completion, as
+before.
+
 Console submissions share the eval prompt's history, so `<space>G p` recalls
 what you typed here. Only single-line entries are mirrored to disk, since that
 file holds one entry per line.

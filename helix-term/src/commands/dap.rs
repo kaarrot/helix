@@ -1595,6 +1595,138 @@ pub fn dap_console_submit(cx: &mut Context) {
     });
 }
 
+/// One thing the adapter offers to complete, already resolved to the buffer
+/// range it would replace.
+#[derive(Clone)]
+struct CompletionTarget {
+    label: String,
+    ty: String,
+    from: usize,
+    to: usize,
+}
+
+/// What to complete, and where the answer's offsets will be anchored.
+///
+/// Only the cursor's own line is sent. The adapter reports `start` relative to
+/// whatever it was given -- measured against debugpy, `items.ap` answers
+/// `start: 6`, and it stays 6 when the same line is submitted as the second
+/// line of a block -- so a single line keeps the mapping back to buffer offsets
+/// unambiguous. Nothing is lost by it: debugpy completes against the frame's
+/// live namespace, not against the text.
+fn console_completion_request(text: RopeSlice, cursor: usize) -> Option<(String, usize, usize)> {
+    let line = text.char_to_line(cursor);
+    let line_start = text.line_to_char(line);
+    let line_text = text.line(line);
+
+    // Skip the prompt so its characters are not offered as Python.
+    let offset = match line_text.starts_with(CONSOLE_PROMPT) {
+        true => CONSOLE_PROMPT.chars().count(),
+        false => 0,
+    };
+    let anchor = line_start + offset;
+    if cursor < anchor {
+        return None;
+    }
+
+    let content: String = text
+        .slice(anchor..line_start + line_text.len_chars())
+        .to_string();
+    let content = content.trim_end_matches(['\n', '\r']).to_string();
+
+    // `columnsStartAt1` is negotiated at initialize, so this is 1-based.
+    Some((content, cursor - anchor + 1, anchor))
+}
+
+/// Complete the word before the cursor.
+///
+/// In the console this asks the adapter, whose answers know the frame's live
+/// namespace -- it can tell that `items` is a list *right now*, which no static
+/// analysis of a scratch buffer could. Anywhere else it is ordinary completion,
+/// so the key keeps meaning the same thing everywhere.
+pub fn dap_console_complete(cx: &mut Context) {
+    let console = cx.editor.dap_console;
+    let (view, doc) = current_ref!(cx.editor);
+    if Some(doc.id()) != console {
+        return super::completion(cx);
+    }
+
+    let cursor = doc
+        .selection(view.id)
+        .primary()
+        .cursor(doc.text().slice(..));
+    let Some((text, column, anchor)) = console_completion_request(doc.text().slice(..), cursor)
+    else {
+        return;
+    };
+
+    let request = cx
+        .editor
+        .debug_adapters
+        .get_active_client()
+        .filter(|debugger| debugger.supports_completions())
+        .map(|debugger| {
+            let frame_id = debugger.thread_id.and_then(|thread_id| {
+                let frame = debugger.active_frame?;
+                Some(debugger.stack_frames.get(&thread_id)?.get(frame)?.id)
+            });
+            (debugger.requester(), frame_id)
+        });
+
+    let Some((requester, frame_id)) = request else {
+        cx.editor
+            .set_error("The debug adapter cannot complete expressions");
+        return;
+    };
+
+    let completions =
+        async move { requester.completions(frame_id, text, None, column).await };
+
+    dap_callback_result(cx.jobs, completions, move |editor, compositor, result| {
+        let targets = match result {
+            Ok(targets) => targets,
+            Err(err) => {
+                editor.set_error(format!("Failed to complete: {}", err));
+                return;
+            }
+        };
+
+        let items: Vec<_> = targets
+            .into_iter()
+            .map(|target| {
+                // `start` and `length` describe the region of the submitted line
+                // the insertion replaces. Without them, replace nothing and just
+                // insert at the cursor.
+                let from = anchor + target.start.unwrap_or(column.saturating_sub(1));
+                CompletionTarget {
+                    to: from + target.length.unwrap_or(0),
+                    from,
+                    ty: target.ty.unwrap_or_default(),
+                    label: target.text.unwrap_or(target.label),
+                }
+            })
+            .collect();
+
+        if items.is_empty() {
+            editor.set_status("No completions");
+            return;
+        }
+
+        let columns = [
+            ui::PickerColumn::new("name", |item: &CompletionTarget, _| {
+                item.label.as_str().into()
+            }),
+            ui::PickerColumn::new("type", |item: &CompletionTarget, _| item.ty.as_str().into()),
+        ];
+
+        let picker = Picker::new(columns, 0, items, (), |cx, item, _action| {
+            cx.editor
+                .dap_console_insert(item.from, item.to, &item.label);
+        });
+
+        compositor.push(Box::new(overlaid(picker)));
+    });
+}
+
 pub fn dap_variables(cx: &mut Context) {
     let Some(items) = collect_variable_items(cx.editor) else {
         return;
@@ -1804,6 +1936,38 @@ mod tests {
         // Unreferenced placeholders and plain text are left alone.
         assert_eq!(substitute_params("{2}", &params), "{2}");
         assert_eq!(substitute_params("python3", &[]), "python3");
+    }
+
+    #[test]
+    fn completes_the_cursor_line_without_its_prompt() {
+        let ask = |text: &str, cursor: usize| {
+            console_completion_request(RopeSlice::from(text), cursor)
+        };
+
+        // The prompt is not Python and must not be offered as context. Its four
+        // characters are also where the buffer offsets are anchored, so a
+        // reported `start` of 0 maps back to just after the prompt.
+        assert_eq!(
+            ask(">>> items.ap", 12),
+            Some(("items.ap".to_string(), 9, 4))
+        );
+
+        // Column is 1-based, as `columnsStartAt1` negotiates.
+        assert_eq!(ask(">>> cou", 7), Some(("cou".to_string(), 4, 4)));
+        assert_eq!(ask(">>> ", 4), Some((String::new(), 1, 4)));
+
+        // A continuation line carries no prompt, so all of it is Python and the
+        // anchor is the line start.
+        assert_eq!(
+            ask(">>> for i in items:\n    print(i", 30),
+            Some(("    print(i".to_string(), 11, 20))
+        );
+
+        // The trailing newline is not part of what is being typed.
+        assert_eq!(ask(">>> xs\n", 6), Some(("xs".to_string(), 3, 4)));
+
+        // A cursor inside the prompt has nothing to complete.
+        assert_eq!(ask(">>> items", 2), None);
     }
 
     #[test]

@@ -577,6 +577,13 @@ impl Client {
             .unwrap_or_default()
     }
 
+    pub fn supports_completions(&self) -> bool {
+        self.caps
+            .as_ref()
+            .and_then(|caps| caps.supports_completions_request)
+            .unwrap_or_default()
+    }
+
     pub fn supports_set_expression(&self) -> bool {
         self.caps
             .as_ref()
@@ -765,6 +772,28 @@ impl Requester {
 
         let response = self.request::<requests::Scopes>(args).await?;
         Ok(response.scopes)
+    }
+
+    /// Ask what could follow the cursor in `text`.
+    ///
+    /// `column` (and `line`, when the text spans several) are 1-based, matching
+    /// the `columnsStartAt1`/`linesStartAt1` Helix negotiates at initialize.
+    pub async fn completions(
+        &self,
+        frame_id: Option<usize>,
+        text: String,
+        line: Option<usize>,
+        column: usize,
+    ) -> Result<Vec<requests::CompletionItem>> {
+        let args = requests::CompletionsArguments {
+            frame_id,
+            text,
+            column,
+            line,
+        };
+
+        let response = self.request::<requests::Completions>(args).await?;
+        Ok(response.targets)
     }
 
     pub async fn variables(&self, variables_reference: usize) -> Result<Vec<Variable>> {

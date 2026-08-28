@@ -212,7 +212,7 @@
 | `align_selections` | Align selections in column | normal: `` & ``, select: `` & `` |
 | `keep_primary_selection` | Keep primary selection | normal: `` , ``, select: `` , `` |
 | `remove_primary_selection` | Remove primary selection | normal: `` <A-,> ``, select: `` <A-,> `` |
-| `completion` | Invoke completion popup | insert: `` <C-x> `` |
+| `completion` | Invoke completion popup |  |
 | `hover` | Show docs for item under cursor | normal: `` <space>k ``, select: `` <space>k `` |
 | `toggle_comments` | Comment/uncomment selections | normal: `` <C-c> ``, `` <space>c ``, select: `` <C-c> ``, `` <space>c `` |
 | `toggle_line_comments` | Line comment/uncomment selections | normal: `` <space><A-c> ``, select: `` <space><A-c> `` |
@@ -291,6 +291,7 @@
 | `dap_evaluate` | Evaluate expression | normal: `` <space>Gp ``, select: `` <space>Gp `` |
 | `dap_console` | Open the debug console | normal: `` <space>GP ``, select: `` <space>GP `` |
 | `dap_console_submit` | Send the debug console's input to the debugger | normal: `` <ret> ``, select: `` <ret> `` |
+| `dap_console_complete` | Complete the expression in the debug console | insert: `` <C-x> `` |
 | `dap_variables` | List and set variables | normal: `` <space>Gv ``, select: `` <space>Gv `` |
 | `dap_terminate` | End debug session | normal: `` <space>Gt ``, select: `` <space>Gt `` |
 | `dap_edit_condition` | Edit breakpoint condition on current line | normal: `` <space>G<C-c> ``, select: `` <space>G<C-c> `` |

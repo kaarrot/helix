@@ -233,6 +233,35 @@ impl Editor {
         true
     }
 
+    /// Replace `from..to` in the console and leave the cursor just after the
+    /// new text, the way accepting a completion should.
+    pub fn dap_console_insert(&mut self, from: usize, to: usize, text: &str) -> bool {
+        let Some((doc_id, view_id)) = self.dap_console_view() else {
+            return false;
+        };
+        let doc = self
+            .documents
+            .get_mut(&doc_id)
+            .expect("the console document was checked to exist");
+
+        // The buffer may have moved on since the request went out.
+        let len = doc.text().len_chars();
+        let (from, to) = (from.min(len), to.min(len));
+        if from > to {
+            return false;
+        }
+
+        let transaction =
+            Transaction::change(doc.text(), [(from, to, Some(text.into()))].into_iter());
+        doc.apply(&transaction, view_id);
+        doc.set_selection(view_id, Selection::point(from + text.chars().count()));
+
+        let view = self.tree.get_mut(view_id);
+        doc.append_changes_to_history(view);
+        doc.reset_modified();
+        true
+    }
+
     /// The character offset of the first pending marker, if the console is
     /// waiting on an evaluation.
     fn dap_console_pending_at(&self) -> Option<usize> {

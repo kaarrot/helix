@@ -1,7 +1,7 @@
 use crate::editor::{Action, Breakpoint};
 use crate::{align_view, Align, Editor};
 use dap::requests::DisconnectArguments;
-use helix_core::Selection;
+use helix_core::{Selection, Transaction};
 use helix_dap::{
     self as dap, registry::DebugAdapterId, Client, ConnectionType, Payload, Request, ThreadId,
 };
@@ -143,6 +143,70 @@ pub fn breakpoints_changed(
 }
 
 impl Editor {
+    /// Append `text` to the debug console transcript.
+    ///
+    /// Returns `false` when there is no console to append to, which is the
+    /// caller's cue to fall back to the status line.
+    pub fn dap_console_append(&mut self, text: &str) -> bool {
+        let Some(doc_id) = self.dap_console else {
+            return false;
+        };
+        if !self.documents.contains_key(&doc_id) {
+            // The buffer was closed out from under us; stop tracking it.
+            self.dap_console = None;
+            return false;
+        }
+
+        // Prefer a view actually showing the console, fall back to one the
+        // document still remembers, and finally to the focused view. The last
+        // case is what lets output keep collecting after the console's split has
+        // been closed: `Editor::close` drops the document's selection for that
+        // view, and `Document::apply` needs some live view to apply against.
+        let view_id = self
+            .tree
+            .views()
+            .find(|(view, _)| view.doc == doc_id)
+            .map(|(view, _)| view.id)
+            .or_else(|| {
+                self.documents[&doc_id]
+                    .selections()
+                    .keys()
+                    .copied()
+                    .find(|id| self.tree.try_get(*id).is_some())
+            })
+            .unwrap_or(self.tree.focus);
+
+        let doc = self
+            .documents
+            .get_mut(&doc_id)
+            .expect("the console document was checked to exist");
+        doc.ensure_view_init(view_id);
+
+        let end = doc.text().len_chars();
+        // Follow the output only when the cursor is already at the end, so that
+        // reading back through the transcript, or editing an input block, is not
+        // interrupted every time the debuggee prints.
+        let follow = doc.selection(view_id).primary().head >= end;
+
+        let transaction =
+            Transaction::change(doc.text(), [(end, end, Some(text.into()))].into_iter());
+        doc.apply(&transaction, view_id);
+
+        if follow {
+            let end = doc.text().len_chars();
+            doc.set_selection(view_id, Selection::point(end));
+        }
+
+        // Commit the change and mark the buffer clean. The transcript is
+        // scrollback, not unsaved work, and must never be what stands between
+        // the user and `:q` -- which means clearing the pending changes too, not
+        // just the saved revision.
+        let view = self.tree.get_mut(view_id);
+        doc.append_changes_to_history(view);
+        doc.reset_modified();
+        true
+    }
+
     pub async fn handle_debugger_message(
         &mut self,
         id: DebugAdapterId,
@@ -291,18 +355,25 @@ impl Editor {
                     Event::Output(events::OutputBody {
                         category, output, ..
                     }) => {
-                        let prefix = match category {
-                            Some(category) => {
-                                if &category == "telemetry" {
-                                    return false;
-                                }
-                                format!("Debug ({}):", category)
-                            }
-                            None => "Debug:".to_owned(),
-                        };
+                        let category = category.unwrap_or_default();
+                        if category == "telemetry" {
+                            return false;
+                        }
 
                         log::info!("{}", output);
-                        self.set_status(format!("{} {}", prefix, output));
+
+                        // This is where a debuggee's `print` lands -- and where
+                        // pydevd echoes the value of a repl evaluation, since it
+                        // redirects stdout for the duration of one. The status
+                        // line shows a single line at a time, so without a
+                        // console every line but the last is lost.
+                        if !self.dap_console_append(&output) {
+                            let prefix = match category.is_empty() {
+                                true => "Debug:".to_owned(),
+                                false => format!("Debug ({}):", category),
+                            };
+                            self.set_status(format!("{} {}", prefix, output));
+                        }
                     }
                     Event::Initialized(_) => {
                         self.set_status("Debugger initialized...");

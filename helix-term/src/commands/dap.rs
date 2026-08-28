@@ -6,10 +6,10 @@ use crate::{
 };
 use dap::{StackFrame, Thread, ThreadStates};
 use helix_core::syntax::config::{DebugArgumentValue, DebugConfigCompletion, DebugTemplate};
-use helix_core::{Range, RopeSlice};
+use helix_core::{Range, RopeSlice, Selection, Transaction};
 use helix_dap::{self as dap, requests::TerminateArguments};
 use helix_lsp::block_on;
-use helix_view::editor::Breakpoint;
+use helix_view::editor::{Action, Breakpoint};
 
 use serde_json::{to_value, Value};
 
@@ -1358,6 +1358,69 @@ fn reopen_variables_picker(cx: &mut compositor::Context) {
         Ok(call)
     });
     cx.jobs.callback(callback);
+}
+
+/// What the console prints before an input block, and what marks where the
+/// live input starts.
+pub const CONSOLE_PROMPT: &str = ">>> ";
+
+/// Open the debug console, or focus it if it is already open.
+///
+/// The transcript is a plain scratch buffer rather than a bespoke widget, so
+/// everything Helix can do to a buffer -- motions, search, yank, undo, Python
+/// highlighting -- works on it, and writing multi-line Python into it needs no
+/// new editing machinery.
+pub fn dap_console(cx: &mut Context) {
+    if let Some(doc_id) = cx.editor.dap_console {
+        let view = cx
+            .editor
+            .tree
+            .views()
+            .find(|(view, _)| view.doc == doc_id)
+            .map(|(view, _)| view.id);
+
+        match view {
+            Some(view_id) => {
+                cx.editor.focus(view_id);
+                return;
+            }
+            // The buffer outlived the split that showed it; show it again.
+            None if cx.editor.documents.contains_key(&doc_id) => {
+                cx.editor.switch(doc_id, Action::HorizontalSplit);
+                return;
+            }
+            None => cx.editor.dap_console = None,
+        }
+    }
+
+    let doc_id = cx.editor.new_file(Action::HorizontalSplit);
+    let loader = cx.editor.syn_loader.load();
+
+    // `new_file` focuses what it opened, so this is the console.
+    let (view, doc) = current!(cx.editor);
+
+    // Python is the language the console is built for; the highlighting is
+    // wrong for other adapters, but a wrong grammar is cheaper to live with
+    // than none at all and can be changed with `:set-language`.
+    if let Err(err) = doc.set_language_by_language_id("python", &loader) {
+        log::warn!("Failed to highlight the debug console as Python: {}", err);
+    }
+
+    // A new file is not empty -- it holds a line ending -- so replace the whole
+    // text rather than inserting, to leave the input point directly after the
+    // prompt instead of on the line below it.
+    let end = doc.text().len_chars();
+    let transaction =
+        Transaction::change(doc.text(), [(0, end, Some(CONSOLE_PROMPT.into()))].into_iter());
+    doc.apply(&transaction, view.id);
+    let end = doc.text().len_chars();
+    doc.set_selection(view.id, Selection::point(end));
+
+    // Commit the seed so the console does not start life as an unsaved buffer.
+    doc.append_changes_to_history(view);
+    doc.reset_modified();
+
+    cx.editor.dap_console = Some(doc_id);
 }
 
 pub fn dap_variables(cx: &mut Context) {

@@ -100,6 +100,24 @@ Inside any prompt, `Ctrl-r` followed by a register name inserts that register:
 `"` for the last yank, `*` for the primary selection (what a mouse drag just
 selected), `+` for the system clipboard.
 
+### The debug console
+
+`<space>G P` opens the debug console in a split, and `:debug-console` does the
+same from the command line. It is where the session's output collects:
+everything the adapter reports -- the debuggee's `print`, its standard error,
+the adapter's own notices -- appends to it as the program runs. Without it those
+arrive on the status line, which shows one line at a time, so all but the last
+is lost.
+
+The console is an ordinary scratch buffer, which is most of the point. Motions,
+search, yank and undo work in it, the transcript is Python-highlighted, and you
+can scroll back through everything that has been printed. It is never considered
+modified, so it will not stand between you and `:q`.
+
+Output follows the end of the buffer only while your cursor is already there.
+Move up to read back and the transcript keeps growing beneath you without
+dragging you along.
+
 ### Exceptions
 
 `e` asks the adapter to break on exceptions, `E` turns that off again. Which

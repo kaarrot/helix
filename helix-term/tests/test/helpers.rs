@@ -187,6 +187,28 @@ pub async fn test_key_sequences(
     Ok(())
 }
 
+/// Feed `in_keys` to `app` and run until it goes idle, without the quit-and-close
+/// teardown [`test_key_sequences`] performs.
+///
+/// That teardown sends a single `:q!`, which cannot exit an app that has opened
+/// a split, and it consumes the app -- so a test that wants to keep poking at
+/// the editor afterwards, or that leaves more than one view open, needs this
+/// instead.
+pub async fn send_keys(app: &mut Application, in_keys: &str) -> anyhow::Result<()> {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut rx_stream = UnboundedReceiverStream::new(rx);
+
+    for key_event in parse_macro(in_keys)?.into_iter() {
+        tx.send(Ok(Event::Key(KeyEvent::from(key_event))))?;
+    }
+
+    if !app.event_loop_until_idle(&mut rx_stream).await {
+        bail!("application exited while sending keys: {}", in_keys);
+    }
+
+    Ok(())
+}
+
 pub async fn test_key_sequence_with_input_text<T: Into<TestCase>>(
     app: Option<Application>,
     test_case: T,

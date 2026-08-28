@@ -1192,6 +1192,10 @@ pub struct Editor {
     /// of `status_msg` so a double-click can still retrieve it after the first click of
     /// the double-click clears the status line. Cleared on use or on a new/failed eval.
     pub dap_eval_result: Option<String>,
+    /// The debug console: a scratch buffer holding the transcript of the current
+    /// debug session -- adapter output, submitted expressions and their results.
+    /// `None` until the console is first opened.
+    pub dap_console: Option<DocumentId>,
     pub autoinfo: Option<Info>,
 
     pub config: Arc<dyn DynAccess<Config>>,
@@ -1331,6 +1335,7 @@ impl Editor {
             ))),
             status_msg: None,
             dap_eval_result: None,
+            dap_console: None,
             autoinfo: None,
             idle_timer: Box::pin(sleep(conf.idle_timeout)),
             redraw_timer: Box::pin(sleep(Duration::MAX)),

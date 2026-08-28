@@ -247,6 +247,7 @@ pub fn default() -> HashMap<Mode, KeyTrie> {
                 "n" => dap_next,
                 "j" => dap_goto_line,
                 "p" => dap_evaluate,
+                "P" => dap_console,
                 "v" => dap_variables,
                 "t" => dap_terminate,
                 "C-c" => dap_edit_condition,

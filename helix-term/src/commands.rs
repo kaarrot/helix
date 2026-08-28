@@ -593,6 +593,7 @@ impl MappableCommand {
         dap_goto_line, "Jump execution to current line",
         dap_evaluate, "Evaluate expression",
         dap_console, "Open the debug console",
+        dap_console_submit, "Send the debug console's input to the debugger",
         dap_variables, "List and set variables",
         dap_terminate, "End debug session",
         dap_edit_condition, "Edit breakpoint condition on current line",

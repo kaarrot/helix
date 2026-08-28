@@ -118,6 +118,39 @@ Output follows the end of the buffer only while your cursor is already there.
 Move up to read back and the transcript keeps growing beneath you without
 dragging you along.
 
+#### Running Python in it
+
+Type after the `>>> ` prompt and press `Enter` in normal mode to run it in the
+current frame. `Enter` in insert mode is still a newline, which is what makes a
+block possible:
+
+```python
+>>> for i in items:
+        print(i * 2)
+```
+
+The block is sent as written, indentation and all -- debugpy dedents it against
+its first non-empty line, so a fragment lifted out of the middle of a function
+body runs unchanged. Statements, `def`s, imports and assignments all work, and
+they change the frame you are stopped in: `count = 41` then `count += 1` leaves
+the program to continue with `42`.
+
+Evaluation does not block the editor. A `⋯ running` marker holds the result's
+place while the request is out, so you can move to the source, open the
+variables picker, copy a name and paste it back into the console meanwhile.
+Output arriving in the meantime is inserted above that marker, which is what
+keeps a loop's prints in front of the value it finally returned. If you submit
+again before the first answer arrives, each result still lands at its own
+marker.
+
+Statements evaluate to nothing, and debugpy echoes the value of anything that
+did evaluate as ordinary output, so the transcript fills in on its own. Errors
+arrive as the Python traceback.
+
+Console submissions share the eval prompt's history, so `<space>G p` recalls
+what you typed here. Only single-line entries are mirrored to disk, since that
+file holds one entry per line.
+
 ### Exceptions
 
 `e` asks the adapter to break on exceptions, `E` turns that off again. Which

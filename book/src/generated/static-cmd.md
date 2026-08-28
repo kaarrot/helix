@@ -290,6 +290,7 @@
 | `dap_goto_line` | Jump execution to current line | normal: `` <space>Gj ``, select: `` <space>Gj `` |
 | `dap_evaluate` | Evaluate expression | normal: `` <space>Gp ``, select: `` <space>Gp `` |
 | `dap_console` | Open the debug console | normal: `` <space>GP ``, select: `` <space>GP `` |
+| `dap_console_submit` | Send the debug console's input to the debugger | normal: `` <ret> ``, select: `` <ret> `` |
 | `dap_variables` | List and set variables | normal: `` <space>Gv ``, select: `` <space>Gv `` |
 | `dap_terminate` | End debug session | normal: `` <space>Gt ``, select: `` <space>Gt `` |
 | `dap_edit_condition` | Edit breakpoint condition on current line | normal: `` <space>G<C-c> ``, select: `` <space>G<C-c> `` |

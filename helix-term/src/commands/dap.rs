@@ -7,6 +7,7 @@ use crate::{
 use dap::{StackFrame, Thread, ThreadStates};
 use helix_core::syntax::config::{DebugArgumentValue, DebugConfigCompletion, DebugTemplate};
 use helix_core::{Range, RopeSlice, Selection, Transaction};
+use helix_stdx::rope::RopeSliceExt;
 use helix_dap::{self as dap, requests::TerminateArguments};
 use helix_lsp::block_on;
 use helix_view::editor::{Action, Breakpoint};
@@ -17,10 +18,13 @@ use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::{anyhow, bail};
 
-use helix_view::handlers::dap::{breakpoints_changed, jump_to_stack_frame, select_thread_id};
+use helix_view::handlers::dap::{
+    breakpoints_changed, jump_to_stack_frame, select_thread_id, CONSOLE_PENDING, CONSOLE_PROMPT,
+};
 
 fn thread_picker(
     cx: &mut Context,
@@ -1003,6 +1007,54 @@ fn eval_complete(debugger: &dap::Client, expression: &str, frame_id: usize) -> d
     Ok(result)
 }
 
+/// The same evaluation as [`eval_complete`], but as a `'static` future that can
+/// be driven off the UI thread.
+///
+/// The elided-value retry is the reason this needs a [`Requester`] rather than
+/// a plain call: whether to ask a second time depends on the first answer, so
+/// the second request has to be built from inside the future. The quirk
+/// template and the capability are captured by value for the same reason --
+/// nothing may borrow the client.
+fn eval_complete_async(
+    requester: dap::Requester,
+    expression: String,
+    frame_id: usize,
+    full_value_template: Option<String>,
+    supports_clipboard_context: bool,
+    timeout: Duration,
+) -> impl Future<Output = dap::Result<String>> + Send + 'static {
+    async move {
+        // "repl" is the context that lets the adapter run statements rather than
+        // only evaluate expressions.
+        let mut result = requester
+            .evaluate(expression.clone(), Some(frame_id), "repl", timeout)
+            .await?
+            .result;
+
+        // A truncated value is useless, so ask for it again in full.
+        let retry = full_value_expression(
+            &result,
+            &expression,
+            full_value_template.as_deref(),
+            supports_clipboard_context,
+        );
+        if let Some(expression) = retry {
+            let context = match supports_clipboard_context {
+                true => "clipboard",
+                false => "repl",
+            };
+            if let Ok(response) = requester
+                .evaluate(expression, Some(frame_id), context, timeout)
+                .await
+            {
+                result = unquote(&response.result).to_string();
+            }
+        }
+
+        Ok(result)
+    }
+}
+
 /// What of an evaluated value to park on the status line. Rendering measures the
 /// status message on every frame, so a multi-megabyte repr would be walked over
 /// and over -- and only a screenful of it is ever visible anyway. The complete
@@ -1360,10 +1412,6 @@ fn reopen_variables_picker(cx: &mut compositor::Context) {
     cx.jobs.callback(callback);
 }
 
-/// What the console prints before an input block, and what marks where the
-/// live input starts.
-pub const CONSOLE_PROMPT: &str = ">>> ";
-
 /// Open the debug console, or focus it if it is already open.
 ///
 /// The transcript is a plain scratch buffer rather than a bespoke widget, so
@@ -1421,6 +1469,130 @@ pub fn dap_console(cx: &mut Context) {
     doc.reset_modified();
 
     cx.editor.dap_console = Some(doc_id);
+}
+
+/// How long a console evaluation may take before the request is abandoned.
+///
+/// Far longer than the deadline that suits an ordinary request: running a
+/// deliberate long computation is a normal thing to do at a REPL. It stays
+/// bounded so a wedged debuggee eventually reports rather than hanging forever.
+const CONSOLE_EVAL_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// The live input block: everything after the last prompt marker.
+///
+/// Continuation lines carry no marker of their own, so a `for` loop typed over
+/// several lines comes back whole -- indentation included, which pydevd needs
+/// in order to dedent the block correctly.
+fn console_input(text: RopeSlice) -> Option<String> {
+    let start = (0..text.len_lines()).rev().find_map(|line| {
+        text.line(line)
+            .starts_with(CONSOLE_PROMPT)
+            .then(|| text.line_to_char(line) + CONSOLE_PROMPT.chars().count())
+    })?;
+
+    Some(text.slice(start..).to_string())
+}
+
+/// Send the console's input block to the debugger.
+///
+/// Bound to `ret` in normal mode, where it would otherwise do nothing, so it has
+/// to be silent unless the console is focused. Insert-mode `ret` stays a
+/// newline, which is what makes multi-line Python typable in the first place.
+pub fn dap_console_submit(cx: &mut Context) {
+    let Some(console) = cx.editor.dap_console else {
+        return;
+    };
+    let (view, doc) = current_ref!(cx.editor);
+    if doc.id() != console {
+        return;
+    }
+
+    let Some(input) = console_input(doc.text().slice(..)) else {
+        return;
+    };
+    // Nothing typed: just offer a fresh prompt, the way a bare Enter does at any
+    // other REPL.
+    if input.trim().is_empty() {
+        cx.editor.dap_console_push("\n");
+        cx.editor.dap_console_push(CONSOLE_PROMPT);
+        return;
+    }
+
+    let view_id = view.id;
+    let frame = cx
+        .editor
+        .debug_adapters
+        .get_active_client()
+        .and_then(|debugger| {
+            let thread_id = debugger.thread_id?;
+            let frame = debugger.active_frame?;
+            let frame_id = debugger.stack_frames.get(&thread_id)?.get(frame)?.id;
+            Some((
+                debugger.requester(),
+                frame_id,
+                debugger.quirks.full_value_expression.clone(),
+                debugger.supports_clipboard_context(),
+            ))
+        });
+
+    let Some((requester, frame_id, full_value_template, supports_clipboard_context)) = frame else {
+        // Report into the transcript rather than the status line: the answer to
+        // "why did nothing happen" belongs next to what was typed.
+        cx.editor
+            .dap_console_push("\nNot stopped in a frame -- start a session and pause first.\n");
+        cx.editor.dap_console_push(CONSOLE_PROMPT);
+        return;
+    };
+
+    // Remember the block the way the eval prompt does, so the two share history.
+    // Multi-line blocks are dropped when the history is mirrored to disk, whose
+    // format is one entry per line, but they still recall within the session.
+    load_eval_history(cx.editor);
+    if let Err(err) = cx.editor.registers.push(EVAL_HISTORY_REGISTER, input.clone()) {
+        log::error!("Failed to record the evaluated expression: {}", err);
+    }
+    save_eval_history(cx.editor);
+
+    // Park a marker where the result will go. Output arriving in the meantime is
+    // inserted above it, so a loop's prints stay in front of its value, and a
+    // second submission gets a marker of its own -- results land where they
+    // belong even if they come back out of order.
+    let marker = {
+        let id = cx.editor.dap_console_next_id();
+        format!("{}running #{}", CONSOLE_PENDING, id)
+    };
+    cx.editor.dap_console_push(&format!("\n{}\n", marker));
+
+    // Leave the cursor at the end of the input block rather than dragging it
+    // down to the marker, so the block can still be edited and resubmitted.
+    if let Some(doc) = cx.editor.document_mut(console) {
+        let head = doc.text().len_chars().saturating_sub(marker.chars().count() + 2);
+        doc.set_selection(view_id, Selection::point(head));
+    }
+
+    let eval = eval_complete_async(
+        requester,
+        input,
+        frame_id,
+        full_value_template,
+        supports_clipboard_context,
+        CONSOLE_EVAL_TIMEOUT,
+    );
+
+    dap_callback_result(cx.jobs, eval, move |editor, _compositor, result| {
+        let resolved = match result {
+            // A statement evaluates to nothing. pydevd echoes the value of
+            // anything that did evaluate through an output event, so there is
+            // nothing left to report and the marker just goes away.
+            Ok(value) if value.is_empty() => String::new(),
+            Ok(value) => format!("{}\n", value),
+            // The adapter's message carries the Python traceback.
+            Err(err) => format!("{}\n", err),
+        };
+
+        editor.dap_console_resolve(&marker, &resolved);
+        editor.dap_console_push(CONSOLE_PROMPT);
+    });
 }
 
 pub fn dap_variables(cx: &mut Context) {
@@ -1632,6 +1804,37 @@ mod tests {
         // Unreferenced placeholders and plain text are left alone.
         assert_eq!(substitute_params("{2}", &params), "{2}");
         assert_eq!(substitute_params("python3", &[]), "python3");
+    }
+
+    #[test]
+    fn takes_the_input_after_the_last_prompt() {
+        let input = |text: &str| console_input(RopeSlice::from(text));
+
+        // A fresh console has an empty input block.
+        assert_eq!(input(">>> "), Some(String::new()));
+        assert_eq!(input(">>> items"), Some("items".to_string()));
+
+        // Only the last prompt counts; everything before it is scrollback.
+        assert_eq!(
+            input(">>> count = 1\n1\n>>> count"),
+            Some("count".to_string())
+        );
+
+        // Continuation lines carry no marker, so a block comes back whole --
+        // indentation included, which is what pydevd dedents against.
+        assert_eq!(
+            input(">>> for i in items:\n    print(i)\n"),
+            Some("for i in items:\n    print(i)\n".to_string())
+        );
+
+        // Output that happens to mention the prompt mid-line is not a prompt.
+        assert_eq!(
+            input(">>> x\nsee >>> for details\n"),
+            Some("x\nsee >>> for details\n".to_string())
+        );
+
+        // No prompt at all: nothing to submit.
+        assert_eq!(input("no prompt here"), None);
     }
 
     #[test]

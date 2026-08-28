@@ -119,3 +119,103 @@ async fn append_reports_when_there_is_no_console() -> anyhow::Result<()> {
     assert!(app.editor.dap_console.is_none());
     Ok(())
 }
+
+/// Output belongs to the evaluation still running, so it is inserted above the
+/// marker standing in for that evaluation's result -- which is what keeps a
+/// loop's prints in front of the value the loop returned.
+#[tokio::test(flavor = "multi_thread")]
+async fn output_lands_above_a_pending_marker() -> anyhow::Result<()> {
+    let mut app = AppBuilder::new().build()?;
+    send_keys(&mut app, ":debug-console<ret>").await?;
+    let console = app.editor.dap_console.unwrap();
+
+    app.editor.dap_console_push("for i in items:\n");
+    let marker = format!("\u{22ef} running #{}", app.editor.dap_console_next_id());
+    app.editor.dap_console_push(&format!("{}\n", marker));
+
+    // Two prints arrive while the evaluation is outstanding.
+    assert!(app.editor.dap_console_append("2\n"));
+    assert!(app.editor.dap_console_append("4\n"));
+
+    let doc = app.editor.document(console).unwrap();
+    assert_eq!(
+        doc.text().to_string(),
+        ">>> for i in items:\n2\n4\n\u{22ef} running #1\n",
+        "output should collect above the marker, not below it"
+    );
+
+    // The result replaces the marker, and a fresh prompt follows.
+    assert!(app.editor.dap_console_resolve(&marker, ""));
+    assert!(app.editor.dap_console_push(">>> "));
+
+    let doc = app.editor.document(console).unwrap();
+    assert_eq!(doc.text().to_string(), ">>> for i in items:\n2\n4\n>>> ");
+    assert!(!doc.is_modified());
+
+    Ok(())
+}
+
+/// Two evaluations in flight each get their own marker, so results land where
+/// they belong even when they come back out of order.
+#[tokio::test(flavor = "multi_thread")]
+async fn results_land_at_their_own_marker() -> anyhow::Result<()> {
+    let mut app = AppBuilder::new().build()?;
+    send_keys(&mut app, ":debug-console<ret>").await?;
+    let console = app.editor.dap_console.unwrap();
+
+    let first = format!("\u{22ef} running #{}", app.editor.dap_console_next_id());
+    app.editor.dap_console_push(&format!("slow\n{}\n", first));
+    let second = format!("\u{22ef} running #{}", app.editor.dap_console_next_id());
+    app.editor.dap_console_push(&format!(">>> quick\n{}\n", second));
+
+    // The second finishes first.
+    assert!(app.editor.dap_console_resolve(&second, "2\n"));
+    assert!(app.editor.dap_console_resolve(&first, "1\n"));
+
+    let doc = app.editor.document(console).unwrap();
+    assert_eq!(doc.text().to_string(), ">>> slow\n1\n>>> quick\n2\n");
+
+    Ok(())
+}
+
+/// A result whose marker the user deleted is appended rather than dropped.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lost_marker_does_not_lose_the_result() -> anyhow::Result<()> {
+    let mut app = AppBuilder::new().build()?;
+    send_keys(&mut app, ":debug-console<ret>").await?;
+    let console = app.editor.dap_console.unwrap();
+
+    assert!(app
+        .editor
+        .dap_console_resolve("\u{22ef} running #7", "42\n"));
+
+    let doc = app.editor.document(console).unwrap();
+    assert_eq!(doc.text().to_string(), ">>> 42\n");
+
+    Ok(())
+}
+
+/// `ret` is bound globally in normal mode, so it must do nothing at all unless
+/// the console is the focused buffer.
+#[tokio::test(flavor = "multi_thread")]
+async fn submitting_outside_the_console_does_nothing() -> anyhow::Result<()> {
+    let mut app = AppBuilder::new().build()?;
+    send_keys(&mut app, ":debug-console<ret>").await?;
+    let console = app.editor.dap_console.unwrap();
+
+    // Move to the other split and type into it, then press Enter.
+    send_keys(&mut app, "<C-w>wihello<esc><ret>").await?;
+
+    let (_, doc) = current_ref!(app.editor);
+    assert_ne!(doc.id(), console);
+    assert_eq!(doc.text().to_string(), "hello\n");
+
+    let console_doc = app.editor.document(console).unwrap();
+    assert_eq!(
+        console_doc.text().to_string(),
+        ">>> ",
+        "the console must be untouched by Enter pressed elsewhere"
+    );
+
+    Ok(())
+}

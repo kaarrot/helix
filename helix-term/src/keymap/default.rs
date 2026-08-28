@@ -175,6 +175,7 @@ pub fn default() -> HashMap<Mode, KeyTrie> {
         // "Q" => replay_macro,
 
         "&" => align_selections,
+        "ret" => dap_console_submit,
         "_" => trim_selections,
 
         "(" => rotate_selections_backward,

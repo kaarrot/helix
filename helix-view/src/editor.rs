@@ -1196,6 +1196,10 @@ pub struct Editor {
     /// debug session -- adapter output, submitted expressions and their results.
     /// `None` until the console is first opened.
     pub dap_console: Option<DocumentId>,
+    /// Distinguishes the markers standing in for evaluations that have been sent
+    /// but not answered, so a result can find its own place in the transcript
+    /// even when several are outstanding.
+    pub dap_console_seq: usize,
     pub autoinfo: Option<Info>,
 
     pub config: Arc<dyn DynAccess<Config>>,
@@ -1336,6 +1340,7 @@ impl Editor {
             status_msg: None,
             dap_eval_result: None,
             dap_console: None,
+            dap_console_seq: 0,
             autoinfo: None,
             idle_timer: Box::pin(sleep(conf.idle_timeout)),
             redraw_timer: Box::pin(sleep(Duration::MAX)),

@@ -1,7 +1,18 @@
 use crate::editor::{Action, Breakpoint};
+use crate::{DocumentId, ViewId};
+use helix_stdx::rope::RopeSliceExt;
+use std::borrow::Cow;
 use crate::{align_view, Align, Editor};
 use dap::requests::DisconnectArguments;
 use helix_core::{Selection, Transaction};
+
+/// What the console prints before an input block, and what marks where the
+/// live input starts.
+pub const CONSOLE_PROMPT: &str = ">>> ";
+
+/// Prefix of the line standing in for an evaluation that has been sent but
+/// has not answered yet.
+pub const CONSOLE_PENDING: &str = "\u{22ef} ";
 use helix_dap::{
     self as dap, registry::DebugAdapterId, Client, ConnectionType, Payload, Request, ThreadId,
 };
@@ -143,25 +154,28 @@ pub fn breakpoints_changed(
 }
 
 impl Editor {
-    /// Append `text` to the debug console transcript.
+    /// The next marker id, for an evaluation about to be sent.
+    pub fn dap_console_next_id(&mut self) -> usize {
+        self.dap_console_seq += 1;
+        self.dap_console_seq
+    }
+
+    /// Resolve the view a console edit should be applied through, and make sure
+    /// the document knows about it.
     ///
-    /// Returns `false` when there is no console to append to, which is the
-    /// caller's cue to fall back to the status line.
-    pub fn dap_console_append(&mut self, text: &str) -> bool {
-        let Some(doc_id) = self.dap_console else {
-            return false;
-        };
+    /// Prefers a view actually showing the console, falls back to one the
+    /// document still remembers, and finally to the focused view. The last case
+    /// is what lets output keep collecting after the console's split has been
+    /// closed: `Editor::close` drops the document's selection for that view,
+    /// leaving nothing to apply a change against.
+    fn dap_console_view(&mut self) -> Option<(DocumentId, ViewId)> {
+        let doc_id = self.dap_console?;
         if !self.documents.contains_key(&doc_id) {
             // The buffer was closed out from under us; stop tracking it.
             self.dap_console = None;
-            return false;
+            return None;
         }
 
-        // Prefer a view actually showing the console, fall back to one the
-        // document still remembers, and finally to the focused view. The last
-        // case is what lets output keep collecting after the console's split has
-        // been closed: `Editor::close` drops the document's selection for that
-        // view, and `Document::apply` needs some live view to apply against.
         let view_id = self
             .tree
             .views()
@@ -176,20 +190,32 @@ impl Editor {
             })
             .unwrap_or(self.tree.focus);
 
+        self.documents
+            .get_mut(&doc_id)
+            .expect("the console document was checked to exist")
+            .ensure_view_init(view_id);
+
+        Some((doc_id, view_id))
+    }
+
+    /// Replace `from..to` in the console with `text`.
+    fn dap_console_change(&mut self, from: usize, to: usize, text: &str) -> bool {
+        let Some((doc_id, view_id)) = self.dap_console_view() else {
+            return false;
+        };
         let doc = self
             .documents
             .get_mut(&doc_id)
             .expect("the console document was checked to exist");
-        doc.ensure_view_init(view_id);
 
+        // Follow the tail only when the cursor is already there, so reading back
+        // through the transcript, or typing an input block, is not interrupted
+        // every time the debuggee prints.
         let end = doc.text().len_chars();
-        // Follow the output only when the cursor is already at the end, so that
-        // reading back through the transcript, or editing an input block, is not
-        // interrupted every time the debuggee prints.
         let follow = doc.selection(view_id).primary().head >= end;
 
         let transaction =
-            Transaction::change(doc.text(), [(end, end, Some(text.into()))].into_iter());
+            Transaction::change(doc.text(), [(from, to, Some(text.into()))].into_iter());
         doc.apply(&transaction, view_id);
 
         if follow {
@@ -205,6 +231,78 @@ impl Editor {
         doc.append_changes_to_history(view);
         doc.reset_modified();
         true
+    }
+
+    /// The character offset of the first pending marker, if the console is
+    /// waiting on an evaluation.
+    fn dap_console_pending_at(&self) -> Option<usize> {
+        let doc = self.documents.get(&self.dap_console?)?;
+        let text = doc.text();
+
+        (0..text.len_lines()).find_map(|line| {
+            text.line(line)
+                .starts_with(CONSOLE_PENDING)
+                .then(|| text.line_to_char(line))
+        })
+    }
+
+    /// Append `text` to the console transcript, above any pending marker.
+    ///
+    /// Returns `false` when there is no console to append to, which is the
+    /// caller's cue to fall back to the status line.
+    ///
+    /// Output belongs to the evaluation still running, so it is inserted above
+    /// the marker standing in for that evaluation's result rather than below it.
+    /// That is what keeps a loop's `print` output in front of the value the loop
+    /// finally returned.
+    pub fn dap_console_append(&mut self, text: &str) -> bool {
+        let at = match self.dap_console_pending_at() {
+            Some(at) => at,
+            None => match self.dap_console.and_then(|id| self.documents.get(&id)) {
+                Some(doc) => doc.text().len_chars(),
+                None => return self.dap_console_change(0, 0, text),
+            },
+        };
+
+        self.dap_console_change(at, at, text)
+    }
+
+    /// Append `text` at the very end of the transcript, below any pending
+    /// marker. This is where a fresh prompt goes.
+    pub fn dap_console_push(&mut self, text: &str) -> bool {
+        let end = match self.dap_console.and_then(|id| self.documents.get(&id)) {
+            Some(doc) => doc.text().len_chars(),
+            None => return false,
+        };
+
+        self.dap_console_change(end, end, text)
+    }
+
+    /// Replace the pending marker line `marker` with `text`.
+    ///
+    /// Markers are located by their text rather than by a remembered offset:
+    /// the transcript is an ordinary buffer that the user may have edited, and
+    /// output arriving in the meantime moves everything below it anyway.
+    pub fn dap_console_resolve(&mut self, marker: &str, text: &str) -> bool {
+        let Some(doc) = self.dap_console.and_then(|id| self.documents.get(&id)) else {
+            return false;
+        };
+        let rope = doc.text();
+
+        let found = (0..rope.len_lines()).find_map(|line| {
+            let slice = rope.line(line);
+            let start = rope.line_to_char(line);
+            (Cow::<str>::from(slice).trim_end() == marker)
+                .then_some((start, start + slice.len_chars()))
+        });
+
+        match found {
+            Some((start, end)) => self.dap_console_change(start, end, text),
+            // The user deleted the marker, or the console was reset under us.
+            // Losing the result outright would be worse than putting it at the
+            // end, so fall back to appending.
+            None => self.dap_console_push(text),
+        }
     }
 
     pub async fn handle_debugger_message(

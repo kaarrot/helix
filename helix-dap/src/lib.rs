@@ -3,7 +3,7 @@ pub mod registry;
 mod transport;
 mod types;
 
-pub use client::Client;
+pub use client::{Client, Requester, DEFAULT_REQUEST_TIMEOUT};
 pub use transport::{Payload, Response, Transport};
 pub use types::*;
 
@@ -20,6 +20,18 @@ pub enum Error {
     Timeout(u64),
     #[error("server closed the stream")]
     StreamClosed,
+    /// A request the adapter answered with `success: false`.
+    ///
+    /// Carries the adapter's own words rather than a rendering of the response:
+    /// for an evaluation debugpy puts the formatted Python traceback in
+    /// `message`, and a failed `evaluate` has no `body` at all, so anything
+    /// derived from the body alone reports nothing useful.
+    #[error("{}", .message.as_deref().unwrap_or("the debug adapter reported a failure"))]
+    Adapter {
+        command: String,
+        message: Option<String>,
+        body: Option<serde_json::Value>,
+    },
     #[error("Unhandled")]
     Unhandled,
     #[error(transparent)]
@@ -28,6 +40,34 @@ pub enum Error {
     Other(#[from] anyhow::Error),
 }
 pub type Result<T> = core::result::Result<T, Error>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_adapter_failure_reports_its_own_message() {
+        // debugpy answers a failed evaluation with the formatted traceback in
+        // `message` and no body whatsoever, so the message is all there is.
+        let traceback = "Traceback (most recent call last):\n  File \"<string>\", \
+                         line 1, in <module>\nZeroDivisionError: division by zero\n";
+        let err = Error::Adapter {
+            command: "evaluate".to_string(),
+            message: Some(traceback.to_string()),
+            body: None,
+        };
+        assert_eq!(err.to_string(), traceback);
+
+        // An adapter that says nothing at all still has to read as a failure
+        // rather than as an empty line.
+        let err = Error::Adapter {
+            command: "evaluate".to_string(),
+            message: None,
+            body: None,
+        };
+        assert_eq!(err.to_string(), "the debug adapter reported a failure");
+    }
+}
 
 impl From<serde_json::Error> for Error {
     fn from(value: serde_json::Error) -> Self {

@@ -196,7 +196,14 @@ impl Transport {
                 self.id, res.message, res.body, res.request_seq, res.command
             );
 
-            Err(Error::Other(anyhow::format_err!("{:?}", res.body)))
+            // Keep the adapter's own message: for a failed evaluation debugpy
+            // puts the formatted Python traceback there, and such a response
+            // carries no body at all, so rendering the body reports nothing.
+            Err(Error::Adapter {
+                command: res.command,
+                message: res.message,
+                body: res.body,
+            })
         }
     }
 

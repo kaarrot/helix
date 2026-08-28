@@ -251,6 +251,37 @@ fn dap_callback<T, F>(
     jobs.callback(callback);
 }
 
+/// Like [`dap_callback`], but hands the whole `Result` to the callback.
+///
+/// `dap_callback` lets a failure escape the job, where `Jobs::add` reports it on
+/// the status line and the caller never hears about it. That is fine for
+/// fire-and-forget requests, but an evaluation's failure *is* its result: a
+/// Python traceback belongs in the console transcript, next to the expression
+/// that raised it. So the future here always resolves to `Ok`, carrying the
+/// adapter's answer -- success or error -- into the callback.
+// Used by the debug console, which lands in a later commit.
+#[allow(dead_code)]
+fn dap_callback_result<T, F>(
+    jobs: &mut Jobs,
+    call: impl Future<Output = helix_dap::Result<T>> + 'static + Send,
+    callback: F,
+) where
+    T: Send + 'static,
+    F: FnOnce(&mut Editor, &mut Compositor, helix_dap::Result<T>) + Send + 'static,
+{
+    let callback = Box::pin(async move {
+        let response = call.await;
+        let call: Callback = Callback::EditorCompositor(Box::new(
+            move |editor: &mut Editor, compositor: &mut Compositor| {
+                callback(editor, compositor, response)
+            },
+        ));
+        Ok(call)
+    });
+
+    jobs.callback(callback);
+}
+
 /// Resolves a single template parameter: paths are canonicalized and process
 /// names are mapped onto their PID.
 fn resolve_parameter(

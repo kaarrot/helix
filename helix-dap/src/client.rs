@@ -17,6 +17,8 @@ use std::{
     path::PathBuf,
     process::Stdio,
     sync::atomic::{AtomicU64, Ordering},
+    sync::Arc,
+    time::Duration,
 };
 use tokio::{
     io::{AsyncBufRead, AsyncWrite, BufReader, BufWriter},
@@ -31,7 +33,7 @@ pub struct Client {
     id: DebugAdapterId,
     _process: Option<Child>,
     server_tx: UnboundedSender<Payload>,
-    request_counter: AtomicU64,
+    request_counter: Arc<AtomicU64>,
     connection_type: Option<ConnectionType>,
     starting_request_args: Option<Value>,
     /// The socket address of the debugger, if using TCP transport.
@@ -90,7 +92,7 @@ impl Client {
             id,
             _process: process,
             server_tx,
-            request_counter: AtomicU64::new(0),
+            request_counter: Arc::new(AtomicU64::new(0)),
             caps: None,
             connection_type: None,
             starting_request_args: None,
@@ -238,14 +240,6 @@ impl Client {
         self.connection_type
     }
 
-    fn next_request_id(&self) -> u64 {
-        // > The `seq` for the first message sent by a client or debug adapter
-        // > is 1, and for each subsequent message is 1 greater than the
-        // > previous message sent by that actor
-        // <https://microsoft.github.io/debug-adapter-protocol/specification#Base_Protocol_ProtocolMessage>
-        self.request_counter.fetch_add(1, Ordering::Relaxed) + 1
-    }
-
     // Internal, called by specific DAP commands when resuming
     pub fn resume_application(&mut self) {
         if let Some(thread_id) = self.thread_id {
@@ -256,44 +250,23 @@ impl Client {
         self.thread_id = None;
     }
 
+    /// A handle for issuing requests without borrowing the client.
+    pub fn requester(&self) -> Requester {
+        Requester {
+            server_tx: self.server_tx.clone(),
+            request_counter: Arc::clone(&self.request_counter),
+        }
+    }
+
     /// Execute a RPC request on the debugger.
     pub fn call<R: crate::types::Request>(
         &self,
         arguments: R::Arguments,
-    ) -> impl Future<Output = Result<Value>>
+    ) -> impl Future<Output = Result<Value>> + Send + 'static
     where
         R::Arguments: serde::Serialize,
     {
-        let server_tx = self.server_tx.clone();
-        let id = self.next_request_id();
-
-        async move {
-            use std::time::Duration;
-            use tokio::time::timeout;
-
-            let arguments = Some(serde_json::to_value(arguments)?);
-
-            let (callback_tx, mut callback_rx) = channel(1);
-
-            let req = Request {
-                back_ch: Some(callback_tx),
-                seq: id,
-                command: R::COMMAND.to_string(),
-                arguments,
-            };
-
-            server_tx
-                .send(Payload::Request(req))
-                .map_err(|e| Error::Other(e.into()))?;
-
-            // TODO: specifiable timeout, delay other calls until initialize success
-            timeout(Duration::from_secs(20), callback_rx.recv())
-                .await
-                .map_err(|_| Error::Timeout(id))? // return Timeout
-                .ok_or(Error::StreamClosed)?
-                .map(|response| response.body.unwrap_or_default())
-            // TODO: check response.success
-        }
+        self.requester().call::<R>(arguments)
     }
 
     pub async fn request<R: crate::types::Request>(&self, params: R::Arguments) -> Result<R::Result>
@@ -301,10 +274,7 @@ impl Client {
         R::Arguments: serde::Serialize,
         R::Result: core::fmt::Debug, // TODO: temporary
     {
-        // a future that resolves into the response
-        let json = self.call::<R>(params).await?;
-        let response = serde_json::from_value(json)?;
-        Ok(response)
+        self.requester().request::<R>(params).await
     }
 
     pub fn reply(
@@ -497,23 +467,11 @@ impl Client {
     }
 
     pub async fn scopes(&self, frame_id: usize) -> Result<Vec<Scope>> {
-        let args = requests::ScopesArguments { frame_id };
-
-        let response = self.request::<requests::Scopes>(args).await?;
-        Ok(response.scopes)
+        self.requester().scopes(frame_id).await
     }
 
     pub async fn variables(&self, variables_reference: usize) -> Result<Vec<Variable>> {
-        let args = requests::VariablesArguments {
-            variables_reference,
-            filter: None,
-            start: None,
-            count: None,
-            format: None,
-        };
-
-        let response = self.request::<requests::Variables>(args).await?;
-        Ok(response.variables)
+        self.requester().variables(variables_reference).await
     }
 
     pub fn step_in(&self, thread_id: ThreadId) -> impl Future<Output = Result<Value>> {
@@ -632,6 +590,165 @@ impl Client {
         frame_id: Option<usize>,
         context: &str,
     ) -> Result<requests::EvaluateResponse> {
+        self.requester()
+            .evaluate(expression, frame_id, context, DEFAULT_REQUEST_TIMEOUT)
+            .await
+    }
+
+    pub async fn set_variable(
+        &self,
+        variables_reference: usize,
+        name: String,
+        value: String,
+    ) -> Result<requests::SetVariableResponse> {
+        self.requester()
+            .set_variable(variables_reference, name, value)
+            .await
+    }
+
+    pub async fn set_expression(
+        &self,
+        expression: String,
+        value: String,
+        frame_id: Option<usize>,
+    ) -> Result<requests::SetExpressionResponse> {
+        self.requester()
+            .set_expression(expression, value, frame_id)
+            .await
+    }
+
+    pub fn set_exception_breakpoints(
+        &self,
+        filters: Vec<String>,
+    ) -> impl Future<Output = Result<Value>> {
+        let args = requests::SetExceptionBreakpointsArguments { filters };
+
+        self.call::<requests::SetExceptionBreakpoints>(args)
+    }
+
+    pub fn current_stack_frame(&self) -> Option<&StackFrame> {
+        self.stack_frames
+            .get(&self.thread_id?)?
+            .get(self.active_frame?)
+    }
+}
+
+/// How long to wait for an adapter to answer a request before giving up.
+pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// A `'static` handle for issuing requests to an adapter.
+///
+/// [`Client::call`] already hands back a future that borrows nothing, which is
+/// what lets a single request be driven from a background job. A `Requester`
+/// extends that to *chained* requests: it owns both halves a call needs -- the
+/// channel to the adapter and the shared sequence counter -- so an async block
+/// can decide what to ask next based on the answer it just got, all without
+/// holding a borrow on the client.
+#[derive(Debug, Clone)]
+pub struct Requester {
+    server_tx: UnboundedSender<Payload>,
+    request_counter: Arc<AtomicU64>,
+}
+
+impl Requester {
+    fn next_request_id(&self) -> u64 {
+        // > The `seq` for the first message sent by a client or debug adapter
+        // > is 1, and for each subsequent message is 1 greater than the
+        // > previous message sent by that actor
+        // <https://microsoft.github.io/debug-adapter-protocol/specification#Base_Protocol_ProtocolMessage>
+        self.request_counter.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// Execute a RPC request on the debugger.
+    pub fn call<R: crate::types::Request>(
+        &self,
+        arguments: R::Arguments,
+    ) -> impl Future<Output = Result<Value>> + Send + 'static
+    where
+        R::Arguments: serde::Serialize,
+    {
+        self.call_with_timeout::<R>(arguments, DEFAULT_REQUEST_TIMEOUT)
+    }
+
+    /// Execute a RPC request, giving the adapter `timeout` to answer.
+    ///
+    /// A console evaluation is the reason this is adjustable: running a
+    /// deliberate long computation at a REPL is normal, and the deadline that
+    /// suits an ordinary request is far too short for it.
+    pub fn call_with_timeout<R: crate::types::Request>(
+        &self,
+        arguments: R::Arguments,
+        timeout: Duration,
+    ) -> impl Future<Output = Result<Value>> + Send + 'static
+    where
+        R::Arguments: serde::Serialize,
+    {
+        let server_tx = self.server_tx.clone();
+        let id = self.next_request_id();
+        // Serialize up front so the future captures a plain `Value` and stays
+        // `Send + 'static` whatever the argument type is.
+        let arguments = serde_json::to_value(arguments);
+
+        async move {
+            let arguments = Some(arguments?);
+
+            let (callback_tx, mut callback_rx) = channel(1);
+
+            let req = Request {
+                back_ch: Some(callback_tx),
+                seq: id,
+                command: R::COMMAND.to_string(),
+                arguments,
+            };
+
+            server_tx
+                .send(Payload::Request(req))
+                .map_err(|e| Error::Other(e.into()))?;
+
+            // TODO: delay other calls until initialize success
+            time::timeout(timeout, callback_rx.recv())
+                .await
+                .map_err(|_| Error::Timeout(id))? // return Timeout
+                .ok_or(Error::StreamClosed)?
+                .map(|response| response.body.unwrap_or_default())
+        }
+    }
+
+    pub async fn request<R: crate::types::Request>(&self, params: R::Arguments) -> Result<R::Result>
+    where
+        R::Arguments: serde::Serialize,
+    {
+        self.request_with_timeout::<R>(params, DEFAULT_REQUEST_TIMEOUT)
+            .await
+    }
+
+    pub async fn request_with_timeout<R: crate::types::Request>(
+        &self,
+        params: R::Arguments,
+        timeout: Duration,
+    ) -> Result<R::Result>
+    where
+        R::Arguments: serde::Serialize,
+    {
+        // a future that resolves into the response
+        let json = self.call_with_timeout::<R>(params, timeout).await?;
+        let response = serde_json::from_value(json)?;
+        Ok(response)
+    }
+
+    /// Evaluate `expression` in the given frame under a DAP `context`.
+    ///
+    /// The context is the caller's to choose because it decides what the
+    /// adapter is even willing to do: "repl" is the only one for which pydevd
+    /// executes a statement rather than merely evaluating an expression, while
+    /// "clipboard" lifts its truncation limits but cannot run statements.
+    pub async fn evaluate(
+        &self,
+        expression: String,
+        frame_id: Option<usize>,
+        context: &str,
+        timeout: Duration,
+    ) -> Result<requests::EvaluateResponse> {
         let args = requests::EvaluateArguments {
             expression,
             frame_id,
@@ -639,7 +756,28 @@ impl Client {
             format: None,
         };
 
-        self.request::<requests::Evaluate>(args).await
+        self.request_with_timeout::<requests::Evaluate>(args, timeout)
+            .await
+    }
+
+    pub async fn scopes(&self, frame_id: usize) -> Result<Vec<Scope>> {
+        let args = requests::ScopesArguments { frame_id };
+
+        let response = self.request::<requests::Scopes>(args).await?;
+        Ok(response.scopes)
+    }
+
+    pub async fn variables(&self, variables_reference: usize) -> Result<Vec<Variable>> {
+        let args = requests::VariablesArguments {
+            variables_reference,
+            filter: None,
+            start: None,
+            count: None,
+            format: None,
+        };
+
+        let response = self.request::<requests::Variables>(args).await?;
+        Ok(response.variables)
     }
 
     pub async fn set_variable(
@@ -672,20 +810,5 @@ impl Client {
         };
 
         self.request::<requests::SetExpression>(args).await
-    }
-
-    pub fn set_exception_breakpoints(
-        &self,
-        filters: Vec<String>,
-    ) -> impl Future<Output = Result<Value>> {
-        let args = requests::SetExceptionBreakpointsArguments { filters };
-
-        self.call::<requests::SetExceptionBreakpoints>(args)
-    }
-
-    pub fn current_stack_frame(&self) -> Option<&StackFrame> {
-        self.stack_frames
-            .get(&self.thread_id?)?
-            .get(self.active_frame?)
     }
 }

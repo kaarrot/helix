@@ -1,5 +1,64 @@
 # Python debug console for Helix
 
+## Status
+
+**All five phases are implemented.** Every phase landed as its own commit,
+each naming the phase it addresses.
+
+| Phase | Commit | State |
+|---|---|---|
+| 0 — async foundation (`Requester`, result-preserving callback) | `458ea7f7` | done |
+| 1 — console buffer + output capture | `2fc4b6b3` | done |
+| 2 — non-blocking submit loop + placeholders | `f1b2577b` | done |
+| 3 — real tracebacks | `cf3b6eb3` | done |
+| 4 — tab completion | `c1dac856` | done |
+| 5 — async / expandable / yankable variables | `db8bdbd1` | done |
+| — console editing coverage | `55d82739` | done (extra) |
+
+337 unit tests and 12 console integration tests pass. `cargo xtask docgen` has
+been run and `book/src/debugger.md` documents the whole flow.
+
+### What the plan got wrong, and what changed
+
+- **Phase 3 could not wait for its slot.** Measured against debugpy, a failed
+  `evaluate` answers with `success: false`, the traceback in `message`, and **no
+  `body` at all** — so the old `format!("{:?}", res.body)` rendered the string
+  `None`. Phase 2's error path would have been useless without it, so 3 landed
+  first.
+- **Completions send only the cursor's line.** The plan assumed `start` indexed
+  the whole submitted text. It does not: `items.ap` answers `start: 6` both on
+  its own and as the second line of a block, so `start` is line-relative.
+  Sending one line keeps the mapping unambiguous and costs nothing, since
+  debugpy completes against the frame rather than the text.
+- **`Picker` gained a key handler.** It exposed only its three `Action` slots,
+  one verb short once an item affords more than "open it". Overloading
+  `C-s`/`C-v` would have meant unmemorable, unrebindable keys.
+- **Grouping rows are refused by the yank.** debugpy pads listings with
+  `special variables` / `function variables` rows that report their own prose as
+  their evaluate name; yanking one pastes something that is not Python.
+- **The test harness gained `send_keys` and `send_paste`.**
+  `test_key_sequences` tears down with a single `:q!`, which cannot exit an app
+  that has opened a split, and it consumes the app rather than leaving it
+  inspectable.
+
+### Still open
+
+- **No manual end-to-end run.** The protocol layer is verified by a DAP probe
+  against debugpy 1.6.3 and the editor layer by integration tests, but the two
+  have never been exercised together in the real TUI. This is the one thing
+  worth doing before relying on it.
+- **Timeout reporting is generic.** A console evaluation that outstays
+  `CONSOLE_EVAL_TIMEOUT` (120 s) resolves its marker with `request N timed out`
+  rather than the plainer "the debuggee may still be running it" the
+  runaway-evaluation note below asks for.
+- **DAP `cancel` is still unimplemented**, as that note anticipated. Terminate
+  and restart remains the escape hatch for a wedged debuggee.
+- **Multi-line history is session-only.** `history_to_file` holds one entry per
+  line, so a submitted block recalls within the session but is not mirrored to
+  disk.
+- **The full integration suite SIGABRTs.** Pre-existing and unrelated —
+  it reproduces identically with `--skip debug_console`.
+
 ## Context
 
 Today the eval path is a one-shot single-line prompt. `<space>G p` opens
@@ -75,7 +134,7 @@ re-editable to resubmit a previous block.
 
 ## Implementation
 
-### Phase 0 — Async foundation
+### Phase 0 — Async foundation *(done: `458ea7f7`)*
 
 *File: `helix-dap/src/client.rs`, `helix-term/src/commands/dap.rs`*
 
@@ -124,7 +183,7 @@ It awaits the call, deserializes, and moves the whole `Result` into the
 Also make the request timeout configurable rather than a hardcoded
 `Duration::from_secs(20)` (`client.rs:287`) — see the runaway-eval note below.
 
-### Phase 1 — Console buffer and output capture
+### Phase 1 — Console buffer and output capture *(done: `2fc4b6b3`)*
 
 *Files: `helix-view/src/editor.rs`, `helix-view/src/handlers/dap.rs`,
 `helix-term/src/commands/dap.rs`, `helix-term/src/commands.rs`,
@@ -172,7 +231,7 @@ Also make the request timeout configurable rather than a hardcoded
    - Bind under the sticky debug menu in `keymap/default.rs:239-261`, e.g.
      `"c" => dap_console`.
 
-### Phase 2 — The non-blocking submit loop
+### Phase 2 — The non-blocking submit loop *(done: `f1b2577b`)*
 
 *File: `helix-term/src/commands/dap.rs`*
 
@@ -225,7 +284,7 @@ Also make the request timeout configurable rather than a hardcoded
 10. Bind `"ret" => dap_console_submit` in **normal** mode
     (`keymap/default.rs:8`). Insert-mode `ret` stays `insert_newline` (`:396`).
 
-### Phase 3 — Real Python tracebacks
+### Phase 3 — Real Python tracebacks *(done: `cf3b6eb3`, landed before Phase 2)*
 
 *Files: `helix-dap/src/transport.rs`, `helix-dap/src/lib.rs`*
 
@@ -243,7 +302,7 @@ Also make the request timeout configurable rather than a hardcoded
     This touches every DAP call site that formats an error, but they all just
     `format!("{}", e)`, so the change is additive.
 
-### Phase 4 — Tab completion
+### Phase 4 — Tab completion *(done: `c1dac856`)*
 
 *Files: `helix-dap/src/types.rs`, `helix-dap/src/client.rs`,
 `helix-term/src/commands/dap.rs`*
@@ -269,7 +328,7 @@ Also make the request timeout configurable rather than a hardcoded
     Prefer this over the LSP: debugpy's completions are **frame-aware** (jedi
     against live locals), so they know `items` is a list *right now*.
 
-### Phase 5 — Variables: non-blocking, expandable, yankable
+### Phase 5 — Variables: non-blocking, expandable, yankable *(done: `db8bdbd1`)*
 
 *File: `helix-term/src/commands/dap.rs`*
 
@@ -340,6 +399,12 @@ Phases 0+1+2 (~6-7 days) give a working non-blocking console. 3, 4 and 5 are
 independent after that and can land in any order.
 
 ## Verification
+
+*Status: the automated half is done and passing — 337 unit tests, 12 console
+integration tests, plus a DAP probe run against debugpy 1.6.3 that confirmed
+multi-line exec, frame write-back, traceback shape, completion offsets and
+nested `variablesReference`. The manual walkthrough below has **not** been done.*
+
 
 Build and run (see `project_helix_build_grammars` — this repo needs the flag and
 a clean config):

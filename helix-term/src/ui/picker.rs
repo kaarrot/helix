@@ -259,6 +259,8 @@ pub struct Picker<T: 'static + Send + Sync, D: 'static> {
 
     callback_fn: PickerCallback<T>,
     default_action: Action,
+    /// Keys the caller wants to handle itself, tried before the picker's own.
+    key_handler: Option<PickerKeyHandler<T>>,
 
     pub truncate_start: bool,
     /// Caches paths to documents
@@ -387,6 +389,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             show_preview: true,
             callback_fn: Box::new(callback_fn),
             default_action: Action::Replace,
+            key_handler: None,
             completion_height: 0,
             widths,
             preview_cache: HashMap::new(),
@@ -452,6 +455,15 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
 
     pub fn with_default_action(mut self, action: Action) -> Self {
         self.default_action = action;
+        self
+    }
+
+    /// Handle keys against the selected item before the picker's own bindings.
+    ///
+    /// The picker otherwise exposes only its three `Action` slots, which is one
+    /// verb short whenever an item affords more than "open it".
+    pub fn with_key_handler(mut self, handler: PickerKeyHandler<T>) -> Self {
+        self.key_handler = Some(handler);
         self
     }
 
@@ -1068,6 +1080,19 @@ impl<I: 'static + Send + Sync, D: 'static + Send + Sync> Component for Picker<I,
             EventResult::Consumed(Some(callback))
         };
 
+        // Give the caller first refusal on the key. Taking the handler out keeps
+        // it from borrowing `self` while the selected item does.
+        if let Some(handler) = self.key_handler.take() {
+            let handled = match self.selection() {
+                Some(option) => handler(ctx, option, key_event),
+                None => false,
+            };
+            self.key_handler = Some(handler);
+            if handled {
+                return EventResult::Consumed(None);
+            }
+        }
+
         match key_event {
             shift!(Tab) | key!(Up) | ctrl!('p') => {
                 self.move_by(1, Direction::Backward);
@@ -1187,3 +1212,8 @@ impl<T: 'static + Send + Sync, D> Drop for Picker<T, D> {
 }
 
 type PickerCallback<T> = Box<dyn Fn(&mut Context, &T, Action)>;
+
+/// Handles a key against the selected item before the picker's own bindings.
+/// Returning `true` consumes the key.
+pub type PickerKeyHandler<T> =
+    Box<dyn Fn(&mut Context, &T, helix_view::input::KeyEvent) -> bool>;

@@ -292,6 +292,7 @@
 | `dap_console` | Open the debug console | normal: `` <space>GP ``, select: `` <space>GP `` |
 | `dap_console_submit` | Send the debug console's input to the debugger | normal: `` <ret> ``, select: `` <ret> `` |
 | `dap_console_complete` | Complete the expression in the debug console | insert: `` <C-x> `` |
+| `dap_console_expand` | Expand the debug console's last result | normal: `` <space>Gx ``, select: `` <space>Gx `` |
 | `dap_variables` | List and set variables | normal: `` <space>Gv ``, select: `` <space>Gv `` |
 | `dap_terminate` | End debug session | normal: `` <space>Gt ``, select: `` <space>Gt `` |
 | `dap_edit_condition` | Edit breakpoint condition on current line | normal: `` <space>G<C-c> ``, select: `` <space>G<C-c> `` |

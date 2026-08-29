@@ -72,6 +72,24 @@ the variable has an evaluate name, otherwise `setVariable`). The picker then
 reopens with the new value. This only edits names that already exist in the
 frame; creating a new name, or running any other statement, is what eval is for.
 
+Two more keys in that picker:
+
+- `Alt-l` descends into a container, so a `dict`, a list or an object can be
+  opened up rather than read as one elided line. Each level is its own layer, so
+  `Esc` comes back up.
+- `Alt-y` yanks the variable's name. It takes the *evaluate name* -- the whole
+  path that resolves in the frame, `self._rows` rather than the bare `_rows` --
+  and puts it straight into the debug console when one is open, so a name you
+  found by browsing never has to be retyped. debugpy pads its listings with
+  grouping rows like "special variables", which are not expressions and are
+  refused.
+
+Fetching and setting both happen off the UI thread. That matters more than it
+looks: debugpy services requests on the suspended thread, so while the console
+is running an expression this listing queues behind it -- blocking would freeze
+the editor for exactly as long, at the moment you most want to go and look
+something up.
+
 `<space>G p` opens the `eval:` prompt, which evaluates an expression in the
 current frame. It is the most useful key in the mode, and it does a little more
 than it looks:
@@ -146,6 +164,11 @@ marker.
 Statements evaluate to nothing, and debugpy echoes the value of anything that
 did evaluate as ordinary output, so the transcript fills in on its own. Errors
 arrive as the Python traceback.
+
+When a result has structure -- a dict, a list, an object -- `<space>G x` opens it
+in the variables picker. The transcript can only show the repr, which debugpy
+elides once it gets long; the picker lists the value properly and `Alt-l`
+descends through it.
 
 `Ctrl-x` completes the word before the cursor. In the console the answers come
 from the adapter, so they know the frame's live namespace -- debugpy can tell

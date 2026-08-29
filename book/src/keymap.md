@@ -371,6 +371,7 @@ mode. See the [debugger](./debugger.md) documentation for what these do.
 | `j`      | Jump execution to current line                     | `dap_goto_line`            |
 | `p`      | Evaluate expression                                | `dap_evaluate`             |
 | `P`      | Open the debug console                             | `dap_console`              |
+| `x`      | Expand the debug console's last result             | `dap_console_expand`       |
 | `v`      | List / set variables                               | `dap_variables`            |
 | `t`      | End debug session                                  | `dap_terminate`            |
 | `Ctrl-c` | Edit breakpoint condition on current line          | `dap_edit_condition`       |

@@ -8,6 +8,7 @@ use dap::{StackFrame, Thread, ThreadStates};
 use helix_core::syntax::config::{DebugArgumentValue, DebugConfigCompletion, DebugTemplate};
 use helix_core::{Range, RopeSlice, Selection, Transaction};
 use helix_stdx::rope::RopeSliceExt;
+use helix_view::input::{KeyCode, KeyModifiers};
 use helix_dap::{self as dap, requests::TerminateArguments};
 use helix_lsp::block_on;
 use helix_view::editor::{Action, Breakpoint};
@@ -1022,14 +1023,17 @@ fn eval_complete_async(
     full_value_template: Option<String>,
     supports_clipboard_context: bool,
     timeout: Duration,
-) -> impl Future<Output = dap::Result<String>> + Send + 'static {
+) -> impl Future<Output = dap::Result<(String, usize)>> + Send + 'static {
     async move {
         // "repl" is the context that lets the adapter run statements rather than
         // only evaluate expressions.
-        let mut result = requester
+        let response = requester
             .evaluate(expression.clone(), Some(frame_id), "repl", timeout)
-            .await?
-            .result;
+            .await?;
+        // A non-zero reference means the value has structure the adapter can
+        // list, which is worth far more than its repr for a dict or an object.
+        let reference = response.variables_reference;
+        let mut result = response.result;
 
         // A truncated value is useless, so ask for it again in full.
         let retry = full_value_expression(
@@ -1051,7 +1055,7 @@ fn eval_complete_async(
             }
         }
 
-        Ok(result)
+        Ok((result, reference))
     }
 }
 
@@ -1164,7 +1168,11 @@ struct VariableItem {
     value: String,
     evaluate_name: Option<String>,
     attributes: Vec<String>,
+    /// The scope or variable this one was listed from, which `setVariable`
+    /// addresses it through.
     container_reference: usize,
+    /// This variable's own children, when it has any. Zero means a leaf.
+    variables_reference: usize,
     frame_id: usize,
 }
 
@@ -1233,7 +1241,9 @@ fn set_target(
     Err(SetRefuse::Unsupported)
 }
 
-fn collect_variable_items(editor: &mut Editor) -> Option<Vec<VariableItem>> {
+/// Resolve what is needed to list the current frame's variables, reporting why
+/// if the session is not in a state that can answer.
+fn variable_source(editor: &mut Editor) -> Option<(dap::Requester, usize)> {
     let debugger = match editor.debug_adapters.get_active_client() {
         Some(debugger) => debugger,
         None => {
@@ -1271,26 +1281,68 @@ fn collect_variable_items(editor: &mut Editor) -> Option<Vec<VariableItem>> {
         }
     };
 
-    let frame_id = stack_frame.id;
-    let scopes = match block_on(debugger.scopes(frame_id)) {
-        Ok(s) => s,
-        Err(e) => {
-            editor.set_error(format!("Failed to get scopes: {}", e));
-            return None;
-        }
-    };
+    Some((debugger.requester(), stack_frame.id))
+}
 
-    // TODO: allow expanding variables into sub-fields
-    let mut items = Vec::new();
-    for scope in scopes {
-        let response = block_on(debugger.variables(scope.variables_reference));
-        let Ok(vars) = response else {
-            continue;
-        };
-        items.reserve(vars.len());
-        for var in vars {
-            items.push(VariableItem {
-                scope: scope.name.clone(),
+/// List every variable of the frame, scope by scope.
+///
+/// Off the UI thread, and deliberately so: pydevd services requests on the
+/// suspended thread, so while a console evaluation is running Python this very
+/// request queues behind it. Blocking here would freeze the editor for as long
+/// as that evaluation takes -- exactly when you most want to go and look
+/// something up.
+fn collect_variable_items(
+    requester: dap::Requester,
+    frame_id: usize,
+) -> impl Future<Output = dap::Result<Vec<VariableItem>>> + Send + 'static {
+    async move {
+        let scopes = requester.scopes(frame_id).await?;
+
+        let mut items = Vec::new();
+        for scope in scopes {
+            let Ok(vars) = requester.variables(scope.variables_reference).await else {
+                continue;
+            };
+            items.reserve(vars.len());
+            for var in vars {
+                items.push(VariableItem {
+                    scope: scope.name.clone(),
+                    name: var.name,
+                    ty: var.ty,
+                    value: var.value,
+                    evaluate_name: var.evaluate_name,
+                    attributes: var
+                        .presentation_hint
+                        .and_then(|hint| hint.attributes)
+                        .unwrap_or_default(),
+                    container_reference: scope.variables_reference,
+                    variables_reference: var.variables_reference,
+                    frame_id,
+                });
+            }
+        }
+
+        Ok(items)
+    }
+}
+
+/// List the children of one variable, for descending into a container.
+fn collect_child_items(
+    requester: dap::Requester,
+    parent: VariableItem,
+) -> impl Future<Output = dap::Result<Vec<VariableItem>>> + Send + 'static {
+    async move {
+        let vars = requester.variables(parent.variables_reference).await?;
+
+        Ok(vars
+            .into_iter()
+            .map(|var| VariableItem {
+                // The scope column becomes the path walked to get here, so a
+                // nested list still says where it came from.
+                scope: parent
+                    .evaluate_name
+                    .clone()
+                    .unwrap_or_else(|| parent.name.clone()),
                 name: var.name,
                 ty: var.ty,
                 value: var.value,
@@ -1299,13 +1351,12 @@ fn collect_variable_items(editor: &mut Editor) -> Option<Vec<VariableItem>> {
                     .presentation_hint
                     .and_then(|hint| hint.attributes)
                     .unwrap_or_default(),
-                container_reference: scope.variables_reference,
-                frame_id,
-            });
-        }
+                container_reference: parent.variables_reference,
+                variables_reference: var.variables_reference,
+                frame_id: parent.frame_id,
+            })
+            .collect())
     }
-
-    Some(items)
 }
 
 fn variables_picker(items: Vec<VariableItem>) -> Picker<VariableItem, ()> {
@@ -1324,6 +1375,98 @@ fn variables_picker(items: Vec<VariableItem>) -> Picker<VariableItem, ()> {
     // Paths truncate at the start so the filename stays visible; values should
     // keep the start so a long list shows `[0, 1, 2, …` rather than `…, 98, 99]`.
     .truncate_start(false)
+    .with_key_handler(Box::new(|cx, item: &VariableItem, key| {
+        match (key.modifiers, key.code) {
+            // Alt-l: descend into a container. Esc comes back up, since each
+            // level is its own layer.
+            (KeyModifiers::ALT, KeyCode::Char('l')) => {
+                descend_into_variable(cx, item.clone());
+                true
+            }
+            // Alt-y: take the name away with you.
+            (KeyModifiers::ALT, KeyCode::Char('y')) => {
+                yank_variable_name(cx, item);
+                true
+            }
+            _ => false,
+        }
+    }))
+}
+
+/// Open a picker on a variable's children.
+fn descend_into_variable(cx: &mut compositor::Context, item: VariableItem) {
+    if item.variables_reference == 0 {
+        cx.editor.set_status(format!("{} has no fields", item.name));
+        return;
+    }
+
+    let Some((requester, _)) = variable_source(cx.editor) else {
+        return;
+    };
+
+    let name = item.name.clone();
+    let children = collect_child_items(requester, item);
+
+    dap_callback_result(cx.jobs, children, move |editor, compositor, result| {
+        match result {
+            Ok(items) if items.is_empty() => {
+                editor.set_status(format!("{} has no fields", name));
+            }
+            Ok(items) => compositor.push(Box::new(variables_picker(items))),
+            Err(err) => editor.set_error(format!("Failed to list {}: {}", name, err)),
+        }
+    });
+}
+
+/// Whether a row's name is something that could actually be evaluated.
+///
+/// debugpy pads a listing with rows that are groupings rather than values --
+/// "special variables", "function variables" -- and reports the same text as
+/// their evaluate name. Yanking one produces something that is not Python, so
+/// they are refused. Real names never contain a space.
+fn is_expression_name(name: &str) -> bool {
+    !name.is_empty() && !name.contains(' ')
+}
+
+/// Put a variable's name where it can be used.
+///
+/// The evaluate name is what actually resolves in the frame -- for a nested
+/// variable `name` is the bare leaf, while the evaluate name is the whole path
+/// -- so pasting the leaf would usually be wrong. It goes into the default
+/// register, and straight into the console's input when one is open, which is
+/// the point: a name you found by browsing should not have to be retyped.
+fn yank_variable_name(cx: &mut compositor::Context, item: &VariableItem) {
+    let name = item
+        .evaluate_name
+        .clone()
+        .unwrap_or_else(|| item.name.clone());
+
+    if !is_expression_name(&name) {
+        cx.editor
+            .set_error(format!("{} is not an expression", item.name));
+        return;
+    }
+
+    if let Err(err) = cx.editor.registers.write('"', vec![name.clone()]) {
+        cx.editor.set_error(format!("Failed to yank name: {}", err));
+        return;
+    }
+
+    let inserted = cx
+        .editor
+        .dap_console
+        .and_then(|console| {
+            let doc = cx.editor.document(console)?;
+            let end = doc.text().len_chars();
+            Some(end)
+        })
+        .map(|end| cx.editor.dap_console_insert(end, end, &name))
+        .unwrap_or(false);
+
+    match inserted {
+        true => cx.editor.set_status(format!("{} -> console", name)),
+        false => cx.editor.set_status(format!("yanked {}", name)),
+    }
 }
 
 fn prompt_set_variable(cx: &mut compositor::Context, item: VariableItem) {
@@ -1374,42 +1517,114 @@ fn apply_set(cx: &mut compositor::Context, item: &VariableItem, value: &str) {
         }
     };
 
-    let result = match target {
-        SetTarget::Expression {
-            expression,
-            frame_id,
-        } => block_on(debugger.set_expression(expression, value.to_owned(), Some(frame_id)))
-            .map(|response| response.value),
-        SetTarget::Variable {
-            variables_reference,
-            name,
-        } => block_on(debugger.set_variable(variables_reference, name, value.to_owned()))
-            .map(|response| response.value),
+    // Off the UI thread for the same reason the listing is: this request queues
+    // behind whatever Python the adapter is currently running.
+    let requester = debugger.requester();
+    let value = value.to_owned();
+    let set = async move {
+        match target {
+            SetTarget::Expression {
+                expression,
+                frame_id,
+            } => requester
+                .set_expression(expression, value, Some(frame_id))
+                .await
+                .map(|response| response.value),
+            SetTarget::Variable {
+                variables_reference,
+                name,
+            } => requester
+                .set_variable(variables_reference, name, value)
+                .await
+                .map(|response| response.value),
+        }
     };
 
-    match result {
+    dap_callback_result(cx.jobs, set, |editor, _compositor, result| match result {
         Ok(new_value) => {
-            cx.editor.set_status(new_value);
-            reopen_variables_picker(cx);
+            editor.set_status(new_value);
+            reopen_variables_picker(editor);
         }
-        Err(e) => {
-            cx.editor
-                .set_error(format!("Failed to set variable: {}", e));
-        }
-    }
+        Err(err) => editor.set_error(format!("Failed to set variable: {}", err)),
+    });
 }
 
-fn reopen_variables_picker(cx: &mut compositor::Context) {
-    let Some(items) = collect_variable_items(cx.editor) else {
+/// Show the frame's variables again, so an edit is reflected in the list.
+fn reopen_variables_picker(editor: &mut Editor) {
+    let Some((requester, frame_id)) = variable_source(editor) else {
         return;
     };
-    let callback = Box::pin(async move {
-        let call: Callback = Callback::EditorCompositor(Box::new(move |_editor, compositor| {
-            compositor.push(Box::new(variables_picker(items)));
-        }));
-        Ok(call)
+
+    // Already inside a job callback, so drive this one through the global queue
+    // rather than `Jobs`, which is not reachable from here.
+    let items = collect_variable_items(requester, frame_id);
+    tokio::spawn(async move {
+        match items.await {
+            Ok(items) => {
+                crate::job::dispatch(move |_editor, compositor| {
+                    compositor.push(Box::new(variables_picker(items)));
+                })
+                .await
+            }
+            Err(err) => {
+                crate::job::dispatch(move |editor, _compositor| {
+                    editor.set_error(format!("Failed to get variables: {}", err));
+                })
+                .await
+            }
+        }
     });
-    cx.jobs.callback(callback);
+}
+
+pub fn dap_variables(cx: &mut Context) {
+    let Some((requester, frame_id)) = variable_source(cx.editor) else {
+        return;
+    };
+
+    let items = collect_variable_items(requester, frame_id);
+    dap_callback_result(cx.jobs, items, |editor, compositor, result| match result {
+        Ok(items) => compositor.push(Box::new(variables_picker(items))),
+        Err(err) => editor.set_error(format!("Failed to get variables: {}", err)),
+    });
+}
+
+/// Open the console's last result in the variables picker.
+///
+/// An expression that evaluates to a dict, a list or an object comes back as a
+/// repr, which debugpy elides once it gets long. The adapter also hands back a
+/// handle to the value's structure, and that is worth more: it can be listed,
+/// and descended into, like any variable in the frame.
+pub fn dap_console_expand(cx: &mut Context) {
+    let Some((value, reference)) = cx.editor.dap_console_result.clone() else {
+        cx.editor
+            .set_status("The last result has no fields to expand");
+        return;
+    };
+
+    let Some((requester, frame_id)) = variable_source(cx.editor) else {
+        return;
+    };
+
+    // Stand in for the evaluated expression itself, so its children are listed
+    // the same way a variable's are.
+    let parent = VariableItem {
+        scope: "result".to_string(),
+        name: "result".to_string(),
+        ty: None,
+        value,
+        evaluate_name: None,
+        attributes: Vec::new(),
+        container_reference: reference,
+        variables_reference: reference,
+        frame_id,
+    };
+
+    let children = collect_child_items(requester, parent);
+    dap_callback_result(cx.jobs, children, |editor, compositor, result| match result {
+        Ok(items) if items.is_empty() => editor.set_status("The result has no fields"),
+        Ok(items) => compositor.push(Box::new(variables_picker(items))),
+        Err(err) => editor.set_error(format!("Failed to expand the result: {}", err)),
+    });
 }
 
 /// Open the debug console, or focus it if it is already open.
@@ -1584,10 +1799,22 @@ pub fn dap_console_submit(cx: &mut Context) {
             // A statement evaluates to nothing. pydevd echoes the value of
             // anything that did evaluate through an output event, so there is
             // nothing left to report and the marker just goes away.
-            Ok(value) if value.is_empty() => String::new(),
-            Ok(value) => format!("{}\n", value),
+            Ok((value, _)) if value.is_empty() => {
+                editor.dap_console_result = None;
+                String::new()
+            }
+            Ok((value, reference)) => {
+                // Keep the handle so a container result can be opened in the
+                // variables picker rather than only read as a repr.
+                editor.dap_console_result =
+                    (reference != 0).then(|| (value.clone(), reference));
+                format!("{}\n", value)
+            }
             // The adapter's message carries the Python traceback.
-            Err(err) => format!("{}\n", err),
+            Err(err) => {
+                editor.dap_console_result = None;
+                format!("{}\n", err)
+            }
         };
 
         editor.dap_console_resolve(&marker, &resolved);
@@ -1725,13 +1952,6 @@ pub fn dap_console_complete(cx: &mut Context) {
 
         compositor.push(Box::new(overlaid(picker)));
     });
-}
-
-pub fn dap_variables(cx: &mut Context) {
-    let Some(items) = collect_variable_items(cx.editor) else {
-        return;
-    };
-    cx.push_layer(Box::new(variables_picker(items)));
 }
 
 pub fn dap_terminate(cx: &mut Context) {
@@ -1968,6 +2188,21 @@ mod tests {
 
         // A cursor inside the prompt has nothing to complete.
         assert_eq!(ask(">>> items", 2), None);
+    }
+
+    #[test]
+    fn refuses_to_yank_a_grouping_row() {
+        // Real names, including the ones debugpy gives a dict's keys.
+        assert!(is_expression_name("count"));
+        assert!(is_expression_name("self._rows"));
+        assert!(is_expression_name("xs[0]"));
+        assert!(is_expression_name("len()"));
+
+        // debugpy pads a listing with groupings whose "name" is prose, and
+        // reports the same text as their evaluate name.
+        assert!(!is_expression_name("special variables"));
+        assert!(!is_expression_name("function variables"));
+        assert!(!is_expression_name(""));
     }
 
     #[test]

@@ -1200,6 +1200,10 @@ pub struct Editor {
     /// but not answered, so a result can find its own place in the transcript
     /// even when several are outstanding.
     pub dap_console_seq: usize,
+    /// The structured handle for the console's most recent result, when it had
+    /// one. An expression that evaluates to a container can be opened in the
+    /// variables picker, which a plain repr cannot.
+    pub dap_console_result: Option<(String, usize)>,
     pub autoinfo: Option<Info>,
 
     pub config: Arc<dyn DynAccess<Config>>,
@@ -1341,6 +1345,7 @@ impl Editor {
             dap_eval_result: None,
             dap_console: None,
             dap_console_seq: 0,
+            dap_console_result: None,
             autoinfo: None,
             idle_timer: Box::pin(sleep(conf.idle_timeout)),
             redraw_timer: Box::pin(sleep(Duration::MAX)),

@@ -18,6 +18,7 @@
 | `:write-buffer-close`, `:wbc` | Write changes to disk and closes the buffer. Accepts an optional path (:write-buffer-close some/path.txt) |
 | `:write-buffer-close!`, `:wbc!` | Force write changes to disk creating necessary subdirectories and closes the buffer. Accepts an optional path (:write-buffer-close! some/path.txt) |
 | `:new`, `:n` | Create a new scratch buffer. |
+| `:copy-path`, `:cp` | Copy the current file's absolute path to the system clipboard. Use ':copy-path url' to copy a link to the file at this pane's commit instead. |
 | `:format`, `:fmt` | Format the file using an external formatter or language server. |
 | `:indent-style` | Set the indentation style for editing. ('t' for tabs or 1-16 for number of spaces.) |
 | `:line-ending` | Set the document's default line ending. Options: crlf, lf. |
@@ -57,6 +58,7 @@
 | `:lsp-workspace-command` | Open workspace command picker |
 | `:lsp-restart` | Restarts the given language servers, or all language servers that are used by the current file if no arguments are supplied |
 | `:lsp-stop` | Stops the given language servers, or all language servers that are used by the current file if no arguments are supplied |
+| `:markdown-preview`, `:md-preview`, `:mdp` | Render the current buffer as markdown in a side panel for reading. |
 | `:tree-sitter-scopes` | Display tree sitter scopes, primarily for theming and development. |
 | `:tree-sitter-highlight-name` | Display name of tree-sitter highlight scope under the cursor. |
 | `:tree-sitter-layers` | Display language names of tree-sitter injection layers under the cursor. |

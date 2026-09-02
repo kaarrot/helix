@@ -844,3 +844,66 @@ async fn global_search_with_multibyte_chars() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_copy_path_command() -> anyhow::Result<()> {
+    let file = tempfile::NamedTempFile::new()?;
+    let expected = file.path().to_string_lossy().into_owned();
+
+    // The default, an explicit `absolute`, and `url` outside a diff pane all
+    // copy the absolute path: there is no commit to link to.
+    for command in [
+        ":copy-path<ret>",
+        ":copy-path absolute<ret>",
+        ":copy-path url<ret>",
+    ] {
+        let expected = expected.clone();
+        test_key_sequence(
+            &mut AppBuilder::new().with_file(file.path(), None).build()?,
+            Some(command),
+            Some(&move |app: &Application| {
+                let copied = app
+                    .editor
+                    .registers
+                    .first('+', &app.editor)
+                    .unwrap()
+                    .into_owned();
+                assert_eq!(expected, copied);
+                assert_eq!(
+                    format!("Copied path to clipboard: {}", expected),
+                    app.editor.get_status().unwrap().0.as_ref()
+                );
+            }),
+            false,
+        )
+        .await?;
+    }
+
+    test_key_sequence(
+        &mut AppBuilder::new().build()?,
+        Some(":copy-path<ret>"),
+        Some(&|app| {
+            assert_eq!(
+                "'copy-path': No file path available (scratch buffer)",
+                app.editor.get_status().unwrap().0
+            );
+        }),
+        false,
+    )
+    .await?;
+
+    test_key_sequence(
+        &mut AppBuilder::new().with_file(file.path(), None).build()?,
+        Some(":copy-path relative<ret>"),
+        Some(&|app| {
+            assert_eq!(
+                "'copy-path': Unknown argument 'relative', expected 'url'",
+                app.editor.get_status().unwrap().0
+            );
+        }),
+        false,
+    )
+    .await?;
+
+    Ok(())
+}

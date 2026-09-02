@@ -269,7 +269,10 @@ fn for_each_untracked_file_matches_git_semantics() {
     let found = found.into_inner().unwrap();
     let has = |name: &str| found.iter().any(|p| p.ends_with(name));
     assert!(has("untracked.txt"), "expected untracked.txt: {found:?}");
-    assert!(has("nested/also-new.txt"), "expected nested file: {found:?}");
+    assert!(
+        has("nested/also-new.txt"),
+        "expected nested file: {found:?}"
+    );
     assert!(!has("tracked.txt"), "tracked file must not appear");
     assert!(!has("debug.log"), "ignored file must not appear");
 }
@@ -773,4 +776,60 @@ fn for_each_changed_file_from_root_commit() {
     assert!(changes
         .iter()
         .any(|c| matches!(c, FileChange::Modified { path } if path.ends_with("file2.txt"))));
+}
+
+#[test]
+fn file_web_link_resolves_remote_commit_and_path() {
+    let temp_git = empty_git_repo();
+    let repo = temp_git.path();
+    exec_git_cmd(
+        "remote add origin git@gitlab.example.com:grp/sub/repo.git",
+        repo,
+    );
+    write_repo_file(repo, "src/nested/file.txt", "foo");
+    create_commit(repo, true);
+    let head = exec_git_cmd_output("rev-parse HEAD", repo);
+
+    let link = git::file_web_link(&repo.join("src/nested/file.txt"), "HEAD").unwrap();
+    assert_eq!(link.remote_url, "git@gitlab.example.com:grp/sub/repo.git");
+    assert_eq!(link.commit, head);
+    assert_eq!(link.path, "src/nested/file.txt");
+
+    // A short hash resolves to the same full hash, so links are permalinks
+    // regardless of how the revision was spelled.
+    let short = &head[..8];
+    assert_eq!(
+        git::file_web_link(&repo.join("src/nested/file.txt"), short)
+            .unwrap()
+            .commit,
+        head
+    );
+}
+
+#[test]
+fn file_web_link_without_a_remote_fails() {
+    let temp_git = empty_git_repo();
+    let repo = temp_git.path();
+    write_repo_file(repo, "file.txt", "foo");
+    create_commit(repo, true);
+
+    let err = git::file_web_link(&repo.join("file.txt"), "HEAD")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("no git remote"), "unexpected error: {err}");
+}
+
+#[test]
+fn file_web_link_prefers_the_tracking_branch_remote() {
+    let temp_git = empty_git_repo();
+    let repo = temp_git.path();
+    exec_git_cmd("remote add origin git@example.com:grp/origin.git", repo);
+    exec_git_cmd("remote add upstream git@example.com:grp/upstream.git", repo);
+    write_repo_file(repo, "file.txt", "foo");
+    create_commit(repo, true);
+    // With two remotes, only the branch's configured remote disambiguates.
+    exec_git_cmd("config branch.main.remote upstream", repo);
+
+    let link = git::file_web_link(&repo.join("file.txt"), "HEAD").unwrap();
+    assert_eq!(link.remote_url, "git@example.com:grp/upstream.git");
 }

@@ -571,6 +571,115 @@ fn new_file(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> an
     Ok(())
 }
 
+/// Which file the focused pane shows, and the revision it shows it at.
+///
+/// Diff and merge panes hold virtual documents that intentionally carry no path
+/// (see `Document::from_git_revision`), so the path is recovered from the diff
+/// session, which keeps both sides' real paths and refs. A `None` revision
+/// means the pane shows the working tree, which has no commit to link to.
+fn focused_file_revision(editor: &Editor) -> (Option<PathBuf>, Option<String>) {
+    let view = view!(editor);
+
+    if let Some(state) = editor.diff.views.get(&view.id) {
+        if state.source == helix_view::diff_view::DiffViewSource::Git {
+            if view.doc == state.base_doc_id && !state.base_path.as_os_str().is_empty() {
+                return (Some(state.base_path.clone()), Some(state.base_ref.clone()));
+            }
+            if view.doc == state.working_doc_id && !state.working_path.as_os_str().is_empty() {
+                return (Some(state.working_path.clone()), state.target_ref.clone());
+            }
+        }
+    }
+
+    // Merge panes are index stages rather than commits, so only the path of the
+    // file being merged is meaningful.
+    if let Some(path) = editor
+        .diff
+        .merge_views
+        .values()
+        .find(|state| state.contains_view(view.id))
+        .and_then(|state| editor.document(state.result_doc_id))
+        .and_then(|doc| doc.path().cloned())
+    {
+        return (Some(path), None);
+    }
+
+    (
+        editor
+            .document(view.doc)
+            .and_then(|doc| doc.path().cloned()),
+        None,
+    )
+}
+
+/// The 1-based, inclusive line span covered by the primary selection.
+fn selected_line_span(editor: &Editor) -> (usize, usize) {
+    let (view, doc) = current_ref!(editor);
+    let text = doc.text().slice(..);
+    let range = doc.selection(view.id).primary();
+    let start = text.char_to_line(range.from().min(text.len_chars()));
+    // `to()` is exclusive, so a selection ending at a line start would
+    // otherwise report the following line.
+    let end_char = if range.to() > range.from() {
+        range.to() - 1
+    } else {
+        range.to()
+    };
+    let end = text.char_to_line(end_char.min(text.len_chars()));
+    (start + 1, end + 1)
+}
+
+fn copy_path_to_clipboard(
+    cx: &mut compositor::Context,
+    args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+
+    let as_url = match args.first() {
+        None | Some("absolute") => false,
+        Some("url") => true,
+        Some(arg) => anyhow::bail!("Unknown argument '{arg}', expected 'url'"),
+    };
+
+    let (path, rev) = focused_file_revision(cx.editor);
+    let path = path.ok_or_else(|| anyhow::anyhow!("No file path available (scratch buffer)"))?;
+
+    // In a working-tree pane there is no commit to point at, so `url` copies
+    // the path just like the default does.
+    let (copied, what) = match rev.filter(|_| as_url) {
+        Some(rev) => {
+            let link = helix_vcs::git::file_web_link(&path, &rev)?;
+            let base = helix_vcs::web_url::web_base(&link.remote_url).ok_or_else(|| {
+                anyhow::anyhow!("git remote '{}' has no web address", link.remote_url)
+            })?;
+            let template = cx.editor.config().git_remote.template_for_host(&base.host);
+            let url = helix_vcs::web_url::render(
+                &template,
+                &helix_vcs::web_url::WebUrlFields {
+                    base: &base,
+                    commit: &link.commit,
+                    path: &link.path,
+                },
+                Some(selected_line_span(cx.editor)),
+            );
+            (url, "URL")
+        }
+        None => (path.to_string_lossy().into_owned(), "path"),
+    };
+
+    cx.editor
+        .registers
+        .write('+', vec![copied.clone()])
+        .map_err(|err| anyhow::anyhow!("Failed to copy to clipboard: {}", err))?;
+    cx.editor
+        .set_status(format!("Copied {what} to clipboard: {copied}"));
+
+    Ok(())
+}
+
 fn format(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> anyhow::Result<()> {
     if event != PromptEvent::Validate {
         return Ok(());
@@ -2959,6 +3068,17 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         completer: CommandCompleter::none(),
         signature: Signature {
             positionals: (0, Some(0)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "copy-path",
+        aliases: &["cp"],
+        doc: "Copy the current file's absolute path to the system clipboard. Use ':copy-path url' to copy a link to the file at this pane's commit instead.",
+        fun: copy_path_to_clipboard,
+        completer: CommandCompleter::positional(&[completers::copy_path_kind]),
+        signature: Signature {
+            positionals: (0, Some(1)),
             ..Signature::DEFAULT
         },
     },

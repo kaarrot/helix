@@ -102,6 +102,78 @@ pub fn get_diff_base_from_ref(file: &Path, ref_name: &str) -> Result<Vec<u8>> {
     }
 }
 
+/// The pieces needed to build a web link to `file` as it exists in `rev`.
+#[derive(Debug, Clone)]
+pub struct FileWebLink {
+    /// The remote URL as git resolved it, with any `insteadOf` rewrite applied.
+    pub remote_url: String,
+    /// Full commit hash, so the link stays valid when the branch moves on.
+    pub commit: String,
+    /// Repository-root relative path, forward slashes.
+    pub path: String,
+}
+
+/// Resolve everything needed to link to `file` at `rev` on the repository's
+/// web host: which remote this repository tracks, what commit `rev` names, and
+/// where the file sits relative to the repository root.
+///
+/// `rev` accepts the same spellings as the diff commands (a ref, tag, short or
+/// full hash, with an optional `^` suffix) and is always resolved to a full
+/// hash so the resulting link is a permalink.
+pub fn file_web_link(file: &Path, rev: &str) -> Result<FileWebLink> {
+    debug_assert!(file.is_absolute());
+    let file = resolve_file_path(file)?;
+
+    let repo_dir = get_repo_dir(&file)?;
+    let repo = open_repo(repo_dir)
+        .context("failed to open git repo")?
+        .to_thread_local();
+
+    let remote_url = remote_url(&repo)?;
+    let commit = resolve_commit(&repo, rev)?.id().to_hex().to_string();
+
+    let work_dir = repo
+        .workdir()
+        .ok_or_else(|| anyhow::anyhow!("not a working tree"))?;
+    let rela_path = file
+        .strip_prefix(work_dir)
+        .context("file is outside the repository")?;
+    let path = rela_path
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/");
+
+    Ok(FileWebLink {
+        remote_url,
+        commit,
+        path,
+    })
+}
+
+/// The URL of the remote this repository tracks. Prefers the remote configured
+/// for the checked-out branch (what `git fetch` with no arguments would use),
+/// then falls back to `origin`, so it works both on a tracking branch and on a
+/// detached HEAD.
+fn remote_url(repo: &Repository) -> Result<String> {
+    // `find_fetch_remote(None)` is what `git fetch` with no arguments resolves:
+    // the checked-out branch's remote, then the only/`origin` remote. On a
+    // detached HEAD or an odd config it can fail outright, so `origin` is tried
+    // once more before giving up.
+    let remote = match repo.find_fetch_remote(None) {
+        Ok(remote) => remote,
+        Err(_) => repo
+            .find_remote("origin")
+            .map_err(|_| anyhow::anyhow!("no git remote configured for this repository"))?,
+    };
+
+    let url = remote
+        .url(gix::remote::Direction::Fetch)
+        .ok_or_else(|| anyhow::anyhow!("git remote has no fetch URL"))?;
+
+    Ok(url.to_bstring().to_string())
+}
+
 pub fn get_current_head_name(file: &Path) -> Result<Arc<ArcSwap<Box<str>>>> {
     debug_assert!(!file.exists() || file.is_file());
     debug_assert!(file.is_absolute());

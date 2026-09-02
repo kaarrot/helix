@@ -252,7 +252,7 @@
 | `diff_toggle_split_view` | Toggle between single-pane and side-by-side diff | normal: `` <space>mv ``, select: `` <space>mv `` |
 | `diff_toggle_sync_scroll` | Toggle synchronized scrolling in split diff | normal: `` <space>ms ``, select: `` <space>ms `` |
 | `diff_reset` | Reset diff base to HEAD | normal: `` <space>mr ``, select: `` <space>mr `` |
-| `diff_commit_from_selection` | Set diff range from selected commit hash(es) | normal: `` <space>mc ``, select: `` <space>mc `` |
+| `diff_commit_from_selection` | Set inclusive diff range from selected git log lines | normal: `` <space>mc ``, select: `` <space>mc `` |
 | `diff_show_commit_from_selection` | Show changes introduced by selected commit | normal: `` <space>mC ``, select: `` <space>mC `` |
 | `merge_accept_ours` | Accept HEAD version for current conflict | normal: `` <space>mo ``, select: `` <space>mo `` |
 | `merge_accept_theirs` | Accept incoming version for current conflict | normal: `` <space>mt ``, select: `` <space>mt `` |

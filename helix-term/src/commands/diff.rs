@@ -949,14 +949,16 @@ pub fn diff_commit_from_selection(cx: &mut Context) {
             return;
         };
         let hash = hash.to_string();
+        // Include the selected commit: parent vs working tree.
         cx.editor.diff.range = Some(DiffRange {
-            base_ref: hash.clone(),
+            base_ref: format!("{}^", hash),
             target_ref: None,
         });
         cx.editor
-            .set_status(format!("Diff set: {} vs working tree", hash));
+            .set_status(format!("Diff set: {}^ vs working tree", hash));
     } else {
-        // In git log output, the first line is the newer commit; diff goes OLD..NEW.
+        // git log lists newest first. Include both selected endpoints: OLDER^..NEWER.
+        // Typed `:diff-commit A..B` stays exclusive of A; this is log selection.
         let (Some(newer), Some(older)) = (
             extract_commit_hash(lines[0]),
             extract_commit_hash(lines[lines.len() - 1]),
@@ -966,11 +968,11 @@ pub fn diff_commit_from_selection(cx: &mut Context) {
         };
         let (older, newer) = (older.to_string(), newer.to_string());
         cx.editor.diff.range = Some(DiffRange {
-            base_ref: older.clone(),
+            base_ref: format!("{}^", older),
             target_ref: Some(newer.clone()),
         });
         cx.editor
-            .set_status(format!("Diff set: {}..{}", older, newer));
+            .set_status(format!("Diff set: {}^..{}", older, newer));
     }
 }
 

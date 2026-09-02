@@ -335,7 +335,7 @@ resolution. The commands that open diff or merge views are documented in
 
 | Key | Description | Command |
 | --- | --- | --- |
-| `c` | Set the changed-file picker range from selected git log lines | `diff_commit_from_selection` |
+| `c` | Set an inclusive changed-file picker range from selected git log lines | `diff_commit_from_selection` |
 | `C` | Set the changed-file picker range to show the selected commit only (`COMMIT^..COMMIT`) | `diff_show_commit_from_selection` |
 | `r` | Reset diff state back to `HEAD` vs working tree | `diff_reset` |
 | `v` | Toggle side-by-side split diff view | `diff_toggle_split_view` |

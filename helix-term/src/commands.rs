@@ -558,7 +558,7 @@ impl MappableCommand {
         diff_toggle_split_view, "Toggle between single-pane and side-by-side diff",
         diff_toggle_sync_scroll, "Toggle synchronized scrolling in split diff",
         diff_reset, "Reset diff base to HEAD",
-        diff_commit_from_selection, "Set diff range from selected commit hash(es)",
+        diff_commit_from_selection, "Set inclusive diff range from selected git log lines",
         diff_show_commit_from_selection, "Show changes introduced by selected commit",
         merge_accept_ours, "Accept HEAD version for current conflict",
         merge_accept_theirs, "Accept incoming version for current conflict",

@@ -24,8 +24,9 @@ You can change the picker's scope before opening it:
 - `:diff-commit REF` compares `REF` to the working tree.
 - `:diff-commit REF!` shows only the changes introduced by `REF`.
 - `:diff-commit REF1..REF2` compares two refs directly.
-- `Space-m c` reads two or more selected git log lines and sets the range to
-  `OLDER..NEWER`.
+- `Space-m c` reads selected git log lines and includes those commits: one
+  line is `COMMIT^` versus the working tree; two or more lines are
+  `OLDER^..NEWER`.
 - `Space-m C` reads one selected git log line and sets the range to
   `COMMIT^..COMMIT`.
 

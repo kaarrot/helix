@@ -1487,50 +1487,36 @@ async fn global_search_jumps_to_match_in_current_file() -> anyhow::Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_copy_path_command() -> anyhow::Result<()> {
     let file = tempfile::NamedTempFile::new()?;
-    let expected_relative = helix_stdx::path::get_relative_path(file.path())
-        .to_string_lossy()
-        .into_owned();
-    let expected_absolute = file.path().to_string_lossy().into_owned();
+    let expected = file.path().to_string_lossy().into_owned();
 
-    test_key_sequence(
-        &mut AppBuilder::new().with_file(file.path(), None).build()?,
-        Some(":copy-path<ret>"),
-        Some(&|app| {
-            let copied = app
-                .editor
-                .registers
-                .first('+', &app.editor)
-                .unwrap()
-                .into_owned();
-            assert_eq!(expected_relative, copied);
-            assert_eq!(
-                format!("Copied path to clipboard: {}", expected_relative),
-                app.editor.get_status().unwrap().0.as_ref()
-            );
-        }),
-        false,
-    )
-    .await?;
-
-    test_key_sequence(
-        &mut AppBuilder::new().with_file(file.path(), None).build()?,
-        Some(":copy-path absolute<ret>"),
-        Some(&|app| {
-            let copied = app
-                .editor
-                .registers
-                .first('+', &app.editor)
-                .unwrap()
-                .into_owned();
-            assert_eq!(expected_absolute, copied);
-            assert_eq!(
-                format!("Copied path to clipboard: {}", expected_absolute),
-                app.editor.get_status().unwrap().0.as_ref()
-            );
-        }),
-        false,
-    )
-    .await?;
+    // The default, an explicit `absolute`, and `url` outside a diff pane all
+    // copy the absolute path: there is no commit to link to.
+    for command in [
+        ":copy-path<ret>",
+        ":copy-path absolute<ret>",
+        ":copy-path url<ret>",
+    ] {
+        let expected = expected.clone();
+        test_key_sequence(
+            &mut AppBuilder::new().with_file(file.path(), None).build()?,
+            Some(command),
+            Some(&move |app: &Application| {
+                let copied = app
+                    .editor
+                    .registers
+                    .first('+', &app.editor)
+                    .unwrap()
+                    .into_owned();
+                assert_eq!(expected, copied);
+                assert_eq!(
+                    format!("Copied path to clipboard: {}", expected),
+                    app.editor.get_status().unwrap().0.as_ref()
+                );
+            }),
+            false,
+        )
+        .await?;
+    }
 
     test_key_sequence(
         &mut AppBuilder::new().build()?,
@@ -1538,6 +1524,19 @@ async fn test_copy_path_command() -> anyhow::Result<()> {
         Some(&|app| {
             assert_eq!(
                 "'copy-path': No file path available (scratch buffer)",
+                app.editor.get_status().unwrap().0
+            );
+        }),
+        false,
+    )
+    .await?;
+
+    test_key_sequence(
+        &mut AppBuilder::new().with_file(file.path(), None).build()?,
+        Some(":copy-path relative<ret>"),
+        Some(&|app| {
+            assert_eq!(
+                "'copy-path': Unknown argument 'relative', expected 'url'",
                 app.editor.get_status().unwrap().0
             );
         }),

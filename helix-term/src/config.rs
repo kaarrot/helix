@@ -511,6 +511,32 @@ mod tests {
     }
 
     #[test]
+    fn parsing_git_remote_config() {
+        let config = Config::load_test(
+            r##"
+            [editor.git-remote]
+            url-template = "{base}/browse/{path}?at={commit}"
+            line-template = "#{line}"
+        "##,
+        );
+        // Overridden keys win; the rest still come from the host's own shape.
+        let template = config
+            .editor
+            .git_remote
+            .template_for_host("gitlab.example.com");
+        assert_eq!(template.file, "{base}/browse/{path}?at={commit}");
+        assert_eq!(template.line, "#{line}");
+        assert_eq!(template.line_range, "#L{line}-{end-line}");
+
+        // With nothing configured every shape comes from the host.
+        let template = Config::default()
+            .editor
+            .git_remote
+            .template_for_host("github.com");
+        assert_eq!(template.file, "{base}/blob/{commit}/{path}");
+    }
+
+    #[test]
     fn parsing_keymaps_config_file() {
         use crate::keymap;
         use helix_core::hashmap;

@@ -20,6 +20,8 @@ mod status;
 
 pub use status::FileChange;
 
+pub mod web_url;
+
 /// Contains all active diff providers. Diff providers are compiled in via features. Currently
 /// only `git` is supported.
 #[derive(Clone)]

@@ -390,6 +390,35 @@ Search specific options.
 | `smart-case` | Enable smart case regex searching (case-insensitive unless pattern contains upper case characters) | `true` |
 | `wrap-around`| Whether the search should wrap after depleting the matches | `true` |
 
+### `[editor.git-remote]` Section
+
+Overrides for the links `:copy-path url` builds. `:copy-path url` looks up the
+remote this repository tracks (the checked-out branch's remote, else `origin`),
+resolves the pane's revision to a full commit hash, and renders a URL to the
+file at that commit with the cursor's line anchored.
+
+The URL shape is chosen from the remote's host — GitHub, GitLab, Bitbucket,
+Gitea/Forgejo/Codeberg and Azure DevOps are recognized — and unrecognized
+(typically self-hosted) hosts get the GitLab shape. Set these keys when that
+guess is wrong for your forge.
+
+| Key | Description | Default |
+|--|--|---------|
+| `url-template` | Addresses the file at a commit | per host, e.g. `{base}/-/blob/{commit}/{path}` |
+| `line-template` | Appended when the selection covers one line | per host, e.g. `#L{line}` |
+| `line-range-template` | Appended when the selection spans lines | per host, e.g. `#L{line}-{end-line}` |
+
+Templates interpolate `{base}` (`scheme://host/repo`), `{host}`, `{repo}`,
+`{commit}`, `{short-commit}`, `{path}`, `{line}` and `{end-line}`. Unknown
+placeholders are left in the output so typos are visible.
+
+```toml
+[editor.git-remote]
+url-template = "https://git.example.com/{repo}/browse/{path}?at={commit}"
+line-template = "#{line}"
+line-range-template = "#{line}-{end-line}"
+```
+
 ### `[editor.whitespace]` Section
 
 Options for rendering whitespace with visible characters. Use `:set whitespace.render all` to temporarily enable visible whitespace.

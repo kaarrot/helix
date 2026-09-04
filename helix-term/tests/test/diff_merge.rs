@@ -532,7 +532,7 @@ async fn split_diff_keyboard_and_search_sync_scroll() -> anyhow::Result<()> {
         if i == 1 {
             base.push_str("one\n");
             working.push_str("one changed\n");
-        } else if i == 200 {
+        } else if i == 200 || i == 240 {
             base.push_str("needle\n");
             working.push_str("needle\n");
         } else {
@@ -596,6 +596,20 @@ async fn split_diff_keyboard_and_search_sync_scroll() -> anyhow::Result<()> {
         "search should scroll both split-diff panes, got base={base_line} working={working_line}"
     );
     assert_eq!(base_line, working_line);
+    let first_match_line = base_line;
+
+    assert!(harness.send_keys(&mut app, "n").await?);
+    let (base_line, working_line) = split_diff_anchor_lines(&app);
+    assert!(
+        base_line > first_match_line && working_line > first_match_line,
+        "n should scroll both split-diff panes to the next match, first={first_match_line} base={base_line} working={working_line}"
+    );
+    assert_eq!(base_line, working_line);
+
+    assert!(harness.send_keys(&mut app, "N").await?);
+    let (base_line, working_line) = split_diff_anchor_lines(&app);
+    assert_eq!(base_line, first_match_line);
+    assert_eq!(working_line, first_match_line);
 
     assert!(harness.send_keys(&mut app, "gg").await?);
     assert_eq!(split_diff_anchor_lines(&app), (0, 0));

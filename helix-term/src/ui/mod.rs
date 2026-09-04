@@ -108,9 +108,13 @@ pub fn raw_regex_prompt(
         move |cx: &mut crate::compositor::Context, input: &str, event: PromptEvent| {
             match event {
                 PromptEvent::Abort => {
-                    let (view, doc) = current!(cx.editor);
-                    doc.set_selection(view.id, snapshot.clone());
-                    doc.set_view_offset(view.id, offset_snapshot);
+                    let view_id = {
+                        let (view, doc) = current!(cx.editor);
+                        doc.set_selection(view.id, snapshot.clone());
+                        doc.set_view_offset(view.id, offset_snapshot);
+                        view.id
+                    };
+                    cx.editor.sync_scroll_to_linked_views(view_id);
                 }
                 PromptEvent::Update | PromptEvent::Validate => {
                     // skip empty input
@@ -145,13 +149,21 @@ pub fn raw_regex_prompt(
 
                             fun(cx, regex, input, event);
 
-                            let (view, doc) = current!(cx.editor);
-                            view.ensure_cursor_in_view(doc, config.scrolloff);
+                            let view_id = {
+                                let (view, doc) = current!(cx.editor);
+                                view.ensure_cursor_in_view(doc, config.scrolloff);
+                                view.id
+                            };
+                            cx.editor.sync_scroll_to_linked_views(view_id);
                         }
                         Err(err) => {
-                            let (view, doc) = current!(cx.editor);
-                            doc.set_selection(view.id, snapshot.clone());
-                            doc.set_view_offset(view.id, offset_snapshot);
+                            let view_id = {
+                                let (view, doc) = current!(cx.editor);
+                                doc.set_selection(view.id, snapshot.clone());
+                                doc.set_view_offset(view.id, offset_snapshot);
+                                view.id
+                            };
+                            cx.editor.sync_scroll_to_linked_views(view_id);
 
                             if event == PromptEvent::Validate {
                                 let callback = async move {

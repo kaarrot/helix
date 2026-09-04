@@ -1400,14 +1400,18 @@ impl Component for EditorView {
 
                 let config = cx.editor.config();
                 let mode = cx.editor.mode();
-                let (view, doc) = current!(cx.editor);
-                view.ensure_cursor_in_view(doc, config.scrolloff);
+                let view_id = {
+                    let (view, doc) = current!(cx.editor);
+                    view.ensure_cursor_in_view(doc, config.scrolloff);
 
-                // Store a history state if not in insert mode. Otherwise wait till we exit insert
-                // to include any edits to the paste in the history state.
-                if mode != Mode::Insert {
-                    doc.append_changes_to_history(view);
-                }
+                    // Store a history state if not in insert mode. Otherwise wait till we exit insert
+                    // to include any edits to the paste in the history state.
+                    if mode != Mode::Insert {
+                        doc.append_changes_to_history(view);
+                    }
+                    view.id
+                };
+                cx.editor.sync_scroll_to_linked_views(view_id);
 
                 EventResult::Consumed(None)
             }
@@ -1498,15 +1502,19 @@ impl Component for EditorView {
 
                 let config = cx.editor.config();
                 let mode = cx.editor.mode();
-                let (view, doc) = current!(cx.editor);
+                let view_id = {
+                    let (view, doc) = current!(cx.editor);
 
-                view.ensure_cursor_in_view(doc, config.scrolloff);
+                    view.ensure_cursor_in_view(doc, config.scrolloff);
 
-                // Store a history state if not in insert mode. This also takes care of
-                // committing changes when leaving insert mode.
-                if mode != Mode::Insert {
-                    doc.append_changes_to_history(view);
-                }
+                    // Store a history state if not in insert mode. This also takes care of
+                    // committing changes when leaving insert mode.
+                    if mode != Mode::Insert {
+                        doc.append_changes_to_history(view);
+                    }
+                    view.id
+                };
+                cx.editor.sync_scroll_to_linked_views(view_id);
                 let callback = if callbacks.is_empty() {
                     None
                 } else {

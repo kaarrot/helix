@@ -70,6 +70,49 @@ fn main_diff_state(app: &Application) -> helix_view::diff_view::DiffViewState {
     app.editor.diff.views.get(&view_id).unwrap().clone()
 }
 
+fn view_anchor_line(
+    app: &Application,
+    doc_id: helix_view::DocumentId,
+    view_id: helix_view::ViewId,
+) -> usize {
+    let doc = app.editor.document(doc_id).unwrap();
+    doc.text()
+        .char_to_line(doc.view_offset(view_id).anchor.min(doc.text().len_chars()))
+}
+
+fn split_diff_anchor_lines(app: &Application) -> (usize, usize) {
+    let diff_state = main_diff_state(app);
+    (
+        view_anchor_line(app, diff_state.base_doc_id, diff_state.base_view_id),
+        view_anchor_line(app, diff_state.working_doc_id, diff_state.working_view_id),
+    )
+}
+
+fn focused_and_other_anchor_lines(app: &Application) -> (usize, usize) {
+    let view_id = app.editor.tree.focus;
+    let diff_state = app.editor.diff.views.get(&view_id).unwrap();
+    let (focused_doc, focused_view, other_doc, other_view) =
+        if view_id == diff_state.working_view_id {
+            (
+                diff_state.working_doc_id,
+                diff_state.working_view_id,
+                diff_state.base_doc_id,
+                diff_state.base_view_id,
+            )
+        } else {
+            (
+                diff_state.base_doc_id,
+                diff_state.base_view_id,
+                diff_state.working_doc_id,
+                diff_state.working_view_id,
+            )
+        };
+    (
+        view_anchor_line(app, focused_doc, focused_view),
+        view_anchor_line(app, other_doc, other_view),
+    )
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn scratch_buffers_can_be_diffed_and_update_live() -> anyhow::Result<()> {
     let mut app = AppBuilder::new().build()?;
@@ -495,6 +538,90 @@ async fn split_diff_controls_and_cross_pane_navigation_work() -> anyhow::Result<
         let doc = app.editor.document(view.doc).unwrap();
         assert!(!doc.char_diff_enabled);
     }
+
+    harness.close(&mut app).await?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn split_diff_keyboard_and_search_sync_scroll() -> anyhow::Result<()> {
+    let repo = GitRepoFixture::new()?;
+    let mut base = String::new();
+    let mut working = String::new();
+    for i in 0..250 {
+        if i == 1 {
+            base.push_str("one\n");
+            working.push_str("one changed\n");
+        } else if i == 200 {
+            base.push_str("needle\n");
+            working.push_str("needle\n");
+        } else {
+            base.push_str(&format!("line {i}\n"));
+            working.push_str(&format!("line {i}\n"));
+        }
+    }
+    repo.write_file("tracked.txt", &base)?;
+    repo.commit_all("initial")?;
+    repo.write_file("tracked.txt", &working)?;
+
+    let _cwd = CwdGuard::enter(repo.path()).await?;
+    let tracked_path = repo.file("tracked.txt");
+    let mut app = AppBuilder::new().with_file(&tracked_path, None).build()?;
+    let mut harness = AppTestHarness::new();
+
+    assert!(harness.send_keys(&mut app, "<space>g").await?);
+    assert!(harness.wait_for_idle(&mut app).await?);
+    assert!(harness.send_keys(&mut app, "<ret>").await?);
+    assert!(harness.send_keys(&mut app, "<space>mv").await?);
+    assert_status(&app, "Split view on", Severity::Info);
+    assert_eq!(app.editor.tree.views().count(), 2);
+    assert_eq!(split_diff_anchor_lines(&app), (0, 0));
+
+    assert!(harness.send_keys(&mut app, "200j").await?);
+    let (base_line, working_line) = split_diff_anchor_lines(&app);
+    assert!(
+        base_line > 0 && working_line > 0,
+        "j/k movement should scroll both split-diff panes, got base={base_line} working={working_line}"
+    );
+    assert_eq!(base_line, working_line);
+
+    assert!(harness.send_keys(&mut app, "gg").await?);
+    assert_eq!(split_diff_anchor_lines(&app), (0, 0));
+
+    assert!(harness.send_keys(&mut app, "<space>ms").await?);
+    assert_status(&app, "Sync scroll disabled", Severity::Info);
+    assert!(harness.send_keys(&mut app, "200j").await?);
+    let (focused, other) = focused_and_other_anchor_lines(&app);
+    assert!(
+        focused > 0,
+        "focused pane should still scroll with sync off"
+    );
+    assert_eq!(
+        other, 0,
+        "unfocused pane should not follow when sync is off"
+    );
+
+    assert!(harness.send_keys(&mut app, "gg").await?);
+    assert!(harness.send_keys(&mut app, "<space>ms").await?);
+    assert_status(&app, "Sync scroll enabled", Severity::Info);
+    // Re-enable does not itself remap; gg already put the focused pane at the top,
+    // so one more movement/ensure is needed to pull the other pane back.
+    assert!(harness.send_keys(&mut app, "gg").await?);
+    assert_eq!(split_diff_anchor_lines(&app), (0, 0));
+
+    assert!(harness.send_keys(&mut app, "/needle<ret>").await?);
+    let (base_line, working_line) = split_diff_anchor_lines(&app);
+    assert!(
+        base_line > 0 && working_line > 0,
+        "search should scroll both split-diff panes, got base={base_line} working={working_line}"
+    );
+    assert_eq!(base_line, working_line);
+
+    assert!(harness.send_keys(&mut app, "gg").await?);
+    assert_eq!(split_diff_anchor_lines(&app), (0, 0));
+    assert!(harness.send_keys(&mut app, "/needle<esc>").await?);
+    assert_eq!(split_diff_anchor_lines(&app), (0, 0));
 
     harness.close(&mut app).await?;
 

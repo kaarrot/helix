@@ -571,6 +571,47 @@ fn new_file(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> an
     Ok(())
 }
 
+/// The 1-based, inclusive line span covered by the primary selection.
+#[cfg(feature = "git")]
+fn selected_line_span(editor: &Editor) -> (usize, usize) {
+    let (view, doc) = current_ref!(editor);
+    let text = doc.text().slice(..);
+    let range = doc.selection(view.id).primary();
+    let start = text.char_to_line(range.from().min(text.len_chars()));
+    // `to()` is exclusive, so a selection ending at a line start would
+    // otherwise report the following line.
+    let end_char = if range.to() > range.from() {
+        range.to() - 1
+    } else {
+        range.to()
+    };
+    let end = text.char_to_line(end_char.min(text.len_chars()));
+    (start + 1, end + 1)
+}
+
+/// Build a permalink to `path` at `rev` using the host's URL shape, or the
+/// `[editor.git-remote]` overrides. Returns `None` when git support is off.
+#[cfg(feature = "git")]
+fn file_url_at_revision(
+    editor: &Editor,
+    path: &std::path::Path,
+    rev: &str,
+) -> anyhow::Result<String> {
+    let link = helix_vcs::git::file_web_link(path, rev)?;
+    let base = helix_vcs::web_url::web_base(&link.remote_url)
+        .ok_or_else(|| anyhow::anyhow!("git remote '{}' has no web address", link.remote_url))?;
+    let template = editor.config().git_remote.template_for_host(&base.host);
+    Ok(helix_vcs::web_url::render(
+        &template,
+        &helix_vcs::web_url::WebUrlFields {
+            base: &base,
+            commit: &link.commit,
+            path: &link.path,
+        },
+        Some(selected_line_span(editor)),
+    ))
+}
+
 fn copy_path_to_clipboard(
     cx: &mut compositor::Context,
     args: Args,
@@ -580,38 +621,44 @@ fn copy_path_to_clipboard(
         return Ok(());
     }
 
-    let doc = doc!(cx.editor);
-
-    // Determine which path to copy based on the argument
-    let use_absolute = args.first().map(|s| s == "absolute").unwrap_or(false);
-
-    let path_str = if use_absolute {
-        // Use absolute path
-        if let Some(path) = doc.path() {
-            path.to_string_lossy().to_string()
-        } else {
-            return Err(anyhow::anyhow!("No file path available (scratch buffer)"));
-        }
-    } else {
-        // Use relative path (default)
-        if let Some(path) = doc.relative_path() {
-            path.to_string_lossy().to_string()
-        } else if let Some(path) = doc.path() {
-            path.to_string_lossy().to_string()
-        } else {
-            return Err(anyhow::anyhow!("No file path available (scratch buffer)"));
-        }
+    let as_url = match args.first() {
+        None | Some("absolute") => false,
+        Some("url") => true,
+        Some(arg) => anyhow::bail!("Unknown argument '{arg}', expected 'url'"),
     };
 
-    // Write to system clipboard (register '+')
-    match cx.editor.registers.write('+', vec![path_str.clone()]) {
-        Ok(_) => {
-            cx.editor
-                .set_status(format!("Copied path to clipboard: {}", path_str));
-            Ok(())
+    let path = doc!(cx.editor)
+        .path()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("No file path available (scratch buffer)"))?;
+
+    // `:copy-path url` links to HEAD. If the file is not in a git repository
+    // with a web remote (a tempfile, a scratch-like path, no remotes), copy
+    // the absolute path instead — there is no commit to point at.
+    let (copied, what) = if as_url {
+        #[cfg(feature = "git")]
+        {
+            match file_url_at_revision(cx.editor, &path, "HEAD") {
+                Ok(url) => (url, "URL"),
+                Err(_) => (path.to_string_lossy().into_owned(), "path"),
+            }
         }
-        Err(err) => Err(anyhow::anyhow!("Failed to copy to clipboard: {}", err)),
-    }
+        #[cfg(not(feature = "git"))]
+        {
+            (path.to_string_lossy().into_owned(), "path")
+        }
+    } else {
+        (path.to_string_lossy().into_owned(), "path")
+    };
+
+    cx.editor
+        .registers
+        .write('+', vec![copied.clone()])
+        .map_err(|err| anyhow::anyhow!("Failed to copy to clipboard: {}", err))?;
+    cx.editor
+        .set_status(format!("Copied {what} to clipboard: {copied}"));
+
+    Ok(())
 }
 
 fn format(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> anyhow::Result<()> {
@@ -2984,9 +3031,9 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     TypableCommand {
         name: "copy-path",
         aliases: &["cp"],
-        doc: "Copy the current file path to the system clipboard. Use ':copy-path absolute' for absolute path, or no argument for relative path.",
+        doc: "Copy the current file's absolute path to the system clipboard. Use ':copy-path url' to copy a link to the file at HEAD on the git remote instead.",
         fun: copy_path_to_clipboard,
-        completer: CommandCompleter::none(),
+        completer: CommandCompleter::positional(&[completers::copy_path_kind]),
         signature: Signature {
             positionals: (0, Some(1)),
             ..Signature::DEFAULT

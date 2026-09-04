@@ -445,6 +445,15 @@ pub mod completers {
             .collect()
     }
 
+    /// The modes `:copy-path` accepts. `absolute` is the default, so it is
+    /// offered mainly to make the alternative to `url` discoverable.
+    pub fn copy_path_kind(_editor: &Editor, input: &str) -> Vec<Completion> {
+        fuzzy_match(input, ["url", "absolute"], false)
+            .into_iter()
+            .map(|(name, _)| ((0..), name.into()))
+            .collect()
+    }
+
     pub fn theme(_editor: &Editor, input: &str) -> Vec<Completion> {
         let mut names = theme::Loader::read_names(&helix_loader::config_dir().join("themes"));
         for rt_dir in helix_loader::runtime_dirs() {

@@ -10,7 +10,7 @@ use std::{
 };
 
 #[cfg(feature = "git")]
-mod git;
+pub mod git;
 
 mod diff;
 
@@ -19,6 +19,8 @@ pub use diff::{DiffHandle, Hunk};
 mod status;
 
 pub use status::FileChange;
+
+pub mod web_url;
 
 /// Contains all active diff providers. Diff providers are compiled in via features. Currently
 /// only `git` is supported.

@@ -374,6 +374,9 @@ pub struct Config {
     #[serde(default)]
     pub search: SearchConfig,
     pub lsp: LspConfig,
+    /// Overrides for how `:copy-path url` builds links to the git remote.
+    #[serde(default)]
+    pub git_remote: GitRemoteConfig,
     pub terminal: Option<TerminalConfig>,
     /// Column numbers at which to draw the rulers. Defaults to `[]`, meaning no rulers.
     pub rulers: Vec<u16>,
@@ -547,6 +550,42 @@ impl Default for LspConfig {
             goto_reference_include_declaration: true,
             display_color_swatches: true,
         }
+    }
+}
+
+/// Overrides for the URL shapes `:copy-path url` builds from the repository's
+/// git remote. Every field is optional; when unset the shape is picked from the
+/// remote's host, falling back to the GitLab layout for unrecognized (typically
+/// self-hosted) forges.
+///
+/// Templates interpolate `{base}` (`scheme://host/repo`), `{host}`, `{repo}`,
+/// `{commit}`, `{short-commit}`, `{path}`, `{line}` and `{end-line}`.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", default, deny_unknown_fields)]
+pub struct GitRemoteConfig {
+    /// Addresses the file at a commit, e.g. `{base}/-/blob/{commit}/{path}`.
+    pub url_template: Option<String>,
+    /// Appended when the selection covers a single line, e.g. `#L{line}`.
+    pub line_template: Option<String>,
+    /// Appended when the selection spans lines, e.g. `#L{line}-{end-line}`.
+    pub line_range_template: Option<String>,
+}
+
+impl GitRemoteConfig {
+    /// The templates to use for `host`: the configured overrides where given,
+    /// the host's own shape everywhere else.
+    pub fn template_for_host(&self, host: &str) -> helix_vcs::web_url::WebUrlTemplate {
+        let mut template = helix_vcs::web_url::template_for_host(host);
+        if let Some(file) = &self.url_template {
+            template.file = file.clone();
+        }
+        if let Some(line) = &self.line_template {
+            template.line = line.clone();
+        }
+        if let Some(line_range) = &self.line_range_template {
+            template.line_range = line_range.clone();
+        }
+        template
     }
 }
 
@@ -1089,6 +1128,7 @@ impl Default for Config {
             undercurl: false,
             search: SearchConfig::default(),
             lsp: LspConfig::default(),
+            git_remote: GitRemoteConfig::default(),
             terminal: get_terminal_provider(),
             rulers: Vec::new(),
             whitespace: WhitespaceConfig::default(),

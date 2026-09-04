@@ -2,7 +2,7 @@ use anyhow::{bail, Context, Result};
 use arc_swap::ArcSwap;
 use gix::filter::plumbing::driver::apply::Delay;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use gix::bstr::ByteSlice;
@@ -25,6 +25,19 @@ mod test;
 #[inline]
 fn get_repo_dir(file: &Path) -> Result<&Path> {
     file.parent().context("file has no parent directory")
+}
+
+/// Resolve a file path, handling the case where the file doesn't exist yet
+/// (e.g. a deleted file being diffed). Falls back to resolving the parent directory.
+fn resolve_file_path(file: &Path) -> Result<PathBuf> {
+    if file.exists() {
+        gix::path::realpath(file).context("resolve symlinks")
+    } else {
+        let parent = get_repo_dir(file)?;
+        let parent = gix::path::realpath(parent).context("resolve symlinks for parent")?;
+        let file_name = file.file_name().context("file has no file name")?;
+        Ok(parent.join(file_name))
+    }
 }
 
 pub fn get_diff_base(file: &Path) -> Result<Vec<u8>> {
@@ -81,6 +94,77 @@ pub fn get_current_head_name(file: &Path) -> Result<Arc<ArcSwap<Box<str>>>> {
 
 pub fn for_each_changed_file(cwd: &Path, f: impl Fn(Result<FileChange>) -> bool) -> Result<()> {
     status(&open_repo(cwd)?.to_thread_local(), f)
+}
+
+/// The pieces needed to build a web link to `file` as it exists in `rev`.
+#[derive(Debug, Clone)]
+pub struct FileWebLink {
+    /// The remote URL as git resolved it, with any `insteadOf` rewrite applied.
+    pub remote_url: String,
+    /// Full commit hash, so the link stays valid when the branch moves on.
+    pub commit: String,
+    /// Repository-root relative path, forward slashes.
+    pub path: String,
+}
+
+/// Resolve everything needed to link to `file` at `rev` on the repository's
+/// web host: which remote this repository tracks, what commit `rev` names, and
+/// where the file sits relative to the repository root.
+///
+/// `rev` accepts a ref, tag, short or full hash, with an optional `^` suffix,
+/// and is always resolved to a full hash so the resulting link is a permalink.
+pub fn file_web_link(file: &Path, rev: &str) -> Result<FileWebLink> {
+    debug_assert!(file.is_absolute());
+    let file = resolve_file_path(file)?;
+
+    let repo_dir = get_repo_dir(&file)?;
+    let repo = open_repo(repo_dir)
+        .context("failed to open git repo")?
+        .to_thread_local();
+
+    let remote_url = remote_url(&repo)?;
+    let commit = resolve_commit(&repo, rev)?.id().to_hex().to_string();
+
+    let work_dir = repo
+        .workdir()
+        .ok_or_else(|| anyhow::anyhow!("not a working tree"))?;
+    let rela_path = file
+        .strip_prefix(work_dir)
+        .context("file is outside the repository")?;
+    let path = rela_path
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/");
+
+    Ok(FileWebLink {
+        remote_url,
+        commit,
+        path,
+    })
+}
+
+/// The URL of the remote this repository tracks. Prefers the remote configured
+/// for the checked-out branch (what `git fetch` with no arguments would use),
+/// then falls back to `origin`, so it works both on a tracking branch and on a
+/// detached HEAD.
+fn remote_url(repo: &Repository) -> Result<String> {
+    // `find_fetch_remote(None)` is what `git fetch` with no arguments resolves:
+    // the checked-out branch's remote, then the only/`origin` remote. On a
+    // detached HEAD or an odd config it can fail outright, so `origin` is tried
+    // once more before giving up.
+    let remote = match repo.find_fetch_remote(None) {
+        Ok(remote) => remote,
+        Err(_) => repo
+            .find_remote("origin")
+            .map_err(|_| anyhow::anyhow!("no git remote configured for this repository"))?,
+    };
+
+    let url = remote
+        .url(gix::remote::Direction::Fetch)
+        .ok_or_else(|| anyhow::anyhow!("git remote has no fetch URL"))?;
+
+    Ok(url.to_bstring().to_string())
 }
 
 fn open_repo(path: &Path) -> Result<ThreadSafeRepository> {
@@ -209,4 +293,51 @@ fn find_file_in_commit(repo: &Repository, commit: &Commit, file: &Path) -> Resul
         // found a file
         EntryKind::Blob | EntryKind::BlobExecutable => Ok(tree_entry.object_id()),
     }
+}
+
+/// Resolve a git reference or commit hash (full or short, with optional `^` parent suffix).
+fn resolve_commit<'a>(repo: &'a Repository, ref_name: &str) -> Result<Commit<'a>> {
+    if let Some(base) = ref_name.strip_suffix('^') {
+        let commit = resolve_commit(repo, base)?;
+        let parent_id = commit
+            .parent_ids()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("commit {} has no parent (root commit)", commit.id))?;
+        return repo
+            .find_object(parent_id)?
+            .try_into_commit()
+            .context(format!("parent of '{}' is not a commit", base));
+    }
+
+    if let Ok(reference) = repo.find_reference(ref_name) {
+        let object_id = reference.into_fully_peeled_id()?.detach();
+        return repo
+            .find_object(object_id)?
+            .try_into_commit()
+            .context(format!("'{}' is not a commit", ref_name));
+    }
+
+    let prefix = gix::hash::Prefix::from_hex(ref_name).context(format!(
+        "'{}' is not a valid reference or commit hash",
+        ref_name
+    ))?;
+
+    let maybe_oid = repo
+        .objects
+        .lookup_prefix(prefix, None)
+        .context("failed to lookup object by hash")?;
+
+    let object_id = match maybe_oid {
+        Some(oid) => oid.map_err(|_| {
+            anyhow::anyhow!(
+                "ambiguous hash prefix '{}'; try using more characters",
+                ref_name
+            )
+        })?,
+        None => bail!("no commit found with hash '{}'", ref_name),
+    };
+
+    repo.find_object(object_id)?
+        .try_into_commit()
+        .context(format!("'{}' is not a commit", ref_name))
 }

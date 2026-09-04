@@ -24,6 +24,9 @@ pub struct KeyTrieNode {
     name: String,
     map: HashMap<KeyEvent, KeyTrie>,
     order: Vec<KeyEvent>,
+    /// Descriptions for entries in `map`, taken from the comments above them in
+    /// the config file. They take precedence over the entry's own doc.
+    docs: HashMap<KeyEvent, String>,
     pub is_sticky: bool,
 }
 
@@ -48,14 +51,29 @@ impl KeyTrieNode {
             name: name.to_string(),
             map,
             order,
+            docs: HashMap::new(),
             is_sticky: false,
         }
+    }
+
+    /// Label this node, as shown in the heading of its infobox.
+    pub fn set_name(&mut self, name: String) {
+        self.name = name;
+    }
+
+    /// Describe `key`, overriding the doc of whatever it is bound to.
+    pub fn set_doc(&mut self, key: KeyEvent, doc: String) {
+        self.docs.insert(key, doc);
     }
 
     /// Merge another Node in. Leaves and subnodes from the other node replace
     /// corresponding keyevent in self, except when both other and self have
     /// subnodes for same key. In that case the merge is recursive.
     pub fn merge(&mut self, mut other: Self) {
+        if !other.name.is_empty() {
+            self.name.clone_from(&other.name);
+        }
+        self.docs.extend(std::mem::take(&mut other.docs));
         for (key, trie) in std::mem::take(&mut other.map) {
             if let Some(KeyTrie::Node(node)) = self.map.get_mut(&key) {
                 if let KeyTrie::Node(other_node) = trie {
@@ -75,15 +93,16 @@ impl KeyTrieNode {
     pub fn infobox(&self) -> Info {
         let mut body: Vec<(BTreeSet<KeyEvent>, &str)> = Vec::with_capacity(self.len());
         for (&key, trie) in self.iter() {
+            let doc = self.docs.get(&key).map(String::as_str);
             let desc = match trie {
                 KeyTrie::MappableCommand(cmd) => {
                     if cmd.name() == "no_op" {
                         continue;
                     }
-                    cmd.doc()
+                    doc.unwrap_or_else(|| cmd.doc())
                 }
-                KeyTrie::Node(n) => &n.name,
-                KeyTrie::Sequence(_) => "[Multiple commands]",
+                KeyTrie::Node(n) => doc.unwrap_or(n.name.as_str()),
+                KeyTrie::Sequence(_) => doc.unwrap_or("[Multiple commands]"),
             };
             match body.iter().position(|(_, d)| d == &desc) {
                 Some(pos) => {

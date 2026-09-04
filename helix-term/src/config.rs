@@ -1,7 +1,7 @@
 use crate::keymap;
-use crate::keymap::{merge_keys, KeyTrie};
+use crate::keymap::{merge_keys, KeyTrie, KeyTrieNode};
 use helix_loader::merge_toml_values;
-use helix_view::{document::Mode, theme};
+use helix_view::{document::Mode, input::KeyEvent, theme};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fmt::Display;
@@ -165,9 +165,12 @@ fn sanitize_config_file(
     let theme = table
         .remove("theme")
         .and_then(|value| sanitize_theme(value, warnings));
-    let keys = table
+    let mut keys = table
         .remove("keys")
         .and_then(|value| sanitize_keys(value, warnings));
+    if let Some(keys) = keys.as_mut() {
+        apply_keymap_docs(keys, file);
+    }
     let editor = table
         .remove("editor")
         .and_then(|value| sanitize_editor(value, warnings));
@@ -452,6 +455,123 @@ fn sanitize_key_table(
     sanitized
 }
 
+/// Describe keymap entries with the comment written above them in the config
+/// file, so that the infobox shows that instead of the bound command:
+///
+/// ```toml
+/// [keys.normal.space]
+/// # Blame the current line
+/// b = ":sh git blame -L %{cursor_line},%{cursor_line} -- %{buffer_name}"
+/// ```
+///
+/// A comment above a table header describes the sub-menu it opens. Comments are
+/// only attached when they sit directly above the key: a blank line in between
+/// detaches them.
+fn apply_keymap_docs(keys: &mut HashMap<Mode, KeyTrie>, file: &str) {
+    for (path, doc) in keymap_comment_docs(file) {
+        let [root, mode, path @ .., last] = path.as_slice() else {
+            continue;
+        };
+        if root != "keys" {
+            continue;
+        }
+        let Ok(mode) = mode.parse::<Mode>() else {
+            continue;
+        };
+        let Ok(key) = last.parse::<KeyEvent>() else {
+            continue;
+        };
+        let Some(node) = keys
+            .get_mut(&mode)
+            .and_then(KeyTrie::node_mut)
+            .and_then(|node| descend(node, path))
+        else {
+            continue;
+        };
+
+        // A sub-menu is described both where it is opened from and in the
+        // heading of its own infobox.
+        if let Some(submenu) = node.get_mut(&key).and_then(KeyTrie::node_mut) {
+            submenu.set_name(doc.clone());
+        }
+        node.set_doc(key, doc);
+    }
+}
+
+fn descend<'a>(mut node: &'a mut KeyTrieNode, path: &[String]) -> Option<&'a mut KeyTrieNode> {
+    for key in path {
+        node = node.get_mut(&key.parse::<KeyEvent>().ok()?)?.node_mut()?;
+    }
+    Some(node)
+}
+
+/// Collect `(path, description)` pairs out of the comments in a config file, for
+/// both table headers and keys. This is deliberately sloppier than a TOML parser:
+/// the parsed config is what decides which keys exist, so a path that comes out
+/// wrong here simply describes nothing.
+fn keymap_comment_docs(file: &str) -> Vec<(Vec<String>, String)> {
+    let mut docs = Vec::new();
+    let mut table: Vec<String> = Vec::new();
+    let mut comments: Vec<&str> = Vec::new();
+
+    for line in file.lines() {
+        let line = line.trim();
+
+        if let Some(comment) = line.strip_prefix('#') {
+            comments.push(comment.trim());
+            continue;
+        }
+
+        if let Some(header) = line
+            .strip_prefix('[')
+            .and_then(|line| line.strip_suffix(']'))
+        {
+            table = key_path(header);
+            if !comments.is_empty() {
+                docs.push((table.clone(), comments.join(" ")));
+            }
+        } else if !line.is_empty() && !comments.is_empty() {
+            let path = key_path(line);
+            if !path.is_empty() {
+                docs.push(([table.clone(), path].concat(), comments.join(" ")));
+            }
+        }
+
+        comments.clear();
+    }
+
+    docs
+}
+
+/// Split a dotted key path, stopping at the `=` of a key-value line. Quoted keys
+/// are unquoted, and neither `.` nor `=` separate while inside quotes.
+fn key_path(line: &str) -> Vec<String> {
+    let mut path = Vec::new();
+    let mut key = String::new();
+    let mut quote = None;
+
+    for ch in line.chars() {
+        match ch {
+            _ if Some(ch) == quote => quote = None,
+            '"' | '\'' if quote.is_none() => quote = Some(ch),
+            _ if quote.is_some() => key.push(ch),
+            '.' | '=' => {
+                path.push(std::mem::take(&mut key).trim().to_owned());
+                if ch == '=' {
+                    return path;
+                }
+            }
+            _ => key.push(ch),
+        }
+    }
+
+    let key = key.trim();
+    if !key.is_empty() {
+        path.push(key.to_owned());
+    }
+    path
+}
+
 fn key_mode_is_valid(mode: &str) -> Result<(), TomlError> {
     let mut modes = Map::new();
     modes.insert(mode.to_owned(), Value::Table(Map::new()));
@@ -539,6 +659,72 @@ mod tests {
                 ..Default::default()
             }
         );
+    }
+
+    /// The description the infobox shows for `key`, without its padding.
+    fn description(info: &helix_view::info::Info, key: &str) -> String {
+        info.text
+            .lines()
+            .find(|line| line.split_whitespace().next() == Some(key))
+            .and_then(|line| line.split_once(char::is_whitespace))
+            .map(|(_, desc)| desc.trim().to_owned())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn comments_above_keys_describe_them() {
+        let config = Config::load_test(
+            r#"
+            [keys.normal]
+            # Blame the current line
+            B = ":sh git blame -L %{cursor_line},%{cursor_line} -- %{buffer_name}"
+
+            # Detached by the blank line below
+
+            C = ":sh git log -- %{buffer_name}"
+            "#,
+        );
+
+        let info = config.keys[&Mode::Normal].node().unwrap().infobox();
+        assert_eq!(description(&info, "B"), "Blame the current line");
+        // Without a comment of its own a binding still shows the command.
+        assert!(
+            description(&info, "C").starts_with(":run-shell-command"),
+            "{}",
+            info.text
+        );
+        assert!(!info.text.contains("Detached"), "{}", info.text);
+    }
+
+    #[test]
+    fn comments_above_table_headers_describe_submenus() {
+        let config = Config::load_test(
+            r#"
+            # Version control
+            [keys.normal.space.v]
+            # Blame the current line
+            b = ":sh git blame -L %{cursor_line},%{cursor_line} -- %{buffer_name}"
+            "#,
+        );
+
+        let space = "space".parse::<KeyEvent>().unwrap();
+        let v = "v".parse::<KeyEvent>().unwrap();
+
+        // Descriptions survive the merge into the default keymap.
+        let menu = config.keys[&Mode::Normal]
+            .search(&[space])
+            .and_then(KeyTrie::node)
+            .unwrap()
+            .infobox();
+        assert_eq!(description(&menu, "v"), "Version control");
+
+        let submenu = config.keys[&Mode::Normal]
+            .search(&[space, v])
+            .and_then(KeyTrie::node)
+            .unwrap()
+            .infobox();
+        assert_eq!(submenu.title, "Version control");
+        assert_eq!(description(&submenu, "b"), "Blame the current line");
     }
 
     #[test]

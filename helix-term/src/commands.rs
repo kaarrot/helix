@@ -2213,11 +2213,14 @@ fn search_impl(
         }
     }
 
-    let (view, doc) = current!(editor);
-    let text = doc.text().slice(..);
-    let selection = doc.selection(view.id);
+    let view_id = {
+        let (view, doc) = current!(editor);
+        let text = doc.text().slice(..);
+        let selection = doc.selection(view.id);
 
-    if let Some(mat) = mat {
+        let Some(mat) = mat else {
+            return;
+        };
         let start = text.byte_to_char(mat.start());
         let end = text.byte_to_char(mat.end());
 
@@ -2237,7 +2240,9 @@ fn search_impl(
 
         doc.set_selection(view.id, selection);
         view.ensure_cursor_in_view_center(doc, scrolloff);
+        view.id
     };
+    editor.sync_scroll_to_linked_views(view_id);
 }
 
 fn search_completions(cx: &mut Context, reg: Option<char>) -> Vec<String> {

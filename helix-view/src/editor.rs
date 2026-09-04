@@ -3351,8 +3351,13 @@ impl Editor {
                 let _ = self.close_document(diff_state.working_doc_id, true);
             }
 
+            // Collapse the extra pane only while both panes still exist.
+            // Range diffs close both virtual documents, which can already
+            // remove one view; closing the leftover view empties the tree
+            // (focus becomes the root container) and panics in switch().
             if diff_state.base_view_id != diff_state.working_view_id
-                && self.tree.contains(diff_state.base_view_id)
+                && self.tree.try_get(diff_state.base_view_id).is_some()
+                && self.tree.try_get(diff_state.working_view_id).is_some()
             {
                 self.close(diff_state.base_view_id);
             }

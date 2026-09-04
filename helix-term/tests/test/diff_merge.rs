@@ -524,6 +524,53 @@ async fn split_diff_controls_and_cross_pane_navigation_work() -> anyhow::Result<
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn range_diff_can_toggle_split_view_off() -> anyhow::Result<()> {
+    let repo = GitRepoFixture::new()?;
+    repo.write_file("tracked.txt", "one\n")?;
+    repo.commit_all("initial")?;
+    let older = repo.rev_parse("HEAD")?;
+    repo.write_file("tracked.txt", "two\n")?;
+    repo.commit_all("second")?;
+    let newer = repo.rev_parse("HEAD")?;
+
+    let _cwd = CwdGuard::enter(repo.path()).await?;
+    let tracked_path = repo.file("tracked.txt");
+    let mut app = AppBuilder::new().with_file(&tracked_path, None).build()?;
+    let mut harness = AppTestHarness::new();
+
+    let command = format!(":diff-commit {older}..{newer}<ret>");
+    assert!(harness.send_keys(&mut app, &command).await?);
+    assert!(harness.send_keys(&mut app, "<space>g").await?);
+    assert!(harness.wait_for_idle(&mut app).await?);
+    assert!(harness.send_keys(&mut app, "<ret>").await?);
+
+    {
+        let diff_state = main_diff_state(&app);
+        assert_eq!(diff_state.base_ref, older);
+        assert_eq!(diff_state.target_ref.as_deref(), Some(newer.as_str()));
+        assert!(diff_state.close_base_doc_on_close);
+        assert!(diff_state.close_working_doc_on_close);
+        assert_eq!(app.editor.diff.views.len(), 1);
+        assert_eq!(app.editor.tree.views().count(), 1);
+    }
+
+    assert!(harness.send_keys(&mut app, "<space>mv").await?);
+    assert_status(&app, "Split view on", Severity::Info);
+    assert_eq!(app.editor.diff.views.len(), 2);
+    assert_eq!(app.editor.tree.views().count(), 2);
+
+    assert!(harness.send_keys(&mut app, "<space>mv").await?);
+    assert_status(&app, "Split view off", Severity::Info);
+    assert_eq!(app.editor.diff.views.len(), 1);
+    assert_eq!(app.editor.tree.views().count(), 1);
+    let _view = app.editor.tree.get(app.editor.tree.focus);
+
+    harness.close(&mut app).await?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn split_diff_keyboard_and_search_sync_scroll() -> anyhow::Result<()> {
     let repo = GitRepoFixture::new()?;
     let mut base = String::new();

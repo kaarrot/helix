@@ -349,20 +349,27 @@ pub mod util {
         .expect("transaction must be valid for primary selection");
         let removed_text = text.slice(removed_start..removed_end);
 
+        let completion_range_for = |range: &Range| {
+            let cursor = range.cursor(text);
+            completion_range(text, edit_offset, replace_mode, cursor)
+                .filter(|(start, end)| text.slice(start..end) == removed_text)
+                .unwrap_or_else(|| find_completion_range(text, replace_mode, cursor))
+        };
+
         let (transaction, mut selection) = Transaction::change_by_selection_ignore_overlapping(
             doc,
             selection,
-            |range| {
-                let cursor = range.cursor(text);
-                completion_range(text, edit_offset, replace_mode, cursor)
-                    .filter(|(start, end)| text.slice(start..end) == removed_text)
-                    .unwrap_or_else(|| find_completion_range(text, replace_mode, cursor))
-            },
+            |range| completion_range_for(range),
             |_, _| replacement.clone(),
         );
         if transaction.changes().is_empty() {
             return transaction;
         }
+        // Don't map the pre-completion insert-mode range: a replacement that
+        // includes a suffix after the cursor can leave a selection over the
+        // whole inserted word, so the cursor lands at the start or on the last
+        // character depending on selection direction. Always sit after the edit.
+        selection = selection.transform(|range| Range::point(completion_range_for(&range).1));
         selection = selection.map(transaction.changes());
         transaction.with_selection(selection)
     }
@@ -1081,5 +1088,107 @@ mod tests {
         let transaction = generate_transaction_from_edits(&source, edits, OffsetEncoding::Utf16);
         assert!(transaction.apply(&mut source));
         assert_eq!(source, "[\n  \"🇺🇸\",\n  \"🎄\",\n]");
+    }
+
+    fn apply_completion_edit(
+        text: &str,
+        selection: helix_core::Selection,
+        edit_offset: Option<(i128, i128)>,
+        replace_mode: bool,
+        new_text: &str,
+    ) -> (helix_core::Rope, helix_core::Selection) {
+        let mut doc = Rope::from(text);
+        let transaction = generate_transaction_from_completion_edit(
+            &doc,
+            &selection,
+            edit_offset,
+            replace_mode,
+            new_text.to_string(),
+        );
+        assert!(transaction.apply(&mut doc));
+        let selection = transaction
+            .selection()
+            .expect("completion edit sets a selection")
+            .clone()
+            .ensure_invariants(doc.slice(..));
+        (doc, selection)
+    }
+
+    #[test]
+    fn completion_edit_with_suffix_places_cursor_after_inserted_text() {
+        // "tihsaaa" with the cursor between the typed prefix and the existing suffix,
+        // matching harper-ls replacing the whole misspelled word.
+        let edit_offset = Some((-4, 3));
+
+        let cases = [
+            // `i` before existing text: reverse 1-width on the first suffix char
+            helix_core::Selection::single(5, 4),
+            // click / `a`: forward 1-width on the first suffix char
+            helix_core::Selection::single(4, 5),
+            // point at the insertion gap
+            helix_core::Selection::point(4),
+        ];
+
+        for selection in cases {
+            let (doc, selection) =
+                apply_completion_edit("tihsaaa", selection, edit_offset, false, "this");
+            assert_eq!(doc, Rope::from("this"));
+            assert_eq!(selection.primary().cursor(doc.slice(..)), 4);
+        }
+
+        let (doc, selection) = apply_completion_edit(
+            "tihsaaa more",
+            helix_core::Selection::single(5, 4),
+            edit_offset,
+            false,
+            "this",
+        );
+        assert_eq!(doc, Rope::from("this more"));
+        assert_eq!(selection.primary().cursor(doc.slice(..)), 4);
+
+        // Cursor at the start of the word being replaced: mapping AfterSticky
+        // at the replacement start would leave the cursor at the front.
+        let (doc, selection) = apply_completion_edit(
+            "tihsaaa",
+            helix_core::Selection::point(0),
+            Some((0, 7)),
+            false,
+            "this",
+        );
+        assert_eq!(doc, Rope::from("this"));
+        assert_eq!(selection.primary().cursor(doc.slice(..)), 4);
+    }
+
+    #[test]
+    fn completion_replace_mode_with_suffix_places_cursor_after_inserted_text() {
+        let (doc, selection) = apply_completion_edit(
+            "tihsaaa",
+            helix_core::Selection::single(5, 4),
+            None,
+            true,
+            "this",
+        );
+        assert_eq!(doc, Rope::from("this"));
+        assert_eq!(selection.primary().cursor(doc.slice(..)), 4);
+    }
+
+    #[test]
+    fn completion_cursor_after_suffix_replace_inserts_space_after_word() {
+        let selections = [
+            helix_core::Selection::single(5, 4),
+            helix_core::Selection::single(4, 5),
+        ];
+        for selection in selections {
+            let (mut doc, selection) =
+                apply_completion_edit("tihsaaa", selection, Some((-4, 3)), false, "this");
+            let cursors = selection.clone().cursors(doc.slice(..));
+            let transaction = helix_core::Transaction::insert(&doc, &cursors, " ".into());
+            assert!(transaction.apply(&mut doc));
+            let selection = selection
+                .map(transaction.changes())
+                .ensure_invariants(doc.slice(..));
+            assert_eq!(doc, Rope::from("this "));
+            assert_eq!(selection.primary().cursor(doc.slice(..)), 5);
+        }
     }
 }

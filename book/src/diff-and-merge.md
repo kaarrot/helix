@@ -48,7 +48,7 @@ Once a diff view is open:
 - `]g` jumps to the next diff hunk.
 - `[g` jumps to the previous diff hunk.
 - `Space-m v` toggles side-by-side split diff view.
-- `Space-m s` toggles synchronized scrolling between split panes.
+- `Space-m s` toggles synchronized scrolling between split panes. When enabled (the default), mouse wheel, `j`/`k`/arrows, page scrolling, and search keep both viewports aligned. Hunk jumps (`]g`/`[g`) still move both cursors as well.
 - `Space-m q` closes the current diff or merge view.
 
 ## Merge resolution

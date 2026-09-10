@@ -288,10 +288,12 @@ impl EditorView {
             Self::render_diagnostics(doc, view, inner, surface, theme);
         }
 
-        let statusline_area = view
-            .area
-            .clip_top(view.area.height.saturating_sub(1))
-            .clip_bottom(1); // -1 from bottom to remove commandline
+        let statusline_height = if is_focused {
+            view.statusline_height.max(1)
+        } else {
+            1
+        };
+        let statusline_area = statusline::area_for_view(view, statusline_height);
 
         let mut context = statusline::RenderContext::new(
             editor,
@@ -1169,6 +1171,7 @@ impl EditorView {
 
         // TODO : propagate required size on resize to completion too
         self.completion = Some(completion);
+        self.sync_statusline_height(editor);
         Some(area)
     }
 
@@ -1176,6 +1179,7 @@ impl EditorView {
         self.statusline_completion_mouse_down = None;
         self.popup_completion_mouse_down = None;
         self.completion = None;
+        self.sync_statusline_height(editor);
         let mut on_next_key: Option<OnKeyCallback> = None;
         editor.handlers.completions.request_controller.restart();
         editor.handlers.completions.active_completions.clear();
@@ -1292,6 +1296,30 @@ impl EditorView {
         self.pseudo_pending.clear();
     }
 
+    fn sync_statusline_height(&self, editor: &mut Editor) {
+        let takeover = statusline::completions_take_over(editor, self.completion.as_ref());
+        let scrolloff = editor.config().scrolloff;
+        let (view, doc) = current!(editor);
+        let new_height = if takeover {
+            statusline::COMPLETION_STRIP_HEIGHT
+                .min(view.area.height)
+                .max(1)
+        } else {
+            1
+        };
+        if view.statusline_height != new_height {
+            view.statusline_height = new_height;
+            view.ensure_cursor_in_view(doc, scrolloff);
+        }
+    }
+
+    fn statusline_area(&self, editor: &Editor) -> Rect {
+        let view_area = current_ref!(editor).0.area;
+        let height = statusline::strip_height(editor, self.completion.as_ref(), view_area.height);
+        let height = height.min(view_area.height).max(1);
+        view_area.clip_top(view_area.height.saturating_sub(height))
+    }
+
     fn statusline_completion_index_at(
         &self,
         editor: &Editor,
@@ -1299,11 +1327,8 @@ impl EditorView {
         column: u16,
     ) -> Option<usize> {
         let completion = self.completion.as_ref()?;
+        let statusline_area = self.statusline_area(editor);
         let (view, doc) = current_ref!(editor);
-        let statusline_area = view
-            .area
-            .clip_top(view.area.height.saturating_sub(1))
-            .clip_bottom(1);
         let mut context = statusline::RenderContext::new(
             editor,
             doc,
@@ -1317,13 +1342,10 @@ impl EditorView {
     }
 
     fn statusline_area_contains(&self, editor: &Editor, row: u16, column: u16) -> bool {
-        let (view, _) = current_ref!(editor);
-        let statusline_area = view
-            .area
-            .clip_top(view.area.height.saturating_sub(1))
-            .clip_bottom(1);
+        let statusline_area = self.statusline_area(editor);
 
-        row == statusline_area.y
+        row >= statusline_area.y
+            && row < statusline_area.y.saturating_add(statusline_area.height)
             && column >= statusline_area.left()
             && column < statusline_area.right()
     }
@@ -1359,8 +1381,7 @@ impl EditorView {
         }
         let selection = doc.selection(view.id).clone();
         let cursors = selection.cursors(doc.text().slice(..));
-        let transaction =
-            Transaction::insert(doc.text(), &cursors, helix_core::Tendril::from(" "));
+        let transaction = Transaction::insert(doc.text(), &cursors, helix_core::Tendril::from(" "));
         doc.apply(&transaction, view.id);
     }
 
@@ -1457,9 +1478,15 @@ impl EditorView {
 
         match kind {
             MouseEventKind::Down(MouseButton::Left) => {
-                if let Some(index) = self.statusline_completion_index_at(cxt.editor, row, column) {
-                    if self.select_completion(cxt.editor, index, PromptEvent::Update) {
-                        self.statusline_completion_mouse_down = Some(index);
+                if statusline::completions_take_over(cxt.editor, self.completion.as_ref())
+                    && self.statusline_area_contains(cxt.editor, row, column)
+                {
+                    if let Some(index) =
+                        self.statusline_completion_index_at(cxt.editor, row, column)
+                    {
+                        if self.select_completion(cxt.editor, index, PromptEvent::Update) {
+                            self.statusline_completion_mouse_down = Some(index);
+                        }
                     }
 
                     return EventResult::Consumed(None);
@@ -1948,6 +1975,7 @@ impl Component for EditorView {
 
         // if the terminal size suddenly changed, we need to trigger a resize
         cx.editor.resize(editor_area);
+        self.sync_statusline_height(cx.editor);
 
         if use_bufferline {
             Self::render_bufferline(cx.editor, area.with_height(1), surface);

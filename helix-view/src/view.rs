@@ -154,6 +154,10 @@ pub struct View {
     // left to future work. For now we treat all views as focused and give them
     // each their own handler.
     pub diagnostics_handler: DiagnosticsHandler,
+    /// Rows reserved at the bottom of the view for the statusline.
+    /// Grows above 1 while statusline completion suggestions are active so
+    /// the suggestion chips have a larger tap target.
+    pub statusline_height: u16,
 }
 
 impl fmt::Debug for View {
@@ -179,6 +183,7 @@ impl View {
             gutters,
             doc_revisions: HashMap::new(),
             diagnostics_handler: DiagnosticsHandler::new(),
+            statusline_height: 1,
         }
     }
 
@@ -190,11 +195,16 @@ impl View {
     }
 
     pub fn inner_area(&self, doc: &Document) -> Rect {
-        self.area.clip_left(self.gutter_offset(doc)).clip_bottom(1) // -1 for statusline
+        self.area
+            .clip_left(self.gutter_offset(doc))
+            .clip_bottom(self.statusline_height.max(1))
     }
 
     pub fn inner_height(&self) -> usize {
-        self.area.clip_bottom(1).height.into() // -1 for statusline
+        self.area
+            .clip_bottom(self.statusline_height.max(1))
+            .height
+            .into()
     }
 
     pub fn inner_width(&self, doc: &Document) -> u16 {

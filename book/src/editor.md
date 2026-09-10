@@ -162,6 +162,9 @@ On small or split terminals the default vertical popup can obscure code. The
 `completion-suggestions` statusline element renders the top completion
 candidates as a compact horizontal strip inside the statusline — similar to the
 suggestion bar on smartphone keyboards — instead of (or alongside) the popup.
+While suggestions are active the strip grows to three rows so each candidate is
+easier to tap, and adjacent labels are packed with a single space of padding
+so as many as will fit remain readable.
 
 To enable it, set `completion-display` **and** add the element to the
 statusline layout:

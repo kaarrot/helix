@@ -15,8 +15,11 @@ use helix_view::editor::StatusLineElement as StatusLineElementID;
 use tui::buffer::Buffer as Surface;
 use tui::text::{Span, Spans};
 
-const COMPLETION_MAX_ITEMS: usize = 5;
+/// Extra statusline rows while completion chips are shown, so each chip is
+/// easier to tap on a touch screen. Text is drawn on the middle row.
+pub(crate) const COMPLETION_STRIP_HEIGHT: u16 = 3;
 const COMPLETION_MAX_LABEL_WIDTH: usize = 16;
+const COMPLETION_CHIP_PAD: usize = 1;
 
 pub struct RenderContext<'a> {
     pub editor: &'a Editor,
@@ -26,6 +29,7 @@ pub struct RenderContext<'a> {
     pub spinners: &'a ProgressSpinners,
     pub completion: Option<&'a Completion>,
     pub parts: RenderBuffer<'a>,
+    available_width: u16,
 }
 
 impl<'a> RenderContext<'a> {
@@ -45,6 +49,7 @@ impl<'a> RenderContext<'a> {
             spinners,
             completion,
             parts: RenderBuffer::default(),
+            available_width: view.area.width,
         }
     }
 }
@@ -63,7 +68,11 @@ pub fn render(context: &mut RenderContext, viewport: Rect, surface: &mut Surface
         context.editor.theme.get("ui.statusline.inactive")
     };
 
-    surface.set_style(viewport.with_height(1), base_style);
+    let height = viewport.height.max(1);
+    let text_y = viewport.y + height / 2;
+    context.available_width = viewport.width;
+
+    surface.set_style(viewport.with_height(height), base_style);
 
     // Left side of the status line.
 
@@ -76,13 +85,6 @@ pub fn render(context: &mut RenderContext, viewport: Rect, surface: &mut Surface
         });
     }
 
-    surface.set_spans(
-        viewport.x,
-        viewport.y,
-        &context.parts.left,
-        context.parts.left.width() as u16,
-    );
-
     // Right side of the status line.
 
     for element_id in &config.statusline.right {
@@ -91,16 +93,6 @@ pub fn render(context: &mut RenderContext, viewport: Rect, surface: &mut Surface
             append(&mut context.parts.right, span, base_style)
         })
     }
-
-    surface.set_spans(
-        viewport.x
-            + viewport
-                .width
-                .saturating_sub(context.parts.right.width() as u16),
-        viewport.y,
-        &context.parts.right,
-        context.parts.right.width() as u16,
-    );
 
     // Center of the status line.
 
@@ -114,16 +106,23 @@ pub fn render(context: &mut RenderContext, viewport: Rect, surface: &mut Surface
     // Width of the empty space between the left and center area and between the center and right area.
     let spacing = 1u16;
 
-    let edge_width = context.parts.left.width().max(context.parts.right.width()) as u16;
+    let left_width = context.parts.left.width() as u16;
+    let right_width = context.parts.right.width() as u16;
+    let edge_width = left_width.max(right_width);
     let center_max_width = viewport.width.saturating_sub(2 * edge_width + 2 * spacing);
     let center_width = center_max_width.min(context.parts.center.width() as u16);
+    let center_start = viewport.x + viewport.width / 2 - center_width / 2;
+    let right_start = viewport.x + viewport.width.saturating_sub(right_width);
 
-    surface.set_spans(
-        viewport.x + viewport.width / 2 - center_width / 2,
-        viewport.y,
-        &context.parts.center,
-        center_width,
-    );
+    if height > 1 {
+        paint_completion_chips(context, viewport, surface, base_style);
+    }
+
+    surface.set_spans(viewport.x, text_y, &context.parts.left, left_width);
+
+    surface.set_spans(right_start, text_y, &context.parts.right, right_width);
+
+    surface.set_spans(center_start, text_y, &context.parts.center, center_width);
 }
 
 pub fn completion_suggestion_index_at(
@@ -132,9 +131,15 @@ pub fn completion_suggestion_index_at(
     column: u16,
     row: u16,
 ) -> Option<usize> {
-    if row != viewport.y || column < viewport.left() || column >= viewport.right() {
+    if row < viewport.y
+        || row >= viewport.y.saturating_add(viewport.height)
+        || column < viewport.left()
+        || column >= viewport.right()
+    {
         return None;
     }
+
+    context.available_width = viewport.width;
 
     let (left_elements, center_elements, right_elements) = {
         let config = context.editor.config();
@@ -177,6 +182,7 @@ struct CompletionSuggestionRange {
     start: usize,
     end: usize,
     index: usize,
+    style: Style,
 }
 
 fn section_layout(context: &mut RenderContext, elements: &[StatusLineElementID]) -> SectionLayout {
@@ -191,6 +197,7 @@ fn section_layout(context: &mut RenderContext, elements: &[StatusLineElementID])
                         start: layout.width,
                         end: layout.width + span_width,
                         index,
+                        style: part.span.style,
                     });
                 }
                 layout.width += span_width;
@@ -233,6 +240,82 @@ fn hit_test_completion_suggestion(
         .iter()
         .find(|range| relative_column >= range.start && relative_column < range.end)
         .map(|range| range.index)
+}
+
+fn paint_completion_chips(
+    context: &mut RenderContext,
+    viewport: Rect,
+    surface: &mut Surface,
+    base_style: Style,
+) {
+    let (left_elements, center_elements, right_elements) = {
+        let config = context.editor.config();
+        let statusline = &config.statusline;
+        (
+            statusline.left.clone(),
+            statusline.center.clone(),
+            statusline.right.clone(),
+        )
+    };
+
+    let left = section_layout(context, &left_elements);
+    let right = section_layout(context, &right_elements);
+    let center = section_layout(context, &center_elements);
+
+    let spacing = 1u16;
+    let left_width = left.width.min(u16::MAX as usize) as u16;
+    let right_width = right.width.min(u16::MAX as usize) as u16;
+    let edge_width = left_width.max(right_width);
+    let center_max_width = viewport.width.saturating_sub(2 * edge_width + 2 * spacing);
+    let center_width = center_max_width.min(center.width.min(u16::MAX as usize) as u16);
+
+    let center_start = viewport.x + viewport.width / 2 - center_width / 2;
+    let right_start = viewport.x + viewport.width.saturating_sub(right_width);
+
+    paint_section_chips(
+        &center,
+        center_start,
+        center_width,
+        viewport,
+        surface,
+        base_style,
+    );
+    paint_section_chips(
+        &right,
+        right_start,
+        right_width,
+        viewport,
+        surface,
+        base_style,
+    );
+    paint_section_chips(&left, viewport.x, left_width, viewport, surface, base_style);
+}
+
+fn paint_section_chips(
+    layout: &SectionLayout,
+    section_start: u16,
+    section_width: u16,
+    viewport: Rect,
+    surface: &mut Surface,
+    base_style: Style,
+) {
+    let section_end = section_start.saturating_add(section_width);
+    let clip_start = viewport.left().max(section_start);
+    let clip_end = viewport.right().min(section_end);
+
+    for range in &layout.suggestions {
+        let start = section_start.saturating_add(range.start.min(u16::MAX as usize) as u16);
+        let end = section_start.saturating_add(range.end.min(u16::MAX as usize) as u16);
+        let x = start.max(clip_start);
+        let x_end = end.min(clip_end);
+        if x_end <= x {
+            continue;
+        }
+        surface.set_style(
+            Rect::new(x, viewport.y, x_end - x, viewport.height),
+            base_style.patch(range.style),
+        );
+    }
 }
 
 fn append<'a>(buffer: &mut Spans<'a>, mut span: Span<'a>, base_style: Style) {
@@ -738,28 +821,46 @@ where
 /// True when completion suggestions are currently being rendered in the statusline
 /// and are therefore allowed to hide path elements to free up space.
 fn suggestions_taking_over(context: &RenderContext) -> bool {
+    completions_take_over(context.editor, context.completion)
+}
+
+pub(crate) fn completions_take_over(editor: &Editor, completion: Option<&Completion>) -> bool {
     use helix_view::editor::CompletionDisplay;
-    if context.editor.mode() != Mode::Insert {
+    if editor.mode() != Mode::Insert {
         return false;
     }
-    let Some(completion) = context.completion else {
+    let Some(completion) = completion else {
         return false;
     };
     if completion.is_empty() {
         return false;
     }
-    if matches!(
-        context.editor.config().completion_display,
-        CompletionDisplay::Popup
-    ) {
+    if matches!(editor.config().completion_display, CompletionDisplay::Popup) {
         return false;
     }
-    let cfg = &context.editor.config().statusline;
+    let cfg = &editor.config().statusline;
     cfg.left
         .iter()
         .chain(cfg.center.iter())
         .chain(cfg.right.iter())
         .any(|e| matches!(e, StatusLineElementID::CompletionSuggestions))
+}
+
+pub(crate) fn strip_height(
+    editor: &Editor,
+    completion: Option<&Completion>,
+    view_height: u16,
+) -> u16 {
+    if completions_take_over(editor, completion) {
+        COMPLETION_STRIP_HEIGHT.min(view_height).max(1)
+    } else {
+        1
+    }
+}
+
+pub(crate) fn area_for_view(view: &View, height: u16) -> Rect {
+    let height = height.min(view.area.height).max(1);
+    view.area.clip_top(view.area.height.saturating_sub(height))
 }
 
 fn render_completion_suggestions<'a, F>(context: &mut RenderContext<'a>, write: F)
@@ -776,11 +877,37 @@ struct CompletionSuggestionSpan<'a> {
     index: Option<usize>,
 }
 
+fn completion_item_label(item: &crate::handlers::completion::CompletionItem) -> &str {
+    use crate::handlers::completion::{CompletionItem, LspCompletionItem};
+    use helix_core::CompletionItem as CoreCompletionItem;
+
+    match item {
+        CompletionItem::Lsp(LspCompletionItem { item, .. }) => item.label.as_str(),
+        CompletionItem::Other(CoreCompletionItem { label, .. }) => label.as_ref(),
+    }
+}
+
+fn format_completion_chip(label: &str) -> String {
+    let mut chip = String::with_capacity(COMPLETION_MAX_LABEL_WIDTH + COMPLETION_CHIP_PAD * 2 + 1);
+    for _ in 0..COMPLETION_CHIP_PAD {
+        chip.push(' ');
+    }
+    for (i, ch) in label.chars().enumerate() {
+        if i >= COMPLETION_MAX_LABEL_WIDTH {
+            chip.push('…');
+            break;
+        }
+        chip.push(ch);
+    }
+    for _ in 0..COMPLETION_CHIP_PAD {
+        chip.push(' ');
+    }
+    chip
+}
+
 fn completion_suggestion_spans<'a>(
     context: &RenderContext<'a>,
 ) -> Vec<CompletionSuggestionSpan<'a>> {
-    use crate::handlers::completion::{CompletionItem, LspCompletionItem};
-    use helix_core::CompletionItem as CoreCompletionItem;
     use helix_view::editor::CompletionDisplay;
 
     if context.editor.mode() != Mode::Insert {
@@ -796,54 +923,55 @@ fn completion_suggestion_spans<'a>(
         return Vec::new();
     };
 
+    let items: Vec<_> = completion.matched_items().collect();
+    if items.is_empty() {
+        return Vec::new();
+    }
+
+    let max_width = context.available_width as usize;
+    let selected = completion.cursor().unwrap_or(0).min(items.len() - 1);
+    let chip_width =
+        |index: usize| format_completion_chip(completion_item_label(items[index].0)).width();
+
+    // Keep the selected item visible, fill left first, then pack leftovers to the right.
+    let mut start = selected;
+    let mut end = selected + 1;
+    let mut used = chip_width(selected);
+    while start > 0 {
+        let width = chip_width(start - 1);
+        if used.saturating_add(width) > max_width {
+            break;
+        }
+        used += width;
+        start -= 1;
+    }
+    while end < items.len() {
+        let width = chip_width(end);
+        if used.saturating_add(width) > max_width {
+            break;
+        }
+        used += width;
+        end += 1;
+    }
+
     let unselected_style = context.editor.theme.get("ui.menu");
     let selected_style = context.editor.theme.get("ui.menu.selected");
 
-    let window_start = completion
-        .cursor()
-        .map_or(0, |c| c.saturating_sub(COMPLETION_MAX_ITEMS - 1));
-
-    let mut spans = Vec::new();
-    let mut wrote_any = false;
-    for (relative_index, (item, selected)) in completion
-        .matched_items()
-        .skip(window_start)
-        .take(COMPLETION_MAX_ITEMS)
+    items[start..end]
+        .iter()
         .enumerate()
-    {
-        let label = match item {
-            CompletionItem::Lsp(LspCompletionItem { item, .. }) => item.label.as_str(),
-            CompletionItem::Other(CoreCompletionItem { label, .. }) => label.as_ref(),
-        };
-
-        let mut truncated = String::with_capacity(COMPLETION_MAX_LABEL_WIDTH + 1);
-        for (i, ch) in label.chars().enumerate() {
-            if i >= COMPLETION_MAX_LABEL_WIDTH {
-                truncated.push('…');
-                break;
+        .map(|(relative_index, (item, is_selected))| {
+            let style = if *is_selected {
+                selected_style
+            } else {
+                unselected_style
+            };
+            CompletionSuggestionSpan {
+                span: Span::styled(format_completion_chip(completion_item_label(item)), style),
+                index: Some(start + relative_index),
             }
-            truncated.push(ch);
-        }
-
-        if wrote_any {
-            spans.push(CompletionSuggestionSpan {
-                span: Span::styled(" ", unselected_style),
-                index: None,
-            });
-        }
-        let style = if selected {
-            selected_style
-        } else {
-            unselected_style
-        };
-        spans.push(CompletionSuggestionSpan {
-            span: Span::styled(format!(" {truncated} "), style),
-            index: Some(window_start + relative_index),
-        });
-        wrote_any = true;
-    }
-
-    spans
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -866,7 +994,10 @@ mod tests {
         ui::{Completion, ProgressSpinners},
     };
 
-    use super::{completion_suggestion_index_at, render, RenderContext, Surface};
+    use super::{
+        completion_suggestion_index_at, render, strip_height, RenderContext, Surface,
+        COMPLETION_STRIP_HEIGHT,
+    };
 
     struct TestHarness {
         _runtime: tokio::runtime::Runtime,
@@ -941,20 +1072,33 @@ mod tests {
         Completion::new(editor, items, 0)
     }
 
-    fn render_statusline(editor: &Editor, completion: Option<&Completion>, width: u16) -> String {
+    fn render_statusline(
+        editor: &Editor,
+        completion: Option<&Completion>,
+        width: u16,
+    ) -> Vec<String> {
         let (view, doc) = current_ref!(editor);
-        let viewport = Rect::new(0, 0, width, 1);
+        let height = strip_height(editor, completion, view.area.height);
+        let viewport = Rect::new(0, 0, width, height);
         let mut surface = Surface::empty(viewport);
         let spinners = ProgressSpinners::default();
         let mut context = RenderContext::new(editor, doc, view, true, &spinners, completion);
 
         render(&mut context, viewport, &mut surface);
 
-        let mut line = String::new();
-        for x in 0..width {
-            line.push_str(&surface.get(x, 0).unwrap().symbol);
-        }
-        line.trim_end().to_owned()
+        (0..height)
+            .map(|y| {
+                let mut line = String::new();
+                for x in 0..width {
+                    line.push_str(&surface.get(x, y).unwrap().symbol);
+                }
+                line.trim_end().to_owned()
+            })
+            .collect()
+    }
+
+    fn text_row(rows: &[String]) -> &str {
+        &rows[rows.len() / 2]
     }
 
     #[test]
@@ -964,9 +1108,23 @@ mod tests {
 
         harness.set_completion_display(CompletionDisplay::Statusline);
         harness.editor.mode = Mode::Insert;
-        let line = render_statusline(&harness.editor, Some(&completion), 26);
+        let rows = render_statusline(&harness.editor, Some(&completion), 26);
+        assert_eq!(
+            COMPLETION_STRIP_HEIGHT as usize,
+            rows.len(),
+            "completion strip should grow so chips are easier to tap: {rows:?}"
+        );
+        let line = text_row(&rows);
         assert!(line.contains("alpha"));
         assert!(line.contains("beta"));
+        assert!(
+            line.contains("alpha  beta"),
+            "adjacent chips should be packed without an extra gap: {line:?}"
+        );
+        assert!(
+            !line.contains("alpha   beta"),
+            "packed chips should not keep a separator column: {line:?}"
+        );
         assert!(!line.contains("src/main.rs"));
         assert!(!line.contains("1:1"));
         assert!(
@@ -981,10 +1139,19 @@ mod tests {
             line.contains("gamma"),
             "freed space should allow an extra completion entry: {line:?}"
         );
+        for (i, row) in rows.iter().enumerate() {
+            if i == rows.len() / 2 {
+                continue;
+            }
+            assert!(
+                !row.contains("alpha") && !row.contains("beta") && !row.contains("gamma"),
+                "padding row {i} should be empty of labels: {row:?}"
+            );
+        }
 
         let beta_column = line.find("beta").expect("beta should render") as u16;
         let (view, doc) = current_ref!(harness.editor);
-        let viewport = Rect::new(0, 0, 26, 1);
+        let viewport = Rect::new(0, 0, 26, COMPLETION_STRIP_HEIGHT);
         let spinners = ProgressSpinners::default();
         let mut context = RenderContext::new(
             &harness.editor,
@@ -994,16 +1161,33 @@ mod tests {
             &spinners,
             Some(&completion),
         );
-        assert_eq!(
-            Some(1),
-            completion_suggestion_index_at(&mut context, viewport, beta_column, 0)
-        );
+        for row in 0..COMPLETION_STRIP_HEIGHT {
+            assert_eq!(
+                Some(1),
+                completion_suggestion_index_at(&mut context, viewport, beta_column, row),
+                "padding rows should share the chip's tap target, row {row}"
+            );
+        }
         assert_eq!(
             None,
-            completion_suggestion_index_at(&mut context, viewport, beta_column, 1)
+            completion_suggestion_index_at(
+                &mut context,
+                viewport,
+                beta_column,
+                COMPLETION_STRIP_HEIGHT
+            )
         );
 
-        let narrow_line = render_statusline(&harness.editor, Some(&completion), 20);
+        // Packed chips: " alpha " (7) + " beta " (6) + " gamma " (7) = 20.
+        let packed_rows = render_statusline(&harness.editor, Some(&completion), 20);
+        let packed_line = text_row(&packed_rows);
+        assert!(
+            packed_line.contains("gamma"),
+            "packing should fit an extra chip in the same width: {packed_line:?}"
+        );
+
+        let narrow_rows = render_statusline(&harness.editor, Some(&completion), 19);
+        let narrow_line = text_row(&narrow_rows);
         assert!(
             narrow_line.contains("alpha"),
             "statusline row: {narrow_line:?}"
@@ -1019,7 +1203,13 @@ mod tests {
 
         harness.set_completion_display(CompletionDisplay::Popup);
         harness.editor.mode = Mode::Insert;
-        let line = render_statusline(&harness.editor, Some(&completion), 40);
+        let rows = render_statusline(&harness.editor, Some(&completion), 40);
+        assert_eq!(
+            1,
+            rows.len(),
+            "popup display should keep a one-row statusline"
+        );
+        let line = text_row(&rows);
         assert!(line.contains("src/main.rs"));
         assert!(line.contains("1:1"));
         assert!(!line.contains("alpha"));
@@ -1034,7 +1224,8 @@ mod tests {
 
         harness.set_completion_display(CompletionDisplay::Both);
         harness.editor.mode = Mode::Normal;
-        let line = render_statusline(&harness.editor, Some(&completion), 40);
+        let rows = render_statusline(&harness.editor, Some(&completion), 40);
+        let line = text_row(&rows);
         assert!(line.contains("src/main.rs"));
         assert!(line.contains("1:1"));
         assert!(!line.contains("alpha"));

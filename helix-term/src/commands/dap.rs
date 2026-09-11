@@ -6,13 +6,15 @@ use crate::{
 };
 use dap::{StackFrame, Thread, ThreadStates};
 use helix_core::syntax::config::{DebugArgumentValue, DebugConfigCompletion, DebugTemplate};
-use helix_core::{Range, RopeSlice};
+use helix_core::{Range, RopeSlice, Selection, Transaction};
 use helix_dap::{self as dap, requests::TerminateArguments};
 use helix_lsp::block_on;
-use helix_view::editor::Breakpoint;
+use helix_view::editor::{Action, Breakpoint, DapEvalResult};
+use helix_view::DocumentId;
 
 use serde_json::{to_value, Value};
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
@@ -895,16 +897,45 @@ fn full_value_expression(
 }
 
 /// Re-requesting a value as text hands back a quoted string, e.g. `repr(xs)`
-/// evaluates to `'[1, 2, 3]'`. Peel those quotes so what lands in the clipboard
-/// is the value itself.
-fn unquote(value: &str) -> &str {
+/// evaluates to `'[1, 2, 3]'`. Peel those quotes so what lands in the buffer is
+/// the value itself, and undo the escaping that came with them -- a list of
+/// strings round trips as `'["a\\'b"]'` and the backslash is not part of the
+/// value. Returns the value untouched when it is not a quoted string.
+fn unquote(value: &str) -> Cow<'_, str> {
     let mut chars = value.chars();
-    match (chars.next(), chars.next_back()) {
-        (Some(first), Some(last)) if first == last && (first == '\'' || first == '"') => {
-            &value[first.len_utf8()..value.len() - last.len_utf8()]
-        }
-        _ => value,
+    let quote = match (chars.next(), chars.next_back()) {
+        (Some(first), Some(last)) if first == last && (first == '\'' || first == '"') => first,
+        _ => return Cow::Borrowed(value),
+    };
+
+    let inner = &value[quote.len_utf8()..value.len() - quote.len_utf8()];
+    if !inner.contains('\\') {
+        return Cow::Borrowed(inner);
     }
+
+    let mut unescaped = String::with_capacity(inner.len());
+    let mut chars = inner.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            unescaped.push(ch);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => unescaped.push('\n'),
+            Some('t') => unescaped.push('\t'),
+            Some('r') => unescaped.push('\r'),
+            // Anything else escapes to itself (`\\`, `\'`, `\"`). Leave more exotic
+            // escapes such as `\x41` alone rather than half-decoding them.
+            Some(other) => {
+                if !matches!(other, '\\' | '\'' | '"') {
+                    unescaped.push('\\');
+                }
+                unescaped.push(other);
+            }
+            None => unescaped.push('\\'),
+        }
+    }
+    Cow::Owned(unescaped)
 }
 
 /// The target of an assignment, i.e. `xs[0]` in `xs[0] += 1`. An assignment
@@ -930,8 +961,9 @@ fn assignment_target(expression: &str) -> Option<&str> {
                 let comparison = expression[i + 1..].starts_with('=')
                     || match prev {
                         Some('!') | Some('=') | Some(':') => true,
-                        Some(ch @ ('<' | '>')) => !before[..before.len() - ch.len_utf8()]
-                            .ends_with(ch),
+                        Some(ch @ ('<' | '>')) => {
+                            !before[..before.len() - ch.len_utf8()].ends_with(ch)
+                        }
                         _ => false,
                     };
                 if comparison {
@@ -983,6 +1015,56 @@ fn status_line_value(result: &str) -> String {
         Some((end, _)) => result[..end].to_string(),
         None => result.to_string(),
     }
+}
+
+/// The buffer that evaluate results are written to, created on first use and
+/// reused afterwards. A long collection is only useful when it can be scrolled and
+/// searched, and one shared buffer keeps repeated lookups from piling up scratch
+/// buffers. Splits it into view, or focuses the split it is already in.
+fn eval_result_buffer(editor: &mut Editor) -> DocumentId {
+    let existing = editor
+        .dap_eval_buffer
+        .filter(|id| editor.documents.contains_key(id));
+
+    let doc_id = match existing {
+        Some(doc_id) => doc_id,
+        None => {
+            let doc_id = editor.new_file(Action::HorizontalSplit);
+            editor.dap_eval_buffer = Some(doc_id);
+            return doc_id;
+        }
+    };
+
+    match editor.tree.traverse().find(|(_, view)| view.doc == doc_id) {
+        Some((view_id, _)) => editor.focus(view_id),
+        None => editor.switch(doc_id, Action::HorizontalSplit),
+    }
+    doc_id
+}
+
+/// Append an evaluated value to the shared evaluate-result buffer and put the
+/// cursor on the start of the entry, so the whole value is there to scroll through
+/// rather than the screenful the status line can hold.
+pub fn append_eval_result(editor: &mut Editor, result: &DapEvalResult) {
+    let entry = format!("eval: {}\n{}\n\n", result.expression, result.value);
+
+    let doc_id = eval_result_buffer(editor);
+    let view_id = editor.tree.focus;
+
+    let doc = doc_mut!(editor, &doc_id);
+    doc.ensure_view_init(view_id);
+    let end = doc.text().len_chars();
+    let transaction = Transaction::change(doc.text(), [(end, end, Some(entry.into()))].into_iter())
+        .with_selection(Selection::point(end));
+    doc.apply(&transaction, view_id);
+
+    let view = view_mut!(editor);
+    doc.append_changes_to_history(view);
+    // Nothing here is worth saving, and a modified buffer would make `:q` complain
+    // about unsaved changes on the way out.
+    doc.reset_modified();
+
+    editor.ensure_cursor_in_view(view_id);
 }
 
 pub fn dap_evaluate(cx: &mut Context) {
@@ -1056,7 +1138,10 @@ pub fn dap_evaluate(cx: &mut Context) {
                     }
 
                     let status = status_line_value(&value);
-                    cx.editor.dap_eval_result = Some(value);
+                    cx.editor.dap_eval_result = Some(DapEvalResult {
+                        expression: input.to_string(),
+                        value,
+                    });
                     cx.editor.set_status(status);
                 }
                 Err(e) => {
@@ -1614,6 +1699,18 @@ mod tests {
         assert_eq!(unquote("[0, 1, 2]"), "[0, 1, 2]");
         assert_eq!(unquote("'"), "'");
         assert_eq!(unquote(""), "");
+    }
+
+    #[test]
+    fn unquoting_undoes_the_escaping_of_the_round_trip() {
+        // `repr(["a'b"])` comes back as a quoted string with the inner quote escaped.
+        assert_eq!(unquote(r#"'["a\'b"]'"#), r#"["a'b"]"#);
+        assert_eq!(unquote(r#""['a\"b']""#), r#"['a"b']"#);
+        // A backslash in the value itself was doubled on the way out.
+        assert_eq!(unquote(r"'C:\\tmp'"), r"C:\tmp");
+        assert_eq!(unquote(r"'a\nb'"), "a\nb");
+        // Escapes that are not undone keep their backslash rather than losing it.
+        assert_eq!(unquote(r"'\x41'"), r"\x41");
     }
 
     #[test]

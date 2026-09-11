@@ -1144,6 +1144,17 @@ pub struct Breakpoint {
     pub log_message: Option<String>,
 }
 
+/// A DAP "evaluate expression" result, complete rather than trimmed to what the
+/// status line can show.
+#[derive(Debug, Clone)]
+pub struct DapEvalResult {
+    /// The expression that produced the value, used to head the entry when the
+    /// result is written out to a buffer.
+    pub expression: String,
+    /// The full, untrimmed value.
+    pub value: String,
+}
+
 use futures_util::stream::{Flatten, Once};
 
 type Diagnostics = BTreeMap<Uri, Vec<(lsp::Diagnostic, DiagnosticProvider)>>;
@@ -1188,10 +1199,13 @@ pub struct Editor {
     pub last_selection: Option<Selection>,
 
     pub status_msg: Option<(Cow<'static, str>, Severity)>,
-    /// Full text of the most recent DAP "evaluate expression" result, kept independently
-    /// of `status_msg` so a double-click can still retrieve it after the first click of
+    /// The most recent DAP "evaluate expression" result, kept independently of
+    /// `status_msg` so a double-click can still retrieve it after the first click of
     /// the double-click clears the status line. Cleared on use or on a new/failed eval.
-    pub dap_eval_result: Option<String>,
+    pub dap_eval_result: Option<DapEvalResult>,
+    /// Scratch buffer that double-clicked evaluate results are written to. Reused for
+    /// every result so a debugging session does not leave a trail of scratch buffers.
+    pub dap_eval_buffer: Option<DocumentId>,
     pub autoinfo: Option<Info>,
 
     pub config: Arc<dyn DynAccess<Config>>,
@@ -1331,6 +1345,7 @@ impl Editor {
             ))),
             status_msg: None,
             dap_eval_result: None,
+            dap_eval_buffer: None,
             autoinfo: None,
             idle_timer: Box::pin(sleep(conf.idle_timeout)),
             redraw_timer: Box::pin(sleep(Duration::MAX)),

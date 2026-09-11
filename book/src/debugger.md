@@ -87,7 +87,12 @@ than it looks:
   entries.
 - **The whole result is yours to keep.** A status line only ever shows one line,
   so the complete value is copied to the system clipboard after every
-  evaluation. Double-clicking the result on the status line copies it again.
+  evaluation. Double-clicking the result on the status line copies it again and
+  also writes it out to a buffer, headed by the expression that produced it — a
+  long list is only useful once you can scroll and search it. That buffer is
+  reused, so later results are appended to it rather than opening a new one each
+  time. Nothing in it is worth saving, so it never counts as modified and `:q`
+  will not ask about it.
 - **It runs statements, not just expressions.** `count = 0`, `items.append(x)`
   or an import all work, and they change the frame you are stopped in — execution
   continues with the new values. An assignment evaluates to nothing, so its
@@ -151,6 +156,12 @@ template, which returns the value as a plain string and so escapes the limit.
 Note this evaluates your expression **a second time**, so an expression with
 side effects performs them twice; it only happens for values that were actually
 shortened.
+
+If you override `[language.debugger]` in your own `languages.toml`, **repeat the
+quirk there**. Configuration merging stops at that table, so your block replaces
+the bundled one wholesale and drops any key you leave out — including `quirks`.
+The symptom is an ellipsis that survives into the clipboard and the result
+buffer, and the status line says so when it happens.
 
 Assignment works because Helix evaluates in the protocol's `repl` context, the
 only one for which debugpy will execute a statement instead of merely evaluating

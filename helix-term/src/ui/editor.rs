@@ -1430,13 +1430,20 @@ impl EditorView {
                 );
                 if is_double_click {
                     self.last_left_click = None;
-                    let text = cxt.editor.dap_eval_result.take().unwrap();
-                    match cxt.editor.registers.write('+', vec![text]) {
-                        Ok(()) => cxt
-                            .editor
-                            .set_status("yanked evaluate result to system clipboard"),
-                        Err(err) => cxt.editor.set_error(err.to_string()),
+                    let result = cxt.editor.dap_eval_result.take().unwrap();
+                    if let Err(err) = cxt.editor.registers.write('+', vec![result.value.clone()]) {
+                        cxt.editor.set_error(err.to_string());
+                        return EventResult::Consumed(None);
                     }
+                    // A big collection is no use on the status line even untrimmed,
+                    // so park the whole value in a buffer that can be scrolled and
+                    // searched.
+                    commands::dap::append_eval_result(cxt.editor, &result);
+                    let status = match result.value.contains("...") {
+                        true => "yanked evaluate result to clipboard and buffer (adapter elided the value)",
+                        false => "yanked evaluate result to clipboard and buffer",
+                    };
+                    cxt.editor.set_status(status);
                     return EventResult::Consumed(None);
                 }
                 preserve_status = true;

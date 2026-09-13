@@ -567,3 +567,57 @@ async fn append_inside_nested_pair_multi() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn insert_triple_same_pairs() -> anyhow::Result<()> {
+    for pair in matching_pairs() {
+        let o = pair.0;
+        // ""| + "  =>  """|"""
+        test((
+            format!("#[{}|]#", LINE_END),
+            format!("i{o}{o}{o}"),
+            format!("{o}{o}{o}#[|{o}]#{o}{o}{eol}", o = o, eol = LINE_END),
+            LineFeedHandling::AsIs,
+        ))
+        .await?;
+    }
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn insert_triple_then_skip_closers() -> anyhow::Result<()> {
+    for pair in matching_pairs() {
+        let o = pair.0;
+        // """|""" + "  =>  """"""|
+        test((
+            format!("#[{}|]#", LINE_END),
+            format!("i{o}{o}{o}{o}"),
+            format!("{o}{o}{o}{o}{o}{o}#[|{eol}]#", o = o, eol = LINE_END),
+            LineFeedHandling::AsIs,
+        ))
+        .await?;
+    }
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn insert_triple_multi_range() -> anyhow::Result<()> {
+    for pair in matching_pairs() {
+        let o = pair.0;
+        test((
+            format!("#[{eol}|]##({eol}|)##({eol}|)#", eol = LINE_END),
+            format!("i{o}{o}{o}"),
+            format!(
+                "{o}{o}{o}#[|{o}]#{o}{o}{eol}{o}{o}{o}#(|{o})#{o}{o}{eol}{o}{o}{o}#(|{o})#{o}{o}{eol}",
+                o = o,
+                eol = LINE_END
+            ),
+            LineFeedHandling::AsIs,
+        ))
+        .await?;
+    }
+
+    Ok(())
+}

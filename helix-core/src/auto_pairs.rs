@@ -115,9 +115,7 @@ impl Default for AutoPairs {
 // to simplify, maybe return Option<Transaction> and just reimplement the default
 
 // [TODO]
-// * delete implementation where it erases the whole bracket (|) -> |
-// * change to multi character pairs to handle cases like placing the cursor in the
-//   middle of triple quotes, and more exotic pairs like Jinja's {% %}
+// * change to multi character pairs to handle exotic pairs like Jinja's {% %}
 
 #[must_use]
 pub fn hook(doc: &Rope, selection: &Selection, ch: char, pairs: &AutoPairs) -> Option<Transaction> {
@@ -145,8 +143,28 @@ fn prev_char(doc: &Rope, pos: usize) -> Option<char> {
     doc.get_char(pos - 1)
 }
 
+/// True when `doc[start..start + n]` is `n` copies of `ch`.
+fn chars_eq(doc: &Rope, start: usize, ch: char, n: usize) -> bool {
+    (0..n).all(|i| doc.get_char(start + i) == Some(ch))
+}
+
+/// True when the `n` characters immediately before `cursor` are `ch`, and the
+/// character before that run (if any) is not `ch`.
+fn exactly_n_before(doc: &Rope, cursor: usize, ch: char, n: usize) -> bool {
+    if cursor < n || !chars_eq(doc, cursor - n, ch, n) {
+        return false;
+    }
+    cursor == n || doc.get_char(cursor - n - 1) != Some(ch)
+}
+
 /// calculate what the resulting range should be for an auto pair insertion
-fn get_next_range(doc: &Rope, start_range: &Range, offset: usize, len_inserted: usize) -> Range {
+fn get_next_range(
+    doc: &Rope,
+    start_range: &Range,
+    offset: usize,
+    len_inserted: usize,
+    skip_graphemes: usize,
+) -> Range {
     // When the character under the cursor changes due to complete pair
     // insertion, we must look backward a grapheme and then add the length
     // of the insertion to put the resulting cursor in the right place, e.g.
@@ -176,8 +194,9 @@ fn get_next_range(doc: &Rope, start_range: &Range, offset: usize, len_inserted: 
 
     // just skip over graphemes
     if len_inserted == 0 {
+        let n = skip_graphemes.max(1);
         let end_anchor = if single_grapheme {
-            graphemes::next_grapheme_boundary(doc_slice, start_range.anchor) + offset
+            graphemes::nth_next_grapheme_boundary(doc_slice, start_range.anchor, n) + offset
 
         // even for backward inserts with multiple grapheme selections,
         // we want the anchor to stay where it is so that the relative
@@ -190,7 +209,7 @@ fn get_next_range(doc: &Rope, start_range: &Range, offset: usize, len_inserted: 
 
         return Range::new(
             end_anchor,
-            graphemes::next_grapheme_boundary(doc_slice, start_range.head) + offset,
+            graphemes::nth_next_grapheme_boundary(doc_slice, start_range.head, n) + offset,
         );
     }
 
@@ -289,7 +308,7 @@ fn handle_open(doc: &Rope, selection: &Selection, pair: &Pair) -> Transaction {
             }
         };
 
-        let next_range = get_next_range(doc, start_range, offs, len_inserted);
+        let next_range = get_next_range(doc, start_range, offs, len_inserted, 0);
         end_ranges.push(next_range);
         offs += len_inserted;
 
@@ -309,9 +328,11 @@ fn handle_close(doc: &Rope, selection: &Selection, pair: &Pair) -> Transaction {
         let cursor = start_range.cursor(doc.slice(..));
         let next_char = doc.get_char(cursor);
         let mut len_inserted = 0;
+        let mut skip_graphemes = 0;
 
         let change = if next_char == Some(pair.close) {
             // return transaction that moves past close
+            skip_graphemes = 1;
             (cursor, cursor, None) // no-op
         } else {
             len_inserted = 1;
@@ -320,7 +341,7 @@ fn handle_close(doc: &Rope, selection: &Selection, pair: &Pair) -> Transaction {
             (cursor, cursor, Some(tendril))
         };
 
-        let next_range = get_next_range(doc, start_range, offs, len_inserted);
+        let next_range = get_next_range(doc, start_range, offs, len_inserted, skip_graphemes);
         end_ranges.push(next_range);
         offs += len_inserted;
 
@@ -332,7 +353,12 @@ fn handle_close(doc: &Rope, selection: &Selection, pair: &Pair) -> Transaction {
     t
 }
 
-/// handle cases where open and close is the same, or in triples ("""docstring""")
+/// Handle cases where open and close are the same character (`"`, `'`, `` ` ``).
+///
+/// Follows CodeMirror's `closebrackets` `handleSame` for triples: typing a
+/// third quote after an empty auto-paired pair (`""|`) inserts the rest of a
+/// triple (`"""|"""`). Typing the closer inside that triple skips all three
+/// auto-inserted closers.
 fn handle_same(doc: &Rope, selection: &Selection, pair: &Pair) -> Transaction {
     let mut end_ranges = SmallVec::with_capacity(selection.len());
 
@@ -341,14 +367,28 @@ fn handle_same(doc: &Rope, selection: &Selection, pair: &Pair) -> Transaction {
     let transaction = Transaction::change_by_selection(doc, selection, |start_range| {
         let cursor = start_range.cursor(doc.slice(..));
         let mut len_inserted = 0;
+        let mut skip_graphemes = 0;
         let next_char = doc.get_char(cursor);
+        let ch = pair.open;
 
-        let change = if next_char == Some(pair.open) {
-            //  return transaction that moves past close
+        let change = if next_char == Some(ch) {
+            // Skip one closer, or all three when inside `"""|"""`.
+            skip_graphemes = if exactly_n_before(doc, cursor, ch, 3) && chars_eq(doc, cursor, ch, 3)
+            {
+                3
+            } else {
+                1
+            };
             (cursor, cursor, None) // no-op
+        } else if exactly_n_before(doc, cursor, ch, 2) && Pair::next_is_not_alpha(doc, start_range)
+        {
+            // `""|` + `"` => `"""|"""`
+            let pair_str = Tendril::from_iter([ch, ch, ch, ch]);
+            len_inserted = 4;
+            (cursor, cursor, Some(pair_str))
         } else {
             let mut pair_str = Tendril::new();
-            pair_str.push(pair.open);
+            pair_str.push(ch);
 
             // for equal pairs, don't insert both open and close if either
             // side has a non-pair char
@@ -360,7 +400,7 @@ fn handle_same(doc: &Rope, selection: &Selection, pair: &Pair) -> Transaction {
             (cursor, cursor, Some(pair_str))
         };
 
-        let next_range = get_next_range(doc, start_range, offs, len_inserted);
+        let next_range = get_next_range(doc, start_range, offs, len_inserted, skip_graphemes);
         end_ranges.push(next_range);
         offs += len_inserted;
 

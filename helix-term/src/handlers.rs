@@ -23,7 +23,11 @@ mod signature_help;
 mod snippet;
 
 pub fn setup(config: Arc<ArcSwap<Config>>) -> Handlers {
-    events::register();
+    // Event IDs are process-global and panic on a second register. Tests that
+    // build more than one `Editor` (statusline harnesses, for example) would
+    // otherwise crash; production still only calls `setup` once.
+    static EVENTS: std::sync::Once = std::sync::Once::new();
+    EVENTS.call_once(events::register);
 
     let event_tx = completion::CompletionHandler::new(config).spawn();
     let signature_hints = SignatureHelpHandler::new().spawn();

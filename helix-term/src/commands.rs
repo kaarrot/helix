@@ -175,12 +175,12 @@ pub fn stream_spinner_frame(doc_id: DocumentId) -> Option<String> {
 /// Keeps the stream spinner alive for as long as the guard is held, so it can't
 /// outlive the session on any exit path (drained queue, cancellation, error, or
 /// panic).
-struct StreamSpinnerGuard {
+pub(crate) struct StreamSpinnerGuard {
     generation: u64,
 }
 
 impl StreamSpinnerGuard {
-    fn start(generation: u64, doc_id: DocumentId) -> Self {
+    pub(crate) fn start(generation: u64, doc_id: DocumentId) -> Self {
         let mut spinner = ui::Spinner::dots(STREAM_SPINNER_INTERVAL_MS);
         spinner.start();
         *STREAM_SPINNER.lock().unwrap() = Some(StreamSpinner {

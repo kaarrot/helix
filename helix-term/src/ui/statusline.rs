@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use helix_core::indent::IndentStyle;
 use helix_core::{coords_at_pos, encoding, unicode::width::UnicodeWidthStr, Position};
 use helix_lsp::lsp::DiagnosticSeverity;
@@ -329,7 +331,7 @@ where
 {
     match element_id {
         helix_view::editor::StatusLineElement::Mode => render_mode,
-        helix_view::editor::StatusLineElement::Spinner => render_lsp_spinner,
+        helix_view::editor::StatusLineElement::Spinner => render_spinner,
         helix_view::editor::StatusLineElement::FileBaseName => render_file_base_name,
         helix_view::editor::StatusLineElement::FileName => render_file_name,
         helix_view::editor::StatusLineElement::FileAbsolutePath => render_file_absolute_path,
@@ -395,23 +397,29 @@ where
 }
 
 // TODO think about handling multiple language servers
-fn render_lsp_spinner<'a, F>(context: &mut RenderContext<'a>, write: F)
+fn render_spinner<'a, F>(context: &mut RenderContext<'a>, write: F)
 where
     F: Fn(&mut RenderContext<'a>, Span<'a>) + Copy,
 {
-    let language_server = context.doc.language_servers().next();
+    let frame = context
+        .doc
+        .language_servers()
+        .next()
+        .and_then(|srv| {
+            context
+                .spinners
+                .get(srv.id())
+                .and_then(|spinner| spinner.frame())
+        })
+        .map(Cow::Borrowed)
+        // Fall back to the activity spinner of a running `:insert-stream-output`,
+        // which also counts the commands queued behind it.
+        .or_else(|| crate::commands::stream_spinner_frame(context.doc.id()).map(Cow::Owned));
+
     write(
         context,
-        language_server
-            .and_then(|srv| {
-                context
-                    .spinners
-                    .get(srv.id())
-                    .and_then(|spinner| spinner.frame())
-            })
-            // Even if there's no spinner; reserve its space to avoid elements frequently shifting.
-            .unwrap_or(" ")
-            .into(),
+        // Even if there's no spinner; reserve its space to avoid elements frequently shifting.
+        frame.unwrap_or(Cow::Borrowed(" ")).into(),
     );
 }
 
@@ -1052,6 +1060,12 @@ mod tests {
             config.editor.completion_display = completion_display;
             self.app_config.store(Arc::new(config));
         }
+
+        fn set_statusline_left(&self, left: Vec<StatusLineElement>) {
+            let mut config = (*self.app_config.load_full()).clone();
+            config.editor.statusline.left = left;
+            self.app_config.store(Arc::new(config));
+        }
     }
 
     fn test_completion(editor: &Editor, labels: &[&str]) -> Completion {
@@ -1234,5 +1248,35 @@ mod tests {
             "mode indicator should be visible outside insert mode: {line:?}"
         );
         assert!(line.contains("1 sel"));
+    }
+
+    #[test]
+    fn statusline_spinner_falls_back_to_insert_stream_output() {
+        const DOTS: [&str; 8] = ["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"];
+
+        let harness = TestHarness::new();
+        harness.set_statusline_left(vec![
+            StatusLineElement::Mode,
+            StatusLineElement::Spinner,
+            StatusLineElement::FileName,
+        ]);
+
+        let idle_rows = render_statusline(&harness.editor, None, 40);
+        let idle = text_row(&idle_rows);
+        assert!(
+            DOTS.iter().all(|glyph| !idle.contains(glyph)),
+            "idle statusline should not show a stream spinner: {idle:?}"
+        );
+
+        let doc_id = current_ref!(harness.editor).1.id();
+        // Distinct generation so a parallel stream-spinner unit test cannot
+        // Drop-clear this session if it overwrites the global.
+        let _guard = crate::commands::StreamSpinnerGuard::start(u64::MAX, doc_id);
+        let running_rows = render_statusline(&harness.editor, None, 40);
+        let running = text_row(&running_rows);
+        assert!(
+            DOTS.iter().any(|glyph| running.contains(glyph)),
+            "statusline spinner should fall back to insert-stream-output: {running:?}"
+        );
     }
 }

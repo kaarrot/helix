@@ -93,19 +93,30 @@ impl EditorView {
 
         let view_offset = doc.view_offset(view.id);
 
-        let mut text_annotations = view.text_annotations(doc, Some(theme));
-        view.apply_diff_alignment(
+        // One plan drives everything: `text_annotations` reserves the rows from
+        // it, the decoration below paints them, and the coordinate maths reads
+        // the same plan back, so a click lands where the row was drawn. It is
+        // published to the view first, since building the annotations is what
+        // picks it up.
+        let virtual_row_plan = view.virtual_row_plan(
             doc,
-            &mut text_annotations,
             &editor.diff.views,
             &editor.documents,
+            &editor.diff.reviews,
+            crate::review_agent::spinner_frame(),
         );
+        *view.virtual_rows.borrow_mut() = virtual_row_plan.clone();
+
+        let text_annotations = view.text_annotations(doc, Some(theme));
         let mut decorations = DecorationManager::default();
 
-        if editor.diff.views.contains_key(&view.id) {
-            if let Some(diff_handle) = doc.diff_handle() {
-                decorations.add_decoration(diff::DiffSpacerDecoration::new(diff_handle, theme));
-            }
+        if let Some(plan) = &virtual_row_plan {
+            decorations.add_decoration(diff::VirtualRowDecoration::new(
+                plan.clone(),
+                theme,
+                view.id,
+                editor.diff.reviews.hits.clone(),
+            ));
         }
 
         if is_focused && config.cursorline {
@@ -1180,6 +1191,14 @@ impl EditorView {
             MouseEventKind::Down(MouseButton::Left) => {
                 let editor = &mut cxt.editor;
 
+                // A review box is painted into virtual rows, which no document
+                // position corresponds to, so it has to be asked first: mapping
+                // the click to text would put the cursor somewhere arbitrary
+                // underneath it.
+                if commands::review::review_mouse_down(editor, row, column) {
+                    return EventResult::Consumed(None);
+                }
+
                 if let Some((pos, view_id)) = pos_and_view(editor, row, column, true) {
                     editor.focus(view_id);
 
@@ -1234,6 +1253,10 @@ impl EditorView {
             }
 
             MouseEventKind::Drag(MouseButton::Left) => {
+                if commands::review::review_mouse_drag(cxt.editor, row) {
+                    return EventResult::Consumed(None);
+                }
+
                 let (view, doc) = current!(cxt.editor);
 
                 let pos = match view.pos_at_screen_coords(doc, row, column, true) {
@@ -1274,6 +1297,12 @@ impl EditorView {
             }
 
             MouseEventKind::Up(MouseButton::Left) => {
+                // Ending a drag inside a box: the document's selection never
+                // moved, so none of what follows applies to it.
+                if commands::review::review_mouse_up(cxt.editor) {
+                    return EventResult::Consumed(None);
+                }
+
                 if !config.middle_click_paste {
                     return EventResult::Ignored(None);
                 }

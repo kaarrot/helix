@@ -1,3 +1,8 @@
+use crate::review::{
+    agent::{ReviewAgent, ReviewAgentKind},
+    session::ReviewSession,
+    ReviewStore,
+};
 use crate::{
     editor::{DiffRange, MergeViewState},
     DocumentId, ViewId,
@@ -24,6 +29,33 @@ pub struct DiffSession {
     /// still matches, so a slow refresh from an earlier invocation can't
     /// clobber a picker that was reopened in the meantime.
     pub changed_file_request: u64,
+    /// Inline review threads. Lives here rather than per-document because a
+    /// conversation outlives the buffer it is anchored in, and a base pane's
+    /// document cannot even name its own file.
+    pub reviews: ReviewStore,
+    /// The claimed review conversation, created lazily on the first comment.
+    pub session: Option<ReviewSession>,
+    /// Whatever answers review comments. Spawned lazily on the first send, so
+    /// merely commenting never starts a process.
+    pub agent: Option<Box<dyn ReviewAgent>>,
+    /// Which child to spawn. Set by `:review-session [claude|grok]`; default
+    /// Claude. Changing it drops a running child so the next send starts the
+    /// other one.
+    pub agent_kind: ReviewAgentKind,
+}
+
+impl Drop for DiffSession {
+    fn drop(&mut self) {
+        // Give the name back on a clean exit, so the next editor on this branch
+        // takes it rather than a `#2` suffix. A crash skips this, which is what
+        // the liveness check in `claim` is for.
+        if let Some(agent) = &mut self.agent {
+            agent.shutdown();
+        }
+        if let Some(session) = &self.session {
+            crate::review::session::release(session);
+        }
+    }
 }
 
 /// A changed-file listing cached together with the diff range it was computed

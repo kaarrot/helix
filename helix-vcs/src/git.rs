@@ -645,6 +645,15 @@ fn is_file_mode(mode: gix::index::entry::Mode) -> bool {
         .is_some_and(|mode| mode.is_blob_or_symlink())
 }
 
+/// The working-tree root containing `file`, via the same repository discovery
+/// the diff machinery uses.
+pub fn workdir(file: &Path) -> Result<PathBuf> {
+    let repo = open_repo(get_repo_dir(file)?)?.to_thread_local();
+    repo.workdir()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| anyhow::anyhow!("working tree not found"))
+}
+
 /// Emulates the result of running `git status` from the command line.
 ///
 /// `untracked` selects how new files are reported. Callers that enumerate

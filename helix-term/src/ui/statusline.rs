@@ -155,6 +155,7 @@ where
         helix_view::editor::StatusLineElement::Separator => render_separator,
         helix_view::editor::StatusLineElement::Spacer => render_spacer,
         helix_view::editor::StatusLineElement::VersionControl => render_version_control,
+        helix_view::editor::StatusLineElement::ReviewSession => render_review_session,
         helix_view::editor::StatusLineElement::Register => render_register,
         helix_view::editor::StatusLineElement::CurrentWorkingDirectory => render_cwd,
     }
@@ -530,6 +531,26 @@ where
     F: Fn(&mut RenderContext<'a>, Span<'a>) + Copy,
 {
     write(context, " ".into());
+}
+
+/// The active review conversation, and how many drafts are waiting to be sent.
+///
+/// Read-only: this must not claim a session, or merely showing the statusline
+/// would start a conversation for every buffer that is opened.
+fn render_review_session<'a, F>(context: &mut RenderContext<'a>, write: F)
+where
+    F: Fn(&mut RenderContext<'a>, Span<'a>) + Copy,
+{
+    let Some(session) = &context.editor.diff.session else {
+        return;
+    };
+    let pending = context.editor.diff.reviews.pending_count();
+    let display = if pending > 0 {
+        format!("{} +{pending}", session.name)
+    } else {
+        session.name.clone()
+    };
+    write(context, display.into());
 }
 
 fn render_version_control<'a, F>(context: &mut RenderContext<'a>, write: F)

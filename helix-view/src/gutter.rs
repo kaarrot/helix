@@ -117,12 +117,54 @@ pub fn diff<'doc>(
         })
     });
 
+    // Lines carrying a review thread, precomputed once: the closure below runs
+    // per line, and this is a store lookup rather than something derivable from
+    // the line alone. Threads are rare, so this is usually an empty vector.
+    let review_style = theme
+        .try_get("ui.review.gutter")
+        .unwrap_or_else(|| theme.get("ui.linenr.selected"));
+    let mut comment_lines: Vec<usize> = Vec::new();
+    if !editor.diff.reviews.is_empty() && !editor.diff.reviews.hidden {
+        if let Some((file, side)) = view.review_identity(doc, &editor.diff.views) {
+            let text = doc.text();
+            comment_lines = editor
+                .diff
+                .reviews
+                .for_file(&file)
+                .filter(|thread| thread.side == side)
+                .map(|thread| {
+                    doc.review_anchors
+                        .iter()
+                        .find(|anchor| anchor.thread == thread.id)
+                        .map_or(thread.line as usize, |anchor| anchor.line(text))
+                })
+                .collect();
+            comment_lines.sort_unstable();
+            comment_lines.dedup();
+        }
+    }
+
+    // A comment marker wins over the diff marker on the same line: a hunk is
+    // visible from its surroundings, a comment is not.
+    let comment_icon = move |line: usize, out: &mut String| -> bool {
+        if comment_lines.binary_search(&line).is_ok() {
+            write!(out, "{}", REVIEW_MARKER).unwrap();
+            true
+        } else {
+            false
+        }
+    };
+
     if let Some(diff_handle) = doc.diff_handle() {
         let hunks = diff_handle.load();
         let mut hunk_i = 0;
         let mut hunk = hunks.nth_hunk(hunk_i);
         Box::new(
             move |line: usize, _selected: bool, first_visual_line: bool, out: &mut String| {
+                if first_visual_line && comment_icon(line, out) {
+                    return Some(review_style);
+                }
+
                 // truncating the line is fine here because we don't compute diffs
                 // for files with more lines than i32::MAX anyways
                 // we need to special case removals here
@@ -158,9 +200,17 @@ pub fn diff<'doc>(
             },
         )
     } else {
-        Box::new(move |_, _, _, _| None)
+        // No diff to draw, but a buffer with no diff can still carry comments.
+        Box::new(
+            move |line: usize, _selected: bool, first_visual_line: bool, out: &mut String| {
+                (first_visual_line && comment_icon(line, out)).then_some(review_style)
+            },
+        )
     }
 }
+
+/// Marks a line carrying a review thread.
+const REVIEW_MARKER: &str = "▐";
 
 pub fn line_numbers<'doc>(
     editor: &'doc Editor,

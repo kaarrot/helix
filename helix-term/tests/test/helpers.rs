@@ -223,6 +223,59 @@ impl AppTestHarness {
         .await?)
     }
 
+    /// Send keys that start something animating, which `send_keys` cannot do:
+    /// it waits for idle, and an animation means idle never arrives.
+    pub async fn send_keys_pumping(
+        &mut self,
+        app: &mut Application,
+        in_keys: &str,
+        duration: Duration,
+    ) -> anyhow::Result<()> {
+        for key_event in parse_macro(in_keys)?.into_iter() {
+            self.tx.send(Ok(Event::Key(KeyEvent::from(key_event))))?;
+        }
+        self.pump(app, duration).await;
+        Ok(())
+    }
+
+    /// A left-button mouse event at a screen position, as a terminal reporting
+    /// mouse events would deliver one.
+    #[cfg(not(windows))]
+    pub async fn mouse(
+        &mut self,
+        app: &mut Application,
+        kind: termina::event::MouseEventKind,
+        row: u16,
+        column: u16,
+    ) -> anyhow::Result<()> {
+        self.tx.send(Ok(Event::Mouse(termina::event::MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: termina::event::Modifiers::NONE,
+        })))?;
+        self.pump(app, Duration::from_millis(200)).await;
+        Ok(())
+    }
+
+    /// Paste text, as a terminal bracketed paste would deliver it.
+    pub async fn paste(&mut self, app: &mut Application, data: &str) -> anyhow::Result<()> {
+        self.tx.send(Ok(Event::Paste(data.to_string())))?;
+        self.pump(app, Duration::from_millis(300)).await;
+        Ok(())
+    }
+
+    /// Run the event loop for a bounded time, without requiring it to go idle.
+    ///
+    /// `wait_for_idle` is unusable while something keeps requesting redraws:
+    /// under the integration feature the idle timer is reset after every event,
+    /// so a continuous animation means idle never arrives. Use this to let
+    /// dispatched work land instead.
+    pub async fn pump(&mut self, app: &mut Application, duration: Duration) {
+        let _ =
+            tokio::time::timeout(duration, app.event_loop_until_idle(&mut self.rx_stream)).await;
+    }
+
     pub async fn wait_for_idle(&mut self, app: &mut Application) -> anyhow::Result<bool> {
         app.editor.reset_idle_timer();
         Ok(tokio::time::timeout(

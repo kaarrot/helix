@@ -1,6 +1,7 @@
 pub(crate) mod dap;
 pub(crate) mod diff;
 pub(crate) mod lsp;
+pub(crate) mod review;
 pub(crate) mod syntax;
 pub(crate) mod typed;
 pub(crate) mod typed_diff;
@@ -15,6 +16,7 @@ use helix_stdx::{
 };
 use helix_vcs::Hunk;
 pub use lsp::*;
+pub(crate) use review::*;
 pub use syntax::*;
 use tui::{
     text::{Span, Spans},
@@ -416,6 +418,26 @@ impl MappableCommand {
         syntax_symbol_picker, "Open symbol picker from syntax information",
         lsp_or_syntax_symbol_picker, "Open symbol picker from LSP or syntax information",
         changed_file_picker, "Open changed file picker",
+        review_add, "Add a review comment on the current line",
+        review_send_all, "Send all pending review comments to the agent",
+        review_send_or_save_selection, "Send the pending review comment at the cursor, else save the selection to the jumplist",
+        review_comment_or_change, "Reply to the review thread at the cursor, else change selection",
+        review_delete_or_change, "Delete the focused review entry, else delete selection",
+        review_line_down, "Move down, stopping on a review box",
+        review_line_up, "Move up, stopping on a review box",
+        review_scroll_down, "Scroll down within the focused review box",
+        review_scroll_up, "Scroll up within the focused review box",
+        review_toggle_collapse, "Collapse or expand the review thread at the cursor",
+        review_toggle_visible, "Hide or show the review comment boxes",
+        review_copy_or_yank, "Copy from the focused review box to the clipboard, else yank",
+        review_copy_or_yank_to_clipboard, "Copy from the focused review box, else yank to the clipboard",
+        review_prev_message, "Show the previous entry in the review thread at the cursor",
+        review_next_message, "Show the next entry in the review thread at the cursor",
+        review_delete, "Delete the review thread at the cursor",
+        goto_next_review_comment, "Goto next review comment",
+        goto_prev_review_comment, "Goto previous review comment",
+        goto_next_comment_or_review, "Goto next review comment in a diff view, else next code comment",
+        goto_prev_comment_or_review, "Goto previous review comment in a diff view, else previous code comment",
         select_references_to_symbol_under_cursor, "Select symbol references",
         workspace_symbol_picker, "Open workspace symbol picker",
         syntax_workspace_symbol_picker, "Open workspace symbol picker from syntax information",

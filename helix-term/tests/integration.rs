@@ -22,5 +22,6 @@ mod test {
     mod diff_merge;
     mod languages;
     mod movement;
+    mod review;
     mod splits;
 }

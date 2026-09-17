@@ -247,6 +247,89 @@ fn for_each_changed_file_reports_renames_as_untracked_plus_deleted() {
 }
 
 #[test]
+fn for_each_changed_file_reports_staged_changes() {
+    // `git add` makes the index match the worktree, so an index<->worktree scan
+    // alone reports nothing and the file silently vanishes from the changed-file
+    // listing while the change is plainly still there against HEAD.
+    let repo = empty_git_repo();
+    write_repo_file(repo.path(), "tracked.txt", "one\n");
+    create_commit(repo.path(), true);
+
+    write_repo_file(repo.path(), "tracked.txt", "one\ntwo\n");
+    exec_git_cmd("add tracked.txt", repo.path());
+
+    let changes = RefCell::new(Vec::new());
+    git::for_each_changed_file(repo.path(), |change| {
+        changes.borrow_mut().push(change.unwrap());
+        true
+    })
+    .unwrap();
+
+    let changes = changes.into_inner();
+    assert!(
+        changes.iter().any(|change| {
+            matches!(change, FileChange::Modified { path } if path.ends_with("tracked.txt"))
+        }),
+        "staged change missing from the listing: {changes:?}"
+    );
+}
+
+#[test]
+fn for_each_changed_file_reports_staged_new_file_once() {
+    // A staged addition is tracked, so it must be reported as a change against
+    // HEAD rather than as untracked, and exactly once even though the head-tree
+    // and worktree halves of the scan can both see it.
+    let repo = empty_git_repo();
+    write_repo_file(repo.path(), "tracked.txt", "tracked\n");
+    create_commit(repo.path(), true);
+
+    write_repo_file(repo.path(), "added.txt", "brand new\n");
+    exec_git_cmd("add added.txt", repo.path());
+
+    let changes = RefCell::new(Vec::new());
+    git::for_each_changed_file(repo.path(), |change| {
+        changes.borrow_mut().push(change.unwrap());
+        true
+    })
+    .unwrap();
+
+    let changes = changes.into_inner();
+    let matching: Vec<_> = changes
+        .iter()
+        .filter(|change| change.path().ends_with("added.txt"))
+        .collect();
+    assert_eq!(matching.len(), 1, "expected exactly one entry: {changes:?}");
+    assert!(
+        matches!(matching[0], FileChange::Modified { .. }),
+        "staged addition should be tracked, not untracked: {matching:?}"
+    );
+}
+
+#[test]
+fn for_each_changed_file_reports_staged_deletion() {
+    let repo = empty_git_repo();
+    write_repo_file(repo.path(), "doomed.txt", "bye\n");
+    create_commit(repo.path(), true);
+
+    exec_git_cmd("rm doomed.txt", repo.path());
+
+    let changes = RefCell::new(Vec::new());
+    git::for_each_changed_file(repo.path(), |change| {
+        changes.borrow_mut().push(change.unwrap());
+        true
+    })
+    .unwrap();
+
+    let changes = changes.into_inner();
+    assert!(
+        changes.iter().any(|change| {
+            matches!(change, FileChange::Deleted { path } if path.ends_with("doomed.txt"))
+        }),
+        "staged deletion missing from the listing: {changes:?}"
+    );
+}
+
+#[test]
 fn for_each_untracked_file_matches_git_semantics() {
     let repo = empty_git_repo();
     write_repo_file(repo.path(), "tracked.txt", "tracked\n");

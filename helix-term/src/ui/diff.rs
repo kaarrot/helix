@@ -4,11 +4,13 @@ use crate::ui::{
 };
 use helix_core::{syntax::OverlayHighlights, Position};
 use helix_view::{
+    annotations::rows::{Attention, CommentRowKind, RowMark, VirtualRow, VirtualRowPlan},
     graphics::{Color, Rect, Style},
+    review::MARKER,
     Document, Theme,
 };
 use similar::{Algorithm, ChangeTag, DiffOp, TextDiff};
-use std::{ops::Range, time::Duration};
+use std::{ops::Range, rc::Rc, time::Duration};
 
 const MAX_INTRALINE_HUNK_LINES: usize = 40;
 const MAX_INTRALINE_HUNK_CHARS: usize = 8 * 1024;
@@ -27,87 +29,263 @@ struct IntralineRange {
     chars: Range<usize>,
 }
 
-/// Paints a tinted background on virtual spacer lines produced by `DiffAlignment`
-/// so the "no content here" regions are visually distinct from real lines.
-pub(super) struct DiffSpacerDecoration {
-    spacer_rows: Vec<(usize, usize)>,
-    style: Style,
+/// The theme background as rgb, if it has one.
+fn background_rgb(theme: &Theme) -> Option<(u8, u8, u8)> {
+    match theme.get("ui.background").bg {
+        Some(Color::Rgb(r, g, b)) => Some((r, g, b)),
+        _ => None,
+    }
 }
 
-impl DiffSpacerDecoration {
-    pub(super) fn new(diff_handle: &helix_vcs::DiffHandle, theme: &Theme) -> Self {
-        let diff = diff_handle.load();
-        let mut padding = std::collections::BTreeMap::<usize, usize>::new();
-        for i in 0..diff.len() {
-            let hunk = diff.nth_hunk(i);
-            let before_len = hunk.before.len() as usize;
-            let after_len = hunk.after.len() as usize;
-            if before_len > after_len {
-                let deficit = before_len - after_len;
-                let doc_line = hunk.after.start as usize;
-                let emit_after = doc_line.saturating_sub(1);
-                *padding.entry(emit_after).or_insert(0) += deficit;
-            }
-        }
-        let style = theme.try_get("ui.diff.spacer").unwrap_or_else(|| {
-            let bg_style = theme.get("ui.background");
-            match bg_style.bg {
-                Some(Color::Rgb(br, bg, bb)) => {
-                    let lum = 0.299 * br as f64 + 0.587 * bg as f64 + 0.114 * bb as f64;
-                    let (r, g, b) = if lum < 128.0 {
-                        (
-                            (br as u16 + 15).min(255) as u8,
-                            (bg as u16 + 15).min(255) as u8,
-                            (bb as u16 + 15).min(255) as u8,
-                        )
-                    } else {
-                        (
-                            br.saturating_sub(15),
-                            bg.saturating_sub(15),
-                            bb.saturating_sub(15),
-                        )
-                    };
-                    Style::default().bg(Color::Rgb(r, g, b))
+fn luminance((r, g, b): (u8, u8, u8)) -> f64 {
+    0.299 * r as f64 + 0.587 * g as f64 + 0.114 * b as f64
+}
+
+/// A background derived from `ui.background` by nudging its luminance, used when
+/// a theme does not define a diff surface colour of its own.
+pub(crate) fn blended_bg(theme: &Theme, delta: u8) -> Style {
+    let Some((br, bg, bb)) = background_rgb(theme) else {
+        return Style::default().bg(Color::Gray);
+    };
+    let (r, g, b) = if luminance((br, bg, bb)) < 128.0 {
+        (
+            (br as u16 + delta as u16).min(255) as u8,
+            (bg as u16 + delta as u16).min(255) as u8,
+            (bb as u16 + delta as u16).min(255) as u8,
+        )
+    } else {
+        (
+            br.saturating_sub(delta),
+            bg.saturating_sub(delta),
+            bb.saturating_sub(delta),
+        )
+    };
+    Style::default().bg(Color::Rgb(r, g, b))
+}
+
+/// A surface with **both** a background and a legible foreground.
+///
+/// A background alone is not enough: text drawn with no foreground inherits
+/// whatever was there, which on a light theme means near-white on near-white.
+/// The foreground comes from the theme's own text colour where it has one, and
+/// otherwise from the background's luminance, so it is always readable.
+pub(crate) fn blended_surface(theme: &Theme, delta: u8, dim: bool) -> Style {
+    let style = blended_bg(theme, delta);
+
+    let fg = theme
+        .try_get("ui.text")
+        .and_then(|text| text.fg)
+        .or_else(|| {
+            background_rgb(theme).map(|rgb| {
+                if luminance(rgb) < 128.0 {
+                    Color::White
+                } else {
+                    Color::Black
                 }
-                _ => Style::default().bg(Color::Gray),
-            }
-        });
+            })
+        })
+        .unwrap_or(Color::White);
+
+    // Headers and stale notes read as secondary, but must still be readable:
+    // pull them toward the background rather than washing them out.
+    let fg = match (dim, fg, background_rgb(theme)) {
+        (true, Color::Rgb(fr, fg_, fb), Some((br, bg, bb))) => Color::Rgb(
+            ((fr as u16 + br as u16) / 2) as u8,
+            ((fg_ as u16 + bg as u16) / 2) as u8,
+            ((fb as u16 + bb as u16) / 2) as u8,
+        ),
+        (_, fg, _) => fg,
+    };
+
+    style.fg(fg)
+}
+
+/// Paints the virtual rows reserved by `VirtualRowLines`.
+///
+/// Walks the same `VirtualRowPlan` the annotation reserved from, so the painted
+/// row count always matches the reserved one.
+pub(super) struct VirtualRowDecoration {
+    plan: Rc<VirtualRowPlan>,
+    /// Where each comment row lands, written back as it is painted so the mouse
+    /// can find out what it is over.
+    hits: Rc<std::cell::RefCell<Vec<helix_view::review::BoxHit>>>,
+    view: helix_view::ViewId,
+    spacer: Style,
+    /// Backgrounds for the two attention levels.
+    focused_bg: Option<helix_view::graphics::Color>,
+    under_cursor_bg: Option<helix_view::graphics::Color>,
+    /// Backgrounds for the cursor and selection drawn inside a focused box.
+    box_cursor_bg: Option<helix_view::graphics::Color>,
+    box_selection_bg: Option<helix_view::graphics::Color>,
+    user: Style,
+    agent: Style,
+    pending: Style,
+    summary: Style,
+    orphaned: Style,
+}
+
+impl VirtualRowDecoration {
+    pub(super) fn new(
+        plan: Rc<VirtualRowPlan>,
+        theme: &Theme,
+        view: helix_view::ViewId,
+        hits: Rc<std::cell::RefCell<Vec<helix_view::review::BoxHit>>>,
+    ) -> Self {
+        // This view's rows are about to be painted again, so whatever was
+        // recorded for it last frame is stale.
+        hits.borrow_mut().retain(|hit| hit.view != view);
+        // Fallbacks carry a foreground as well as a background. A theme that
+        // defines none of these keys must still be readable.
+        let body = blended_surface(theme, 12, false);
+        let secondary = blended_surface(theme, 12, true);
+        let role = |key: &str, fallback: Style| theme.try_get(key).unwrap_or(fallback);
         Self {
-            spacer_rows: padding.into_iter().collect(),
-            style,
+            plan,
+            hits,
+            view,
+            focused_bg: theme
+                .try_get("ui.review.comment.focused")
+                .and_then(|style| style.bg)
+                .or_else(|| blended_surface(theme, 40, false).bg),
+            under_cursor_bg: theme
+                .try_get("ui.review.comment.cursor")
+                .and_then(|style| style.bg)
+                .or_else(|| blended_surface(theme, 22, false).bg),
+            // The box draws its own cursor and selection, so it borrows the
+            // editor's own keys for them: a selection inside a box should look
+            // like a selection, not like a third kind of highlight.
+            box_cursor_bg: theme
+                .try_get("ui.review.comment.line")
+                .and_then(|style| style.bg)
+                .or_else(|| {
+                    theme
+                        .try_get("ui.cursor.primary")
+                        .and_then(|style| style.bg)
+                })
+                .or_else(|| blended_surface(theme, 70, false).bg),
+            box_selection_bg: theme
+                .try_get("ui.review.comment.selection")
+                .and_then(|style| style.bg)
+                .or_else(|| theme.try_get("ui.selection").and_then(|style| style.bg))
+                .or_else(|| blended_surface(theme, 55, false).bg),
+            spacer: theme
+                .try_get("ui.diff.spacer")
+                .unwrap_or_else(|| blended_bg(theme, 15)),
+            user: role("ui.review.comment.user", body),
+            agent: role("ui.review.comment.agent", body),
+            pending: role("ui.review.comment.pending", body),
+            summary: role("ui.review.comment.collapsed", secondary),
+            orphaned: role("ui.review.comment.orphaned", secondary),
+        }
+    }
+
+    fn comment_style(&self, kind: CommentRowKind) -> Style {
+        match kind {
+            CommentRowKind::Summary => self.summary,
+            CommentRowKind::User => self.user,
+            CommentRowKind::Agent => self.agent,
+            CommentRowKind::Pending => self.pending,
+            CommentRowKind::Orphaned => self.orphaned,
         }
     }
 }
 
-impl Decoration for DiffSpacerDecoration {
+impl Decoration for VirtualRowDecoration {
     fn render_virt_lines(
         &mut self,
         renderer: &mut TextRenderer,
         pos: LinePos,
         virt_off: Position,
     ) -> Position {
-        let rows = self
-            .spacer_rows
-            .binary_search_by_key(&pos.doc_line, |(line, _)| *line)
-            .ok()
-            .map(|idx| self.spacer_rows[idx].1)
-            .unwrap_or(0);
-
-        if rows > 0 {
-            for i in 0..rows {
-                let y = pos.visual_line + virt_off.row as u16 + i as u16;
-                if y >= renderer.offset.row as u16 + renderer.viewport.height {
-                    break;
-                }
-                renderer.set_style(
-                    Rect::new(renderer.viewport.x, y, renderer.viewport.width, 1),
-                    self.style,
-                );
-            }
-            Position::new(rows, 0)
-        } else {
-            Position::default()
+        if !pos.first_visual_line {
+            return Position::default();
         }
+        let rows = self.plan.rows_at(pos.doc_line);
+        if rows.is_empty() {
+            return Position::default();
+        }
+
+        let viewport = renderer.viewport;
+        for (i, row) in rows.iter().enumerate() {
+            let y = pos.visual_line + virt_off.row as u16 + i as u16;
+            if y >= renderer.offset.row as u16 + viewport.height {
+                break;
+            }
+            match row {
+                VirtualRow::Spacer => {
+                    renderer.set_style(Rect::new(viewport.x, y, viewport.width, 1), self.spacer);
+                }
+                // The open input draws over these; painting them keeps the code
+                // beneath from showing through while it is being typed into.
+                VirtualRow::Composing => {
+                    renderer.set_style(Rect::new(viewport.x, y, viewport.width, 1), self.spacer);
+                }
+                VirtualRow::Comment {
+                    thread,
+                    kind,
+                    text,
+                    attention,
+                    mark,
+                    body,
+                } => {
+                    self.hits.borrow_mut().push(helix_view::review::BoxHit {
+                        view: self.view,
+                        row: y,
+                        x: viewport.x,
+                        width: viewport.width,
+                        thread: *thread,
+                        body: *body,
+                    });
+                    let mut style = self.comment_style(*kind);
+                    // Two steps of emphasis: passing the line tints it, stopping
+                    // on the box tints it further, so "this one takes my keys"
+                    // is visible rather than inferred.
+                    match attention {
+                        Attention::Focused => {
+                            if let Some(bg) = self.focused_bg {
+                                style = style.bg(bg);
+                            }
+                        }
+                        Attention::UnderCursor => {
+                            if let Some(bg) = self.under_cursor_bg {
+                                style = style.bg(bg);
+                            }
+                        }
+                        Attention::Idle => {}
+                    }
+                    // The in-box cursor and selection sit on top of that: they
+                    // say where `y` would copy from, which is a stronger claim
+                    // than which box has the keys.
+                    match mark {
+                        RowMark::Cursor => {
+                            if let Some(bg) = self.box_cursor_bg {
+                                style = style.bg(bg);
+                            }
+                        }
+                        RowMark::Selected => {
+                            if let Some(bg) = self.box_selection_bg {
+                                style = style.bg(bg);
+                            }
+                        }
+                        RowMark::None => {}
+                    }
+                    renderer.set_style(Rect::new(viewport.x, y, viewport.width, 1), style);
+                    renderer.set_stringn(viewport.x, y, MARKER, 1, style);
+                    renderer.set_stringn(
+                        viewport.x + 1,
+                        y,
+                        text,
+                        viewport.width.saturating_sub(1) as usize,
+                        style,
+                    );
+                }
+            }
+        }
+
+        // Always the full reserved count, even when the loop broke early at the
+        // viewport edge: the annotation reserved this many, and the formatter
+        // laid text out around that count.
+        Position::new(rows.len(), 0)
     }
 }
 

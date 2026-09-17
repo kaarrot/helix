@@ -610,6 +610,23 @@ fn open_repo(path: &Path) -> Result<ThreadSafeRepository> {
 /// untracked files separately (via [`for_each_untracked_file`], which uses a
 /// parallel walker) pass [`UntrackedFiles::None`] so gix does no directory
 /// walk at all — leaving only the fast index<->worktree modification pass.
+/// The working-tree root containing `file`, via the same repository discovery
+/// the diff machinery uses.
+pub fn workdir(file: &Path) -> Result<PathBuf> {
+    let repo = open_repo(get_repo_dir(file)?)?.to_thread_local();
+    repo.workdir()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| anyhow::anyhow!("working tree not found"))
+}
+
+/// Whether an index entry is a regular file or symlink, as opposed to a
+/// submodule or sparse directory. Mirrors the `is_blob` filtering the tree-diff
+/// paths above apply, for which index entry modes have no direct equivalent.
+fn is_file_mode(mode: gix::index::entry::Mode) -> bool {
+    mode.to_tree_entry_mode()
+        .is_some_and(|mode| mode.is_blob_or_symlink())
+}
+
 fn status(
     repo: &Repository,
     untracked: UntrackedFiles,
@@ -619,6 +636,13 @@ fn status(
         .workdir()
         .ok_or_else(|| anyhow::anyhow!("working tree not found"))?
         .to_path_buf();
+
+    // HEAD^{tree} is compared against the index as well as the index against the
+    // worktree. Without the head tree, staged work is invisible here: `git add`
+    // makes the index match the worktree, so an index<->worktree scan alone
+    // reports nothing while the change is plainly still there against HEAD.
+    // `or_empty` covers an unborn HEAD, where every indexed file reads as added.
+    let head_tree_id = repo.head_tree_id_or_empty()?;
 
     let status_platform = repo
         .status(gix::progress::Discard)?
@@ -632,46 +656,110 @@ fn status(
         // measured as roughly half the total scan time on a large repo with a
         // few thousand untracked files, worse still on network filesystems. A
         // renamed file surfaces as an untracked + deleted pair instead.
-        .index_worktree_rewrites(None::<Rewrites>);
+        .index_worktree_rewrites(None::<Rewrites>)
+        .head_tree(head_tree_id)
+        // Likewise off between head tree and index, for consistency with the
+        // above rather than cost: both sides are already-hashed objects here, so
+        // this one is cheap. A staged rename surfaces as a deletion + addition.
+        .tree_index_track_renames(gix::status::tree_index::TrackRenames::Disabled);
 
     // No filtering based on path
     let empty_patterns = vec![];
 
-    let status_iter = status_platform.into_index_worktree_iter(empty_patterns)?;
+    // Yields head-tree<->index and index<->worktree changes. Under the `parallel`
+    // feature the two run concurrently with the dirwalk, so the added comparison
+    // costs no extra filesystem I/O: it reads objects, never the worktree.
+    let status_iter = status_platform.into_iter(empty_patterns)?;
+
+    // A file can be reported by both halves (staged, then modified again). Emit
+    // it once. Ordering between the halves is explicitly undefined under
+    // `parallel`, so which half labels it is not guaranteed; every label here
+    // means "changed", and the picker keys on the path.
+    let mut seen = std::collections::HashSet::new();
 
     for item in status_iter {
         let Ok(item) = item.map_err(|err| f(Err(err.into()))) else {
             continue;
         };
         let change = match item {
-            Item::Modification {
-                rela_path, status, ..
-            } => {
-                let path = work_dir.join(rela_path.to_path()?);
-                match status {
-                    EntryStatus::Conflict { .. } => FileChange::Conflict { path },
-                    EntryStatus::Change(Change::Removed) => FileChange::Deleted { path },
-                    EntryStatus::Change(Change::Modification { .. }) => {
-                        FileChange::Modified { path }
+            gix::status::Item::IndexWorktree(item) => match item {
+                Item::Modification {
+                    rela_path, status, ..
+                } => {
+                    let path = work_dir.join(rela_path.to_path()?);
+                    match status {
+                        EntryStatus::Conflict { .. } => FileChange::Conflict { path },
+                        EntryStatus::Change(Change::Removed) => FileChange::Deleted { path },
+                        EntryStatus::Change(Change::Modification { .. }) => {
+                            FileChange::Modified { path }
+                        }
+                        _ => continue,
                     }
-                    _ => continue,
                 }
-            }
-            Item::DirectoryContents { entry, .. } if entry.status == Status::Untracked => {
-                FileChange::Untracked {
-                    path: work_dir.join(entry.rela_path.to_path()?),
+                Item::DirectoryContents { entry, .. } if entry.status == Status::Untracked => {
+                    FileChange::Untracked {
+                        path: work_dir.join(entry.rela_path.to_path()?),
+                    }
                 }
-            }
-            Item::Rewrite {
-                source,
-                dirwalk_entry,
-                ..
-            } => FileChange::Renamed {
-                from_path: work_dir.join(source.rela_path().to_path()?),
-                to_path: work_dir.join(dirwalk_entry.rela_path.to_path()?),
+                Item::Rewrite {
+                    source,
+                    dirwalk_entry,
+                    ..
+                } => FileChange::Renamed {
+                    from_path: work_dir.join(source.rela_path().to_path()?),
+                    to_path: work_dir.join(dirwalk_entry.rela_path.to_path()?),
+                },
+                _ => continue,
             },
-            _ => continue,
+            gix::status::Item::TreeIndex(change) => {
+                use gix::diff::index::ChangeRef;
+                match change {
+                    // Staged additions are tracked, so they are a modification
+                    // against HEAD rather than an untracked file.
+                    ChangeRef::Addition {
+                        location,
+                        entry_mode,
+                        ..
+                    }
+                    | ChangeRef::Modification {
+                        location,
+                        entry_mode,
+                        ..
+                    } => {
+                        if !is_file_mode(entry_mode) {
+                            continue;
+                        }
+                        FileChange::Modified {
+                            path: work_dir.join(gix::path::from_bstr(location.as_ref())),
+                        }
+                    }
+                    ChangeRef::Deletion {
+                        location,
+                        entry_mode,
+                        ..
+                    } => {
+                        if !is_file_mode(entry_mode) {
+                            continue;
+                        }
+                        FileChange::Deleted {
+                            path: work_dir.join(gix::path::from_bstr(location.as_ref())),
+                        }
+                    }
+                    ChangeRef::Rewrite {
+                        source_location,
+                        location,
+                        ..
+                    } => FileChange::Renamed {
+                        from_path: work_dir.join(gix::path::from_bstr(source_location.as_ref())),
+                        to_path: work_dir.join(gix::path::from_bstr(location.as_ref())),
+                    },
+                }
+            }
         };
+
+        if !seen.insert(change.path().to_path_buf()) {
+            continue;
+        }
         if !f(Ok(change)) {
             break;
         }

@@ -16,6 +16,7 @@ pub mod input;
 pub mod keyboard;
 pub mod merge_view;
 pub mod register;
+pub mod review;
 pub mod theme;
 pub mod tree;
 pub mod view;

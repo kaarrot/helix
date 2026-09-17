@@ -7,8 +7,8 @@ use helix_core::hashmap;
 pub fn default() -> HashMap<Mode, KeyTrie> {
     let normal = keymap!({ "Normal mode"
         "h" | "left" => move_char_left,
-        "j" | "down" => move_visual_line_down,
-        "k" | "up" => move_visual_line_up,
+        "j" | "down" => review_line_down,
+        "k" | "up" => review_line_up,
         "l" | "right" => move_char_right,
 
         "t" => find_till_char,
@@ -17,6 +17,12 @@ pub fn default() -> HashMap<Mode, KeyTrie> {
         "F" => find_prev_char,
         "r" => replace,
         "R" => replace_with_yanked,
+        // Ctrl rather than bare arrows: the cursor still has to be able to move
+        // left and right on a line that carries a thread.
+        "C-left" => review_prev_message,
+        "C-right" => review_next_message,
+        "C-up" => review_scroll_up,
+        "C-down" => review_scroll_down,
         "A-." =>  repeat_last_motion,
 
         "~" => switch_case,
@@ -70,9 +76,9 @@ pub fn default() -> HashMap<Mode, KeyTrie> {
         "o" => open_below,
         "O" => open_above,
 
-        "d" => delete_selection,
+        "d" => review_delete_or_change,
         "A-d" => delete_selection_noyank,
-        "c" => change_selection,
+        "c" => review_comment_or_change,
         "A-c" => change_selection_noyank,
 
         "C" => copy_selection_on_next_line,
@@ -116,7 +122,8 @@ pub fn default() -> HashMap<Mode, KeyTrie> {
             "f" => goto_prev_function,
             "t" => goto_prev_class,
             "a" => goto_prev_parameter,
-            "c" => goto_prev_comment,
+            "c" => goto_prev_comment_or_review,
+            "C" => goto_prev_review_comment,
             "e" => goto_prev_entry,
             "T" => goto_prev_test,
             "p" => goto_prev_paragraph,
@@ -131,7 +138,8 @@ pub fn default() -> HashMap<Mode, KeyTrie> {
             "f" => goto_next_function,
             "t" => goto_next_class,
             "a" => goto_next_parameter,
-            "c" => goto_next_comment,
+            "c" => goto_next_comment_or_review,
+            "C" => goto_next_review_comment,
             "e" => goto_next_entry,
             "T" => goto_next_test,
             "p" => goto_next_paragraph,
@@ -151,7 +159,10 @@ pub fn default() -> HashMap<Mode, KeyTrie> {
         "A-u" => earlier,
         "A-U" => later,
 
-        "y" => yank,
+        "y" => review_copy_or_yank,
+        // Only reaches Helix where the terminal forwards it rather than using
+        // it for its own copy.
+        "C-S-c" => review_copy_or_yank_to_clipboard,
         // yank_all
         "p" => paste_after,
         // paste_all
@@ -220,7 +231,7 @@ pub fn default() -> HashMap<Mode, KeyTrie> {
 
         "C-i" | "tab" => jump_forward, // tab == <C-i>
         "C-o" => jump_backward,
-        "C-s" => save_selection,
+        "C-s" | "C-S-s" => review_send_or_save_selection,
 
         "space" => { "Space"
             "f" => file_picker,
@@ -249,6 +260,12 @@ pub fn default() -> HashMap<Mode, KeyTrie> {
                 "c" => diff_commit_from_selection,
                 "C" => diff_show_commit_from_selection,
                 "q" => close_diff_or_merge_view,
+                "R" => { "Review"
+                    "c" => review_add,
+                    "S" => review_send_all,
+                    "t" => review_toggle_collapse,
+                    "h" => review_toggle_visible,
+                },
             },
             "G" => { "Debug (experimental)" sticky=true
                 "l" => dap_launch,

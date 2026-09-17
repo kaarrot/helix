@@ -215,6 +215,11 @@ pub struct Document {
     pub char_diff_minus_side: bool,
     /// The paired document in a split diff session.
     pub linked_diff_doc: Option<DocumentId>,
+    /// Live positions of the review threads anchored in this document, kept in
+    /// step with edits by the `DocumentDidChange` hook. The threads themselves
+    /// live on `Editor`; only their positions can be maintained here, because
+    /// that event carries no `&mut Editor`.
+    pub review_anchors: Vec<crate::review::ReviewAnchor>,
 
     pub previous_diagnostic_id: Option<String>,
 
@@ -709,6 +714,7 @@ impl Document {
         Self {
             id: DocumentId::default(),
             active_snippet: None,
+            review_anchors: Vec::new(),
             path: None,
             relative_path: OnceCell::new(),
             encoding,

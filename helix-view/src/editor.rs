@@ -674,6 +674,8 @@ impl Default for ModeConfig {
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum StatusLineElement {
+    /// The name of the active review conversation
+    ReviewSession,
     /// The editor mode (Normal, Insert, Visual/Selection)
     Mode,
 
@@ -2902,6 +2904,133 @@ impl Editor {
         }
 
         Ok(())
+    }
+
+    /// The review conversation for the current file, claiming one if this is the
+    /// first comment.
+    ///
+    /// The name is captured here and never recomputed: deriving it from HEAD on
+    /// every use would silently move the conversation when the branch changes
+    /// mid-review.
+    pub fn review_session(&mut self) -> Option<&crate::review::session::ReviewSession> {
+        if self.diff.session.is_none() {
+            let path = doc!(self).path()?.to_path_buf();
+            let worktree = self.diff_providers.get_workdir(&path)?;
+            let branch = doc!(self)
+                .version_control_head()
+                .map(|head| head.to_string())
+                .filter(|head| !head.is_empty())
+                .unwrap_or_else(|| "review".to_string());
+            let session = crate::review::session::claim(&worktree, &branch);
+            self.load_reviews(&session.uuid);
+            self.diff.session = Some(session);
+        }
+        self.diff.session.as_ref()
+    }
+
+    /// Switch to a differently named conversation for the same worktree, or
+    /// rename the current one. Releases the old claim so its name is reusable.
+    pub fn set_review_session(
+        &mut self,
+        name: &str,
+    ) -> Option<&crate::review::session::ReviewSession> {
+        let worktree = match &self.diff.session {
+            Some(session) => session.worktree.clone(),
+            None => {
+                let path = doc!(self).path()?.to_path_buf();
+                self.diff_providers.get_workdir(&path)?
+            }
+        };
+        if let Some(previous) = &self.diff.session {
+            crate::review::session::release(previous);
+        }
+        // The running child is bound to the previous conversation's UUID.
+        self.drop_review_agent();
+        let session = crate::review::session::claim(&worktree, name);
+        self.load_reviews(&session.uuid);
+        self.diff.session = Some(session);
+        self.diff.session.as_ref()
+    }
+
+    /// Stop the running review child, if any. The next send starts a fresh one.
+    pub fn drop_review_agent(&mut self) {
+        if let Some(mut agent) = self.diff.agent.take() {
+            agent.shutdown();
+        }
+    }
+
+    /// Which child will answer the next send.
+    pub fn set_review_agent(&mut self, kind: crate::review::agent::ReviewAgentKind) {
+        if self.diff.agent_kind != kind {
+            self.drop_review_agent();
+            self.diff.agent_kind = kind;
+        }
+    }
+
+    /// Bring back the conversations belonging to `uuid`.
+    ///
+    /// Threads carry the line they were anchored at; the anchors that track
+    /// edits are re-established as each document opens.
+    fn load_reviews(&mut self, uuid: &str) {
+        // Only ever load onto an empty store. Replacing threads that are already
+        // in memory would discard whatever had been typed but not yet written.
+        if !self.diff.reviews.is_empty() {
+            return;
+        }
+        let dir = crate::review::session::review_dir();
+        self.diff.reviews = crate::review::ReviewStore::load_from(&dir, uuid);
+        // A conversation that could not be read is worth saying out loud: the
+        // reviewer would otherwise see an empty file list and assume the work
+        // was never there.
+        if let Some(message) = self.diff.reviews.load_error.take() {
+            self.set_error(message);
+        }
+        let open: Vec<DocumentId> = self.documents.keys().copied().collect();
+        for id in open {
+            self.seed_review_anchors(id);
+        }
+    }
+
+    /// Give a document anchors for the threads that belong to it, so they track
+    /// edits rather than staying frozen at the line they were saved on.
+    pub fn seed_review_anchors(&mut self, doc_id: DocumentId) {
+        let Some(doc) = self.documents.get(&doc_id) else {
+            return;
+        };
+        let Some(path) = doc.path().map(|path| path.to_path_buf()) else {
+            return;
+        };
+        let text = doc.text().clone();
+        let existing: Vec<crate::review::ThreadId> = doc
+            .review_anchors
+            .iter()
+            .map(|anchor| anchor.thread)
+            .collect();
+
+        let anchors: Vec<crate::review::ReviewAnchor> = self
+            .diff
+            .reviews
+            .for_file(&path)
+            .filter(|thread| !existing.contains(&thread.id))
+            .map(|thread| {
+                crate::review::ReviewAnchor::for_line(thread.id, &text, thread.line as usize)
+            })
+            .collect();
+
+        if let Some(doc) = self.documents.get_mut(&doc_id) {
+            doc.review_anchors.extend(anchors);
+        }
+    }
+
+    /// Write the current conversations out, if a session owns them.
+    pub fn save_reviews(&self) {
+        let Some(session) = &self.diff.session else {
+            return;
+        };
+        let dir = crate::review::session::review_dir();
+        if let Err(err) = self.diff.reviews.save_to(&dir, &session.uuid) {
+            log::warn!("could not save review threads: {err}");
+        }
     }
 
     pub fn open_diff_view_range(

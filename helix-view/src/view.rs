@@ -154,6 +154,15 @@ pub struct View {
     // left to future work. For now we treat all views as focused and give them
     // each their own handler.
     pub diagnostics_handler: DiagnosticsHandler,
+    /// The virtual rows this view last drew, kept so that everything which
+    /// turns a position into a screen coordinate agrees with what is on screen.
+    ///
+    /// Reserving rows without telling the coordinate maths about them puts
+    /// every click, scroll and cursor placement below a box out by its height.
+    /// Filled in while drawing, since drawing is what decides it, and read back
+    /// by [`View::text_annotations`].
+    pub virtual_rows:
+        std::cell::RefCell<Option<std::rc::Rc<crate::annotations::rows::VirtualRowPlan>>>,
 }
 
 impl fmt::Debug for View {
@@ -179,6 +188,7 @@ impl View {
             gutters,
             doc_revisions: HashMap::new(),
             diagnostics_handler: DiagnosticsHandler::new(),
+            virtual_rows: std::cell::RefCell::new(None),
         }
     }
 
@@ -444,6 +454,15 @@ impl View {
     ) -> TextAnnotations<'a> {
         let mut text_annotations = TextAnnotations::default();
 
+        // Rows held for comment boxes and diff spacers count as part of the
+        // layout, so they belong here rather than only in the renderer: this is
+        // what a click, a scroll and a cursor placement all measure against.
+        if let Some(plan) = self.virtual_rows.borrow().clone() {
+            text_annotations.add_line_annotation(Box::new(
+                crate::annotations::rows::VirtualRowLines::new(plan),
+            ));
+        }
+
         if let Some(labels) = doc.jump_labels.get(&self.id) {
             let style = theme.and_then(|t| t.find_highlight("ui.virtual.jump-label"));
             text_annotations.add_overlay(labels, style);
@@ -684,28 +703,127 @@ impl View {
         }
     }
 
-    /// Hook virtual-line alignment spacers into the text annotations for this
-    /// view when it is part of a side-by-side diff session.
-    pub fn apply_diff_alignment<'a>(
+    /// Which file and diff side this view's review threads belong to.
+    ///
+    /// A split diff's base pane holds a virtual document whose `path` was
+    /// cleared by `Document::from_git_revision`, so it cannot name its own file;
+    /// the diff state is the only thing that can. Ordinary buffers are simply
+    /// the working side of their own path.
+    pub fn review_identity(
         &self,
-        doc: &'a Document,
-        text_annotations: &mut helix_core::text_annotations::TextAnnotations<'a>,
+        doc: &Document,
         diff_views: &std::collections::HashMap<ViewId, crate::diff_view::DiffViewState>,
-        documents: &'a std::collections::BTreeMap<DocumentId, Document>,
-    ) {
-        let Some(diff_state) = diff_views.get(&self.id) else {
-            return;
-        };
-        let other_doc_id = if diff_state.is_base_view(self.id) {
-            diff_state.working_doc_id
-        } else {
-            diff_state.base_doc_id
-        };
-        if let (Some(diff_handle), Some(_)) = (doc.diff_handle(), documents.get(&other_doc_id)) {
-            text_annotations.add_line_annotation(Box::new(
-                crate::annotations::diff::DiffAlignment::new(diff_handle.clone()),
-            ));
+    ) -> Option<(std::path::PathBuf, crate::review::DiffSide)> {
+        match diff_views.get(&self.id) {
+            Some(diff_state) if diff_state.is_base_view(self.id) => Some((
+                diff_state.working_path.clone(),
+                crate::review::DiffSide::Base,
+            )),
+            Some(diff_state) => Some((
+                diff_state.working_path.clone(),
+                crate::review::DiffSide::Working,
+            )),
+            None => Some((doc.path()?.to_path_buf(), crate::review::DiffSide::Working)),
         }
+    }
+
+    /// Build this view's virtual-row plan.
+    ///
+    /// Rows come from independent sources: diff alignment spacers only when the
+    /// view is a diff pane, and review comments wherever the document has
+    /// threads. Returns `None` when both are empty, so an ordinary buffer with
+    /// no comments keeps a zero-cost path.
+    ///
+    /// Both consumers -- the reserving annotation and the painting decoration --
+    /// must be driven from the same plan, or they will disagree about row counts.
+    pub fn virtual_row_plan(
+        &self,
+        doc: &Document,
+        diff_views: &std::collections::HashMap<ViewId, crate::diff_view::DiffViewState>,
+        documents: &std::collections::BTreeMap<DocumentId, Document>,
+        reviews: &crate::review::ReviewStore,
+        spinner: Option<&str>,
+    ) -> Option<std::rc::Rc<crate::annotations::rows::VirtualRowPlan>> {
+        use crate::annotations::rows::VirtualRowPlanBuilder;
+
+        let mut builder = VirtualRowPlanBuilder::new();
+
+        // Spacers: only a real two-pane diff needs its sides aligned.
+        if let Some(diff_state) = diff_views.get(&self.id) {
+            let other_doc_id = if diff_state.is_base_view(self.id) {
+                diff_state.working_doc_id
+            } else {
+                diff_state.base_doc_id
+            };
+            if documents.contains_key(&other_doc_id) {
+                if let Some(diff_handle) = doc.diff_handle() {
+                    builder.add_diff_spacers(diff_handle);
+                }
+            }
+        }
+
+        // Space for an open input, even where no thread exists yet, so the
+        // code below moves aside for it rather than being covered by it.
+        if let (Some(composing), Some((file, side))) =
+            (&reviews.composing, self.review_identity(doc, diff_views))
+        {
+            if composing.file == file && composing.side == side {
+                builder.add_comment_rows(
+                    composing.line as usize,
+                    vec![crate::annotations::rows::VirtualRow::Composing; composing.rows],
+                );
+            }
+        }
+
+        if !reviews.is_empty() && !reviews.hidden {
+            if let Some((file, side)) = self.review_identity(doc, diff_views) {
+                let width = self.inner_width(doc) as usize;
+                // Never let a box take more than half the window: the code it
+                // is about has to stay visible, and a box taller than the window
+                // could not be scrolled through anyway.
+                let max_body_rows = (self.inner_height() / 2).max(3);
+                let text = doc.text();
+                // Which box the reader is on, so it can be drawn as the one
+                // they are acting on rather than one of several alike.
+                let cursor_line = doc.selection(self.id).primary().cursor_line(text.slice(..));
+                for thread in reviews.for_file(&file).filter(|thread| thread.side == side) {
+                    // Its space is already held by the input being typed into.
+                    if reviews
+                        .composing
+                        .as_ref()
+                        .is_some_and(|composing| composing.line == thread.line)
+                    {
+                        continue;
+                    }
+                    // An open document's anchor leads; the stored line is the
+                    // fallback for a thread whose document was reopened.
+                    let line = doc
+                        .review_anchors
+                        .iter()
+                        .find(|anchor| anchor.thread == thread.id)
+                        .map_or(thread.line as usize, |anchor| anchor.line(text));
+                    builder.add_comment_rows(
+                        line,
+                        crate::review::comment_rows(
+                            thread,
+                            width,
+                            spinner,
+                            if reviews.focused == Some(thread.id) && line == cursor_line {
+                                crate::annotations::rows::Attention::Focused
+                            } else if line == cursor_line {
+                                crate::annotations::rows::Attention::UnderCursor
+                            } else {
+                                crate::annotations::rows::Attention::Idle
+                            },
+                            max_body_rows,
+                        ),
+                    );
+                }
+            }
+        }
+
+        let plan = builder.build();
+        (!plan.is_empty()).then(|| std::rc::Rc::new(plan))
     }
 }
 

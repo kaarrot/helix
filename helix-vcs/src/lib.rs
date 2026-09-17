@@ -59,6 +59,14 @@ impl DiffProviderRegistry {
             })
     }
 
+    /// The working-tree root containing `file`, used to key review sessions so
+    /// that separate checkouts of one repository stay separate conversations.
+    pub fn get_workdir(&self, file: &Path) -> Option<PathBuf> {
+        self.providers
+            .iter()
+            .find_map(|provider| provider.get_workdir(file).ok())
+    }
+
     /// Fire-and-forget changed file iteration. Runs everything in a background task. Keeps
     /// iteration until `on_change` returns `false`.
     pub fn for_each_changed_file(
@@ -109,6 +117,14 @@ impl DiffProvider {
             #[cfg(feature = "git")]
             Self::Git => git::get_diff_base(file),
             Self::None => bail!("No diff support compiled in"),
+        }
+    }
+
+    fn get_workdir(&self, file: &Path) -> Result<PathBuf> {
+        match self {
+            #[cfg(feature = "git")]
+            Self::Git => git::workdir(file),
+            Self::None => bail!("No version control system found"),
         }
     }
 

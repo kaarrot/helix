@@ -3466,6 +3466,17 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         },
     },
     TypableCommand {
+        name: "review-session",
+        aliases: &[],
+        doc: "Show the review conversation, switch it by name, and/or pick its agent (`claude` or `grok`).",
+        fun: typed_diff::review_session,
+        completer: CommandCompleter::all(completers::review_agent),
+        signature: Signature {
+            positionals: (0, Some(2)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
         name: "diff-base",
         aliases: &["db"],
         doc: "Set diff base to a specific commit (branch, tag, SHA, or HEAD~N). No arguments resets to HEAD.",

@@ -28,6 +28,16 @@ fn only_thread_draft(app: &Application) -> Option<&str> {
         .as_deref()
 }
 
+fn only_thread_line(app: &Application) -> u32 {
+    app.editor
+        .diff
+        .reviews
+        .iter()
+        .next()
+        .expect("expected a review thread")
+        .line
+}
+
 fn focused_review_side(app: &Application) -> DiffSide {
     let view = app.editor.tree.get(app.editor.tree.focus);
     let doc = app.editor.document(view.doc).unwrap();
@@ -245,6 +255,146 @@ async fn editing_above_a_comment_moves_it_and_deleting_orphans_it() -> anyhow::R
         "an orphaned thread must still exist"
     );
 
+    harness.close(&mut app).await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn remapped_comment_line_survives_save_and_reseed() -> anyhow::Result<()> {
+    // Anchors track inserts, but thread.line used to stay at the original
+    // number. Restart reseeds from that snapshot, so the box jumped back.
+    let repo = GitRepoFixture::new()?;
+    repo.write_file("tracked.txt", "one\ntwo\nthree\n")?;
+    repo.commit_all("initial")?;
+    repo.checkout_new_branch("remap-save")?;
+
+    let _cwd = CwdGuard::enter(repo.path()).await?;
+    let path = repo.file("tracked.txt");
+    let mut app = AppBuilder::new().with_file(&path, None).build()?;
+    let mut harness = AppTestHarness::new();
+
+    // Comment on line 1 ("two").
+    assert!(harness.send_keys(&mut app, "j").await?);
+    assert!(harness.send_keys(&mut app, "<space>mRc").await?);
+    assert!(harness.send_keys(&mut app, "about two<C-s>").await?);
+    assert_eq!(only_thread_line(&app), 1);
+
+    assert!(harness.send_keys(&mut app, "ggO").await?);
+    assert!(harness.send_keys(&mut app, "inserted<esc>").await?);
+
+    let view = app.editor.tree.get(app.editor.tree.focus);
+    let doc_id = view.doc;
+    let remapped = {
+        let doc = app.editor.document(doc_id).unwrap();
+        doc.review_anchors[0].line(doc.text())
+    };
+    assert_eq!(
+        remapped, 2,
+        "inserting a line above should push the comment down"
+    );
+
+    app.editor.save_reviews();
+    assert_eq!(
+        only_thread_line(&app),
+        remapped as u32,
+        "save must write the remapped line back into the store"
+    );
+
+    app.editor
+        .document_mut(doc_id)
+        .unwrap()
+        .review_anchors
+        .clear();
+    app.editor.seed_review_anchors(doc_id);
+    let reseeded = {
+        let doc = app.editor.document(doc_id).unwrap();
+        doc.review_anchors[0].line(doc.text())
+    };
+    assert_eq!(
+        reseeded, remapped,
+        "reseed must use the remapped stored line"
+    );
+    assert!(focused_plan_row_count(&app) > 0);
+
+    harness.close(&mut app).await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn remapped_comment_line_survives_closing_the_document() -> anyhow::Result<()> {
+    let file = tempfile::NamedTempFile::new()?;
+    std::fs::write(file.path(), "one\ntwo\nthree\n")?;
+
+    let mut app = AppBuilder::new().with_file(file.path(), None).build()?;
+    let mut harness = AppTestHarness::new();
+
+    assert!(harness.send_keys(&mut app, "j").await?);
+    assert!(harness.send_keys(&mut app, "<space>mRc").await?);
+    assert!(harness.send_keys(&mut app, "about two<C-s>").await?);
+
+    assert!(harness.send_keys(&mut app, "ggO").await?);
+    assert!(harness.send_keys(&mut app, "inserted<esc>").await?);
+
+    let view = app.editor.tree.get(app.editor.tree.focus);
+    let doc_id = view.doc;
+    let remapped = {
+        let doc = app.editor.document(doc_id).unwrap();
+        doc.review_anchors[0].line(doc.text())
+    };
+    assert_eq!(remapped, 2);
+
+    assert!(
+        app.editor.close_document(doc_id, true).is_ok(),
+        "force-close should succeed"
+    );
+    assert_eq!(
+        only_thread_line(&app),
+        remapped as u32,
+        "closing must write the remapped line back before anchors are dropped"
+    );
+
+    harness.close(&mut app).await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn reply_after_insert_composes_on_the_remapped_line() -> anyhow::Result<()> {
+    let file = tempfile::NamedTempFile::new()?;
+    std::fs::write(file.path(), "one\ntwo\nthree\n")?;
+
+    let mut app = AppBuilder::new().with_file(file.path(), None).build()?;
+    let mut harness = AppTestHarness::new();
+
+    assert!(harness.send_keys(&mut app, "j").await?);
+    assert!(harness.send_keys(&mut app, "<space>mRc").await?);
+    assert!(harness.send_keys(&mut app, "about two<C-s>").await?);
+
+    assert!(harness.send_keys(&mut app, "ggO").await?);
+    assert!(harness.send_keys(&mut app, "inserted<esc>").await?);
+
+    let remapped = {
+        let view = app.editor.tree.get(app.editor.tree.focus);
+        let doc = app.editor.document(view.doc).unwrap();
+        doc.review_anchors[0].line(doc.text()) as u32
+    };
+    assert_eq!(remapped, 2);
+
+    assert!(harness.send_keys(&mut app, "]C").await?);
+    assert!(harness.send_keys(&mut app, "<space>mRc").await?);
+
+    let composing = app
+        .editor
+        .diff
+        .reviews
+        .composing
+        .as_ref()
+        .expect("reply should open a composing box");
+    assert_eq!(
+        composing.line, remapped,
+        "the reply box must sit on the remapped line, not the stale stored line"
+    );
+
+    assert!(harness.send_keys(&mut app, "<esc>").await?);
     harness.close(&mut app).await?;
     Ok(())
 }

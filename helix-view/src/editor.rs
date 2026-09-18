@@ -2195,6 +2195,12 @@ impl Editor {
             }
         }
 
+        // Anchors die with the document; write remapped/orphaned lines back
+        // first so a later save or reopen does not reseed at the old place.
+        // An inner close may already have removed this document; that close
+        // synced before removing it, and a second sync is a no-op.
+        self.sync_reviews_from_doc(doc_id);
+
         // Closing a view can tear down the diff/merge session it belonged to,
         // and that teardown closes this same document (`:bc` in a merge
         // OURS/THEIRS pane or a range-diff pane). The inner close already did
@@ -3141,7 +3147,11 @@ impl Editor {
     }
 
     /// Write the current conversations out, if a session owns them.
-    pub fn save_reviews(&self) {
+    pub fn save_reviews(&mut self) {
+        // Anchors track edits in open documents; the store's line numbers are
+        // only a snapshot. Write them back so a restart reseeds at the new
+        // place rather than the line the comment was first left on.
+        self.sync_reviews_from_open_docs();
         let Some(session) = &self.diff.session else {
             return;
         };
@@ -3149,6 +3159,25 @@ impl Editor {
         if let Err(err) = self.diff.reviews.save_to(&dir, &session.uuid) {
             log::warn!("could not save review threads: {err}");
         }
+    }
+
+    fn sync_reviews_from_open_docs(&mut self) {
+        let ids: Vec<DocumentId> = self.documents.keys().copied().collect();
+        for id in ids {
+            self.sync_reviews_from_doc(id);
+        }
+    }
+
+    fn sync_reviews_from_doc(&mut self, doc_id: DocumentId) {
+        let Some(doc) = self.documents.get(&doc_id) else {
+            return;
+        };
+        if doc.review_anchors.is_empty() {
+            return;
+        }
+        let anchors = doc.review_anchors.clone();
+        let text = doc.text().clone();
+        self.diff.reviews.sync_from_anchors(&anchors, &text);
     }
 
     pub fn open_diff_view_range(

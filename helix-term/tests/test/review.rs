@@ -1909,6 +1909,63 @@ async fn d_deletes_the_focused_entry_and_still_deletes_text_elsewhere() -> anyho
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn deleting_a_draft_only_thread_does_not_leave_a_ghost() -> anyhow::Result<()> {
+    let file = tempfile::NamedTempFile::new()?;
+    std::fs::write(file.path(), "one\ntwo\nthree\n")?;
+
+    let mut app = AppBuilder::new().with_file(file.path(), None).build()?;
+    let mut harness = AppTestHarness::new();
+
+    assert!(harness.send_keys(&mut app, "<space>mRc").await?);
+    assert!(harness.send_keys(&mut app, "why?<C-s>").await?);
+    assert_eq!(thread_count(&app), 1);
+    let id = app.editor.diff.reviews.iter().next().unwrap().id;
+
+    // Stop on the box so `d` deletes the entry rather than the buffer.
+    assert!(harness.send_keys(&mut app, "j").await?);
+    assert!(app.editor.diff.reviews.focused.is_some());
+    assert!(harness.send_keys(&mut app, "d").await?);
+
+    assert_eq!(
+        thread_count(&app),
+        0,
+        "a draft-only thread should be removed, not left empty"
+    );
+    assert_eq!(
+        focused_plan_row_count(&app),
+        0,
+        "no ghost box should remain"
+    );
+    let view = app.editor.tree.get(app.editor.tree.focus);
+    let doc = app.editor.document(view.doc).unwrap();
+    assert!(
+        doc.review_anchors.is_empty(),
+        "the deleted thread's anchor should go with it"
+    );
+
+    // `c` on the same line must not reopen a reply on the ghost.
+    assert!(harness.send_keys(&mut app, "c").await?);
+    assert!(
+        app.editor.diff.reviews.composing.is_none(),
+        "c should change the buffer, not reply to a deleted draft"
+    );
+    assert!(harness.send_keys(&mut app, "<esc>").await?);
+    assert_eq!(thread_count(&app), 0);
+
+    // A new comment on the line is a new thread, not the old id.
+    assert!(harness.send_keys(&mut app, "<space>mRc").await?);
+    assert!(harness.send_keys(&mut app, "fresh<C-s>").await?);
+    assert_eq!(thread_count(&app), 1);
+    let thread = app.editor.diff.reviews.iter().next().unwrap();
+    assert_ne!(thread.id, id, "must not reuse the deleted thread");
+    assert_eq!(thread.draft.as_deref(), Some("fresh"));
+    assert!(thread.messages.is_empty());
+
+    harness.close(&mut app).await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn review_boxes_can_be_hidden_and_shown() -> anyhow::Result<()> {
     let file = tempfile::NamedTempFile::new()?;
     std::fs::write(file.path(), "one\ntwo\nthree\n")?;

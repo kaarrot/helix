@@ -603,6 +603,10 @@ impl ReviewStore {
             // The draft has never been sent, so nothing else knows about it and
             // there is nobody to tell.
             thread.draft = None;
+            if thread.entry_count() == 0 {
+                self.remove(id);
+                return None;
+            }
             thread.view = thread.entry_count().saturating_sub(1);
             thread.reset_reading();
             return Some(thread.entry_count());
@@ -1827,5 +1831,37 @@ mod test {
         store.sync_from_anchors(&anchors, &after);
         assert_eq!(store.get(id).unwrap().line, 2);
         assert!(!store.get(id).unwrap().orphaned);
+    }
+
+    #[test]
+    fn removing_a_draft_only_thread_does_not_leave_a_ghost() {
+        let mut store = ReviewStore::default();
+        let file = PathBuf::from("/r/a.rs");
+        let id = store.draft(file.clone(), DiffSide::Working, 7, "why?".into());
+
+        assert_eq!(store.remove_entry(id, 0), None);
+        assert!(store.is_empty(), "the empty thread should be gone");
+        assert!(store.get(id).is_none());
+        assert_eq!(store.thread_at(&file, DiffSide::Working, 7), None);
+    }
+
+    #[test]
+    fn removing_a_draft_keeps_the_sent_messages() {
+        let mut store = ReviewStore::default();
+        let file = PathBuf::from("/r/a.rs");
+        let id = store.draft(file.clone(), DiffSide::Working, 7, "why?".into());
+        store.take_draft(id);
+        store.push_message(id, Role::Agent, "because X".into());
+        store.set_draft(id, "and Y?".into());
+
+        assert_eq!(store.remove_entry(id, 2), Some(2));
+        let thread = store.get(id).unwrap();
+        assert_eq!(thread.entry_count(), 2);
+        assert!(thread.draft.is_none());
+        assert!(
+            !thread.rewound,
+            "the agent never saw the draft, so there is nothing to tell"
+        );
+        assert_eq!(store.thread_at(&file, DiffSide::Working, 7), Some(id));
     }
 }

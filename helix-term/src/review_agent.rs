@@ -109,7 +109,6 @@ fn started_marker(uuid: &str) -> PathBuf {
 
 #[derive(Debug)]
 pub struct ClaudeChildAgent {
-    child: Child,
     stdin: Option<ChildStdin>,
     /// Threads awaiting a reply, oldest first. The child answers turns in the
     /// order they were written, so a queue is enough to attribute each reply.
@@ -120,7 +119,7 @@ impl ClaudeChildAgent {
     pub fn spawn(uuid: &str, worktree: &PathBuf) -> anyhow::Result<Self> {
         let resuming = started_marker(uuid).exists();
 
-        let mut child = Command::new("claude")
+        let child = Command::new("claude")
             .args(child_args(uuid, resuming))
             .current_dir(worktree)
             .stdin(Stdio::piped())
@@ -128,25 +127,27 @@ impl ClaudeChildAgent {
             .stderr(Stdio::null())
             .spawn()?;
 
+        Ok(Self::from_child(child, uuid.to_string()))
+    }
+
+    fn from_child(mut child: Child, uuid: String) -> Self {
         let stdin = child.stdin.take();
         let stdout = child.stdout.take();
         let pending: Arc<Mutex<VecDeque<ThreadId>>> = Arc::default();
+        let pending_for_reader = pending.clone();
+        // A blocking task rather than a bare thread: dispatching back to the
+        // editor goes through `runtime_local!`, which under the integration
+        // test configuration resolves via `Handle::current()` and panics
+        // outside a runtime context. It also reaps the child so shutdown
+        // does not have to `wait()` on the editor thread.
+        tokio::task::spawn_blocking(move || {
+            if let Some(stdout) = stdout {
+                read_replies(stdout, pending_for_reader, uuid);
+            }
+            let _ = child.wait();
+        });
 
-        if let Some(stdout) = stdout {
-            let pending = pending.clone();
-            let uuid = uuid.to_string();
-            // A blocking task rather than a bare thread: dispatching back to the
-            // editor goes through `runtime_local!`, which under the integration
-            // test configuration resolves via `Handle::current()` and panics
-            // outside a runtime context.
-            tokio::task::spawn_blocking(move || read_replies(stdout, pending, uuid));
-        }
-
-        Ok(Self {
-            child,
-            stdin,
-            pending,
-        })
+        Self { stdin, pending }
     }
 }
 
@@ -363,8 +364,9 @@ impl ReviewAgent for ClaudeChildAgent {
     fn shutdown(&mut self) {
         // Closing stdin is the documented way for the child to finish: it exits
         // cleanly on EOF. Killing it would lose a reply already in flight.
+        // The stdout task reaps the process; waiting here would freeze the
+        // editor on `:review-session`, agent switch, and DiffSession drop.
         self.stdin.take();
-        let _ = self.child.wait();
     }
 }
 
@@ -738,5 +740,35 @@ mod test {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn claude_shutdown_does_not_wait_for_the_child() {
+        // A child that ignores stdin EOF and stays alive: waiting on it in
+        // shutdown would freeze the editor for the full duration. stdout is
+        // discarded so the reply reader (and its editor dispatch) is not
+        // involved; this only times `wait()`.
+        let child = Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("sleep should spawn");
+        let pid = child.id();
+        let mut agent = ClaudeChildAgent::from_child(child, "shutdown-test".into());
+
+        let start = std::time::Instant::now();
+        agent.shutdown();
+        let elapsed = start.elapsed();
+
+        // Reap so the background wait returns and the test runtime can exit.
+        let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
+
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "shutdown blocked on the child for {elapsed:?}"
+        );
     }
 }

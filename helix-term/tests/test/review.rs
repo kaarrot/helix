@@ -265,6 +265,124 @@ async fn split_diff_base_pane_claims_a_session() -> anyhow::Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn split_diff_prompts_quote_the_matching_side() -> anyhow::Result<()> {
+    // compose_prompt used to ignore thread.side and always quote the working
+    // tree, so a comment on the old pane sent the new text at that line.
+    let repo = GitRepoFixture::new()?;
+    repo.write_file("tracked.txt", "one\ntwo\nthree\n")?;
+    repo.commit_all("initial")?;
+    repo.write_file("tracked.txt", "one\ntwo changed\nthree\n")?;
+
+    let _cwd = CwdGuard::enter(repo.path()).await?;
+    let path = repo.file("tracked.txt");
+    let mut app = AppBuilder::new().with_file(&path, None).build()?;
+    let mut harness = AppTestHarness::new();
+
+    app.editor
+        .open_diff_view(&path, "HEAD", Some(true))
+        .expect("split diff should open");
+    harness
+        .pump(&mut app, std::time::Duration::from_millis(400))
+        .await;
+
+    let (base_view, working_view) = {
+        let view_id = app.editor.tree.focus;
+        let state = &app.editor.diff.views[&view_id];
+        (state.base_view_id, state.working_view_id)
+    };
+
+    app.editor.focus(base_view);
+    harness
+        .send_keys_pumping(&mut app, "ggj", std::time::Duration::from_millis(200))
+        .await?;
+    harness
+        .send_keys_pumping(
+            &mut app,
+            "<space>mRc",
+            std::time::Duration::from_millis(300),
+        )
+        .await?;
+    harness
+        .send_keys_pumping(
+            &mut app,
+            "old two<C-s>",
+            std::time::Duration::from_millis(300),
+        )
+        .await?;
+
+    app.editor.focus(working_view);
+    harness
+        .send_keys_pumping(&mut app, "ggj", std::time::Duration::from_millis(200))
+        .await?;
+    harness
+        .send_keys_pumping(
+            &mut app,
+            "<space>mRc",
+            std::time::Duration::from_millis(300),
+        )
+        .await?;
+    harness
+        .send_keys_pumping(
+            &mut app,
+            "new two<C-s>",
+            std::time::Duration::from_millis(300),
+        )
+        .await?;
+
+    assert_eq!(app.editor.diff.reviews.pending_count(), 2);
+    let fake = FakeAgent::default();
+    let sent = fake.sent.clone();
+    app.editor.diff.agent = Some(Box::new(fake));
+
+    harness
+        .send_keys_pumping(
+            &mut app,
+            "<space>mRS",
+            std::time::Duration::from_millis(400),
+        )
+        .await?;
+
+    let sent = sent.lock().unwrap();
+    assert_eq!(sent.len(), 2, "both drafts should be sent");
+
+    let base_prompt = sent
+        .iter()
+        .find(|(_, prompt)| prompt.contains("old two"))
+        .map(|(_, prompt)| prompt.as_str())
+        .expect("base comment was sent");
+    let working_prompt = sent
+        .iter()
+        .find(|(_, prompt)| prompt.contains("new two"))
+        .map(|(_, prompt)| prompt.as_str())
+        .expect("working comment was sent");
+
+    assert!(
+        base_prompt.contains("side: base"),
+        "base comment must be tagged as the old side:\n{base_prompt}"
+    );
+    assert!(
+        !base_prompt.contains("two changed"),
+        "base comment must quote the old text, not the working tree:\n{base_prompt}"
+    );
+    assert!(
+        base_prompt.contains("two"),
+        "base comment should still quote the old line:\n{base_prompt}"
+    );
+
+    assert!(
+        working_prompt.contains("side: working"),
+        "working comment must be tagged as the working side:\n{working_prompt}"
+    );
+    assert!(
+        working_prompt.contains("two changed"),
+        "working comment must quote the working-tree text:\n{working_prompt}"
+    );
+
+    let _ = app.close().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn ctrl_s_sends_a_saved_draft_from_the_comment_line() -> anyhow::Result<()> {
     let repo = GitRepoFixture::new()?;
     repo.write_file("tracked.rs", "fn one() {}\n")?;

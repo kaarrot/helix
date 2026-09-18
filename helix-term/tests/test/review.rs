@@ -17,6 +17,17 @@ fn only_thread_side(app: &Application) -> DiffSide {
         .side
 }
 
+fn only_thread_draft(app: &Application) -> Option<&str> {
+    app.editor
+        .diff
+        .reviews
+        .iter()
+        .next()
+        .expect("expected a review thread")
+        .draft
+        .as_deref()
+}
+
 fn focused_review_side(app: &Application) -> DiffSide {
     let view = app.editor.tree.get(app.editor.tree.focus);
     let doc = app.editor.document(view.doc).unwrap();
@@ -284,6 +295,75 @@ async fn the_first_comment_claims_a_session_named_for_the_branch() -> anyhow::Re
             .await?
     );
     assert_eq!(app.editor.diff.session.as_ref().unwrap().uuid, uuid);
+
+    harness.close(&mut app).await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn switching_review_sessions_isolates_their_stores() -> anyhow::Result<()> {
+    // :review-session used to keep the in-memory threads and only change the
+    // UUID, so the next save wrote them over the conversation just switched to.
+    let repo = GitRepoFixture::new()?;
+    repo.write_file("tracked.txt", "one\ntwo\n")?;
+    repo.commit_all("initial")?;
+    repo.checkout_new_branch("feature-x")?;
+
+    let _cwd = CwdGuard::enter(repo.path()).await?;
+    let path = repo.file("tracked.txt");
+    let mut app = AppBuilder::new().with_file(&path, None).build()?;
+    let mut harness = AppTestHarness::new();
+
+    assert!(harness.send_keys(&mut app, "<space>mRc").await?);
+    assert!(harness.send_keys(&mut app, "why?<C-s>").await?);
+    assert_eq!(thread_count(&app), 1);
+    assert_eq!(only_thread_draft(&app), Some("why?"));
+
+    assert!(
+        harness
+            .send_keys(&mut app, ":review-session spike<ret>")
+            .await?
+    );
+    assert_eq!(
+        thread_count(&app),
+        0,
+        "switching must not keep the previous conversation's threads"
+    );
+    assert_eq!(focused_plan_row_count(&app), 0);
+    {
+        let view = app.editor.tree.get(app.editor.tree.focus);
+        let doc = app.editor.document(view.doc).unwrap();
+        assert!(
+            doc.review_anchors.is_empty(),
+            "anchors belong to the previous conversation"
+        );
+    }
+
+    assert!(harness.send_keys(&mut app, "<space>mRc").await?);
+    assert!(harness.send_keys(&mut app, "spike note<C-s>").await?);
+    assert_eq!(thread_count(&app), 1);
+    assert_eq!(only_thread_draft(&app), Some("spike note"));
+
+    assert!(
+        harness
+            .send_keys(&mut app, ":review-session feature-x<ret>")
+            .await?
+    );
+    assert_eq!(thread_count(&app), 1);
+    assert_eq!(
+        only_thread_draft(&app),
+        Some("why?"),
+        "the original conversation must come back, not spike's threads"
+    );
+    assert!(focused_plan_row_count(&app) > 0);
+
+    assert!(
+        harness
+            .send_keys(&mut app, ":review-session spike<ret>")
+            .await?
+    );
+    assert_eq!(thread_count(&app), 1);
+    assert_eq!(only_thread_draft(&app), Some("spike note"));
 
     harness.close(&mut app).await?;
     Ok(())

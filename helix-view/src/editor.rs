@@ -2935,12 +2935,22 @@ impl Editor {
         name: &str,
     ) -> Option<&crate::review::session::ReviewSession> {
         let worktree = match &self.diff.session {
+            Some(session) if session.name == name => {
+                return self.diff.session.as_ref();
+            }
             Some(session) => session.worktree.clone(),
             None => {
                 let path = doc!(self).path()?.to_path_buf();
                 self.diff_providers.get_workdir(&path)?
             }
         };
+
+        // load_reviews will not replace a non-empty store, so a first comment
+        // is not overwritten by a disk load. On switch that guard would keep
+        // the old threads; save them, then clear, so the new UUID can load.
+        self.save_reviews();
+        self.clear_reviews();
+
         if let Some(previous) = &self.diff.session {
             crate::review::session::release(previous);
         }
@@ -2950,6 +2960,13 @@ impl Editor {
         self.load_reviews(&session.uuid);
         self.diff.session = Some(session);
         self.diff.session.as_ref()
+    }
+
+    fn clear_reviews(&mut self) {
+        self.diff.reviews = crate::review::ReviewStore::default();
+        for doc in self.documents.values_mut() {
+            doc.review_anchors.clear();
+        }
     }
 
     /// Stop the running review child, if any. The next send starts a fresh one.

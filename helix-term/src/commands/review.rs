@@ -33,14 +33,7 @@ fn threads_in_view(cx: &mut Context) -> Vec<(usize, ThreadId)> {
         .reviews
         .for_file(&file)
         .filter(|thread| thread.side == side)
-        .map(|thread| {
-            let line = doc
-                .review_anchors
-                .iter()
-                .find(|anchor| anchor.thread == thread.id)
-                .map_or(thread.line as usize, |anchor| anchor.line(text));
-            (line, thread.id)
-        })
+        .map(|thread| (thread.line_in(&doc.review_anchors, text), thread.id))
         .collect();
     threads.sort_unstable();
     threads
@@ -103,13 +96,14 @@ pub fn review_add(cx: &mut Context) {
             .get(id)
             .is_some_and(|thread| thread.is_pending());
 
-        let Some(anchor) = cx
-            .editor
-            .diff
-            .reviews
-            .get(id)
-            .map(|thread| (thread.file.clone(), thread.side, thread.line))
-        else {
+        let Some(anchor) = ({
+            let (view, doc) = current_ref!(cx.editor);
+            let _ = view;
+            cx.editor.diff.reviews.get(id).map(|thread| {
+                let line = thread.line_in(&doc.review_anchors, doc.text()) as u32;
+                (thread.file.clone(), thread.side, line)
+            })
+        }) else {
             return;
         };
 

@@ -790,21 +790,17 @@ impl View {
                 // they are acting on rather than one of several alike.
                 let cursor_line = doc.selection(self.id).primary().cursor_line(text.slice(..));
                 for thread in reviews.for_file(&file).filter(|thread| thread.side == side) {
+                    // An open document's anchor leads; the stored line is the
+                    // fallback for a thread whose document was reopened.
+                    let line = thread.line_in(&doc.review_anchors, text);
                     // Its space is already held by the input being typed into.
                     if reviews
                         .composing
                         .as_ref()
-                        .is_some_and(|composing| composing.line == thread.line)
+                        .is_some_and(|composing| composing.line as usize == line)
                     {
                         continue;
                     }
-                    // An open document's anchor leads; the stored line is the
-                    // fallback for a thread whose document was reopened.
-                    let line = doc
-                        .review_anchors
-                        .iter()
-                        .find(|anchor| anchor.thread == thread.id)
-                        .map_or(thread.line as usize, |anchor| anchor.line(text));
                     builder.add_comment_rows(
                         line,
                         crate::review::comment_rows(

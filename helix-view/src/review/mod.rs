@@ -190,6 +190,17 @@ impl Thread {
             .unwrap_or("")
     }
 
+    /// Line this thread occupies in an open document.
+    ///
+    /// The document's [`ReviewAnchor`] tracks edits; `self.line` is only the
+    /// last persisted snapshot.
+    pub fn line_in(&self, anchors: &[ReviewAnchor], text: &Rope) -> usize {
+        anchors
+            .iter()
+            .find(|anchor| anchor.thread == self.id)
+            .map_or(self.line as usize, |anchor| anchor.line(text))
+    }
+
     /// Back to the top of the entry, with nothing selected. Called whenever the
     /// entry on show changes: a reading position in one entry means nothing in
     /// the next.

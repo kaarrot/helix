@@ -1,4 +1,7 @@
+use std::path::Path;
+
 use helix_view::review::{DiffSide, ReviewAnchor, ThreadId};
+use helix_view::Document;
 use helix_view::Editor;
 
 use crate::commands::Context;
@@ -547,50 +550,18 @@ fn compose_prompt(editor: &Editor, thread_id: ThreadId, comment: &str) -> String
         return comment.to_string();
     };
     let file = thread.file.clone();
+    let side = thread.side;
     let stored_line = thread.line as usize;
     // The draft has already become a message by this point, so anything beyond
     // the first means this is a follow-up in a conversation the agent is
     // already holding.
     let is_followup = thread.messages.len() > 1;
-
-    // Prefer the open document, whose anchor has tracked edits since the
-    // comment was written; fall back to the file on disk when it is not open.
-    let open = editor
-        .documents()
-        .find(|doc| !doc.is_virtual_base && doc.path() == Some(&file));
-
-    let (line, quoted) = match open {
-        Some(doc) => {
-            let text = doc.text();
-            let line = doc
-                .review_anchors
-                .iter()
-                .find(|anchor| anchor.thread == thread_id)
-                .map_or(stored_line, |anchor| anchor.line(text));
-            let last_line = text.len_lines().saturating_sub(1);
-            let first = line.saturating_sub(CONTEXT_LINES);
-            let last = (line + CONTEXT_LINES).min(last_line);
-            let mut quoted = String::new();
-            for n in first..=last {
-                quoted.push_str(&quote_line(n, n == line, &text.line(n).to_string()));
-            }
-            (line, quoted)
-        }
-        None => {
-            let quoted = std::fs::read_to_string(&file)
-                .map(|contents| {
-                    let lines: Vec<&str> = contents.lines().collect();
-                    let last = lines.len().saturating_sub(1);
-                    let first = stored_line.saturating_sub(CONTEXT_LINES);
-                    let last = (stored_line + CONTEXT_LINES).min(last);
-                    (first..=last)
-                        .map(|n| quote_line(n, n == stored_line, lines[n]))
-                        .collect::<String>()
-                })
-                .unwrap_or_default();
-            (stored_line, quoted)
-        }
+    let side_label = match side {
+        DiffSide::Base => "base",
+        DiffSide::Working => "working",
     };
+
+    let (line, quoted) = quote_thread(editor, thread_id, &file, side, stored_line);
 
     let rewound = editor
         .diff
@@ -612,7 +583,7 @@ fn compose_prompt(editor: &Editor, thread_id: ThreadId, comment: &str) -> String
         // same session, so the agent already has it. Only the line is worth
         // repeating, since edits may have moved it since the last turn.
         return format!(
-            "A follow-up on the review comment at {}:{}.\n\n\
+            "A follow-up on the review comment at {}:{} (side: {side_label}).\n\n\
              {rewind_note}\
              follow-up: {comment}\n\n\
              Answer it.",
@@ -631,6 +602,7 @@ fn compose_prompt(editor: &Editor, thread_id: ThreadId, comment: &str) -> String
     format!(
         "A review comment was left in the editor.\n\n\
          file: {}\n\
+         side: {side_label}\n\
          line: {}\n\
          {range}\n\
          ```\n{quoted}```\n\n\
@@ -639,6 +611,113 @@ fn compose_prompt(editor: &Editor, thread_id: ThreadId, comment: &str) -> String
         file.display(),
         line + 1
     )
+}
+
+/// Quote the document that matches `side`, not whichever buffer happens to be
+/// the working tree. A base-side comment is about the old text.
+fn quote_thread(
+    editor: &Editor,
+    thread_id: ThreadId,
+    file: &Path,
+    side: DiffSide,
+    stored_line: usize,
+) -> (usize, String) {
+    if let Some(doc) = document_for_side(editor, file, side) {
+        let text = doc.text();
+        let line = doc
+            .review_anchors
+            .iter()
+            .find(|anchor| anchor.thread == thread_id)
+            .map_or(stored_line, |anchor| anchor.line(text));
+        return (line, quote_rope(text, line));
+    }
+    let contents = match side {
+        DiffSide::Base => git_revision_text(editor, file),
+        DiffSide::Working => std::fs::read_to_string(file).ok(),
+    };
+    (
+        stored_line,
+        contents.map_or_else(String::new, |contents| quote_str(&contents, stored_line)),
+    )
+}
+
+fn document_for_side<'a>(editor: &'a Editor, file: &Path, side: DiffSide) -> Option<&'a Document> {
+    if let Some(state) = diff_state_for_file(editor, file) {
+        let id = match side {
+            DiffSide::Base => state.base_doc_id,
+            DiffSide::Working => state.working_doc_id,
+        };
+        return editor.document(id);
+    }
+    (side == DiffSide::Working)
+        .then(|| {
+            editor
+                .documents()
+                .find(|doc| !doc.is_virtual_base && doc.path().map(|p| p.as_path()) == Some(file))
+        })
+        .flatten()
+}
+
+fn diff_state_for_file<'a>(
+    editor: &'a Editor,
+    file: &Path,
+) -> Option<&'a helix_view::diff_view::DiffViewState> {
+    editor.diff.views.values().find(|state| {
+        (!state.working_path.as_os_str().is_empty() && state.working_path == file)
+            || (!state.base_path.as_os_str().is_empty() && state.base_path == file)
+    })
+}
+
+fn git_revision_text(editor: &Editor, file: &Path) -> Option<String> {
+    let git_ref = diff_state_for_file(editor, file)
+        .map(|state| state.base_ref.as_str())
+        .or_else(|| {
+            editor
+                .diff
+                .range
+                .as_ref()
+                .map(|range| range.base_ref.as_str())
+        })
+        .unwrap_or("HEAD");
+    #[cfg(feature = "git")]
+    {
+        helix_vcs::git::get_diff_base_from_ref(file, git_ref)
+            .ok()
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+    }
+    #[cfg(not(feature = "git"))]
+    {
+        let _ = git_ref;
+        None
+    }
+}
+
+fn quote_rope(text: &helix_core::Rope, line: usize) -> String {
+    let last_line = text.len_lines().saturating_sub(1);
+    let first = line.saturating_sub(CONTEXT_LINES);
+    let last = (line + CONTEXT_LINES).min(last_line);
+    let mut quoted = String::new();
+    for n in first..=last {
+        quoted.push_str(&quote_line(n, n == line, &text.line(n).to_string()));
+    }
+    quoted
+}
+
+fn quote_str(contents: &str, line: usize) -> String {
+    let lines: Vec<&str> = contents.lines().collect();
+    if lines.is_empty() {
+        return String::new();
+    }
+    let last = lines.len().saturating_sub(1);
+    let first = line.saturating_sub(CONTEXT_LINES);
+    let last = (line + CONTEXT_LINES).min(last);
+    (first..=last)
+        .filter_map(|n| {
+            lines
+                .get(n)
+                .map(|content| quote_line(n, n == line, content))
+        })
+        .collect()
 }
 
 fn quote_line(n: usize, anchored: bool, content: &str) -> String {

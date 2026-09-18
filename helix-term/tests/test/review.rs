@@ -1,10 +1,28 @@
 use helix_term::application::Application;
-use helix_view::review::ThreadId;
+use helix_view::review::{DiffSide, ThreadId};
 
 use super::*;
 
 fn thread_count(app: &Application) -> usize {
     app.editor.diff.reviews.len()
+}
+
+fn only_thread_side(app: &Application) -> DiffSide {
+    app.editor
+        .diff
+        .reviews
+        .iter()
+        .next()
+        .expect("expected a review thread")
+        .side
+}
+
+fn focused_review_side(app: &Application) -> DiffSide {
+    let view = app.editor.tree.get(app.editor.tree.focus);
+    let doc = app.editor.document(view.doc).unwrap();
+    view.review_identity(doc, &app.editor.diff.views)
+        .expect("focused view should have a review identity")
+        .1
 }
 
 /// The virtual-row plan for the focused view, or `None` when it wants no rows.
@@ -45,6 +63,57 @@ async fn comment_renders_in_a_plain_buffer_with_no_diff() -> anyhow::Result<()> 
     assert!(
         focused_plan_row_count(&app) > 0,
         "comment reserved no rows in a buffer with no diff view"
+    );
+
+    harness.close(&mut app).await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn single_pane_diff_keeps_working_side_comments() -> anyhow::Result<()> {
+    // Single-pane Space-g reuses the working view for both ids; comments
+    // made in the file must stay Working and visible there.
+    let repo = GitRepoFixture::new()?;
+    repo.write_file("tracked.rs", "fn one() {}\n")?;
+    repo.commit_all("initial")?;
+    repo.write_file("tracked.rs", "fn one() { changed }\n")?;
+
+    let _cwd = CwdGuard::enter(repo.path()).await?;
+    let path = repo.file("tracked.rs");
+    let mut app = AppBuilder::new().with_file(&path, None).build()?;
+    let mut harness = AppTestHarness::new();
+
+    assert!(harness.send_keys(&mut app, "<space>mRc").await?);
+    assert!(harness.send_keys(&mut app, "why this line?<C-s>").await?);
+    assert_eq!(thread_count(&app), 1);
+    assert_eq!(only_thread_side(&app), DiffSide::Working);
+    assert!(focused_plan_row_count(&app) > 0);
+
+    assert!(harness.send_keys(&mut app, "<space>g").await?);
+    assert!(harness.wait_for_idle(&mut app).await?);
+    assert!(harness.send_keys(&mut app, "<ret>").await?);
+
+    assert_eq!(
+        app.editor.diff.views.len(),
+        1,
+        "default diff is single-pane"
+    );
+    let view_id = app.editor.tree.focus;
+    let diff_state = &app.editor.diff.views[&view_id];
+    assert_eq!(
+        diff_state.base_view_id, diff_state.working_view_id,
+        "single-pane reuses the working view for both ids"
+    );
+    assert_eq!(
+        thread_count(&app),
+        1,
+        "opening the diff must not create a second thread"
+    );
+    assert_eq!(only_thread_side(&app), DiffSide::Working);
+    assert_eq!(focused_review_side(&app), DiffSide::Working);
+    assert!(
+        focused_plan_row_count(&app) > 0,
+        "in-file comments must still render in a single-pane diff"
     );
 
     harness.close(&mut app).await?;

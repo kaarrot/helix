@@ -707,18 +707,21 @@ impl View {
     ///
     /// A split diff's base pane holds a virtual document whose `path` was
     /// cleared by `Document::from_git_revision`, so it cannot name its own file;
-    /// the diff state is the only thing that can. Ordinary buffers are simply
-    /// the working side of their own path.
+    /// the diff state is the only thing that can. Ordinary buffers and the
+    /// default single-pane diff (same view id on both sides) are the working
+    /// side of their path.
     pub fn review_identity(
         &self,
         doc: &Document,
         diff_views: &std::collections::HashMap<ViewId, crate::diff_view::DiffViewState>,
     ) -> Option<(std::path::PathBuf, crate::review::DiffSide)> {
         match diff_views.get(&self.id) {
-            Some(diff_state) if diff_state.is_base_view(self.id) => Some((
-                diff_state.working_path.clone(),
-                crate::review::DiffSide::Base,
-            )),
+            Some(diff_state) if diff_state.is_split() && diff_state.is_base_view(self.id) => {
+                Some((
+                    diff_state.working_path.clone(),
+                    crate::review::DiffSide::Base,
+                ))
+            }
             Some(diff_state) => Some((
                 diff_state.working_path.clone(),
                 crate::review::DiffSide::Working,

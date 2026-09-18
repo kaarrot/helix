@@ -169,4 +169,11 @@ impl DiffViewState {
     pub fn is_working_view(&self, view_id: ViewId) -> bool {
         view_id == self.working_view_id
     }
+
+    /// True when this is a two-pane split. The default single-pane diff
+    /// stores the same view id for both sides, so `is_base_view` would
+    /// otherwise be true of the working document the user is reviewing.
+    pub fn is_split(&self) -> bool {
+        self.base_view_id != self.working_view_id
+    }
 }

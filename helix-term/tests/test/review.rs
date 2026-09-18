@@ -413,6 +413,61 @@ async fn ctrl_s_sends_a_saved_draft_from_the_comment_line() -> anyhow::Result<()
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn ctrl_shift_s_in_the_box_sends_only_that_thread() -> anyhow::Result<()> {
+    let file = tempfile::NamedTempFile::new()?;
+    std::fs::write(file.path(), "one\ntwo\nthree\n")?;
+
+    let mut app = AppBuilder::new().with_file(file.path(), None).build()?;
+    let mut harness = AppTestHarness::new();
+
+    let fake = FakeAgent::default();
+    let sent = fake.sent.clone();
+    app.editor.diff.agent = Some(Box::new(fake));
+
+    // Draft on line 1, leave it unsent.
+    assert!(harness.send_keys(&mut app, "j").await?);
+    assert!(harness.send_keys(&mut app, "<space>mRc").await?);
+    assert!(harness.send_keys(&mut app, "leave pending<C-s>").await?);
+    assert_eq!(app.editor.diff.reviews.pending_count(), 1);
+
+    // Ctrl-Shift-S in the box on line 0 should send only this new comment.
+    assert!(harness.send_keys(&mut app, "gg").await?);
+    assert!(harness.send_keys(&mut app, "<space>mRc").await?);
+    assert!(harness.send_keys(&mut app, "send this<C-S-s>").await?);
+
+    let sent = sent.lock().unwrap();
+    assert_eq!(
+        sent.len(),
+        1,
+        "in-box Ctrl-Shift-S must not flush every draft"
+    );
+    assert!(
+        sent[0].1.contains("send this"),
+        "the comment just typed should be the one sent:\n{}",
+        sent[0].1
+    );
+    assert!(
+        !sent[0].1.contains("leave pending"),
+        "the other draft must stay unsent:\n{}",
+        sent[0].1
+    );
+    drop(sent);
+
+    assert_eq!(app.editor.diff.reviews.pending_count(), 1);
+    let pending = app
+        .editor
+        .diff
+        .reviews
+        .pending()
+        .next()
+        .expect("the first draft should still be pending");
+    assert_eq!(pending.draft.as_deref(), Some("leave pending"));
+
+    harness.close(&mut app).await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn collapsing_a_thread_shrinks_it_to_one_row() -> anyhow::Result<()> {
     let file = tempfile::NamedTempFile::new()?;
     std::fs::write(file.path(), "alpha\nbeta\ngamma\n")?;

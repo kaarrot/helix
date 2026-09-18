@@ -571,6 +571,15 @@ fn new_file(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> an
     Ok(())
 }
 
+/// 1-based line of the primary cursor. Filesystem copies use `path:line` so
+/// `:open` and `hx path:line` land on that line.
+fn cursor_line_number(editor: &Editor) -> usize {
+    let (view, doc) = current_ref!(editor);
+    let text = doc.text().slice(..);
+    let cursor = doc.selection(view.id).primary().cursor(text);
+    text.char_to_line(cursor.min(text.len_chars())) + 1
+}
+
 /// The 1-based, inclusive line span covered by the primary selection.
 #[cfg(feature = "git")]
 fn selected_line_span(editor: &Editor) -> (usize, usize) {
@@ -632,23 +641,29 @@ fn copy_path_to_clipboard(
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("No file path available (scratch buffer)"))?;
 
-    // `:copy-path url` links to HEAD. If the file is not in a git repository
-    // with a web remote (a tempfile, a scratch-like path, no remotes), copy
-    // the absolute path instead — there is no commit to point at.
+    // Filesystem copies include the cursor line (`path:line`) so Helix can
+    // reopen at that location. `:copy-path url` links to HEAD and already
+    // appends a forge line fragment; if there is no web remote, fall back to
+    // the same `path:line`.
+    let path_with_line = format!(
+        "{}:{}",
+        path.to_string_lossy(),
+        cursor_line_number(cx.editor)
+    );
     let (copied, what) = if as_url {
         #[cfg(feature = "git")]
         {
             match file_url_at_revision(cx.editor, &path, "HEAD") {
                 Ok(url) => (url, "URL"),
-                Err(_) => (path.to_string_lossy().into_owned(), "path"),
+                Err(_) => (path_with_line, "path"),
             }
         }
         #[cfg(not(feature = "git"))]
         {
-            (path.to_string_lossy().into_owned(), "path")
+            (path_with_line, "path")
         }
     } else {
-        (path.to_string_lossy().into_owned(), "path")
+        (path_with_line, "path")
     };
 
     cx.editor
@@ -3031,7 +3046,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     TypableCommand {
         name: "copy-path",
         aliases: &["cp"],
-        doc: "Copy the current file's absolute path to the system clipboard. Use ':copy-path url' to copy a link to the file at HEAD on the git remote instead.",
+        doc: "Copy the current file's absolute path and cursor line (`path:line`) to the system clipboard. Use ':copy-path url' to copy a link to the file at HEAD on the git remote instead.",
         fun: copy_path_to_clipboard,
         completer: CommandCompleter::positional(&[completers::copy_path_kind]),
         signature: Signature {

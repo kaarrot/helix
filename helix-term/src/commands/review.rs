@@ -137,7 +137,7 @@ pub fn review_add(cx: &mut Context) {
             };
             cx.editor.set_status(drafted);
             if send_now {
-                send_now_from_box(cx);
+                send_now_from_box(cx, id);
             }
         });
         return;
@@ -176,7 +176,7 @@ pub fn review_add(cx: &mut Context) {
                 None => format!("Comment drafted ({pending} pending)"),
             });
             if send_now {
-                send_now_from_box(cx);
+                send_now_from_box(cx, id);
             }
         },
     );
@@ -490,10 +490,10 @@ impl CommentInput {
     }
 }
 
-/// Send from inside the comment box, reporting the outcome where the user is
-/// already looking.
-fn send_now_from_box(cx: &mut crate::compositor::Context) {
-    match send_pending(cx.editor) {
+/// Send the comment just drafted in the box. Other unsent drafts stay pending:
+/// `Space-m-R S` is the send-all path, same as after `Ctrl-S` in normal mode.
+fn send_now_from_box(cx: &mut crate::compositor::Context, id: ThreadId) {
+    match send_pending_ids(cx.editor, Some(id)) {
         Ok(sent) => cx.editor.set_status(match sent {
             1 => "Sent 1 comment".to_string(),
             n => format!("Sent {n} comments"),
@@ -752,14 +752,10 @@ fn ensure_agent(editor: &mut Editor) -> Result<(), String> {
     Ok(())
 }
 
-/// Send every unsent draft, oldest first.
+/// Send every unsent draft, oldest first. Returns how many went out.
 ///
 /// Each draft is its own turn so that each reply lands on the thread that asked
 /// for it; they still share one conversation, so the agent sees them together.
-/// Send every unsent draft, oldest first. Returns how many went out.
-///
-/// Takes the editor rather than a command context so the comment box can send
-/// directly, without the user having to leave it and press another key.
 pub fn send_pending(editor: &mut Editor) -> Result<usize, String> {
     send_pending_ids(editor, None)
 }

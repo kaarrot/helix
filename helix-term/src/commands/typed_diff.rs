@@ -263,14 +263,14 @@ pub(crate) fn diff_reset_typed(
         .editor
         .documents
         .iter()
-        .filter_map(|(id, doc)| doc.path().map(|_| *id))
+        .filter_map(|(id, doc)| (!doc.is_virtual_base && doc.path().is_some()).then_some(*id))
         .collect();
 
     for (_, doc) in cx.editor.documents.iter_mut() {
         doc.char_diff_enabled = false;
         doc.char_diff_minus_side = false;
         doc.linked_diff_doc = None;
-        if doc.path().is_none() {
+        if doc.is_virtual_base || doc.path().is_none() {
             doc.clear_diff_handle();
         }
     }

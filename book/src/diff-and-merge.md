@@ -51,6 +51,22 @@ Once a diff view is open:
 - `Space-m s` toggles synchronized scrolling between split panes. When enabled (the default), mouse wheel, `j`/`k`/arrows, page scrolling, and search keep both viewports aligned. Hunk jumps (`]g`/`[g`) still move both cursors as well.
 - `Space-m q` closes the current diff or merge view.
 
+## Git revision buffers
+
+A range-diff (`:diff-commit REF!`, `:diff-commit REF1..REF2`, `Space-m C`)
+opens read-only snapshots named `filename @ ref`, not the file on disk.
+Those snapshots are distinct from the working-tree buffer:
+
+- `:o` of the same path opens the on-disk file and leaves the snapshot in the
+  buffer list (`Space-b`).
+- The same file at two commits is two buffers (`foo.py @ abc123` and
+  `foo.py @ def456`). Opening the same path and ref again reuses that snapshot.
+- Language servers attach to the snapshot through a unique cache URI so they
+  do not collide with the working-tree file. Workspace discovery still uses
+  the real project root, so hover and completions can work; goto-definition
+  still resolves through the current checkout, not the historical tree.
+- `Space-m q` closes the current diff session and its revision buffers.
+
 ## Merge resolution
 
 Open merge view for the current conflicted file with `:merge`, or by selecting a

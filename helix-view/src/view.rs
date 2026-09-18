@@ -718,12 +718,12 @@ impl View {
         match diff_views.get(&self.id) {
             Some(diff_state) if diff_state.is_split() && diff_state.is_base_view(self.id) => {
                 Some((
-                    diff_state.working_path.clone(),
+                    review_diff_file(diff_state, doc)?,
                     crate::review::DiffSide::Base,
                 ))
             }
             Some(diff_state) => Some((
-                diff_state.working_path.clone(),
+                review_diff_file(diff_state, doc)?,
                 crate::review::DiffSide::Working,
             )),
             None => Some((doc.path()?.to_path_buf(), crate::review::DiffSide::Working)),
@@ -823,6 +823,22 @@ impl View {
 
         let plan = builder.build();
         (!plan.is_empty()).then(|| std::rc::Rc::new(plan))
+    }
+}
+
+/// Path a diff pane keys review threads on.
+///
+/// Git diffs always set `working_path`. Buffer diffs should too; if they do
+/// not, fall back to the document's own path so comments are not stored under
+/// an empty path and then lost when the diff closes.
+fn review_diff_file(
+    diff_state: &crate::diff_view::DiffViewState,
+    doc: &Document,
+) -> Option<std::path::PathBuf> {
+    if !diff_state.working_path.as_os_str().is_empty() {
+        Some(diff_state.working_path.clone())
+    } else {
+        doc.path().cloned()
     }
 }
 

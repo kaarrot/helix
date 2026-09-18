@@ -142,6 +142,92 @@ async fn single_pane_diff_keeps_working_side_comments() -> anyhow::Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn buffer_diff_comments_use_the_real_path() -> anyhow::Result<()> {
+    // Buffer diffs used to leave working_path empty, so comments were keyed
+    // under PathBuf::new() and disappeared once the diff closed.
+    use helix_view::editor::Action;
+
+    let base_file = tempfile::NamedTempFile::new()?;
+    let working_file = tempfile::NamedTempFile::new()?;
+    std::fs::write(base_file.path(), "base one\nbase two\n")?;
+    std::fs::write(working_file.path(), "work one\nwork two\n")?;
+
+    let mut app = AppBuilder::new()
+        .with_file(working_file.path(), None)
+        .build()?;
+    let mut harness = AppTestHarness::new();
+
+    let working_doc = app.editor.tree.get(app.editor.tree.focus).doc;
+    let base_doc = app.editor.open(base_file.path(), Action::Load)?;
+
+    app.editor
+        .open_buffer_diff_view(base_doc, working_doc, Some(true))
+        .expect("buffer diff should open");
+    harness
+        .pump(&mut app, std::time::Duration::from_millis(400))
+        .await;
+
+    let working_path = {
+        let view_id = app.editor.tree.focus;
+        let state = &app.editor.diff.views[&view_id];
+        assert!(
+            !state.working_path.as_os_str().is_empty(),
+            "buffer diffs must record the working document's path"
+        );
+        state.working_path.clone()
+    };
+
+    harness
+        .send_keys_pumping(
+            &mut app,
+            "<space>mRc",
+            std::time::Duration::from_millis(300),
+        )
+        .await?;
+    harness
+        .send_keys_pumping(
+            &mut app,
+            "about the working file<C-s>",
+            std::time::Duration::from_millis(300),
+        )
+        .await?;
+
+    assert_eq!(thread_count(&app), 1);
+    let thread = app.editor.diff.reviews.iter().next().unwrap();
+    assert_eq!(thread.file, working_path);
+    assert_eq!(thread.side, DiffSide::Working);
+    assert!(focused_plan_row_count(&app) > 0);
+
+    let view_id = app.editor.tree.focus;
+    assert!(app.editor.close_diff_view(view_id));
+    assert!(
+        app.editor.diff.views.is_empty(),
+        "leaving the diff should drop the diff views"
+    );
+
+    let view = app.editor.tree.get(app.editor.tree.focus);
+    let doc = app.editor.document(view.doc).unwrap();
+    assert_eq!(doc.id(), working_doc);
+    assert_eq!(
+        doc.path().map(|p| p.as_path()),
+        Some(working_path.as_path()),
+        "the working buffer should still be the focused file"
+    );
+    assert_eq!(thread_count(&app), 1);
+    assert_eq!(
+        app.editor.diff.reviews.iter().next().unwrap().file,
+        working_path
+    );
+    assert!(
+        focused_plan_row_count(&app) > 0,
+        "the comment must still render after leaving the buffer diff"
+    );
+
+    let _ = app.close().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn split_diff_base_pane_claims_a_session() -> anyhow::Result<()> {
     // Virtual base docs have path == None, so the first comment from the left
     // pane used to skip claiming a session, never persist, and seed its

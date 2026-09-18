@@ -613,6 +613,15 @@ fn focused_file_revision(editor: &Editor) -> (Option<PathBuf>, Option<String>) {
     )
 }
 
+/// 1-based line of the primary cursor. Filesystem copies use `path:line` so
+/// `:open` and `hx path:line` land on that line.
+fn cursor_line_number(editor: &Editor) -> usize {
+    let (view, doc) = current_ref!(editor);
+    let text = doc.text().slice(..);
+    let cursor = doc.selection(view.id).primary().cursor(text);
+    text.char_to_line(cursor.min(text.len_chars())) + 1
+}
+
 /// The 1-based, inclusive line span covered by the primary selection.
 fn selected_line_span(editor: &Editor) -> (usize, usize) {
     let (view, doc) = current_ref!(editor);
@@ -648,8 +657,15 @@ fn copy_path_to_clipboard(
     let (path, rev) = focused_file_revision(cx.editor);
     let path = path.ok_or_else(|| anyhow::anyhow!("No file path available (scratch buffer)"))?;
 
-    // In a working-tree pane there is no commit to point at, so `url` copies
-    // the path just like the default does.
+    // Filesystem copies include the cursor line (`path:line`) so Helix can
+    // reopen at that location. In a working-tree pane there is no commit to
+    // point at, so `url` copies the same `path:line`. URL mode already
+    // appends a forge line fragment when a revision is available.
+    let path_with_line = format!(
+        "{}:{}",
+        path.to_string_lossy(),
+        cursor_line_number(cx.editor)
+    );
     let (copied, what) = match rev.filter(|_| as_url) {
         Some(rev) => {
             let link = helix_vcs::git::file_web_link(&path, &rev)?;
@@ -668,7 +684,7 @@ fn copy_path_to_clipboard(
             );
             (url, "URL")
         }
-        None => (path.to_string_lossy().into_owned(), "path"),
+        None => (path_with_line, "path"),
     };
 
     cx.editor
@@ -3181,7 +3197,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     TypableCommand {
         name: "copy-path",
         aliases: &["cp"],
-        doc: "Copy the current file's absolute path to the system clipboard. Use ':copy-path url' to copy a link to the file at this pane's commit instead.",
+        doc: "Copy the current file's absolute path and cursor line (`path:line`) to the system clipboard. Use ':copy-path url' to copy a link to the file at this pane's commit instead.",
         fun: copy_path_to_clipboard,
         completer: CommandCompleter::positional(&[completers::copy_path_kind]),
         signature: Signature {

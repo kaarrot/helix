@@ -833,6 +833,52 @@ async fn the_first_comment_claims_a_session_named_for_the_branch() -> anyhow::Re
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn quitting_flushes_a_draft_before_the_debounce() -> anyhow::Result<()> {
+    // Saves are debounced 500ms on a raw tokio task. Application::close used
+    // not to write, so `:q` inside that window dropped a Ctrl-S draft.
+    let repo = GitRepoFixture::new()?;
+    repo.write_file("tracked.txt", "one\ntwo\n")?;
+    repo.commit_all("initial")?;
+    repo.checkout_new_branch("flush-on-quit")?;
+
+    let _cwd = CwdGuard::enter(repo.path()).await?;
+    let path = repo.file("tracked.txt");
+    let mut app = AppBuilder::new().with_file(&path, None).build()?;
+    let mut harness = AppTestHarness::new();
+
+    assert!(harness.send_keys(&mut app, "<space>mRc").await?);
+    assert!(harness.send_keys(&mut app, "keep this draft<C-s>").await?);
+
+    let uuid = app
+        .editor
+        .diff
+        .session
+        .as_ref()
+        .expect("commenting must claim a session")
+        .uuid
+        .clone();
+    let dir = helix_view::review::session::review_dir();
+    let threads_path = dir.join(format!("{uuid}.threads.json"));
+    assert!(
+        !threads_path.exists(),
+        "the test must close before the 500ms debounce writes"
+    );
+
+    // Do not wait for idle: that could outlast the debounce.
+    let _ = app.close().await;
+
+    let store = helix_view::review::ReviewStore::load_from(&dir, &uuid);
+    assert_eq!(store.len(), 1, "close must flush the in-memory draft");
+    assert_eq!(
+        store.iter().next().unwrap().draft.as_deref(),
+        Some("keep this draft")
+    );
+
+    let _ = std::fs::remove_file(threads_path);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn switching_review_sessions_isolates_their_stores() -> anyhow::Result<()> {
     // :review-session used to keep the in-memory threads and only change the
     // UUID, so the next save wrote them over the conversation just switched to.

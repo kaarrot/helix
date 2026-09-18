@@ -1294,6 +1294,11 @@ impl Application {
         //        errors along the way
         let mut errs = Vec::new();
 
+        // Review saves are a 500ms tokio debounce, not a helix job. Cancel it
+        // so it cannot dispatch after this loop is gone, then write now so a
+        // Ctrl-S immediately followed by `:q` is not lost.
+        crate::review_agent::cancel_scheduled_save();
+
         if let Err(err) = self
             .jobs
             .finish(&mut self.editor, Some(&mut self.compositor))
@@ -1302,6 +1307,8 @@ impl Application {
             log::error!("Error executing job: {}", err);
             errs.push(err);
         };
+
+        self.editor.save_reviews();
 
         if let Err(err) = self.editor.flush_writes().await {
             log::error!("Error writing: {}", err);

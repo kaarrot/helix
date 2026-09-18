@@ -74,20 +74,37 @@ fn apply(event: AgentEvent) {
 /// Whether a write is already pending, so a burst of changes costs one write.
 static SAVE_SCHEDULED: AtomicBool = AtomicBool::new(false);
 
+/// Bumped when a pending debounce is cancelled, so a sleeping save does not
+/// dispatch after the editor has already flushed (or gone).
+static SAVE_GENERATION: AtomicUsize = AtomicUsize::new(0);
+
 /// Ask for the conversations to be written out shortly.
 ///
 /// Debounced rather than immediate: streamed replies arrive as dozens of deltas
 /// a second, and the state directory is commonly on a network filesystem. A
 /// crash inside the debounce window loses at most the last moment of typing.
+/// `:q` flushes immediately via [`cancel_scheduled_save`] plus `save_reviews`.
 pub fn schedule_save() {
     if SAVE_SCHEDULED.swap(true, Ordering::SeqCst) {
         return;
     }
+    let generation = SAVE_GENERATION.load(Ordering::SeqCst);
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         SAVE_SCHEDULED.store(false, Ordering::SeqCst);
+        if SAVE_GENERATION.load(Ordering::SeqCst) != generation {
+            return;
+        }
         job::dispatch_blocking(move |editor, _| editor.save_reviews());
     });
+}
+
+/// Drop a pending debounced save so it cannot dispatch after the editor is gone.
+///
+/// The caller must `save_reviews` itself: this only invalidates the timer.
+pub fn cancel_scheduled_save() {
+    SAVE_GENERATION.fetch_add(1, Ordering::SeqCst);
+    SAVE_SCHEDULED.store(false, Ordering::SeqCst);
 }
 
 /// Whether this conversation has been started before, which decides between

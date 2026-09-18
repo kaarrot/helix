@@ -391,6 +391,11 @@ impl crate::compositor::Component for CommentInput {
                     // Give the space back, or the thread would stay hidden
                     // behind a box that is no longer there.
                     cx.editor.diff.reviews.composing = None;
+                    // Replying sets focused so Ctrl-left/right walk while the
+                    // box is open. Once it is gone the cursor is only on the
+                    // line again: `j` must be able to stop on the box, and
+                    // `d` must not delete an entry as if it already had.
+                    cx.editor.diff.reviews.focused = None;
                 },
             ) as crate::compositor::Callback))
         };

@@ -3070,6 +3070,15 @@ impl Editor {
         Some((doc.path()?.to_path_buf(), crate::review::DiffSide::Working))
     }
 
+    /// Store key for a document's review threads: its path, or a stable scratch
+    /// identity so pathless buffers do not all collide under `PathBuf::new()`.
+    fn document_review_path(doc: &Document) -> PathBuf {
+        match doc.path() {
+            Some(path) => helix_stdx::path::canonicalize(path),
+            None => PathBuf::from(format!("[scratch {}]", doc.id())),
+        }
+    }
+
     /// Worktree file for the focused view: `doc.path()`, or the diff state's
     /// working path when the focused pane is a virtual base document.
     fn review_session_path(&self) -> Option<PathBuf> {
@@ -3282,6 +3291,12 @@ impl Editor {
 
         self.link_shared_diff_handles(base_doc_id, working_doc_id);
 
+        // Review threads are keyed by these paths. Leaving them empty stored
+        // every buffer-diff comment under PathBuf::new(), so unrelated pairs
+        // collided and the threads vanished once the diff closed.
+        let base_path = Self::document_review_path(self.documents.get(&base_doc_id).unwrap());
+        let working_path = Self::document_review_path(self.documents.get(&working_doc_id).unwrap());
+
         let split_view_override = split_view_override.or(self.diff.split_view_override);
         let split_view = split_view_override.unwrap_or_else(|| self.config().diff.split_view);
         let display = format!("buffer {base_doc_id}..{working_doc_id}");
@@ -3307,6 +3322,7 @@ impl Editor {
                 working_view_id,
                 display,
             )
+            .with_reopen(base_path, working_path, String::new(), None)
             .with_buffer_reopen();
             self.diff.views.insert(base_view_id, diff_state.clone());
             self.diff.views.insert(working_view_id, diff_state);
@@ -3320,6 +3336,7 @@ impl Editor {
                 working_view_id,
                 display,
             )
+            .with_reopen(base_path, working_path, String::new(), None)
             .with_buffer_reopen();
             self.diff.views.insert(working_view_id, diff_state);
         }

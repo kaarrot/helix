@@ -573,10 +573,9 @@ fn new_file(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> an
 
 /// Which file the focused pane shows, and the revision it shows it at.
 ///
-/// Diff and merge panes hold virtual documents that intentionally carry no path
-/// (see `Document::from_git_revision`), so the path is recovered from the diff
-/// session, which keeps both sides' real paths and refs. A `None` revision
-/// means the pane shows the working tree, which has no commit to link to.
+/// Git revision buffers keep the real path on `Document::git_revision` (their
+/// `path()` is a cache file for LSP). A `None` revision means the pane shows
+/// the working tree.
 fn focused_file_revision(editor: &Editor) -> (Option<PathBuf>, Option<String>) {
     let view = view!(editor);
 
@@ -589,6 +588,13 @@ fn focused_file_revision(editor: &Editor) -> (Option<PathBuf>, Option<String>) {
                 return (Some(state.working_path.clone()), state.target_ref.clone());
             }
         }
+    }
+
+    if let Some((path, rev)) = editor
+        .document(view.doc)
+        .and_then(|doc| doc.git_revision.clone())
+    {
+        return (Some(path), Some(rev));
     }
 
     // Merge panes are index stages rather than commits, so only the path of the
@@ -934,7 +940,7 @@ pub fn write_all_impl(
         .into_iter()
         .filter_map(|id| {
             let doc = doc!(cx.editor, &id);
-            if !doc.is_modified() {
+            if !doc.is_modified() || doc.is_virtual_base {
                 return None;
             }
             if doc.path().is_none() {

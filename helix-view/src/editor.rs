@@ -1771,7 +1771,14 @@ impl Editor {
         let Some(doc_url) = doc.url() else {
             return;
         };
-        let (lang, path) = (doc.language.clone(), doc.path().cloned());
+        // Git revision snapshots use a cache-file URI so they don't collide
+        // with the working-tree file; workspace discovery still uses the real path.
+        let workspace_path = doc
+            .git_revision
+            .as_ref()
+            .map(|(path, _)| path.clone())
+            .or_else(|| doc.path().cloned());
+        let (lang, path) = (doc.language.clone(), workspace_path);
         let config = doc.config.load();
         let root_dirs = &config.workspace_lsp_roots;
 
@@ -1889,23 +1896,35 @@ impl Editor {
 
         let focust_lost = match action {
             Action::Replace => {
-                let (view, doc) = current_ref!(self);
-                // If the current view is an empty scratch buffer and is not displayed in any other views, delete it.
-                // Boolean value is determined before the call to `view_mut` because the operation requires a borrow
-                // of `self.tree`, which is mutably borrowed when `view_mut` is called.
-                let remove_empty_scratch = !doc.is_modified()
-                    // If the buffer has no path and is not modified, it is an empty scratch buffer.
-                    && doc.path().is_none()
-                    // If the buffer we are changing to is not this buffer
-                    && id != doc.id
-                    // Ensure the buffer is not displayed in any other splits.
-                    && !self
-                        .tree
-                        .traverse()
-                        .any(|(_, v)| v.doc == doc.id && v.id != view.id);
+                let (view_id, remove_empty_scratch, leaving_diff, leaving_merge) = {
+                    let (view, doc) = current_ref!(self);
+                    let view_id = view.id;
+                    let current_doc_id = doc.id;
+                    // Pathless unmodified buffers are scratch — except virtual git
+                    // revisions, which omit their path so they don't collide with
+                    // the working-tree file.
+                    let remove_empty_scratch = !doc.is_modified()
+                        && doc.path().is_none()
+                        && !doc.is_virtual_base
+                        && id != current_doc_id
+                        && !self
+                            .tree
+                            .traverse()
+                            .any(|(_, v)| v.doc == current_doc_id && v.id != view_id);
+                    let leaving_diff =
+                        self.diff.views.get(&view_id).is_some_and(|state| {
+                            id != state.base_doc_id && id != state.working_doc_id
+                        });
+                    let leaving_merge = self.diff.merge_views.get(&view_id).is_some_and(|state| {
+                        id != state.ours_doc_id
+                            && id != state.theirs_doc_id
+                            && id != state.result_doc_id
+                    });
+                    (view_id, remove_empty_scratch, leaving_diff, leaving_merge)
+                };
 
                 let (view, doc) = current!(self);
-                let view_id = view.id;
+                debug_assert_eq!(view.id, view_id);
 
                 // Append any outstanding changes to history in the old document.
                 doc.append_changes_to_history(view);
@@ -1936,6 +1955,15 @@ impl Editor {
                 }
 
                 self.replace_document_in_view(view_id, id);
+
+                // Drop the session from this view but keep revision buffers so
+                // the same file can stay open at other commits.
+                if leaving_diff {
+                    self.detach_diff_view(view_id);
+                }
+                if leaving_merge {
+                    self.close_merge_session_leaving_view(view_id);
+                }
 
                 dispatch(DocumentFocusLost {
                     editor: self,
@@ -2154,6 +2182,14 @@ impl Editor {
         }
 
         let doc = self.documents.remove(&doc_id).unwrap();
+        if doc.is_virtual_base {
+            if let Some(path) = doc.path() {
+                let _ = std::fs::remove_file(path);
+                if let Some(parent) = path.parent() {
+                    let _ = std::fs::remove_dir(parent);
+                }
+            }
+        }
 
         // If the document we removed was visible in all views, we will have no more views. We don't
         // want to close the editor just for a simple buffer close, so we need to create a new view
@@ -2773,6 +2809,44 @@ impl Editor {
         })
     }
 
+    fn virtual_document_id_by_revision(&self, path: &Path, git_ref: &str) -> Option<DocumentId> {
+        self.documents.iter().find_map(|(id, doc)| {
+            doc.git_revision
+                .as_ref()
+                .and_then(|(p, r)| (p.as_path() == path && r == git_ref).then_some(*id))
+        })
+    }
+
+    fn get_or_create_git_revision_doc(
+        &mut self,
+        path: &Path,
+        git_ref: &str,
+    ) -> Result<DocumentId, Error> {
+        if let Some(id) = self.virtual_document_id_by_revision(path, git_ref) {
+            return Ok(id);
+        }
+        let content = Self::get_diff_content_or_empty(path, git_ref)
+            .map_err(|e| anyhow::anyhow!("Failed to fetch '{}': {}", git_ref, e))?;
+        let doc = Document::from_git_revision(
+            content,
+            path,
+            git_ref,
+            self.config.clone(),
+            self.syn_loader.clone(),
+        )?;
+        Ok(self.insert_git_revision_document(doc))
+    }
+
+    fn insert_git_revision_document(&mut self, doc: Document) -> DocumentId {
+        let id = self.new_document(doc);
+        self.launch_language_servers(id);
+        helix_event::dispatch(DocumentDidOpen {
+            editor: self,
+            doc: id,
+        });
+        id
+    }
+
     /// Share one differ worker between a minus-side (base) doc and a plus-side
     /// (working/target) doc. Edits to either side then update both gutters.
     fn link_shared_diff_handles(&mut self, base_doc_id: DocumentId, working_doc_id: DocumentId) {
@@ -2827,7 +2901,7 @@ impl Editor {
 
         let focused_view = self.tree.focus;
         if self.diff.views.contains_key(&focused_view) {
-            self.close_diff_view(focused_view);
+            self.detach_diff_view(focused_view);
         }
 
         let working_doc_id = if let Some(id) = self.non_virtual_document_id_by_path(&working_path) {
@@ -2836,17 +2910,7 @@ impl Editor {
             self.open(&working_path, Action::Load)?
         };
 
-        let base_content = Self::get_diff_content_or_empty(&base_path, git_ref)
-            .map_err(|e| anyhow::anyhow!("Failed to fetch git revision: {}", e))?;
-
-        let base_doc = Document::from_git_revision(
-            base_content,
-            &base_path,
-            git_ref,
-            self.config.clone(),
-            self.syn_loader.clone(),
-        )?;
-        let base_doc_id = self.new_document(base_doc);
+        let base_doc_id = self.get_or_create_git_revision_doc(&base_path, git_ref)?;
         self.link_shared_diff_handles(base_doc_id, working_doc_id);
 
         let split_view_override = split_view_override.or(self.diff.split_view_override);
@@ -2929,7 +2993,7 @@ impl Editor {
 
         let focused_view = self.tree.focus;
         if self.diff.views.contains_key(&focused_view) {
-            self.close_diff_view(focused_view);
+            self.detach_diff_view(focused_view);
         }
 
         let split_view_override = split_view_override.or(self.diff.split_view_override);
@@ -2942,28 +3006,8 @@ impl Editor {
                 split_view_override,
             ),
             Some(target) => {
-                let base_content = Self::get_diff_content_or_empty(&base_path, base_ref)
-                    .map_err(|e| anyhow::anyhow!("Failed to fetch '{}': {}", base_ref, e))?;
-                let target_content = Self::get_diff_content_or_empty(&target_path, target)
-                    .map_err(|e| anyhow::anyhow!("Failed to fetch '{}': {}", target, e))?;
-
-                let base_doc = Document::from_git_revision(
-                    base_content,
-                    &base_path,
-                    base_ref,
-                    self.config.clone(),
-                    self.syn_loader.clone(),
-                )?;
-                let base_doc_id = self.new_document(base_doc);
-
-                let target_doc = Document::from_git_revision(
-                    target_content,
-                    &target_path,
-                    target,
-                    self.config.clone(),
-                    self.syn_loader.clone(),
-                )?;
-                let target_doc_id = self.new_document(target_doc);
+                let base_doc_id = self.get_or_create_git_revision_doc(&base_path, base_ref)?;
+                let target_doc_id = self.get_or_create_git_revision_doc(&target_path, target)?;
                 self.link_shared_diff_handles(base_doc_id, target_doc_id);
 
                 let split_view =
@@ -3096,6 +3140,45 @@ impl Editor {
         Ok(())
     }
 
+    /// Drop the diff session from this view without closing revision buffers.
+    fn detach_diff_view(&mut self, view_id: ViewId) {
+        if let Some(diff_state) = self.diff.views.remove(&view_id) {
+            self.diff.views.remove(&diff_state.base_view_id);
+            self.diff.views.remove(&diff_state.working_view_id);
+            if diff_state.base_view_id != diff_state.working_view_id {
+                let other = if view_id == diff_state.base_view_id {
+                    diff_state.working_view_id
+                } else {
+                    diff_state.base_view_id
+                };
+                if other != view_id && self.tree.contains(other) {
+                    self.close(other);
+                }
+            }
+        }
+    }
+
+    fn close_merge_session_leaving_view(&mut self, view_id: ViewId) {
+        if let Some(state) = self.diff.merge_views.remove(&view_id) {
+            self.diff.merge_views.remove(&state.ours_view_id);
+            self.diff.merge_views.remove(&state.theirs_view_id);
+            self.diff.merge_views.remove(&state.result_view_id);
+
+            let _ = self.close_document(state.ours_doc_id, true);
+            let _ = self.close_document(state.theirs_doc_id, true);
+
+            for other in [
+                state.ours_view_id,
+                state.theirs_view_id,
+                state.result_view_id,
+            ] {
+                if other != view_id && self.tree.contains(other) {
+                    self.close(other);
+                }
+            }
+        }
+    }
+
     pub fn close_diff_view(&mut self, view_id: ViewId) -> bool {
         if let Some(diff_state) = self.diff.views.remove(&view_id) {
             self.diff.views.remove(&diff_state.base_view_id);
@@ -3211,8 +3294,8 @@ impl Editor {
                 self.syn_loader.clone(),
             )?;
 
-            let ours_doc_id = self.new_document(ours_doc);
-            let theirs_doc_id = self.new_document(theirs_doc);
+            let ours_doc_id = self.insert_git_revision_document(ours_doc);
+            let theirs_doc_id = self.insert_git_revision_document(theirs_doc);
 
             // 5. Wire char-diff: OURS shows diff vs THEIRS and vice-versa.
             self.link_shared_diff_handles(ours_doc_id, theirs_doc_id);

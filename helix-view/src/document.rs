@@ -207,6 +207,8 @@ pub struct Document {
 
     /// True when this document holds a read-only git revision (virtual base doc).
     pub is_virtual_base: bool,
+    /// Real path and git ref for a virtual revision document (`filename @ ref`).
+    pub git_revision: Option<(PathBuf, String)>,
     /// Override the display name shown in the bufferline / statusline.
     pub display_name_override: Option<String>,
     /// Character-level diff highlighting enabled for this document.
@@ -741,6 +743,7 @@ impl Document {
             focused_at: std::time::Instant::now(),
             readonly: false,
             is_virtual_base: false,
+            git_revision: None,
             display_name_override: None,
             char_diff_enabled: false,
             char_diff_minus_side: false,
@@ -1900,6 +1903,27 @@ impl Document {
         self.language_servers().any(|l| l.id() == id)
     }
 
+    fn materialize_git_revision(
+        real_path: &Path,
+        git_ref: &str,
+        content: &[u8],
+    ) -> Option<PathBuf> {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        real_path.hash(&mut hasher);
+        git_ref.hash(&mut hasher);
+        let filename = real_path
+            .file_name()
+            .unwrap_or_else(|| std::ffi::OsStr::new("unknown"));
+        let cache_path = helix_loader::cache_dir()
+            .join("git-rev")
+            .join(format!("{:016x}", hasher.finish()))
+            .join(filename);
+        std::fs::create_dir_all(cache_path.parent()?).ok()?;
+        std::fs::write(&cache_path, content).ok()?;
+        Some(helix_stdx::path::canonicalize(&cache_path))
+    }
+
     /// Create a read-only virtual document from raw bytes fetched from a git revision.
     pub fn from_git_revision(
         content: Vec<u8>,
@@ -1913,6 +1937,7 @@ impl Document {
         let mut doc = Self::from(text, Some((encoding, has_bom)), config, syn_loader.clone());
         doc.is_virtual_base = true;
         doc.readonly = true;
+        doc.git_revision = Some((real_path.to_path_buf(), git_ref.to_string()));
         let filename = real_path
             .file_name()
             .and_then(|n| n.to_str())
@@ -1921,7 +1946,9 @@ impl Document {
         // Detect language from the real filename without claiming the working-tree path.
         doc.path = Some(real_path.to_path_buf());
         doc.detect_language(&syn_loader.load());
-        doc.path = None;
+        // Materialize to a unique cache file so LSP can didOpen this snapshot
+        // without colliding with the working-tree URI.
+        doc.path = Self::materialize_git_revision(real_path, git_ref, &content);
         doc.relative_path = OnceCell::new();
         Ok(doc)
     }

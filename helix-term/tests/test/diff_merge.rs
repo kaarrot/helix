@@ -592,6 +592,130 @@ async fn range_diff_can_toggle_split_view_off() -> anyhow::Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn opening_working_tree_path_keeps_revision_buffers() -> anyhow::Result<()> {
+    let repo = GitRepoFixture::new()?;
+    repo.write_file("tracked.txt", "one\n")?;
+    repo.commit_all("initial")?;
+    let older = repo.rev_parse("HEAD")?;
+    repo.write_file("tracked.txt", "two\n")?;
+    repo.commit_all("second")?;
+    let newer = repo.rev_parse("HEAD")?;
+
+    let _cwd = CwdGuard::enter(repo.path()).await?;
+    let tracked_path = repo.file("tracked.txt");
+    let mut app = AppBuilder::new().build()?;
+
+    app.editor
+        .open_diff_view_range(&tracked_path, &older, Some(&newer), Some(false))?;
+
+    let diff_state = main_diff_state(&app);
+    let base_doc_id = diff_state.base_doc_id;
+    let target_doc_id = diff_state.working_doc_id;
+
+    {
+        let target_doc = app.editor.document(target_doc_id).unwrap();
+        assert!(target_doc.url().is_some());
+        assert_eq!(
+            target_doc.git_revision.as_ref().map(|(p, _)| p.as_path()),
+            Some(tracked_path.as_path())
+        );
+    }
+
+    let working_doc_id = app.editor.open(&tracked_path, Action::Replace)?;
+
+    assert_current_doc_path(&app, &tracked_path);
+    assert_ne!(working_doc_id, target_doc_id);
+    assert!(app.editor.diff.views.is_empty());
+    assert_eq!(
+        app.editor.document(base_doc_id).unwrap().text().to_string(),
+        "one\n"
+    );
+    assert_eq!(
+        app.editor
+            .document(target_doc_id)
+            .unwrap()
+            .text()
+            .to_string(),
+        "two\n"
+    );
+
+    let errs = app.close().await;
+    assert!(errs.is_empty(), "errors closing app: {errs:?}");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn same_file_at_different_commits_are_separate_buffers() -> anyhow::Result<()> {
+    let repo = GitRepoFixture::new()?;
+    repo.write_file("tracked.txt", "one\n")?;
+    repo.commit_all("initial")?;
+    let first = repo.rev_parse("HEAD")?;
+    repo.write_file("tracked.txt", "two\n")?;
+    repo.commit_all("second")?;
+    let second = repo.rev_parse("HEAD")?;
+    repo.write_file("tracked.txt", "three\n")?;
+    repo.commit_all("third")?;
+    let third = repo.rev_parse("HEAD")?;
+
+    let _cwd = CwdGuard::enter(repo.path()).await?;
+    let tracked_path = repo.file("tracked.txt");
+    let mut app = AppBuilder::new().build()?;
+
+    app.editor
+        .open_diff_view_range(&tracked_path, &first, Some(&second), Some(false))?;
+    let first_diff = main_diff_state(&app);
+    let first_doc = first_diff.base_doc_id;
+    let second_doc = first_diff.working_doc_id;
+    assert_eq!(
+        app.editor.document(first_doc).unwrap().text().to_string(),
+        "one\n"
+    );
+    assert_eq!(
+        app.editor.document(second_doc).unwrap().text().to_string(),
+        "two\n"
+    );
+
+    app.editor
+        .open_diff_view_range(&tracked_path, &second, Some(&third), Some(false))?;
+    let second_diff = main_diff_state(&app);
+    let third_doc = second_diff.working_doc_id;
+    assert_eq!(second_diff.base_doc_id, second_doc);
+    assert_ne!(third_doc, second_doc);
+    assert_ne!(third_doc, first_doc);
+    assert_eq!(
+        app.editor.document(first_doc).unwrap().text().to_string(),
+        "one\n"
+    );
+    assert_eq!(
+        app.editor.document(second_doc).unwrap().text().to_string(),
+        "two\n"
+    );
+    assert_eq!(
+        app.editor.document(third_doc).unwrap().text().to_string(),
+        "three\n"
+    );
+
+    app.editor
+        .open_diff_view_range(&tracked_path, &second, Some(&third), Some(false))?;
+    let reused = main_diff_state(&app);
+    assert_eq!(reused.base_doc_id, second_doc);
+    assert_eq!(reused.working_doc_id, third_doc);
+
+    let working_doc_id = app.editor.open(&tracked_path, Action::Replace)?;
+    assert_current_doc_path(&app, &tracked_path);
+    assert_ne!(working_doc_id, first_doc);
+    assert_ne!(working_doc_id, second_doc);
+    assert_ne!(working_doc_id, third_doc);
+    assert!(app.editor.document(first_doc).is_some());
+    assert!(app.editor.document(second_doc).is_some());
+    assert!(app.editor.document(third_doc).is_some());
+
+    let errs = app.close().await;
+    assert!(errs.is_empty(), "errors closing app: {errs:?}");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn split_diff_keyboard_and_search_sync_scroll() -> anyhow::Result<()> {
     let repo = GitRepoFixture::new()?;
     let mut base = String::new();
@@ -921,18 +1045,14 @@ async fn git_split_diff_stays_in_sync_after_edits() -> anyhow::Result<()> {
     assert!(harness.wait_for_idle(&mut app).await?);
 
     let diff_state = main_diff_state(&app);
-    assert!(app
-        .editor
-        .document(diff_state.base_doc_id)
-        .unwrap()
-        .path()
-        .is_none());
-    assert!(
-        app.editor
-            .document(diff_state.base_doc_id)
-            .unwrap()
-            .readonly
-    );
+    {
+        let base_doc = app.editor.document(diff_state.base_doc_id).unwrap();
+        assert!(base_doc.is_virtual_base);
+        assert!(base_doc.readonly);
+        assert!(base_doc.git_revision.is_some());
+        assert_ne!(base_doc.path(), Some(&tracked_path));
+        assert!(base_doc.url().is_some());
+    }
 
     app.editor.focus(diff_state.working_view_id);
     assert!(harness.send_keys(&mut app, "Goedited<esc>").await?);

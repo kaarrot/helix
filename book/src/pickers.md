@@ -17,7 +17,9 @@ to the working tree and lists modified, untracked, renamed, deleted, and
 conflicted files.
 
 Selecting a normal entry opens that file in diff view. Selecting a conflicted
-entry opens the 3-way merge view instead.
+entry opens the 3-way merge view instead. Range-diff entries
+(`:diff-commit REF!` / `REF1..REF2`) open read-only `filename @ ref`
+snapshots; see [Git revision buffers](./diff-and-merge.md#git-revision-buffers).
 
 You can change the picker's scope before opening it:
 

@@ -2917,13 +2917,9 @@ impl Editor {
     /// mid-review.
     pub fn review_session(&mut self) -> Option<&crate::review::session::ReviewSession> {
         if self.diff.session.is_none() {
-            let path = doc!(self).path()?.to_path_buf();
+            let path = self.review_session_path()?;
             let worktree = self.diff_providers.get_workdir(&path)?;
-            let branch = doc!(self)
-                .version_control_head()
-                .map(|head| head.to_string())
-                .filter(|head| !head.is_empty())
-                .unwrap_or_else(|| "review".to_string());
+            let branch = self.review_branch_name(&path);
             let session = crate::review::session::claim(&worktree, &branch);
             self.load_reviews(&session.uuid);
             self.diff.session = Some(session);
@@ -2943,7 +2939,7 @@ impl Editor {
             }
             Some(session) => session.worktree.clone(),
             None => {
-                let path = doc!(self).path()?.to_path_buf();
+                let path = self.review_session_path()?;
                 self.diff_providers.get_workdir(&path)?
             }
         };
@@ -3014,10 +3010,10 @@ impl Editor {
     /// Give a document anchors for the threads that belong to it, so they track
     /// edits rather than staying frozen at the line they were saved on.
     pub fn seed_review_anchors(&mut self, doc_id: DocumentId) {
-        let Some(doc) = self.documents.get(&doc_id) else {
+        let Some((path, side)) = self.review_doc_identity(doc_id) else {
             return;
         };
-        let Some(path) = doc.path().map(|path| path.to_path_buf()) else {
+        let Some(doc) = self.documents.get(&doc_id) else {
             return;
         };
         let text = doc.text().clone();
@@ -3031,7 +3027,7 @@ impl Editor {
             .diff
             .reviews
             .for_file(&path)
-            .filter(|thread| !existing.contains(&thread.id))
+            .filter(|thread| thread.side == side && !existing.contains(&thread.id))
             .map(|thread| {
                 crate::review::ReviewAnchor::for_line(thread.id, &text, thread.line as usize)
             })
@@ -3040,6 +3036,69 @@ impl Editor {
         if let Some(doc) = self.documents.get_mut(&doc_id) {
             doc.review_anchors.extend(anchors);
         }
+    }
+
+    /// File and side a document's review threads belong to.
+    ///
+    /// Virtual base documents have `path == None`; the diff state's working
+    /// path is the store key for both sides. Threads are seeded only onto the
+    /// document that matches `thread.side`.
+    fn review_doc_identity(
+        &self,
+        doc_id: DocumentId,
+    ) -> Option<(PathBuf, crate::review::DiffSide)> {
+        let doc = self.documents.get(&doc_id)?;
+        let path_from_diff = |state: &crate::diff_view::DiffViewState| {
+            if !state.working_path.as_os_str().is_empty() {
+                Some(state.working_path.clone())
+            } else {
+                doc.path().map(|p| p.to_path_buf())
+            }
+        };
+
+        if let Some(state) = self.diff.views.values().find(|s| s.base_doc_id == doc_id) {
+            return Some((path_from_diff(state)?, crate::review::DiffSide::Base));
+        }
+        if let Some(state) = self
+            .diff
+            .views
+            .values()
+            .find(|s| s.working_doc_id == doc_id)
+        {
+            return Some((path_from_diff(state)?, crate::review::DiffSide::Working));
+        }
+        Some((doc.path()?.to_path_buf(), crate::review::DiffSide::Working))
+    }
+
+    /// Worktree file for the focused view: `doc.path()`, or the diff state's
+    /// working path when the focused pane is a virtual base document.
+    fn review_session_path(&self) -> Option<PathBuf> {
+        let view = self.tree.get(self.tree.focus);
+        let doc = self.document(view.doc)?;
+        match view.review_identity(doc, &self.diff.views) {
+            Some((path, _)) if !path.as_os_str().is_empty() => Some(path),
+            _ => doc.path().map(|p| p.to_path_buf()),
+        }
+    }
+
+    fn review_branch_name(&self, path: &Path) -> String {
+        if let Some(doc_id) = self.non_virtual_document_id_by_path(path) {
+            if let Some(head) = self
+                .documents
+                .get(&doc_id)
+                .and_then(Document::version_control_head)
+            {
+                let head = head.to_string();
+                if !head.is_empty() {
+                    return head;
+                }
+            }
+        }
+        self.diff_providers
+            .get_current_head_name(path)
+            .map(|head| head.load_full().to_string())
+            .filter(|head| !head.is_empty())
+            .unwrap_or_else(|| "review".to_string())
     }
 
     /// Write the current conversations out, if a session owns them.

@@ -142,6 +142,129 @@ async fn single_pane_diff_keeps_working_side_comments() -> anyhow::Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn split_diff_base_pane_claims_a_session() -> anyhow::Result<()> {
+    // Virtual base docs have path == None, so the first comment from the left
+    // pane used to skip claiming a session, never persist, and seed its
+    // anchors onto the working document.
+    let repo = GitRepoFixture::new()?;
+    repo.write_file("tracked.txt", "one\ntwo\nthree\n")?;
+    repo.commit_all("initial")?;
+    repo.checkout_new_branch("base-pane")?;
+    repo.write_file("tracked.txt", "one\ntwo changed\nthree\n")?;
+
+    let _cwd = CwdGuard::enter(repo.path()).await?;
+    let path = repo.file("tracked.txt");
+    let mut app = AppBuilder::new().with_file(&path, None).build()?;
+    let mut harness = AppTestHarness::new();
+
+    app.editor
+        .open_diff_view(&path, "HEAD", Some(true))
+        .expect("split diff should open");
+    // The differ can keep requesting redraws, so wait_for_idle is unusable
+    // until it settles; pump instead of requiring idle.
+    harness
+        .pump(&mut app, std::time::Duration::from_millis(400))
+        .await;
+    assert_eq!(app.editor.diff.views.len(), 2, "expected a split diff");
+
+    let (base_view, base_doc, working_doc) = {
+        let view_id = app.editor.tree.focus;
+        let state = &app.editor.diff.views[&view_id];
+        assert_ne!(
+            state.base_view_id, state.working_view_id,
+            "split panes must be distinct views"
+        );
+        (state.base_view_id, state.base_doc_id, state.working_doc_id)
+    };
+    assert!(
+        app.editor.document(base_doc).unwrap().path().is_none(),
+        "the bug is that the virtual base document has no path"
+    );
+
+    app.editor.focus(base_view);
+    assert_eq!(focused_review_side(&app), DiffSide::Base);
+
+    harness
+        .send_keys_pumping(
+            &mut app,
+            "<space>mRc",
+            std::time::Duration::from_millis(300),
+        )
+        .await?;
+    harness
+        .send_keys_pumping(
+            &mut app,
+            "old two<C-s>",
+            std::time::Duration::from_millis(300),
+        )
+        .await?;
+
+    let session = app
+        .editor
+        .diff
+        .session
+        .as_ref()
+        .expect("commenting from the base pane must claim a session");
+    assert_eq!(session.name, "base-pane");
+    let uuid = session.uuid.clone();
+    assert_eq!(thread_count(&app), 1);
+    assert_eq!(only_thread_side(&app), DiffSide::Base);
+    assert_eq!(
+        app.editor.document(base_doc).unwrap().review_anchors.len(),
+        1,
+        "the comment must be anchored on the base document"
+    );
+    assert!(
+        app.editor
+            .document(working_doc)
+            .unwrap()
+            .review_anchors
+            .is_empty(),
+        "a base-side comment must not seed onto the working document"
+    );
+    assert!(focused_plan_row_count(&app) > 0);
+
+    app.editor.save_reviews();
+    let dir = helix_view::review::session::review_dir();
+    assert!(
+        dir.join(format!("{uuid}.threads.json")).exists(),
+        "claiming the session is what makes the draft persist"
+    );
+
+    app.editor
+        .document_mut(base_doc)
+        .unwrap()
+        .review_anchors
+        .clear();
+    app.editor
+        .document_mut(working_doc)
+        .unwrap()
+        .review_anchors
+        .clear();
+    app.editor.seed_review_anchors(base_doc);
+    app.editor.seed_review_anchors(working_doc);
+    assert_eq!(
+        app.editor.document(base_doc).unwrap().review_anchors.len(),
+        1,
+        "reseed must put base-side threads back on the base document"
+    );
+    assert!(
+        app.editor
+            .document(working_doc)
+            .unwrap()
+            .review_anchors
+            .is_empty(),
+        "reseed must not copy base-side threads onto the working document"
+    );
+
+    // :q! via harness.close waits for the event loop to exit; a split differ
+    // that is still redrawing never goes idle, so the 2s close timeout fires.
+    let _ = app.close().await;
+    let _ = std::fs::remove_file(dir.join(format!("{uuid}.threads.json")));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn ctrl_s_sends_a_saved_draft_from_the_comment_line() -> anyhow::Result<()> {
     let repo = GitRepoFixture::new()?;
     repo.write_file("tracked.rs", "fn one() {}\n")?;

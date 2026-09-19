@@ -3588,7 +3588,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     TypableCommand {
         name: "markdown-preview",
         aliases: &["md-preview", "mdp"],
-        doc: "Render the current buffer as markdown in a side panel for reading.",
+        doc: "Render the current buffer as a markdown overlay (fullscreen, or side-by-side on wide terminals). Source stays focused; q/Esc close, Enter follows a link.",
         fun: markdown_preview,
         completer: CommandCompleter::none(),
         signature: Signature {

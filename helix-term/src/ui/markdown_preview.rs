@@ -55,6 +55,9 @@ pub struct MarkdownPreview {
     links: Vec<MarkdownLink>,
     total_lines: usize,
     area: Rect,
+    /// `:markdown-preview split` asked for a side-by-side overlay.
+    want_split: bool,
+    /// True while the preview is actually painted on the right half.
     side_by_side: bool,
     cache: Option<PreviewCache>,
 }
@@ -62,7 +65,12 @@ pub struct MarkdownPreview {
 impl MarkdownPreview {
     pub const ID: &'static str = "markdown-preview";
 
-    pub fn new(source_view: ViewId, source_doc: DocumentId, base_dir: PathBuf) -> Self {
+    pub fn new(
+        source_view: ViewId,
+        source_doc: DocumentId,
+        base_dir: PathBuf,
+        want_split: bool,
+    ) -> Self {
         Self {
             source_view,
             source_doc,
@@ -75,6 +83,7 @@ impl MarkdownPreview {
             links: Vec::new(),
             total_lines: 0,
             area: Rect::default(),
+            want_split,
             side_by_side: false,
             cache: None,
         }
@@ -292,7 +301,7 @@ impl Component for MarkdownPreview {
 
     fn render(&mut self, area: Rect, surface: &mut Surface, cx: &mut Context) {
         let area = area.clip_bottom(1);
-        let side_by_side = area.width >= MIN_WIDTH_FOR_SIDE_BY_SIDE;
+        let side_by_side = self.want_split && area.width >= MIN_WIDTH_FOR_SIDE_BY_SIDE;
         let panel = if side_by_side {
             area.clip_left(area.width / 2)
         } else {

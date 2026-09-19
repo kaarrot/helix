@@ -1881,12 +1881,18 @@ fn lsp_stop(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> any
 
 fn markdown_preview(
     cx: &mut compositor::Context,
-    _args: Args,
+    args: Args,
     event: PromptEvent,
 ) -> anyhow::Result<()> {
     if event != PromptEvent::Validate {
         return Ok(());
     }
+
+    let want_split = match args.first() {
+        None => false,
+        Some(arg) if arg == "split" => true,
+        Some(arg) => anyhow::bail!("unknown argument `{arg}`, expected `split`"),
+    };
 
     let (view, doc) = current_ref!(cx.editor);
     let view_id = view.id;
@@ -1901,7 +1907,7 @@ fn markdown_preview(
     let callback = async move {
         let call: job::Callback = Callback::EditorCompositor(Box::new(
             move |_editor: &mut Editor, compositor: &mut Compositor| {
-                let preview = ui::MarkdownPreview::new(view_id, doc_id, base_dir);
+                let preview = ui::MarkdownPreview::new(view_id, doc_id, base_dir, want_split);
                 compositor.replace_or_push(ui::MarkdownPreview::ID, preview);
             },
         ));
@@ -3654,11 +3660,11 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     TypableCommand {
         name: "markdown-preview",
         aliases: &["md-preview", "mdp"],
-        doc: "Render the current buffer as markdown in a side panel for reading.",
+        doc: "Render the current buffer as a fullscreen markdown overlay. Pass `split` for a side-by-side view on wide terminals. Source stays focused; q/Esc close, Enter follows a link.",
         fun: markdown_preview,
-        completer: CommandCompleter::none(),
+        completer: CommandCompleter::positional(&[completers::markdown_preview]),
         signature: Signature {
-            positionals: (0, Some(0)),
+            positionals: (0, Some(1)),
             ..Signature::DEFAULT
         },
     },

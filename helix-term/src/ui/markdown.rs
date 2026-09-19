@@ -7,12 +7,11 @@ use tui::{
 
 use std::sync::Arc;
 
-use pulldown_cmark::{
-    Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd,
-};
+use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 
 use helix_core::{
     syntax::{self, HighlightEvent, OverlayHighlights},
+    unicode::{segmentation::UnicodeSegmentation, width::UnicodeWidthStr},
     RopeSlice, Syntax,
 };
 use helix_view::{
@@ -30,7 +29,15 @@ pub struct MarkdownLink {
     pub line: usize,
     /// The link destination as written in the markdown (URL or path).
     pub dest: String,
+    /// Display column range of the link text on the rendered line `[start, end)`.
+    pub start_col: u16,
+    pub end_col: u16,
 }
+
+const TABLE_SEP: &str = " │ ";
+const TABLE_SEP_WIDTH: usize = 3;
+const TABLE_DIV: &str = "─┼─";
+const MIN_CELL_WIDTH: usize = 3;
 
 /// Buffered contents of a GFM table while it is being parsed. The whole table
 /// is collected before emitting so per-column widths can be computed and each
@@ -38,18 +45,46 @@ pub struct MarkdownLink {
 struct TableCtx<'a> {
     alignments: Vec<Alignment>,
     rows: Vec<TableRowCtx<'a>>,
-    /// Row currently being filled (between a row Start and its End).
     cur_row: Option<TableRowCtx<'a>>,
-    /// Cell currently being filled; inline text/code events append here instead
-    /// of the main span buffer.
-    cur_cell: Option<Vec<Span<'a>>>,
+    /// Cell currently being filled; inline events append here instead of the
+    /// main span buffer (so `push_line` is not used for table rows).
+    cur_cell: Option<TableCell<'a>>,
 }
 
 struct TableRowCtx<'a> {
-    cells: Vec<Vec<Span<'a>>>,
+    cells: Vec<TableCell<'a>>,
     is_header: bool,
-    /// Source line this row starts on, for the preview's line mapping.
     src: Option<usize>,
+}
+
+struct TableCell<'a> {
+    spans: Vec<Span<'a>>,
+    /// Destinations with display-column range relative to the start of the cell.
+    links: Vec<(String, usize, usize)>,
+}
+
+struct OpenLink {
+    dest: String,
+    start_col: usize,
+}
+
+struct LineLink {
+    dest: String,
+    start_col: usize,
+    end_col: usize,
+}
+
+struct GraphemePiece {
+    text: String,
+    style: Style,
+    width: usize,
+    orig_col: usize,
+    is_whitespace: bool,
+}
+
+struct WrappedRow<'a> {
+    spans: Vec<Span<'a>>,
+    orig_to_vis: Vec<(usize, usize, usize)>,
 }
 
 /// Total display width of a cell's spans.
@@ -57,9 +92,18 @@ fn cells_width(spans: &[Span]) -> usize {
     spans.iter().map(Span::width).sum()
 }
 
+fn cell_text(spans: &[Span]) -> String {
+    spans.iter().map(|s| s.content.as_ref()).collect()
+}
+
 /// Pad `cell` to `width` columns per `align`, styling the inserted spaces with
 /// `pad_style`.
-fn pad_cell(cell: Vec<Span<'_>>, width: usize, align: Alignment, pad_style: Style) -> Vec<Span<'_>> {
+fn pad_cell(
+    cell: Vec<Span<'_>>,
+    width: usize,
+    align: Alignment,
+    pad_style: Style,
+) -> Vec<Span<'_>> {
     let pad = width.saturating_sub(cells_width(&cell));
     let space = |n: usize| Span::styled(" ".repeat(n), pad_style);
     let mut out = Vec::new();
@@ -74,7 +118,6 @@ fn pad_cell(cell: Vec<Span<'_>>, width: usize, align: Alignment, pad_style: Styl
             out.extend(cell);
             out.push(space(pad - left));
         }
-        // Left and None both left-align.
         Alignment::Left | Alignment::None => {
             out.extend(cell);
             out.push(space(pad));
@@ -83,16 +126,296 @@ fn pad_cell(cell: Vec<Span<'_>>, width: usize, align: Alignment, pad_style: Styl
     out
 }
 
-/// Emit a buffered table as aligned rendered lines: cells padded to per-column
-/// widths and separated by ` │ `, with a `─┼─` divider under the header row.
-/// Appends to `lines`/`line_map` in lockstep so the preview's source mapping
-/// stays consistent.
-fn emit_table<'a>(
-    table: TableCtx<'a>,
-    text_style: Style,
+fn flatten_graphemes(spans: &[Span]) -> Vec<GraphemePiece> {
+    let mut col = 0;
+    let mut out = Vec::new();
+    for span in spans {
+        for g in span.content.graphemes(true) {
+            let w = UnicodeWidthStr::width(g);
+            let is_whitespace =
+                g.chars().all(char::is_whitespace) && g != "\u{00a0}" && g != "\u{202f}";
+            out.push(GraphemePiece {
+                text: g.to_string(),
+                style: span.style,
+                width: w,
+                orig_col: col,
+                is_whitespace,
+            });
+            col += w;
+        }
+    }
+    out
+}
+
+fn pieces_to_spans<'a>(pieces: &[GraphemePiece]) -> Vec<Span<'a>> {
+    let mut spans: Vec<Span<'a>> = Vec::new();
+    for p in pieces {
+        if let Some(last) = spans.last_mut() {
+            if last.style == p.style {
+                last.content.to_mut().push_str(&p.text);
+                continue;
+            }
+        }
+        spans.push(Span::styled(p.text.clone(), p.style));
+    }
+    spans
+}
+
+fn wrap_graphemes<'a>(pieces: &[GraphemePiece], width: usize) -> Vec<WrappedRow<'a>> {
+    if pieces.is_empty() {
+        return vec![WrappedRow {
+            spans: Vec::new(),
+            orig_to_vis: Vec::new(),
+        }];
+    }
+    if width == 0 {
+        let mut vis = 0;
+        let orig_to_vis = pieces
+            .iter()
+            .map(|p| {
+                let entry = (p.orig_col, vis, p.width);
+                vis += p.width;
+                entry
+            })
+            .collect();
+        return vec![WrappedRow {
+            spans: pieces_to_spans(pieces),
+            orig_to_vis,
+        }];
+    }
+
+    let mut rows = Vec::new();
+    let mut i = 0;
+    while i < pieces.len() {
+        let mut end = i;
+        let mut line_width = 0;
+        let mut last_ws = None;
+        while end < pieces.len() {
+            let p = &pieces[end];
+            if line_width + p.width > width && line_width > 0 {
+                break;
+            }
+            line_width += p.width;
+            if p.is_whitespace {
+                last_ws = Some(end + 1);
+            }
+            end += 1;
+        }
+        let mut row_end = if end < pieces.len() {
+            last_ws.filter(|&w| w > i).unwrap_or(end)
+        } else {
+            end
+        };
+        if row_end == i {
+            row_end = (i + 1).min(pieces.len());
+        }
+
+        let row_pieces = &pieces[i..row_end];
+        let mut vis = 0;
+        let mut orig_to_vis = Vec::new();
+        for p in row_pieces {
+            orig_to_vis.push((p.orig_col, vis, p.width));
+            vis += p.width;
+        }
+        rows.push(WrappedRow {
+            spans: pieces_to_spans(row_pieces),
+            orig_to_vis,
+        });
+
+        i = row_end;
+        if i < pieces.len() {
+            while i < pieces.len() && pieces[i].is_whitespace {
+                i += 1;
+            }
+        }
+    }
+
+    if rows.is_empty() {
+        rows.push(WrappedRow {
+            spans: Vec::new(),
+            orig_to_vis: Vec::new(),
+        });
+    }
+    rows
+}
+
+fn map_link_to_rows(rows: &[WrappedRow<'_>], start: usize, end: usize) -> Vec<(usize, u16, u16)> {
+    let mut out = Vec::new();
+    for (ri, row) in rows.iter().enumerate() {
+        let mut vis_start = None;
+        let mut vis_end = None;
+        for &(orig, vis, w) in &row.orig_to_vis {
+            if orig < end && orig + w > start {
+                vis_start = Some(vis_start.map_or(vis, |s: usize| s.min(vis)));
+                vis_end = Some(vis + w);
+            }
+        }
+        if let (Some(s), Some(e)) = (vis_start, vis_end) {
+            out.push((ri, s as u16, e.max(s + 1) as u16));
+        }
+    }
+    out
+}
+
+fn budget_column_widths(natural: &[usize], wrap_width: u16) -> Option<Vec<usize>> {
+    let n_cols = natural.len();
+    if n_cols == 0 {
+        return Some(Vec::new());
+    }
+    if wrap_width == 0 {
+        return Some(natural.to_vec());
+    }
+    let available = (wrap_width as usize)
+        .saturating_sub(TABLE_SEP_WIDTH.saturating_mul(n_cols.saturating_sub(1)));
+    if available < n_cols * MIN_CELL_WIDTH {
+        return None;
+    }
+    let natural_sum: usize = natural.iter().sum();
+    if natural_sum <= available {
+        return Some(natural.to_vec());
+    }
+
+    let mut widths = vec![MIN_CELL_WIDTH; n_cols];
+    let extra = available.saturating_sub(MIN_CELL_WIDTH * n_cols);
+    let deficits: Vec<(usize, usize)> = (0..n_cols)
+        .map(|i| (i, natural[i].saturating_sub(MIN_CELL_WIDTH)))
+        .filter(|(_, d)| *d > 0)
+        .collect();
+    let total_deficit: usize = deficits.iter().map(|(_, d)| *d).sum();
+    if total_deficit > 0 && extra > 0 {
+        for &(i, d) in &deficits {
+            widths[i] += extra * d / total_deficit;
+        }
+        let mut rem = available.saturating_sub(widths.iter().sum());
+        for &(i, _) in &deficits {
+            if rem == 0 {
+                break;
+            }
+            let can = natural[i].saturating_sub(widths[i]);
+            let add = can.min(rem);
+            widths[i] += add;
+            rem -= add;
+        }
+    }
+    Some(widths)
+}
+
+fn header_labels(rows: &[TableRowCtx]) -> Vec<String> {
+    match rows.iter().find(|r| r.is_header) {
+        Some(header) => header
+            .cells
+            .iter()
+            .enumerate()
+            .map(|(i, cell)| {
+                let text = cell_text(&cell.spans);
+                let trimmed = text.trim();
+                if trimmed.is_empty() {
+                    format!("Col {}", i + 1)
+                } else {
+                    trimmed.to_string()
+                }
+            })
+            .collect(),
+        None => Vec::new(),
+    }
+}
+
+fn label_for(labels: &[String], i: usize) -> String {
+    labels
+        .get(i)
+        .cloned()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| format!("Col {}", i + 1))
+}
+
+fn push_table_line<'a>(
+    spans: Vec<Span<'a>>,
+    src: Option<usize>,
+    lines: &mut Vec<Spans<'a>>,
+    line_map: &mut Vec<Option<usize>>,
+) -> usize {
+    let idx = lines.len();
+    lines.push(Spans::from(spans));
+    line_map.push(src);
+    idx
+}
+
+fn emit_cell_links(
+    links: &[(String, usize, usize)],
+    rows: &[WrappedRow<'_>],
+    line_base: usize,
+    col_offset: usize,
+    col_width: usize,
+    out: &mut Vec<MarkdownLink>,
+) {
+    if links.is_empty() {
+        return;
+    }
+    for (dest, start, end) in links {
+        let mapped = map_link_to_rows(rows, *start, *end);
+        if mapped.is_empty() {
+            for ri in 0..rows.len().max(1) {
+                out.push(MarkdownLink {
+                    line: line_base + ri,
+                    dest: dest.clone(),
+                    start_col: col_offset as u16,
+                    end_col: (col_offset + col_width) as u16,
+                });
+            }
+        } else {
+            for (ri, vs, ve) in mapped {
+                out.push(MarkdownLink {
+                    line: line_base + ri,
+                    dest: dest.clone(),
+                    start_col: (col_offset as u16).saturating_add(vs),
+                    end_col: (col_offset as u16).saturating_add(ve),
+                });
+            }
+        }
+    }
+}
+
+fn emit_stacked_row<'a>(
+    row: TableRowCtx<'a>,
+    labels: &[String],
+    wrap_width: u16,
     border_style: Style,
     lines: &mut Vec<Spans<'a>>,
     line_map: &mut Vec<Option<usize>>,
+    links: &mut Vec<MarkdownLink>,
+) {
+    let width = wrap_width as usize;
+    for (i, cell) in row.cells.into_iter().enumerate() {
+        let label = label_for(labels, i);
+        let prefix = format!("{label}: ");
+        let prefix_width = UnicodeWidthStr::width(prefix.as_str());
+        let mut spans = vec![Span::styled(prefix, border_style)];
+        spans.extend(cell.spans);
+        let wrapped = wrap_graphemes(&flatten_graphemes(&spans), width);
+        let line_base = lines.len();
+        for wrow in &wrapped {
+            push_table_line(wrow.spans.clone(), row.src, lines, line_map);
+        }
+        let offset_links: Vec<(String, usize, usize)> = cell
+            .links
+            .iter()
+            .map(|(dest, start, end)| (dest.clone(), start + prefix_width, end + prefix_width))
+            .collect();
+        emit_cell_links(&offset_links, &wrapped, line_base, 0, 0, links);
+    }
+}
+
+/// Emit a buffered table as aligned rendered lines. When `wrap_width` is non-zero,
+/// each cell is word-wrapped to a budgeted column width; if the columns cannot
+/// fit, the row is stacked as `Col: value` lines.
+fn emit_table<'a>(
+    mut table: TableCtx<'a>,
+    text_style: Style,
+    border_style: Style,
+    wrap_width: u16,
+    lines: &mut Vec<Spans<'a>>,
+    line_map: &mut Vec<Option<usize>>,
+    links: &mut Vec<MarkdownLink>,
 ) {
     let n_cols = table
         .rows
@@ -105,41 +428,97 @@ fn emit_table<'a>(
         return;
     }
 
-    // Column width = the widest cell in that column (at least 1 so the divider
-    // is visible for empty columns).
-    let mut widths = vec![1usize; n_cols];
-    for row in &table.rows {
-        for (i, cell) in row.cells.iter().enumerate() {
-            widths[i] = widths[i].max(cells_width(cell));
+    for row in &mut table.rows {
+        while row.cells.len() < n_cols {
+            row.cells.push(TableCell {
+                spans: Vec::new(),
+                links: Vec::new(),
+            });
         }
     }
-    let align = |i: usize| table.alignments.get(i).copied().unwrap_or(Alignment::None);
 
+    let mut natural = vec![1usize; n_cols];
+    for row in &table.rows {
+        for (i, cell) in row.cells.iter().enumerate() {
+            natural[i] = natural[i].max(cells_width(&cell.spans).max(1));
+        }
+    }
+
+    let labels = header_labels(&table.rows);
+    let widths = budget_column_widths(&natural, wrap_width);
+    let stacked = widths.is_none();
+    let skip_header = stacked && table.rows.iter().any(|r| !r.is_header);
+
+    if stacked {
+        for row in table.rows {
+            if row.is_header && skip_header {
+                continue;
+            }
+            emit_stacked_row(
+                row,
+                &labels,
+                wrap_width,
+                border_style,
+                lines,
+                line_map,
+                links,
+            );
+        }
+        return;
+    }
+
+    let widths = widths.unwrap();
+    let align = |i: usize| table.alignments.get(i).copied().unwrap_or(Alignment::None);
     let mut divider_emitted = false;
+
     for row in table.rows {
         let is_header = row.is_header;
-        let mut spans: Vec<Span> = Vec::new();
+        let src = row.src;
+        let mut wrapped_cells: Vec<(Vec<WrappedRow>, Vec<(String, usize, usize)>)> =
+            Vec::with_capacity(n_cols);
+        let mut height = 1usize;
         for (i, cell) in row.cells.into_iter().enumerate() {
-            if i > 0 {
-                spans.push(Span::styled(" │ ", border_style));
-            }
-            spans.extend(pad_cell(cell, widths[i], align(i), text_style));
+            let col_w = widths[i];
+            let rows = wrap_graphemes(
+                &flatten_graphemes(&cell.spans),
+                if wrap_width > 0 { col_w } else { 0 },
+            );
+            height = height.max(rows.len().max(1));
+            wrapped_cells.push((rows, cell.links));
         }
-        lines.push(Spans::from(spans));
-        line_map.push(row.src);
 
-        // Draw the header/body divider once, right after the header row.
+        let line_base = lines.len();
+        for vis_row in 0..height {
+            let mut spans: Vec<Span> = Vec::new();
+            for (i, (rows, _)) in wrapped_cells.iter().enumerate() {
+                if i > 0 {
+                    spans.push(Span::styled(TABLE_SEP, border_style));
+                }
+                let cell_spans = rows
+                    .get(vis_row)
+                    .map(|r| r.spans.clone())
+                    .unwrap_or_default();
+                spans.extend(pad_cell(cell_spans, widths[i], align(i), text_style));
+            }
+            push_table_line(spans, src, lines, line_map);
+        }
+
+        let mut col_offset = 0usize;
+        for (i, (rows, cell_links)) in wrapped_cells.iter().enumerate() {
+            emit_cell_links(cell_links, rows, line_base, col_offset, widths[i], links);
+            col_offset += widths[i] + TABLE_SEP_WIDTH;
+        }
+
         if is_header && !divider_emitted {
             divider_emitted = true;
             let mut sep: Vec<Span> = Vec::new();
             for (i, width) in widths.iter().enumerate() {
                 if i > 0 {
-                    sep.push(Span::styled("─┼─", border_style));
+                    sep.push(Span::styled(TABLE_DIV, border_style));
                 }
                 sep.push(Span::styled("─".repeat(*width), border_style));
             }
-            lines.push(Spans::from(sep));
-            line_map.push(None);
+            push_table_line(sep, None, lines, line_map);
         }
     }
 }
@@ -296,40 +675,62 @@ impl Markdown {
     }
 
     pub fn parse(&self, theme: Option<&Theme>) -> tui::text::Text<'_> {
-        self.parse_with_map(theme).0
+        // Hover / completion / signature-help: original renderer (no GFM table
+        // layout, HTML stripping, or link collection).
+        self.parse_impl(theme, false, 0, false).0
     }
 
-    /// Like [`Markdown::parse`], but also returns a per-rendered-line mapping
-    /// back to the source line it came from (`None` for inserted blank/separator
-    /// lines), plus the markdown links anchored to each rendered line. Used by
-    /// the markdown preview for click-to-source and goto-file.
+    /// Preview parser: aligned/wrapping GFM tables, HTML tag stripping, and
+    /// per-line source mapping plus link column ranges for click-to-source
+    /// and goto-file.
+    ///
+    /// `wrap_width` is the inner panel width used to budget table columns and
+    /// (when `wrap_prose` is set) to wrap long paragraphs. `0` means no width
+    /// constraint.
     pub fn parse_with_map(
         &self,
         theme: Option<&Theme>,
+        wrap_width: u16,
+        wrap_prose: bool,
     ) -> (tui::text::Text<'_>, Vec<Option<usize>>, Vec<MarkdownLink>) {
-        // Flush the accumulated spans as one finished line, recording its source
-        // line and any links anchored to it. ALL visible-line output must go
-        // through this (and blank-line output through `blank`) so `lines`,
-        // `line_map` and `links` stay in lockstep.
+        self.parse_impl(theme, true, wrap_width, wrap_prose)
+    }
+
+    fn parse_impl(
+        &self,
+        theme: Option<&Theme>,
+        preview: bool,
+        wrap_width: u16,
+        wrap_prose: bool,
+    ) -> (tui::text::Text<'_>, Vec<Option<usize>>, Vec<MarkdownLink>) {
         fn push_line<'a>(
             spans: &mut Vec<Span<'a>>,
             lines: &mut Vec<Spans<'a>>,
             line_map: &mut Vec<Option<usize>>,
             links: &mut Vec<MarkdownLink>,
-            cur_links: &mut Vec<String>,
+            line_links: &mut Vec<LineLink>,
             src: Option<usize>,
         ) {
             let spans = std::mem::take(spans);
             if !spans.is_empty() {
                 let idx = lines.len();
+                let line_width = cells_width(&spans);
                 lines.push(Spans::from(spans));
                 line_map.push(src);
-                for dest in cur_links.drain(..) {
-                    links.push(MarkdownLink { line: idx, dest });
+                for link in line_links.drain(..) {
+                    let end = link
+                        .end_col
+                        .max(link.start_col + 1)
+                        .min(line_width.max(link.start_col + 1));
+                    links.push(MarkdownLink {
+                        line: idx,
+                        dest: link.dest,
+                        start_col: link.start_col as u16,
+                        end_col: end as u16,
+                    });
                 }
             } else {
-                // No visible content to anchor links to; drop them.
-                cur_links.clear();
+                line_links.clear();
             }
         }
 
@@ -339,11 +740,7 @@ impl Markdown {
             line_map.push(None);
         }
 
-        // Render raw HTML (common in READMEs, e.g. `<div align="center">`,
-        // `<img ...>`, `<br>`) by stripping the tag markup rather than printing it
-        // verbatim. `<br>` becomes a line break; other tags are dropped but any
-        // text content between them is kept. HTML newlines are treated as
-        // whitespace so block tags don't introduce spurious blank lines.
+        // Preview-only: strip tags, treat `<br>` as a line break, keep inner text.
         #[allow(clippy::too_many_arguments)]
         fn push_html<'a>(
             html: &str,
@@ -352,7 +749,7 @@ impl Markdown {
             lines: &mut Vec<Spans<'a>>,
             line_map: &mut Vec<Option<usize>>,
             links: &mut Vec<MarkdownLink>,
-            cur_links: &mut Vec<String>,
+            line_links: &mut Vec<LineLink>,
             src: Option<usize>,
         ) {
             let mut cur = String::new();
@@ -374,7 +771,7 @@ impl Markdown {
                             if !cur.is_empty() {
                                 spans.push(Span::styled(std::mem::take(&mut cur), style));
                             }
-                            push_line(spans, lines, line_map, links, cur_links, src);
+                            push_line(spans, lines, line_map, links, line_links, src);
                         }
                     }
                     '\n' | '\r' => {}
@@ -393,12 +790,17 @@ impl Markdown {
                 line_starts.push(i + 1);
             }
         }
-        let byte_to_line =
-            |b: usize| line_starts.partition_point(|&start| start <= b).saturating_sub(1);
+        let byte_to_line = |b: usize| {
+            line_starts
+                .partition_point(|&start| start <= b)
+                .saturating_sub(1)
+        };
 
         let mut options = Options::empty();
         options.insert(Options::ENABLE_STRIKETHROUGH);
-        options.insert(Options::ENABLE_TABLES);
+        if preview {
+            options.insert(Options::ENABLE_TABLES);
+        }
         // `into_offset_iter` yields the source byte range alongside each event so
         // we can map rendered lines back to source lines.
         let parser = Parser::new_ext(&self.contents, options).into_offset_iter();
@@ -409,14 +811,10 @@ impl Markdown {
         let mut lines = Vec::new();
         let mut line_map: Vec<Option<usize>> = Vec::new();
         let mut links: Vec<MarkdownLink> = Vec::new();
-        // Link destinations seen on the line currently being accumulated; flushed
-        // into `links` by `push_line` once the line is finalized.
-        let mut cur_links: Vec<String> = Vec::new();
-        // Source line of the content currently being accumulated into `spans`.
+        let mut line_links: Vec<LineLink> = Vec::new();
+        let mut open_link: Option<OpenLink> = None;
         let mut src: Option<usize> = None;
         let mut list_stack = Vec::new();
-        // `Some` while inside a GFM table; cells buffer here until the table
-        // closes so columns can be aligned.
         let mut table: Option<TableCtx> = None;
 
         let get_indent = |level: usize| {
@@ -474,7 +872,7 @@ impl Markdown {
                             &mut lines,
                             &mut line_map,
                             &mut links,
-                            &mut cur_links,
+                            &mut line_links,
                             src,
                         );
                     }
@@ -542,28 +940,42 @@ impl Markdown {
                 }
                 Event::Start(Tag::TableCell) => {
                     if let Some(t) = table.as_mut() {
-                        t.cur_cell = Some(Vec::new());
+                        t.cur_cell = Some(TableCell {
+                            spans: Vec::new(),
+                            links: Vec::new(),
+                        });
                     }
                 }
                 Event::Start(tag) => {
-                    // Capture link/image destinations so the preview can offer
-                    // goto-file on them. The link text itself flows through the
-                    // normal `Event::Text` path below.
-                    if let Tag::Link { dest_url, .. } | Tag::Image { dest_url, .. } = &tag {
-                        cur_links.push(dest_url.to_string());
+                    if preview {
+                        if let Tag::Link { dest_url, .. } | Tag::Image { dest_url, .. } = &tag {
+                            let start_col = match table.as_ref().and_then(|t| t.cur_cell.as_ref()) {
+                                Some(cell) => cells_width(&cell.spans),
+                                None => cells_width(&spans),
+                            };
+                            open_link = Some(OpenLink {
+                                dest: dest_url.to_string(),
+                                start_col,
+                            });
+                        }
                     }
                     tags.push(tag);
                     if spans.is_empty() && !list_stack.is_empty() {
-                        // TODO: could push indent + 2 or 3 spaces to align with
-                        // the rest of the list.
                         spans.push(Span::from(get_indent(list_stack.len())));
                     }
                 }
                 Event::End(TagEnd::TableCell) => {
+                    if let Some(open) = open_link.take() {
+                        if let Some(cell) = table.as_mut().and_then(|t| t.cur_cell.as_mut()) {
+                            let end = cells_width(&cell.spans).max(open.start_col + 1);
+                            cell.links.push((open.dest, open.start_col, end));
+                        }
+                    }
                     if let Some(t) = table.as_mut() {
-                        let cell = t.cur_cell.take().unwrap_or_default();
-                        if let Some(row) = t.cur_row.as_mut() {
-                            row.cells.push(cell);
+                        if let Some(cell) = t.cur_cell.take() {
+                            if let Some(row) = t.cur_row.as_mut() {
+                                row.cells.push(cell);
+                            }
                         }
                     }
                 }
@@ -576,13 +988,39 @@ impl Markdown {
                 }
                 Event::End(TagEnd::Table) => {
                     if let Some(t) = table.take() {
-                        emit_table(t, text_style, rule_style, &mut lines, &mut line_map);
+                        emit_table(
+                            t,
+                            text_style,
+                            rule_style,
+                            wrap_width,
+                            &mut lines,
+                            &mut line_map,
+                            &mut links,
+                        );
                         blank(&mut lines, &mut line_map);
                     }
-                    // Links inside table cells aren't anchored; drop any pending.
-                    cur_links.clear();
+                    open_link = None;
+                    line_links.clear();
                 }
                 Event::End(tag) => {
+                    if matches!(tag, TagEnd::Link | TagEnd::Image) {
+                        if let Some(open) = open_link.take() {
+                            let end = match table.as_ref().and_then(|t| t.cur_cell.as_ref()) {
+                                Some(cell) => cells_width(&cell.spans),
+                                None => cells_width(&spans),
+                            }
+                            .max(open.start_col + 1);
+                            if let Some(cell) = table.as_mut().and_then(|t| t.cur_cell.as_mut()) {
+                                cell.links.push((open.dest, open.start_col, end));
+                            } else {
+                                line_links.push(LineLink {
+                                    dest: open.dest,
+                                    start_col: open.start_col,
+                                    end_col: end,
+                                });
+                            }
+                        }
+                    }
                     tags.pop();
                     match tag {
                         TagEnd::Heading(_)
@@ -594,7 +1032,7 @@ impl Markdown {
                                 &mut lines,
                                 &mut line_map,
                                 &mut links,
-                                &mut cur_links,
+                                &mut line_links,
                                 src,
                             );
                         }
@@ -646,19 +1084,17 @@ impl Markdown {
                             }
                             _ => text_style,
                         };
-                        // Make link/image text visibly clickable: apply the theme
-                        // link color (if any) and always underline, even when the
-                        // link text also carries emphasis/strong.
-                        if tags
-                            .iter()
-                            .any(|tag| matches!(tag, Tag::Link { .. } | Tag::Image { .. }))
+                        if preview
+                            && tags
+                                .iter()
+                                .any(|tag| matches!(tag, Tag::Link { .. } | Tag::Image { .. }))
                         {
                             style = style.patch(link_style);
                             style.underline_style = Some(UnderlineStyle::Line);
                         }
                         let span = Span::styled(text, style);
                         match table.as_mut().and_then(|t| t.cur_cell.as_mut()) {
-                            Some(cell) => cell.push(span),
+                            Some(cell) => cell.spans.push(span),
                             None => spans.push(span),
                         }
                     }
@@ -666,13 +1102,15 @@ impl Markdown {
                 Event::Code(text) => {
                     let span = Span::styled(text, code_style);
                     match table.as_mut().and_then(|t| t.cur_cell.as_mut()) {
-                        Some(cell) => cell.push(span),
+                        Some(cell) => cell.spans.push(span),
                         None => spans.push(span),
                     }
                 }
                 Event::Html(text) | Event::InlineHtml(text) => {
-                    if let Some(cell) = table.as_mut().and_then(|t| t.cur_cell.as_mut()) {
-                        cell.push(Span::styled(text, text_style));
+                    if !preview {
+                        spans.push(Span::styled(text, code_style));
+                    } else if let Some(cell) = table.as_mut().and_then(|t| t.cur_cell.as_mut()) {
+                        cell.spans.push(Span::styled(text, text_style));
                     } else {
                         push_html(
                             &text,
@@ -681,23 +1119,30 @@ impl Markdown {
                             &mut lines,
                             &mut line_map,
                             &mut links,
-                            &mut cur_links,
+                            &mut line_links,
                             src,
                         );
                     }
                 }
                 Event::SoftBreak | Event::HardBreak => {
+                    if let Some(open) = open_link.as_mut() {
+                        let end = cells_width(&spans).max(open.start_col + 1);
+                        line_links.push(LineLink {
+                            dest: open.dest.clone(),
+                            start_col: open.start_col,
+                            end_col: end,
+                        });
+                        open.start_col = 0;
+                    }
                     push_line(
                         &mut spans,
                         &mut lines,
                         &mut line_map,
                         &mut links,
-                        &mut cur_links,
+                        &mut line_links,
                         src,
                     );
                     if !list_stack.is_empty() {
-                        // TODO: could push indent + 2 or 3 spaces to align with
-                        // the rest of the list.
                         spans.push(Span::from(get_indent(list_stack.len())));
                     }
                 }
@@ -719,7 +1164,7 @@ impl Markdown {
             &mut lines,
             &mut line_map,
             &mut links,
-            &mut cur_links,
+            &mut line_links,
             src,
         );
 
@@ -731,8 +1176,74 @@ impl Markdown {
             }
         }
 
+        if preview && wrap_prose && wrap_width > 0 {
+            (lines, line_map, links) = wrap_wide_lines(lines, line_map, links, wrap_width);
+        }
+
         (Text::from(lines), line_map, links)
     }
+}
+
+fn wrap_wide_lines<'a>(
+    lines: Vec<Spans<'a>>,
+    line_map: Vec<Option<usize>>,
+    links: Vec<MarkdownLink>,
+    width: u16,
+) -> (Vec<Spans<'a>>, Vec<Option<usize>>, Vec<MarkdownLink>) {
+    let width = width as usize;
+    if width == 0 {
+        return (lines, line_map, links);
+    }
+    let mut by_line: Vec<Vec<MarkdownLink>> = vec![Vec::new(); lines.len()];
+    for link in links {
+        if link.line < by_line.len() {
+            by_line[link.line].push(link);
+        }
+    }
+    let mut out_lines = Vec::new();
+    let mut out_map = Vec::new();
+    let mut out_links = Vec::new();
+    for (i, line) in lines.into_iter().enumerate() {
+        let src = line_map[i];
+        let line_links = std::mem::take(&mut by_line[i]);
+        if line.width() <= width {
+            let idx = out_lines.len();
+            for mut link in line_links {
+                link.line = idx;
+                out_links.push(link);
+            }
+            out_lines.push(line);
+            out_map.push(src);
+            continue;
+        }
+        let rows = wrap_graphemes(&flatten_graphemes(&line.0), width);
+        let base = out_lines.len();
+        for row in &rows {
+            out_lines.push(Spans::from(row.spans.clone()));
+            out_map.push(src);
+        }
+        for link in line_links {
+            let mapped = map_link_to_rows(&rows, link.start_col as usize, link.end_col as usize);
+            if mapped.is_empty() {
+                out_links.push(MarkdownLink {
+                    line: base,
+                    dest: link.dest,
+                    start_col: link.start_col,
+                    end_col: link.end_col,
+                });
+            } else {
+                for (ri, vs, ve) in mapped {
+                    out_links.push(MarkdownLink {
+                        line: base + ri,
+                        dest: link.dest.clone(),
+                        start_col: vs,
+                        end_col: ve,
+                    });
+                }
+            }
+        }
+    }
+    (out_lines, out_map, out_links)
 }
 
 impl Component for Markdown {
@@ -766,10 +1277,7 @@ mod tests {
     use super::*;
     use arc_swap::ArcSwap;
 
-    fn render_lines(md: &str) -> Vec<String> {
-        let loader = Arc::new(ArcSwap::from_pointee(syntax::Loader::default()));
-        let markdown = Markdown::new(md.to_string(), loader);
-        let text = markdown.parse(None);
+    fn stringify(text: &Text) -> Vec<String> {
         text.lines
             .iter()
             .map(|spans| {
@@ -780,6 +1288,20 @@ mod tests {
                     .collect::<String>()
             })
             .collect()
+    }
+
+    fn parse_preview(
+        md: &str,
+        wrap_width: u16,
+    ) -> (Vec<String>, Vec<Option<usize>>, Vec<MarkdownLink>) {
+        let loader = Arc::new(ArcSwap::from_pointee(syntax::Loader::default()));
+        let markdown = Markdown::new(md.to_string(), loader);
+        let (text, map, links) = markdown.parse_with_map(None, wrap_width, false);
+        (stringify(&text), map, links)
+    }
+
+    fn render_lines(md: &str) -> Vec<String> {
+        parse_preview(md, 0).0
     }
 
     #[test]
@@ -823,5 +1345,183 @@ mod tests {
         // col0 width 4 (left), col1 width 3 (center), col2 width 5 (right):
         // left stays flush-left, center pads both sides, right is flush-right.
         assert_eq!(row, "a    │  b  │     c");
+    }
+
+    #[test]
+    fn table_pads_ragged_rows() {
+        let md = "\
+| A | B | C |
+| --- | --- | --- |
+| only |
+| x | y |
+";
+        let lines = render_lines(md);
+        let table: Vec<&String> = lines.iter().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(table.len(), 4, "unexpected lines: {lines:?}");
+        let widths: Vec<usize> = table.iter().map(|l| l.chars().count()).collect();
+        assert!(
+            widths.windows(2).all(|w| w[0] == w[1]),
+            "ragged rows differ in width: {widths:?} {table:?}"
+        );
+        assert!(table[2].contains("only"), "{table:?}");
+        assert!(
+            table[3].contains('x') && table[3].contains('y'),
+            "{table:?}"
+        );
+    }
+
+    #[test]
+    fn line_map_tracks_header_divider_and_body() {
+        let md = "\
+# Title
+
+| Name | Age |
+| --- | --- |
+| Alice | 30 |
+";
+        let (lines, map, _) = parse_preview(md, 0);
+        assert_eq!(
+            lines.len(),
+            map.len(),
+            "lines and line_map must stay in lockstep"
+        );
+        // Title is source line 0; table header is source line 2; divider has no source.
+        let title = lines
+            .iter()
+            .position(|l| l.contains("Title"))
+            .expect("title");
+        assert_eq!(map[title], Some(0));
+        let header = lines
+            .iter()
+            .position(|l| l.starts_with("Name"))
+            .expect("header");
+        assert_eq!(map[header], Some(2));
+        assert_eq!(
+            map[header + 1],
+            None,
+            "divider should not map to a source line"
+        );
+        let body = lines
+            .iter()
+            .position(|l| l.contains("Alice"))
+            .expect("body");
+        assert_eq!(map[body], Some(4));
+    }
+
+    #[test]
+    fn link_is_anchored_to_rendered_line() {
+        let md = "see [docs](README.md) please\n";
+        let (lines, _, links) = parse_preview(md, 0);
+        let line = lines
+            .iter()
+            .position(|l| l.contains("docs"))
+            .expect("link text");
+        let link = links
+            .iter()
+            .find(|l| l.dest == "README.md")
+            .expect("link dest stored");
+        assert_eq!(link.line, line);
+        assert!(link.end_col > link.start_col, "{link:?}");
+        let rendered = &lines[line];
+        let text = "docs";
+        let start = rendered.find(text).unwrap();
+        assert_eq!(link.start_col as usize, start);
+        assert_eq!(link.end_col as usize, start + text.len());
+    }
+
+    #[test]
+    fn table_cell_wraps_to_width() {
+        let md = "\
+| Left | Right |
+| --- | --- |
+| a-long-cell-value | short |
+";
+        let (lines, _, _) = parse_preview(md, 18);
+        let table: Vec<&String> = lines.iter().filter(|l| !l.trim().is_empty()).collect();
+        assert!(
+            table.iter().all(|l| l.chars().count() <= 18),
+            "wrapped table exceeded width: {table:?}"
+        );
+        let joined = table
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            joined.contains("a-long-cell") && joined.contains("value"),
+            "expected the long cell to wrap onto extra rows: {lines:?}"
+        );
+        assert!(
+            table.len() > 3,
+            "expected extra wrap rows beyond header/divider/body: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn table_stacks_when_too_narrow() {
+        let md = "\
+| Name | Age | City | Country |
+| --- | --- | --- | --- |
+| Alice | 30 | New York | USA |
+";
+        let (lines, map, _) = parse_preview(md, 12);
+        let stacked: Vec<&String> = lines
+            .iter()
+            .filter(|l| {
+                l.contains("Alice") || l.contains("30") || l.contains("York") || l.contains("USA")
+            })
+            .collect();
+        assert!(
+            stacked
+                .iter()
+                .any(|l| l.contains("Name:") && l.contains("Alice")),
+            "expected stacked Col: value fallback, got {lines:?}"
+        );
+        assert!(
+            stacked.iter().all(|l| l.chars().count() <= 12),
+            "stacked rows exceeded width: {stacked:?}"
+        );
+        let alice_idx = lines.iter().position(|l| l.contains("Alice")).unwrap();
+        assert_eq!(map[alice_idx], Some(2));
+    }
+
+    #[test]
+    fn table_cell_link_is_anchored() {
+        let md = "\
+| A | B |
+| --- | --- |
+| [docs](README.md) | x |
+";
+        let (lines, _, links) = parse_preview(md, 0);
+        let line = lines
+            .iter()
+            .position(|l| l.contains("docs"))
+            .expect("link text in table");
+        let link = links
+            .iter()
+            .find(|l| l.dest == "README.md")
+            .expect("table cell dest stored");
+        assert_eq!(link.line, line);
+        assert!(link.end_col > link.start_col, "{link:?} lines={lines:?}");
+    }
+
+    #[test]
+    fn popup_parse_does_not_align_tables() {
+        let md = "\
+| Name | Age |
+| --- | --- |
+| Alice | 30 |
+";
+        let loader = Arc::new(ArcSwap::from_pointee(syntax::Loader::default()));
+        let markdown = Markdown::new(md.to_string(), loader);
+        let lines = stringify(&markdown.parse(None));
+        assert!(
+            lines.iter().any(|l| l.contains('|')),
+            "popup parse should keep table syntax as text, got {lines:?}"
+        );
+        assert!(
+            lines.iter().all(|l| !l.contains('│')),
+            "popup parse should not emit aligned table columns, got {lines:?}"
+        );
     }
 }

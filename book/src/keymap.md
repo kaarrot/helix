@@ -95,7 +95,7 @@ Normal mode is the default mode when you launch helix. You can return to it from
 | `=`         | Format selection (**LSP**)                                           | `format_selections`       |
 | `d`         | Delete selection                                                     | `delete_selection`        |
 | `Alt-d`     | Delete selection, without yanking                                    | `delete_selection_noyank` |
-| `c`         | Reply to the review thread at the cursor, else change selection      | `review_comment_or_change` |
+| `c`         | Continue the unsent review draft at the cursor, else reply, else change selection | `review_comment_or_change` |
 | `d`         | Delete the focused review entry, else delete selection               | `review_delete_or_change` |
 | `C-left` / `C-right` | Show the previous / next entry in the thread at the cursor   | `review_prev_message` / `review_next_message` |
 | `C-up` / `C-down` | Move the cursor up / down inside the focused review box         | `review_scroll_up` / `review_scroll_down` |
@@ -362,7 +362,10 @@ useful, not a requirement.
 Pressing `c` — in the submenu, or on its own on a line that carries a thread — adds a reply rather than
 starting a second thread, so a thread grows into a conversation. `c` only does
 this when the cursor is on a thread; elsewhere it changes the selection as
-usual, at the cost of not being able to change text on a commented line.
+usual, at the cost of not being able to change text on a commented line. If the
+thread still has an unsent draft, `c` opens that draft again with the text in
+place and the cursor at the end. `Esc` closes the box and leaves the saved
+draft as it was.
 
 Moving down onto a line that carries a thread stops on its box first: the
 cursor stays put, the box is drawn as focused, and the next press carries on.
@@ -407,7 +410,8 @@ point and **discards the entries after it** — the point of going back is to ta
 it a different way. The status line says how many were dropped. The agent is in
 the same session and still remembers them, so the next message tells it they no
 longer stand. Inside the box, Enter inserts a newline, `Ctrl-S`
-saves a draft, and `Ctrl-Shift-S` saves and sends it straight away. A thread shows one
+saves a draft and closes the box, and `Ctrl-Shift-S` saves and sends it straight away.
+`c` on that line opens the saved draft again. A thread shows one
 entry at a time, with a `3/5` counter in its header, so its height stays bounded
 by a single message however long the conversation grows.
 
@@ -443,7 +447,7 @@ renaming.
 
 | Key | Description | Command |
 | --- | --- | --- |
-| `c` | Comment on the current line, or reply to the thread already there | `review_add` |
+| `c` | Comment, reply, or continue editing the unsent draft on this line | `review_add` |
 | `S` | Send any comments saved but not yet sent | `review_send_all` |
 | `t` | Collapse or expand the thread at the cursor | `review_toggle_collapse` |
 | `h` | Hide or show every review box | `review_toggle_visible` |
@@ -451,9 +455,10 @@ renaming.
 Everything else happens on the box itself: `c` and `d` act on it, `C-left` /
 `C-right` walk its history, `C-up` / `C-down` read a long reply, the mouse
 selects from it and `y` copies that, and `]c` / `[c` move between threads.
-`Ctrl-Shift-S` in the box sends straight away. After saving with `Ctrl-S`, the
-same keys send the draft on this line (`Ctrl-S` or `Ctrl-Shift-S`); `S` in the
-review submenu still sends every unsent comment.
+`Ctrl-Shift-S` in the box sends straight away. After saving with `Ctrl-S`, `c`
+on the line opens that draft for editing again. `Ctrl-S` or `Ctrl-Shift-S` in
+normal mode send the draft on this line; `S` in the review submenu still sends
+every unsent comment.
 
 `h` hides the boxes for the keys as well as for the eye: `c`, `d` and the motion
 stops fall back to what they normally do, so a box you cannot see cannot be

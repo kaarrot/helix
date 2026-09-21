@@ -62,6 +62,11 @@ fn thread_at_cursor(cx: &mut Context) -> Option<ThreadId> {
 /// the reader's side: say something about this line. A thread already on the
 /// line makes it a reply, which is what turns a question and an answer into a
 /// conversation.
+///
+/// An unsent draft is the comment still being written. `Ctrl-S` only closes
+/// the box, so the same key opens that draft again with the text in place.
+/// A reply looked at from an older entry still starts blank: continuing from
+/// there discards the draft along with everything after that entry.
 pub fn review_add(cx: &mut Context) {
     // Claim the conversation first. Claiming is what loads the saved threads,
     // and until it happens the store is empty -- so on a freshly opened editor
@@ -114,7 +119,17 @@ pub fn review_add(cx: &mut Context) {
         // without first having to stop on it with j/k.
         cx.editor.diff.reviews.focused = Some(id);
 
-        prompt_at_cursor(cx, "reply: ", anchor, move |cx, input, send_now| {
+        // Rewind clears a draft it throws away. Whatever draft is still here
+        // is the one the box should show, caret at the end, ready to continue.
+        let (initial, label) = match cx.editor.diff.reviews.get(id) {
+            Some(thread) if thread.messages.is_empty() => {
+                (thread.draft.clone().unwrap_or_default(), "comment: ")
+            }
+            Some(thread) => (thread.draft.clone().unwrap_or_default(), "reply: "),
+            None => return,
+        };
+
+        prompt_at_cursor(cx, label, anchor, &initial, move |cx, input, send_now| {
             if input.trim().is_empty() {
                 return;
             }
@@ -129,9 +144,7 @@ pub fn review_add(cx: &mut Context) {
                 // store discards text, so it should never be silent.
                 format!("Reply drafted, {discarded} later entries discarded ({pending} pending)")
             } else if had_draft {
-                // Say so: the previous unsent text is gone, and silently
-                // dropping something the user typed would be worse.
-                format!("Reply draft replaced ({pending} pending)")
+                format!("Draft updated ({pending} pending)")
             } else {
                 format!("Reply drafted ({pending} pending)")
             };
@@ -154,6 +167,7 @@ pub fn review_add(cx: &mut Context) {
         cx,
         "comment: ",
         (file.clone(), side, line as u32),
+        "",
         move |cx, input, send_now| {
             if input.trim().is_empty() {
                 return;
@@ -226,13 +240,23 @@ struct CommentInput {
 impl CommentInput {
     fn new(
         label: String,
+        initial: &str,
         on_submit: impl FnMut(&mut crate::compositor::Context, &str, bool) + 'static,
     ) -> Self {
+        // `split` keeps a trailing empty line, so a draft that ended on Enter
+        // reopens with the caret on that new line rather than glued to the
+        // previous one. `lines()` would drop it.
+        let mut lines: Vec<String> = initial.split('\n').map(str::to_string).collect();
+        if lines.is_empty() {
+            lines.push(String::new());
+        }
+        let row = lines.len() - 1;
+        let col = lines[row].chars().count();
         Self {
             label,
-            lines: vec![String::new()],
-            row: 0,
-            col: 0,
+            lines,
+            row,
+            col,
             on_submit: Box::new(on_submit),
             area: helix_view::graphics::Rect::default(),
         }
@@ -508,31 +532,41 @@ fn send_now_from_box(cx: &mut crate::compositor::Context, id: ThreadId) {
 }
 
 /// Put the input where the comment will appear, rather than on the status line
-/// Put the input where the comment will appear, rather than on the status line
 /// at the bottom of the screen.
 ///
 /// The comment row itself cannot be typed into: virtual rows are painted by a
 /// decoration and are not part of the document, so no cursor can go there. A
 /// popup anchored under the line is the closest thing that is actually
 /// editable, and it lands in the same place the comment will.
+///
+/// `initial` is the unsent draft being continued, or empty for a new comment.
 fn prompt_at_cursor(
     cx: &mut Context,
     label: &'static str,
     anchor: (std::path::PathBuf, DiffSide, u32),
+    initial: &str,
     callback: impl FnMut(&mut crate::compositor::Context, &str, bool) + 'static,
 ) {
     // Hold room for the box being typed into, in place of the thread that lives
     // there. A one-line reply should not leave a tall answer underneath it.
+    // A resumed draft may already be several lines, so reserve that up front
+    // rather than after the first keystroke.
     let (file, side, line) = anchor;
+    let body_lines = if initial.is_empty() {
+        1
+    } else {
+        initial.split('\n').count()
+    };
     cx.editor.diff.reviews.composing = Some(helix_view::review::Composing {
         file,
         side,
         line,
-        rows: 2,
+        rows: body_lines + 1,
     });
 
     let input = CommentInput::new(
         format!("{label}  (ret: newline · ctrl-s: save · ctrl-shift-s: send · esc: cancel)"),
+        initial,
         callback,
     );
 
@@ -1267,7 +1301,8 @@ pub fn review_delete_or_change(cx: &mut Context) {
 }
 
 /// `c` opens a reply when the cursor is on a thread, and otherwise changes the
-/// selection as it always does.
+/// selection as it always does. An unsent draft on that line is opened again
+/// so it can be edited, rather than replaced by a blank box.
 ///
 /// The cost is real: on a line carrying a thread you cannot `c` to change the
 /// text, which during a review is something you might well want. `s`, `d` then

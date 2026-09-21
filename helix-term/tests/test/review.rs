@@ -499,6 +499,70 @@ async fn ctrl_s_sends_a_saved_draft_from_the_comment_line() -> anyhow::Result<()
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn saving_a_draft_can_be_reopened_for_editing() -> anyhow::Result<()> {
+    let file = tempfile::NamedTempFile::new()?;
+    std::fs::write(file.path(), "one\ntwo\n")?;
+
+    let mut app = AppBuilder::new().with_file(file.path(), None).build()?;
+    let mut harness = AppTestHarness::new();
+
+    assert!(harness.send_keys(&mut app, "<space>mRc").await?);
+    assert!(
+        harness
+            .send_keys(&mut app, "why this?<ret>still<C-s>")
+            .await?
+    );
+    assert!(app.editor.diff.reviews.composing.is_none());
+    assert_eq!(
+        app.editor
+            .diff
+            .reviews
+            .iter()
+            .next()
+            .unwrap()
+            .draft
+            .as_deref(),
+        Some("why this?\nstill")
+    );
+
+    // `c` brings the saved text back, caret at the end of the last line.
+    // A blank box would keep only the characters typed this time.
+    assert!(harness.send_keys(&mut app, "c").await?);
+    assert!(app.editor.diff.reviews.composing.is_some());
+    assert!(harness.send_keys(&mut app, " more<C-s>").await?);
+    assert_eq!(
+        app.editor
+            .diff
+            .reviews
+            .iter()
+            .next()
+            .unwrap()
+            .draft
+            .as_deref(),
+        Some("why this?\nstill more")
+    );
+
+    // Esc abandons the keystrokes and leaves the saved draft.
+    assert!(harness.send_keys(&mut app, "c").await?);
+    assert!(harness.send_keys(&mut app, "nope<esc>").await?);
+    assert!(app.editor.diff.reviews.composing.is_none());
+    assert_eq!(
+        app.editor
+            .diff
+            .reviews
+            .iter()
+            .next()
+            .unwrap()
+            .draft
+            .as_deref(),
+        Some("why this?\nstill more")
+    );
+
+    harness.close(&mut app).await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn ctrl_shift_s_in_the_box_sends_only_that_thread() -> anyhow::Result<()> {
     let file = tempfile::NamedTempFile::new()?;
     std::fs::write(file.path(), "one\ntwo\nthree\n")?;
@@ -1478,7 +1542,11 @@ async fn c_replies_on_a_thread_and_still_changes_elsewhere() -> anyhow::Result<(
         "c on a thread replies to it rather than starting another"
     );
     let thread = app.editor.diff.reviews.iter().next().unwrap();
-    assert_eq!(thread.draft.as_deref(), Some("a reply"));
+    assert_eq!(
+        thread.draft.as_deref(),
+        Some("why?a reply"),
+        "c reopens the saved draft, so further typing continues it"
+    );
 
     harness.close(&mut app).await?;
     Ok(())

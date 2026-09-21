@@ -89,7 +89,6 @@ impl EditorView {
         let area = view.area;
         let theme = &editor.theme;
         let config = editor.config();
-        let loader = editor.syn_loader.load();
 
         let view_offset = doc.view_offset(view.id);
 
@@ -98,15 +97,24 @@ impl EditorView {
         // the same plan back, so a click lands where the row was drawn. It is
         // published to the view first, since building the annotations is what
         // picks it up.
+        // Agent replies are laid out with the markdown preview renderer. The
+        // source is not written back, so the reply stays read-only; delete
+        // still removes the entry.
+        let syn_loader = editor.syn_loader.clone();
+        let mut layout_agent = |text: &str, width: usize| {
+            crate::ui::layout_agent_markdown(text, width, theme, syn_loader.clone())
+        };
         let virtual_row_plan = view.virtual_row_plan(
             doc,
             &editor.diff.views,
             &editor.documents,
             &editor.diff.reviews,
             crate::review_agent::spinner_frame(),
+            Some(&mut layout_agent),
         );
         *view.virtual_rows.borrow_mut() = virtual_row_plan.clone();
 
+        let loader = editor.syn_loader.load();
         let text_annotations = view.text_annotations(doc, Some(theme));
         let mut decorations = DecorationManager::default();
 

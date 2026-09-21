@@ -22,7 +22,7 @@ pub use completion::Completion;
 pub use editor::EditorView;
 use helix_stdx::rope;
 use helix_view::theme::Style;
-pub use markdown::Markdown;
+pub use markdown::{layout_agent_markdown, Markdown};
 pub use menu::Menu;
 pub use picker::{Column as PickerColumn, FileLocation, Picker};
 pub use popup::Popup;

@@ -452,6 +452,11 @@ renaming.
 | `t` | Collapse or expand the thread at the cursor | `review_toggle_collapse` |
 | `h` | Hide or show every review box | `review_toggle_visible` |
 
+An agent's reply is drawn with the markdown preview renderer: headings, lists,
+tables and code are laid out instead of shown as source. That text is not
+editable. `d` still deletes the reply on screen, and `c` starts a new reply
+rather than opening what the agent wrote.
+
 Everything else happens on the box itself: `c` and `d` act on it, `C-left` /
 `C-right` walk its history, `C-up` / `C-down` read a long reply, the mouse
 selects from it and `y` copies that, and `]c` / `[c` move between threads.

@@ -2,7 +2,7 @@ use crate::ui::{
     document::{LinePos, TextRenderer},
     text_decorations::Decoration,
 };
-use helix_core::{syntax::OverlayHighlights, Position};
+use helix_core::{syntax::OverlayHighlights, unicode::width::UnicodeWidthStr, Position};
 use helix_view::{
     annotations::rows::{Attention, CommentRowKind, RowMark, VirtualRow, VirtualRowPlan},
     graphics::{Color, Rect, Style},
@@ -224,6 +224,7 @@ impl Decoration for VirtualRowDecoration {
                     thread,
                     kind,
                     text,
+                    spans,
                     attention,
                     mark,
                     body,
@@ -271,13 +272,16 @@ impl Decoration for VirtualRowDecoration {
                     }
                     renderer.set_style(Rect::new(viewport.x, y, viewport.width, 1), style);
                     renderer.set_stringn(viewport.x, y, MARKER, 1, style);
-                    renderer.set_stringn(
-                        viewport.x + 1,
-                        y,
-                        text,
-                        viewport.width.saturating_sub(1) as usize,
-                        style,
-                    );
+                    let text_x = viewport.x + 1;
+                    let text_width = viewport.width.saturating_sub(1);
+                    if spans.is_empty() {
+                        renderer.set_stringn(text_x, y, text, text_width as usize, style);
+                    } else {
+                        // Span backgrounds would cover the focus and cursor
+                        // tint painted above. Keep the markdown foreground and
+                        // emphasis, and let the row keep its own background.
+                        paint_comment_spans(renderer, text_x, y, text_width, style, spans);
+                    }
                 }
             }
         }
@@ -286,6 +290,31 @@ impl Decoration for VirtualRowDecoration {
         // viewport edge: the annotation reserved this many, and the formatter
         // laid text out around that count.
         Position::new(rows.len(), 0)
+    }
+}
+
+/// Paint one markdown row. The row background is already set; span backgrounds
+/// are dropped so a focused or selected row keeps that tint.
+fn paint_comment_spans(
+    renderer: &mut TextRenderer,
+    mut x: u16,
+    y: u16,
+    width: u16,
+    row_style: Style,
+    spans: &[helix_view::annotations::rows::CommentSpan],
+) {
+    let right = x.saturating_add(width);
+    for span in spans {
+        if x >= right || span.text.is_empty() {
+            continue;
+        }
+        let room = (right - x) as usize;
+        let mut span_style = span.style;
+        span_style.bg = None;
+        let span_style = row_style.patch(span_style);
+        renderer.set_stringn(x, y, &span.text, room, span_style);
+        let advance = UnicodeWidthStr::width(span.text.as_str()).min(room) as u16;
+        x = x.saturating_add(advance);
     }
 }
 

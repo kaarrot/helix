@@ -13,7 +13,42 @@ use helix_core::Position;
 use helix_vcs::DiffHandle;
 use std::{cell::Cell, collections::BTreeMap, rc::Rc};
 
+use crate::graphics::Style;
 use crate::review::ThreadId;
+
+/// One styled piece of a comment row.
+///
+/// Markdown rendering produces these. A default [`Style`] means "use the row's
+/// own comment style" — the painter then keeps the role colour and the focus
+/// background.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommentSpan {
+    pub text: String,
+    pub style: Style,
+}
+
+/// One screen row of a comment body, already wrapped to the pane.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommentLine {
+    pub spans: Vec<CommentSpan>,
+}
+
+impl CommentLine {
+    pub fn plain(text: impl Into<String>) -> Self {
+        let text = text.into();
+        Self {
+            spans: vec![CommentSpan {
+                text,
+                style: Style::default(),
+            }],
+        }
+    }
+
+    /// The row with its styling stripped, which is what a copy of that row is.
+    pub fn text(&self) -> String {
+        self.spans.iter().map(|span| span.text.as_str()).collect()
+    }
+}
 
 /// How much attention a thread currently has.
 ///
@@ -74,6 +109,9 @@ pub enum VirtualRow {
         thread: ThreadId,
         kind: CommentRowKind,
         text: String,
+        /// Markdown styling for `text`. Empty means paint `text` with the row
+        /// style. When set, the pieces concatenate to `text`.
+        spans: Vec<CommentSpan>,
         attention: Attention,
         mark: RowMark,
         /// Which wrapped line of the entry this row shows, if it shows one at
@@ -288,6 +326,7 @@ mod test {
                 thread: ThreadId(1),
                 kind: CommentRowKind::User,
                 text: "why?".into(),
+                spans: Vec::new(),
                 attention: Attention::Idle,
                 mark: RowMark::None,
                 body: Some(0),

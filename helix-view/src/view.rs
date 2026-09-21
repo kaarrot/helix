@@ -739,6 +739,9 @@ impl View {
     ///
     /// Both consumers -- the reserving annotation and the painting decoration --
     /// must be driven from the same plan, or they will disagree about row counts.
+    ///
+    /// `layout_agent` is the markdown preview layout for agent replies. `None`
+    /// wraps that source as plain text.
     pub fn virtual_row_plan(
         &self,
         doc: &Document,
@@ -746,6 +749,9 @@ impl View {
         documents: &std::collections::BTreeMap<DocumentId, Document>,
         reviews: &crate::review::ReviewStore,
         spinner: Option<&str>,
+        mut layout_agent: Option<
+            &mut dyn FnMut(&str, usize) -> Vec<crate::annotations::rows::CommentLine>,
+        >,
     ) -> Option<std::rc::Rc<crate::annotations::rows::VirtualRowPlan>> {
         use crate::annotations::rows::VirtualRowPlanBuilder;
 
@@ -803,7 +809,7 @@ impl View {
                     }
                     builder.add_comment_rows(
                         line,
-                        crate::review::comment_rows(
+                        crate::review::render_comment_rows(
                             thread,
                             width,
                             spinner,
@@ -815,6 +821,7 @@ impl View {
                                 crate::annotations::rows::Attention::Idle
                             },
                             max_body_rows,
+                            &mut layout_agent,
                         ),
                     );
                 }

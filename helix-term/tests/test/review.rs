@@ -50,12 +50,18 @@ fn focused_review_side(app: &Application) -> DiffSide {
 fn focused_plan_row_count(app: &Application) -> usize {
     let view = app.editor.tree.get(app.editor.tree.focus);
     let doc = app.editor.document(view.doc).unwrap();
+    let theme = &app.editor.theme;
+    let loader = app.editor.syn_loader.clone();
+    let mut layout = |text: &str, width: usize| {
+        helix_term::ui::layout_agent_markdown(text, width, theme, loader.clone())
+    };
     view.virtual_row_plan(
         doc,
         &app.editor.diff.views,
         &app.editor.documents,
         &app.editor.diff.reviews,
         None,
+        Some(&mut layout),
     )
     .map_or(0, |plan| {
         (0..doc.text().len_lines())
@@ -2281,6 +2287,118 @@ async fn review_boxes_can_be_hidden_and_shown() -> anyhow::Result<()> {
     assert!(harness.send_keys(&mut app, "<space>mRc").await?);
     assert!(!app.editor.diff.reviews.hidden);
     assert!(harness.send_keys(&mut app, "<esc>").await?);
+
+    harness.close(&mut app).await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn agent_replies_render_as_markdown_and_can_still_be_deleted() -> anyhow::Result<()> {
+    use helix_view::annotations::rows::{CommentRowKind, VirtualRow};
+    use helix_view::review::agent::AgentEvent;
+
+    let file = tempfile::NamedTempFile::new()?;
+    std::fs::write(file.path(), "one\ntwo\nthree\n")?;
+
+    let mut app = AppBuilder::new().with_file(file.path(), None).build()?;
+    let mut harness = AppTestHarness::new();
+
+    let fake = FakeAgent::default();
+    let sent = fake.sent.clone();
+    app.editor.diff.agent = Some(Box::new(fake));
+
+    assert!(harness.send_keys(&mut app, "<space>mRc").await?);
+    assert!(harness.send_keys(&mut app, "see **this**<C-s>").await?);
+    assert!(harness.send_keys(&mut app, "<space>mRS").await?);
+    let id = sent.lock().unwrap()[0].0;
+    app.editor
+        .diff
+        .reviews
+        .apply_agent_event(AgentEvent::Completed(
+            id,
+            "**bold** and `code`\n\n- alpha\n- beta\n".into(),
+        ));
+
+    let body = |app: &Application, kind: CommentRowKind| -> Vec<String> {
+        let view = app.editor.tree.get(app.editor.tree.focus);
+        let doc = app.editor.document(view.doc).unwrap();
+        let theme = &app.editor.theme;
+        let loader = app.editor.syn_loader.clone();
+        let mut layout = |text: &str, width: usize| {
+            helix_term::ui::layout_agent_markdown(text, width, theme, loader.clone())
+        };
+        let plan = view
+            .virtual_row_plan(
+                doc,
+                &app.editor.diff.views,
+                &app.editor.documents,
+                &app.editor.diff.reviews,
+                None,
+                Some(&mut layout),
+            )
+            .expect("the thread should occupy rows");
+        let line = doc
+            .selection(view.id)
+            .primary()
+            .cursor_line(doc.text().slice(..));
+        plan.rows_at(line)
+            .iter()
+            .filter_map(|row| match row {
+                VirtualRow::Comment {
+                    kind: row_kind,
+                    text,
+                    body: Some(_),
+                    ..
+                } if *row_kind == kind => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+
+    let agent = body(&app, CommentRowKind::Agent);
+    let joined = agent.join("\n");
+    assert!(joined.contains("bold"), "rendered reply: {agent:?}");
+    assert!(
+        !joined.contains("**"),
+        "source markers should be gone: {agent:?}"
+    );
+    assert!(joined.contains("code"), "rendered reply: {agent:?}");
+    assert!(
+        !joined.contains('`'),
+        "source markers should be gone: {agent:?}"
+    );
+    assert!(
+        agent
+            .iter()
+            .any(|line| line.contains('•') && line.contains("alpha")),
+        "list item should be a bullet: {agent:?}"
+    );
+    // The reply on screen is not a rewrite of what the agent sent.
+    assert_eq!(
+        app.editor.diff.reviews.get(id).unwrap().messages[1].text,
+        "**bold** and `code`\n\n- alpha\n- beta\n"
+    );
+
+    // The user's own comment stays source text.
+    assert!(harness.send_keys(&mut app, "j").await?);
+    assert!(harness.send_keys(&mut app, "<C-left>").await?);
+    let user = body(&app, CommentRowKind::User);
+    assert!(
+        user.iter().any(|line| line.contains("**this**")),
+        "a user comment is not rendered: {user:?}"
+    );
+
+    // Back on the agent reply, `d` removes it and leaves the comment.
+    assert!(harness.send_keys(&mut app, "<C-right>").await?);
+    assert_eq!(app.editor.diff.reviews.get(id).unwrap().view_index(), 1);
+    assert!(harness.send_keys(&mut app, "d").await?);
+    let thread = app.editor.diff.reviews.get(id).unwrap();
+    assert_eq!(thread.entry_count(), 1);
+    assert_eq!(thread.entry(0).unwrap().text, "see **this**");
+    assert!(thread
+        .messages
+        .iter()
+        .all(|message| message.role != helix_view::review::Role::Agent));
 
     harness.close(&mut app).await?;
     Ok(())

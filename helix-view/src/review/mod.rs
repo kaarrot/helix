@@ -21,7 +21,7 @@ pub mod session;
 use helix_core::{ChangeSet, Rope};
 use serde::{Deserialize, Serialize};
 
-use crate::annotations::rows::{Attention, RowMark, VirtualRow};
+use crate::annotations::rows::{Attention, CommentLine, CommentSpan, RowMark, VirtualRow};
 use agent::AgentEvent;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -95,6 +95,12 @@ pub struct Thread {
     /// how tall the box was allowed to be -- so rendering is what settles it.
     #[serde(skip)]
     pub scroll: Cell<usize>,
+    /// Body rows last painted for [`Thread::view`], at the body width they were
+    /// wrapped to. Copy and scrolling measure these so they agree with the
+    /// screen. An agent reply is markdown, which does not wrap like its source;
+    /// measuring the source again would copy text the box is not showing.
+    #[serde(skip)]
+    pub drawn: RefCell<Option<DrawnBody>>,
     /// Row of the current entry the in-box cursor is on, counted in wrapped
     /// body lines. Drawn only while the box is focused, and the thing `y`
     /// copies from. Not persisted: it is a reading position.
@@ -113,6 +119,16 @@ pub struct Thread {
     /// collapse point: silently discarding a conversation is worse than showing
     /// one that has lost its footing.
     pub orphaned: bool,
+}
+
+/// Plain text of the body rows last drawn for one entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DrawnBody {
+    /// [`Thread::view`] these rows belong to.
+    pub view: usize,
+    /// Width after the marker column, the same value [`body_width`] returns.
+    pub width: usize,
+    pub lines: Vec<String>,
 }
 
 /// One addressable entry of a thread: a sent message, or the unsent draft.
@@ -215,11 +231,20 @@ impl Thread {
     /// The in-box cursor counts in these, so anything that moves it has to
     /// measure with the same width the box was drawn at.
     pub fn body_rows(&self, width: usize) -> Vec<String> {
+        let text_width = body_width(width);
+        if let Some(drawn) = self.drawn.borrow().as_ref() {
+            if drawn.view == self.view_index()
+                && drawn.width == text_width
+                && !drawn.lines.is_empty()
+            {
+                return drawn.lines.clone();
+            }
+        }
         let entry = match self.entry(self.view_index()) {
             Some(entry) => entry,
             None => return Vec::new(),
         };
-        crate::annotations::rows::wrap_text(entry.text, body_width(width))
+        crate::annotations::rows::wrap_text(entry.text, text_width)
     }
 
     /// The selected rows as an inclusive range, in either direction of travel.
@@ -502,6 +527,7 @@ impl ReviewStore {
                 collapsed: false,
                 view: 0,
                 scroll: Cell::new(0),
+                drawn: RefCell::new(None),
                 cursor: 0,
                 select: None,
                 awaiting: false,
@@ -852,7 +878,8 @@ impl ReviewStore {
 /// Render a thread into the virtual rows it occupies.
 ///
 /// One row per screen line, already wrapped, so reserving and painting can both
-/// just count the slice.
+/// just count the slice. Agent replies are plain wrapped text here; the editor
+/// passes the markdown preview layout through [`render_comment_rows`].
 pub fn comment_rows(
     thread: &Thread,
     width: usize,
@@ -860,18 +887,40 @@ pub fn comment_rows(
     attention: Attention,
     max_body_rows: usize,
 ) -> Vec<VirtualRow> {
+    render_comment_rows(thread, width, spinner, attention, max_body_rows, &mut None)
+}
+
+/// [`comment_rows`], with an optional layout for agent replies.
+///
+/// `layout_agent` is the markdown preview renderer. It is asked only for an
+/// agent entry, and what it returns is what the box shows. The message text is
+/// not written back, so rendering a reply does not make it editable.
+///
+/// The `Option` is behind a `&mut` so a caller can hand the same layout to
+/// every thread in a loop. Passing the inner `&mut` directly makes the borrow
+/// last for the whole loop.
+pub(crate) fn render_comment_rows(
+    thread: &Thread,
+    width: usize,
+    spinner: Option<&str>,
+    attention: Attention,
+    max_body_rows: usize,
+    layout_agent: &mut Option<&mut dyn FnMut(&str, usize) -> Vec<CommentLine>>,
+) -> Vec<VirtualRow> {
     use crate::annotations::rows::{wrap_text, CommentRowKind};
 
     // Leave room for the marker column so wrapped text lines up under itself.
     let text_width = body_width(width);
 
     if thread.orphaned {
+        thread.drawn.take();
         return wrap_text(&format!("(line gone) {}", thread.summary()), text_width)
             .into_iter()
             .map(|text| VirtualRow::Comment {
                 thread: thread.id,
                 kind: CommentRowKind::Orphaned,
                 text,
+                spans: Vec::new(),
                 attention,
                 mark: RowMark::None,
                 body: None,
@@ -880,6 +929,7 @@ pub fn comment_rows(
     }
 
     if thread.collapsed {
+        thread.drawn.take();
         let replies = thread.messages.len().saturating_sub(1);
         let summary = match replies {
             0 => format!("{COLLAPSED} {}", thread.summary()),
@@ -891,6 +941,7 @@ pub fn comment_rows(
             thread: thread.id,
             kind: CommentRowKind::Summary,
             text: summary,
+            spans: Vec::new(),
             attention,
             mark: RowMark::None,
             body: None,
@@ -937,6 +988,7 @@ pub fn comment_rows(
         thread: thread.id,
         kind: CommentRowKind::Summary,
         text: header,
+        spans: Vec::new(),
         attention,
         mark: RowMark::None,
         body: None,
@@ -948,7 +1000,36 @@ pub fn comment_rows(
     // cursor's line on the next frame. Capping it and scrolling *within* it
     // keeps the code being reviewed on screen, which is the point of the
     // exercise.
-    let body = wrap_text(entry.text, text_width);
+    //
+    // An agent reply is laid out by the markdown preview renderer when one was
+    // given. The source stays the source: deleting the entry is what removes
+    // it, and nothing in this path writes the rendered text back.
+    let body = if entry.label == "agent" {
+        match layout_agent.as_deref_mut() {
+            Some(layout) => {
+                let lines = layout(entry.text, text_width);
+                if lines.is_empty() {
+                    vec![CommentLine::plain("")]
+                } else {
+                    lines
+                }
+            }
+            None => wrap_text(entry.text, text_width)
+                .into_iter()
+                .map(CommentLine::plain)
+                .collect(),
+        }
+    } else {
+        wrap_text(entry.text, text_width)
+            .into_iter()
+            .map(CommentLine::plain)
+            .collect()
+    };
+    thread.drawn.replace(Some(DrawnBody {
+        view: index,
+        width: text_width,
+        lines: body.iter().map(CommentLine::text).collect(),
+    }));
     let max_body_rows = max_body_rows.max(1);
     let last = body.len().saturating_sub(1);
     let cursor = thread.cursor.min(last);
@@ -995,22 +1076,42 @@ pub fn comment_rows(
             .enumerate()
             .skip(scroll)
             .take(max_body_rows)
-            .map(|(row, text)| VirtualRow::Comment {
-                thread: thread.id,
-                kind,
-                text,
-                attention,
-                mark: match selected {
-                    None => RowMark::None,
-                    Some(_) if row == cursor => RowMark::Cursor,
-                    Some(Some((start, end))) if (start..=end).contains(&row) => RowMark::Selected,
-                    Some(_) => RowMark::None,
-                },
-                body: Some(row),
+            .map(|(row, line)| {
+                let (text, spans) = styled_line(line);
+                VirtualRow::Comment {
+                    thread: thread.id,
+                    kind,
+                    text,
+                    spans,
+                    attention,
+                    mark: match selected {
+                        None => RowMark::None,
+                        Some(_) if row == cursor => RowMark::Cursor,
+                        Some(Some((start, end))) if (start..=end).contains(&row) => {
+                            RowMark::Selected
+                        }
+                        Some(_) => RowMark::None,
+                    },
+                    body: Some(row),
+                }
             }),
     );
 
     rows
+}
+
+/// Keep markdown styling only when a span actually carries some. A plain row
+/// stays a single string so it is painted with the comment's own colour.
+fn styled_line(line: CommentLine) -> (String, Vec<CommentSpan>) {
+    use crate::graphics::Style;
+
+    let text = line.text();
+    let spans = if line.spans.iter().any(|span| span.style != Style::default()) {
+        line.spans
+    } else {
+        Vec::new()
+    };
+    (text, spans)
 }
 
 /// `agent 3/5 ─────────` filled to the pane width, so the block reads as one
@@ -1296,6 +1397,93 @@ mod test {
             vec![RowMark::None, RowMark::None],
             "a box the keys do not act on must not look like it has a cursor"
         );
+    }
+
+    #[test]
+    fn an_agent_reply_is_rendered_without_changing_its_text() {
+        use crate::graphics::{Modifier, Style};
+
+        let mut store = ReviewStore::default();
+        let id = store.draft(
+            PathBuf::from("/r/a.rs"),
+            DiffSide::Working,
+            1,
+            "**keep**".into(),
+        );
+        store.take_draft(id);
+        store.push_message(id, Role::Agent, "**bold**\nmore".into());
+
+        let mut layout = |_text: &str, _width: usize| {
+            vec![
+                CommentLine {
+                    spans: vec![CommentSpan {
+                        text: "bold".into(),
+                        style: Style::default().add_modifier(Modifier::BOLD),
+                    }],
+                },
+                CommentLine::plain("more"),
+            ]
+        };
+        let thread = store.get(id).unwrap();
+        let agent = render_comment_rows(
+            thread,
+            40,
+            None,
+            Attention::Idle,
+            usize::MAX,
+            &mut Some(&mut layout),
+        );
+        let body: Vec<_> = agent
+            .into_iter()
+            .skip(1)
+            .map(|row| match row {
+                VirtualRow::Comment { text, spans, .. } => (text, spans),
+                other => unreachable!("comment rows only, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(body.len(), 2);
+        assert_eq!(body[0].0, "bold");
+        assert!(body[0].1.iter().any(|span| {
+            span.text == "bold" && span.style.add_modifier.contains(Modifier::BOLD)
+        }));
+        // Rendering is not an edit.
+        assert_eq!(
+            thread.entry(thread.view_index()).unwrap().text,
+            "**bold**\nmore"
+        );
+
+        // Nothing selected copies the source. A partial selection copies the
+        // rendered rows, which is what is on screen.
+        assert_eq!(thread.copy_text(40).unwrap(), "**bold**\nmore");
+        let thread = store.get_mut(id).unwrap();
+        thread.cursor = 0;
+        thread.select = Some(0);
+        assert_eq!(thread.copy_text(40).unwrap(), "bold");
+
+        // The user's own comment is not run through the agent renderer.
+        store.get_mut(id).unwrap().step_view(false);
+        let user = comment_rows(
+            store.get(id).unwrap(),
+            40,
+            None,
+            Attention::Idle,
+            usize::MAX,
+        );
+        let user_body: Vec<_> = user
+            .into_iter()
+            .skip(1)
+            .map(|row| match row {
+                VirtualRow::Comment { text, .. } => text,
+                other => unreachable!("comment rows only, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(user_body, vec!["**keep**"]);
+
+        // The rendered reply can still be removed. The comment beside it stays.
+        assert_eq!(store.remove_entry(id, 1), Some(1));
+        let thread = store.get(id).unwrap();
+        assert_eq!(thread.entry_count(), 1);
+        assert_eq!(thread.entry(0).unwrap().text, "**keep**");
     }
 
     #[test]
@@ -1766,6 +1954,7 @@ mod test {
                 collapsed: false,
                 view: 0,
                 scroll: Cell::new(0),
+                drawn: RefCell::new(None),
                 cursor: 0,
                 select: None,
                 awaiting: false,

@@ -217,6 +217,10 @@ impl Decoration for VirtualRowDecoration {
             if y >= renderer.offset.row as u16 + viewport.height {
                 break;
             }
+            // Scrolled off the top: the view starts partway into this box.
+            let Some(screen_row) = renderer.screen_row(y) else {
+                continue;
+            };
             match row {
                 VirtualRow::Spacer => {
                     renderer.set_style(Rect::new(viewport.x, y, viewport.width, 1), self.spacer);
@@ -237,7 +241,7 @@ impl Decoration for VirtualRowDecoration {
                 } => {
                     self.hits.borrow_mut().push(helix_view::review::BoxHit {
                         view: self.view,
-                        row: y,
+                        row: screen_row,
                         x: viewport.x,
                         width: viewport.width,
                         thread: *thread,

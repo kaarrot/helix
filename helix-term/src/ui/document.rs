@@ -280,7 +280,7 @@ impl<'a> TextRenderer<'a> {
         col: u16,
     ) -> bool {
         if (row as usize) < self.offset.row
-            || row >= self.viewport.height
+            || row - self.offset.row as u16 >= self.viewport.height
             || col >= self.viewport.width
         {
             return false;
@@ -414,12 +414,22 @@ impl<'a> TextRenderer<'a> {
         }
     }
 
+    /// The terminal row that text row `y` is drawn on, or `None` when it is
+    /// scrolled off the top.
+    ///
+    /// Text rows count from the anchor line. When the view starts partway
+    /// through the virtual rows below that line, the first `offset.row` of them
+    /// are above the viewport, and every later row sits that much higher.
+    pub fn screen_row(&self, y: u16) -> Option<u16> {
+        let y = (y as usize).checked_sub(self.offset.row)?;
+        Some(self.viewport.y + y as u16)
+    }
+
     pub fn set_string(&mut self, x: u16, y: u16, string: impl AsRef<str>, style: Style) {
-        if (y as usize) < self.offset.row {
+        let Some(y) = self.screen_row(y) else {
             return;
-        }
-        self.surface
-            .set_string(x, y + self.viewport.y, string, style)
+        };
+        self.surface.set_string(x, y, string, style)
     }
 
     pub fn set_stringn(
@@ -430,18 +440,18 @@ impl<'a> TextRenderer<'a> {
         width: usize,
         style: Style,
     ) {
-        if (y as usize) < self.offset.row {
+        let Some(y) = self.screen_row(y) else {
             return;
-        }
-        self.surface
-            .set_stringn(x, y + self.viewport.y, string, width, style);
+        };
+        self.surface.set_stringn(x, y, string, width, style);
     }
 
     /// Sets the style of an area **within the text viewport* this accounts
     /// both for the renderers vertical offset and its viewport
     pub fn set_style(&mut self, mut area: Rect, style: Style) {
-        area = area.clip_top(self.offset.row as u16);
-        area.y += self.viewport.y;
+        let top = self.offset.row as u16;
+        area = area.clip_top(top.saturating_sub(area.y));
+        area.y = area.y.saturating_sub(top) + self.viewport.y;
         self.surface.set_style(area, style);
     }
 
@@ -456,18 +466,11 @@ impl<'a> TextRenderer<'a> {
         ellipsis: bool,
         truncate_start: bool,
     ) -> (u16, u16) {
-        if (y as usize) < self.offset.row {
+        let Some(y) = self.screen_row(y) else {
             return (x, y);
-        }
-        self.surface.set_string_truncated(
-            x,
-            y + self.viewport.y,
-            string,
-            width,
-            style,
-            ellipsis,
-            truncate_start,
-        )
+        };
+        self.surface
+            .set_string_truncated(x, y, string, width, style, ellipsis, truncate_start)
     }
 }
 

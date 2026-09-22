@@ -104,6 +104,21 @@ fn setup_integration_logging() {
 }
 
 impl Application {
+    /// The last frame the test backend was sent, one string per terminal row,
+    /// so a test can check where something was actually drawn.
+    #[cfg(feature = "integration")]
+    pub fn screen_rows(&self) -> Vec<String> {
+        let buffer = self.terminal.backend().buffer();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .filter_map(|x| buffer.get(x, y))
+                    .map(|cell| cell.symbol.as_str())
+                    .collect()
+            })
+            .collect()
+    }
+
     pub fn new(args: Args, config: Config, lang_loader: syntax::Loader) -> Result<Self, Error> {
         #[cfg(feature = "integration")]
         setup_integration_logging();

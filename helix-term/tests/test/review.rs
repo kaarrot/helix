@@ -2980,3 +2980,169 @@ async fn a_reply_goes_to_the_focused_box_when_two_share_a_line() -> anyhow::Resu
     harness.close(&mut app).await?;
     Ok(())
 }
+
+/// Every body row the renderer recorded for `view` shows that body line, on
+/// the terminal row the mouse reports for it. Returns how many rows it checked.
+#[cfg(not(windows))]
+fn assert_hits_on_their_rows(app: &Application, view: helix_view::ViewId, id: ThreadId) -> usize {
+    let screen = app.screen_rows();
+    // Inside the view's own pane: two panes on one document show the same box
+    // on the same rows of each, so the text alone could match the wrong pane.
+    let pane = {
+        let view = app.editor.tree.get(view);
+        view.inner_area(app.editor.document(view.doc).unwrap())
+    };
+    let hits: Vec<_> = app
+        .editor
+        .diff
+        .reviews
+        .hits
+        .borrow()
+        .iter()
+        .filter(|hit| hit.view == view && hit.thread == id)
+        .copied()
+        .collect();
+    let mut checked = 0;
+    for hit in hits {
+        assert!(
+            (pane.top()..pane.bottom()).contains(&hit.row),
+            "row {} is outside the pane, rows {}..{}",
+            hit.row,
+            pane.top(),
+            pane.bottom()
+        );
+        let Some(body) = hit.body else {
+            continue;
+        };
+        let shown: String = screen[hit.row as usize]
+            .chars()
+            .skip(hit.x as usize)
+            .take(hit.width as usize)
+            .collect();
+        assert!(
+            shown.contains(&format!("reply row {body}")),
+            "body line {body} is recorded on row {} but that row shows {:?}",
+            hit.row,
+            shown.trim_end()
+        );
+        checked += 1;
+    }
+    checked
+}
+
+/// A reply of `rows` list items, `reply row 0` onwards, one body line each.
+#[cfg(not(windows))]
+fn numbered_reply(rows: usize) -> String {
+    (0..rows).map(|n| format!("- reply row {n}\n")).collect()
+}
+
+/// Scrolled until the view starts partway into a box, the box moves up with
+/// the code. It used to stay where it was, with the code drawn over its bottom
+/// rows, blank rows above it and the line numbers out by the scroll.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg(not(windows))]
+async fn scrolling_into_a_box_moves_it_with_the_code() -> anyhow::Result<()> {
+    use termina::event::{MouseButton, MouseEventKind};
+
+    let file = tempfile::NamedTempFile::new()?;
+    let text: String = (0..400).map(|n| format!("code {n}\n")).collect();
+    std::fs::write(file.path(), &text)?;
+    let (mut app, mut harness, id) = app_with_reply(file.path(), &numbered_reply(10)).await?;
+    harness
+        .pump(&mut app, std::time::Duration::from_millis(200))
+        .await;
+    let before = app.screen_rows();
+
+    // One wheel step is three rows. The box under line 0 is taller than that,
+    // so the view now starts inside it.
+    harness
+        .mouse(&mut app, MouseEventKind::ScrollDown, 10, 20)
+        .await?;
+    let (vertical_offset, view_height) = {
+        let view = app.editor.tree.get(app.editor.tree.focus);
+        let doc = app.editor.document(view.doc).unwrap();
+        (
+            doc.view_offset(view.id).vertical_offset,
+            view.inner_height(),
+        )
+    };
+    assert_eq!(vertical_offset, 3, "the view should start inside the box");
+
+    let after = app.screen_rows();
+    for row in 0..view_height - 3 {
+        assert_eq!(
+            after[row].trim_end(),
+            before[row + 3].trim_end(),
+            "row {row} should show what row {} showed before the scroll",
+            row + 3
+        );
+    }
+
+    // The box rows the mouse can find are the ones on screen, where they are.
+    let view = app.editor.tree.focus;
+    assert_eq!(
+        assert_hits_on_their_rows(&app, view, id),
+        9,
+        "body lines 1..=9 are on screen; the header and line 0 are scrolled off"
+    );
+    let row = after
+        .iter()
+        .position(|row| row.contains("reply row 4"))
+        .expect("body line 4 should be on screen") as u16;
+    harness
+        .mouse(&mut app, MouseEventKind::Down(MouseButton::Left), row, 10)
+        .await?;
+    assert_eq!(app.editor.diff.reviews.focused, Some(id));
+    assert_eq!(
+        app.editor.diff.reviews.get(id).unwrap().cursor,
+        4,
+        "the press should land on the row it was over"
+    );
+
+    harness.close(&mut app).await?;
+    Ok(())
+}
+
+/// A box in a pane that does not start at the top of the terminal records its
+/// rows in terminal coordinates, so a click in the lower of two panes lands on
+/// the row it was over.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg(not(windows))]
+async fn a_click_on_a_box_in_a_lower_split_lands_on_its_row() -> anyhow::Result<()> {
+    use termina::event::{MouseButton, MouseEventKind};
+
+    let file = tempfile::NamedTempFile::new()?;
+    std::fs::write(file.path(), "one\ntwo\nthree\n")?;
+    let (mut app, mut harness, id) = app_with_reply(file.path(), &numbered_reply(5)).await?;
+
+    assert!(harness.send_keys(&mut app, ":hsplit<ret>").await?);
+    let lower = app.editor.tree.focus;
+    let top = {
+        let view = app.editor.tree.get(lower);
+        view.inner_area(app.editor.document(view.doc).unwrap()).y
+    };
+    assert!(top > 0, "the focused pane should be the lower one");
+
+    assert_eq!(assert_hits_on_their_rows(&app, lower, id), 5);
+    let row = app
+        .editor
+        .diff
+        .reviews
+        .hits
+        .borrow()
+        .iter()
+        .find(|hit| hit.view == lower && hit.body == Some(3))
+        .expect("body line 3 should be painted in the lower pane")
+        .row;
+    assert!(row > top, "the lower pane's box is below its top edge");
+    harness
+        .mouse(&mut app, MouseEventKind::Down(MouseButton::Left), row, 10)
+        .await?;
+    assert_eq!(app.editor.tree.focus, lower);
+    assert_eq!(app.editor.diff.reviews.get(id).unwrap().cursor, 3);
+
+    // `close` quits one view, so leave only one.
+    assert!(harness.send_keys(&mut app, "<esc><C-w>o").await?);
+    harness.close(&mut app).await?;
+    Ok(())
+}

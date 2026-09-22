@@ -6,6 +6,7 @@ use helix_view::{
 use tui::buffer::Buffer;
 
 use crate::compositor::{Component, Context, Event, EventResult};
+use crate::ui::picker::MIN_AREA_WIDTH_FOR_SIDE_BY_SIDE;
 
 /// Contains a component placed in the center of the parent component
 pub struct Overlay<T> {
@@ -15,11 +16,23 @@ pub struct Overlay<T> {
     pub calc_child_size: Box<dyn Fn(Rect) -> Rect>,
 }
 
-/// Surrounds the component with a margin of 5% on each side, and an additional 2 rows at the bottom
+/// Surrounds the component with a margin of 5% on each side, and an additional 2 rows at the bottom.
+///
+/// Narrow or tall terminals use the full remaining area so a stacked picker
+/// preview still has room after the 50/50 split.
 pub fn overlaid<T>(content: T) -> Overlay<T> {
     Overlay {
         content,
-        calc_child_size: Box::new(|rect: Rect| clip_rect_relative(rect.clip_bottom(2), 90, 90)),
+        calc_child_size: Box::new(overlay_area),
+    }
+}
+
+pub(crate) fn overlay_area(rect: Rect) -> Rect {
+    let rect = rect.clip_bottom(2);
+    if rect.width < MIN_AREA_WIDTH_FOR_SIDE_BY_SIDE || rect.height > rect.width {
+        rect
+    } else {
+        clip_rect_relative(rect, 90, 90)
     }
 }
 
@@ -72,5 +85,44 @@ impl<T: Component + 'static> Component for Overlay<T> {
 
     fn id(&self) -> Option<&'static str> {
         self.content.id()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn narrow_terminal_uses_full_overlay() {
+        let area = overlay_area(Rect::new(0, 0, 40, 24));
+        assert_eq!(
+            area,
+            Rect::new(0, 0, 40, 22),
+            "phone-sized terminals should not lose 10% to overlay margins"
+        );
+    }
+
+    #[test]
+    fn short_narrow_terminal_still_keeps_statusline_rows() {
+        let area = overlay_area(Rect::new(0, 0, 40, 18));
+        assert_eq!(area, Rect::new(0, 0, 40, 16));
+        assert!(
+            area.height >= crate::ui::picker::MIN_AREA_HEIGHT_FOR_VERTICAL_PREVIEW,
+            "a 18-row Termux screen must still be tall enough for a stacked preview"
+        );
+    }
+
+    #[test]
+    fn wide_short_terminal_keeps_centered_margin() {
+        let area = overlay_area(Rect::new(0, 0, 120, 40));
+        assert_eq!(area.width, 108);
+        assert_eq!(area.height, 34);
+        assert!(area.x > 0 && area.y > 0);
+    }
+
+    #[test]
+    fn tall_terminal_uses_full_overlay() {
+        let area = overlay_area(Rect::new(0, 0, 80, 100));
+        assert_eq!(area, Rect::new(0, 0, 80, 98));
     }
 }

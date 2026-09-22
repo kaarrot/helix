@@ -2581,3 +2581,170 @@ async fn agent_replies_render_as_markdown_and_can_still_be_deleted() -> anyhow::
     harness.close(&mut app).await?;
     Ok(())
 }
+
+/// A reply from a real child process lands on the thread that asked, even when
+/// the cursor has moved to another comment by the time it arrives.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_late_reply_lands_on_its_thread_after_moving_away() -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let bin = tempfile::tempdir()?;
+    let fake = bin.path().join("claude");
+    std::fs::write(
+        &fake,
+        "#!/bin/sh\n\
+         c=$(sed -n 's/^comment: //p' | head -n 1)\n\
+         sleep 1\n\
+         printf '{\"type\":\"result\",\"is_error\":false,\"result\":\"re: %s\"}\\n' \"$c\"\n",
+    )?;
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755))?;
+    let path = std::env::var("PATH").unwrap_or_default();
+    std::env::set_var("PATH", format!("{}:{path}", bin.path().display()));
+
+    let repo = GitRepoFixture::new()?;
+    repo.write_file("tracked.rs", "a\nb\nc\nd\ne\n")?;
+    repo.commit_all("initial")?;
+    let _cwd = CwdGuard::enter(repo.path()).await?;
+    let file = repo.file("tracked.rs");
+    let mut app = AppBuilder::new().with_file(&file, None).build()?;
+    let mut harness = AppTestHarness::new();
+    app.editor.diff.agent = Some(Box::new(helix_term::review_agent::ClaudeChildAgent::new(
+        repo.path().to_path_buf(),
+    )));
+
+    // Ask on line 0, then go and write another comment on line 3 and send it
+    // while the first is still running, and stop on its box.
+    assert!(harness.send_keys(&mut app, "<space>mRc").await?);
+    assert!(harness.send_keys(&mut app, "first<C-s>").await?);
+    assert!(harness.send_keys(&mut app, "<space>mRS").await?);
+    assert!(harness.send_keys(&mut app, "3gg<space>mRc").await?);
+    assert!(harness.send_keys(&mut app, "second<C-s>").await?);
+    assert!(harness.send_keys(&mut app, "<space>mRS").await?);
+    assert!(harness.send_keys(&mut app, "j").await?);
+
+    for _ in 0..40 {
+        harness
+            .pump(&mut app, std::time::Duration::from_millis(100))
+            .await;
+        if !app.editor.diff.reviews.any_awaiting() {
+            break;
+        }
+    }
+
+    let texts = |line: u32| -> Vec<String> {
+        let thread = app
+            .editor
+            .diff
+            .reviews
+            .for_file(&file)
+            .find(|thread| thread.line == line)
+            .expect("thread");
+        thread.messages.iter().map(|m| m.text.clone()).collect()
+    };
+    assert_eq!(texts(0), vec!["first", "re: first"]);
+    assert_eq!(texts(2), vec!["second", "re: second"]);
+
+    std::env::set_var("PATH", path);
+    harness.close(&mut app).await?;
+    Ok(())
+}
+
+/// Opening the reply box on an older entry and cancelling it must not throw
+/// away the entries after it: nothing has been written to replace them.
+#[tokio::test(flavor = "multi_thread")]
+async fn cancelling_a_reply_from_an_older_entry_keeps_the_thread() -> anyhow::Result<()> {
+    use helix_view::review::agent::AgentEvent;
+
+    let file = tempfile::NamedTempFile::new()?;
+    std::fs::write(file.path(), "one\ntwo\nthree\n")?;
+    let mut app = AppBuilder::new().with_file(file.path(), None).build()?;
+    let mut harness = AppTestHarness::new();
+    let fake = FakeAgent::default();
+    let sent = fake.sent.clone();
+    app.editor.diff.agent = Some(Box::new(fake));
+
+    assert!(harness.send_keys(&mut app, "<space>mRc").await?);
+    assert!(harness.send_keys(&mut app, "first<C-s>").await?);
+    assert!(harness.send_keys(&mut app, "<space>mRS").await?);
+    let id = sent.lock().unwrap()[0].0;
+    app.editor
+        .diff
+        .reviews
+        .apply_agent_event(AgentEvent::Completed(id, "answer".into()));
+
+    // Stop on the box, walk back to the question, open a reply and cancel it.
+    assert!(harness.send_keys(&mut app, "j<C-left>").await?);
+    assert_eq!(app.editor.diff.reviews.get(id).unwrap().view_index(), 0);
+    assert!(harness.send_keys(&mut app, "c").await?);
+    assert!(harness.send_keys(&mut app, "<esc>").await?);
+
+    let thread = app.editor.diff.reviews.get(id).unwrap();
+    assert_eq!(thread.entry_count(), 2, "the answer must survive an Esc");
+    assert_eq!(thread.entry(1).unwrap().text, "answer");
+    assert!(!thread.rewound);
+
+    harness.close(&mut app).await?;
+    Ok(())
+}
+
+/// Two threads can end up on one line, for instance when one is orphaned onto
+/// it. `j` stops on each box in turn, and a reply goes to the box it was typed
+/// under rather than to the first thread on the line.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reply_goes_to_the_focused_box_when_two_share_a_line() -> anyhow::Result<()> {
+    use helix_view::review::agent::AgentEvent;
+
+    let file = tempfile::NamedTempFile::new()?;
+    std::fs::write(file.path(), "one\ntwo\nthree\n")?;
+    let mut app = AppBuilder::new().with_file(file.path(), None).build()?;
+    let mut harness = AppTestHarness::new();
+    let fake = FakeAgent::default();
+    let sent = fake.sent.clone();
+    app.editor.diff.agent = Some(Box::new(fake));
+
+    assert!(harness.send_keys(&mut app, "<space>mRc").await?);
+    assert!(harness.send_keys(&mut app, "top<C-s>").await?);
+    let top = app.editor.diff.reviews.pending().next().unwrap().id;
+    let (path, side) = {
+        let thread = app.editor.diff.reviews.get(top).unwrap();
+        (thread.file.clone(), thread.side)
+    };
+    let bottom = app
+        .editor
+        .diff
+        .reviews
+        .draft(path, side, 1, "bottom".into());
+    // `draft` reuses a thread already on the line, so put it there the way an
+    // orphaned thread arrives: by its line moving.
+    app.editor.diff.reviews.get_mut(bottom).unwrap().line = 0;
+    assert!(harness.send_keys(&mut app, "<space>mRS").await?);
+    assert_eq!(sent.lock().unwrap().len(), 2);
+    for id in [top, bottom] {
+        app.editor
+            .diff
+            .reviews
+            .apply_agent_event(AgentEvent::Completed(id, "answer".into()));
+    }
+
+    assert!(harness.send_keys(&mut app, "j").await?);
+    assert_eq!(app.editor.diff.reviews.focused, Some(top));
+    assert!(harness.send_keys(&mut app, "j").await?);
+    assert_eq!(app.editor.diff.reviews.focused, Some(bottom));
+
+    assert!(harness.send_keys(&mut app, "c").await?);
+    assert!(harness.send_keys(&mut app, "for the bottom<C-s>").await?);
+    assert_eq!(
+        app.editor
+            .diff
+            .reviews
+            .get(bottom)
+            .unwrap()
+            .draft
+            .as_deref(),
+        Some("for the bottom")
+    );
+    assert_eq!(app.editor.diff.reviews.get(top).unwrap().draft, None);
+
+    harness.close(&mut app).await?;
+    Ok(())
+}

@@ -48,12 +48,31 @@ fn cursor_line(cx: &mut Context) -> usize {
     doc.selection(view.id).primary().cursor_line(text)
 }
 
-/// The thread anchored on the cursor's line, if any.
-fn thread_at_cursor(cx: &mut Context) -> Option<ThreadId> {
+/// Threads anchored on the cursor's line, in the order their boxes are drawn.
+///
+/// Usually one, but an edit can collapse two threads onto the same line: an
+/// orphaned thread sits at the point its text was deleted from.
+fn threads_at_cursor(cx: &mut Context) -> Vec<ThreadId> {
     let line = cursor_line(cx);
     threads_in_view(cx)
         .into_iter()
-        .find_map(|(thread_line, id)| (thread_line == line).then_some(id))
+        .filter_map(|(thread_line, id)| (thread_line == line).then_some(id))
+        .collect()
+}
+
+/// The thread the keys on the cursor's line act on, if any.
+///
+/// The focused box wins when it is on this line. Taking the first thread
+/// instead would send a reply typed under one box to the conversation of the
+/// box above it.
+fn thread_at_cursor(cx: &mut Context) -> Option<ThreadId> {
+    let on_line = threads_at_cursor(cx);
+    cx.editor
+        .diff
+        .reviews
+        .focused
+        .filter(|id| on_line.contains(id))
+        .or_else(|| on_line.first().copied())
 }
 
 /// Comment on the current line, or reply to the thread already there.
@@ -66,7 +85,8 @@ fn thread_at_cursor(cx: &mut Context) -> Option<ThreadId> {
 /// An unsent draft is the comment still being written. `Ctrl-S` only closes
 /// the box, so the same key opens that draft again with the text in place.
 /// A reply looked at from an older entry still starts blank: continuing from
-/// there discards the draft along with everything after that entry.
+/// there discards the draft along with everything after that entry. Nothing is
+/// discarded until the reply is saved, so `Esc` leaves the thread as it was.
 pub fn review_add(cx: &mut Context) {
     // Claim the conversation first. Claiming is what loads the saved threads,
     // and until it happens the store is empty -- so on a freshly opened editor
@@ -84,25 +104,26 @@ pub fn review_add(cx: &mut Context) {
     if let Some(id) = existing {
         // Replying while looking at an older entry continues from there: the
         // replies after it are dropped, because the point of going back is to
-        // take the conversation a different way.
-        let discarded = if is_focused(cx) {
-            let index = cx
+        // take the conversation a different way. Only once the reply is saved,
+        // though. Dropping them as the box opens would lose them to an `Esc`.
+        let rewind = if is_focused(cx) {
+            cx.editor.diff.reviews.get(id).and_then(|thread| {
+                let index = thread.view_index();
+                (index + 1 < thread.entry_count()).then_some(index)
+            })
+        } else {
+            None
+        };
+
+        // A rewind throws the draft away with the rest, so it is not one this
+        // reply continues.
+        let had_draft = rewind.is_none()
+            && cx
                 .editor
                 .diff
                 .reviews
                 .get(id)
-                .map_or(0, |thread| thread.view_index());
-            cx.editor.diff.reviews.rewind_to(id, index)
-        } else {
-            0
-        };
-
-        let had_draft = cx
-            .editor
-            .diff
-            .reviews
-            .get(id)
-            .is_some_and(|thread| thread.is_pending());
+                .is_some_and(|thread| thread.is_pending());
 
         let Some(anchor) = ({
             let (view, doc) = current_ref!(cx.editor);
@@ -119,40 +140,60 @@ pub fn review_add(cx: &mut Context) {
         // without first having to stop on it with j/k.
         cx.editor.diff.reviews.focused = Some(id);
 
-        // Rewind clears a draft it throws away. Whatever draft is still here
-        // is the one the box should show, caret at the end, ready to continue.
-        let (initial, label) = match cx.editor.diff.reviews.get(id) {
-            Some(thread) if thread.messages.is_empty() => {
-                (thread.draft.clone().unwrap_or_default(), "comment: ")
-            }
-            Some(thread) => (thread.draft.clone().unwrap_or_default(), "reply: "),
+        // The draft is what the box should show, caret at the end, ready to
+        // continue. Not when rewinding: saving would discard it.
+        let (initial, label, agent_session) = match cx.editor.diff.reviews.get(id) {
+            Some(thread) => (
+                if rewind.is_some() {
+                    String::new()
+                } else {
+                    thread.draft.clone().unwrap_or_default()
+                },
+                if thread.messages.is_empty() {
+                    "comment: "
+                } else {
+                    "reply: "
+                },
+                thread.agent_session.clone(),
+            ),
             None => return,
         };
 
-        prompt_at_cursor(cx, label, anchor, &initial, move |cx, input, send_now| {
-            if input.trim().is_empty() {
-                return;
-            }
-            cx.editor
-                .diff
-                .reviews
-                .set_draft(id, input.trim().to_string());
-            let pending = cx.editor.diff.reviews.pending_count();
-            crate::review_agent::schedule_save();
-            let drafted = if discarded > 0 {
-                // Say what was thrown away. This is the only place the
-                // store discards text, so it should never be silent.
-                format!("Reply drafted, {discarded} later entries discarded ({pending} pending)")
-            } else if had_draft {
-                format!("Draft updated ({pending} pending)")
-            } else {
-                format!("Reply drafted ({pending} pending)")
-            };
-            cx.editor.set_status(drafted);
-            if send_now {
-                send_now_from_box(cx, id);
-            }
-        });
+        prompt_at_cursor(
+            cx,
+            label,
+            agent_session,
+            anchor,
+            &initial,
+            move |cx, input, send_now| {
+                if input.trim().is_empty() {
+                    return;
+                }
+                let discarded =
+                    rewind.map_or(0, |index| cx.editor.diff.reviews.rewind_to(id, index));
+                cx.editor
+                    .diff
+                    .reviews
+                    .set_draft(id, input.trim().to_string());
+                let pending = cx.editor.diff.reviews.pending_count();
+                crate::review_agent::schedule_save();
+                let drafted = if discarded > 0 {
+                    // Say what was thrown away. This is the only place the
+                    // store discards text, so it should never be silent.
+                    format!(
+                        "Reply drafted, {discarded} later entries discarded ({pending} pending)"
+                    )
+                } else if had_draft {
+                    format!("Draft updated ({pending} pending)")
+                } else {
+                    format!("Reply drafted ({pending} pending)")
+                };
+                cx.editor.set_status(drafted);
+                if send_now {
+                    send_now_from_box(cx, id);
+                }
+            },
+        );
         return;
     }
 
@@ -166,6 +207,7 @@ pub fn review_add(cx: &mut Context) {
     prompt_at_cursor(
         cx,
         "comment: ",
+        None,
         (file.clone(), side, line as u32),
         "",
         move |cx, input, send_now| {
@@ -227,6 +269,9 @@ fn comment_box_ctrl_s(key: helix_view::input::KeyEvent) -> Option<bool> {
 /// and sends. Alt-Enter is not used: on Windows it toggles fullscreen.
 struct CommentInput {
     label: String,
+    /// The thread's agent conversation, shown at the right of the title row so
+    /// it can be resumed in the agent itself. `None` for a new comment.
+    session: Option<String>,
     lines: Vec<String>,
     row: usize,
     /// Char index within the current line.
@@ -240,6 +285,7 @@ struct CommentInput {
 impl CommentInput {
     fn new(
         label: String,
+        session: Option<String>,
         initial: &str,
         on_submit: impl FnMut(&mut crate::compositor::Context, &str, bool) + 'static,
     ) -> Self {
@@ -254,6 +300,7 @@ impl CommentInput {
         let col = lines[row].chars().count();
         Self {
             label,
+            session,
             lines,
             row,
             col,
@@ -365,9 +412,11 @@ impl crate::compositor::Component for CommentInput {
 
         // Rule out to the edge, the same way a thread's header does, so the
         // box has a visible top rather than trailing off into the buffer.
-        let mut header = self.label.clone();
-        let fill = body_width.saturating_sub(header.chars().count());
-        header.extend(std::iter::repeat('─').take(fill));
+        let header = helix_view::review::rule_with_tail(
+            self.label.clone(),
+            &[self.session.as_deref()],
+            body_width,
+        );
         surface.set_stringn(area.x + 1, area.y, &header, body_width, hint);
         for (row, line) in self.lines.iter().enumerate() {
             let y = area.y + 1 + row as u16;
@@ -543,6 +592,7 @@ fn send_now_from_box(cx: &mut crate::compositor::Context, id: ThreadId) {
 fn prompt_at_cursor(
     cx: &mut Context,
     label: &'static str,
+    agent_session: Option<String>,
     anchor: (std::path::PathBuf, DiffSide, u32),
     initial: &str,
     callback: impl FnMut(&mut crate::compositor::Context, &str, bool) + 'static,
@@ -566,6 +616,7 @@ fn prompt_at_cursor(
 
     let input = CommentInput::new(
         format!("{label}  (ret: newline · ctrl-s: save · ctrl-shift-s: send · esc: cancel)"),
+        agent_session,
         initial,
         callback,
     );
@@ -1607,24 +1658,43 @@ fn review_line_move(cx: &mut Context, down: bool) {
         return;
     }
 
-    if is_focused(cx) {
+    let on_line = threads_at_cursor(cx);
+    let focused = cx
+        .editor
+        .diff
+        .reviews
+        .focused
+        .and_then(|id| on_line.iter().position(|candidate| *candidate == id));
+
+    if let Some(at) = focused {
+        // Boxes stacked on one line are each a stop, in the order drawn.
+        let next = if down {
+            on_line.get(at + 1)
+        } else {
+            at.checked_sub(1).and_then(|at| on_line.get(at))
+        };
+        if let Some(&id) = next {
+            cx.editor.diff.reviews.focused = Some(id);
+            return;
+        }
         cx.editor.diff.reviews.focused = None;
         plain(cx);
         return;
     }
 
     if down {
-        match thread_at_cursor(cx) {
+        match on_line.first() {
             // Stop on the box without moving: the cursor stays on the line the
             // thread belongs to, which is what the box is about.
-            Some(id) => cx.editor.diff.reviews.focused = Some(id),
+            Some(&id) => cx.editor.diff.reviews.focused = Some(id),
             None => plain(cx),
         }
     } else {
         plain(cx);
         // Landing on a line that carries a thread stops on its box, so going up
-        // visits boxes as reliably as going down.
-        cx.editor.diff.reviews.focused = thread_at_cursor(cx);
+        // visits boxes as reliably as going down. The lowest box is the one
+        // reached first from below.
+        cx.editor.diff.reviews.focused = threads_at_cursor(cx).last().copied();
     }
 }
 

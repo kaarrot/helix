@@ -434,7 +434,11 @@ conversation it is. The first turn passes `--session-id`. Every later turn in
 the same window passes `--resume` with that same UUID. Claude is `claude -p`
 with the prompt on stdin. Grok is `grok --prompt-file`. Turns on different
 comments run at the same time. A follow-up waits until its own previous turn
-has finished, so two processes never resume one conversation together. A
+has finished, so two processes never resume one conversation together. The
+UUID is shown at the right of the box's header and of the reply input, so
+running `claude --resume <uuid>` (or `/resume <uuid>`) from the worktree opens
+that one comment's conversation interactively. Helix does not know about that
+session, so do not reply from Helix while it is open there. A
 conversation name and an agent can be given together, in either order:
 `:review-session spike grok`.
 

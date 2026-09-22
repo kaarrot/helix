@@ -1019,29 +1019,12 @@ pub(crate) fn render_comment_rows(
         CommentRowKind::User
     };
 
-    let mut header = header_text(entry.label, index + 1, total, text_width);
     // While a reply is in flight the header carries the spinner, so the wait is
     // visible on the thread it belongs to rather than only in the statusline.
-    if thread.awaiting {
-        if let Some(frame) = spinner {
-            header = header_text(
-                &format!("{} {frame}", entry.label),
-                index + 1,
-                total,
-                text_width,
-            );
-        }
-    }
-
-    let mut rows = vec![VirtualRow::Comment {
-        thread: thread.id,
-        kind: CommentRowKind::Summary,
-        text: header,
-        spans: Vec::new(),
-        attention,
-        mark: RowMark::None,
-        body: None,
-    }];
+    let label = match (thread.awaiting, spinner) {
+        (true, Some(frame)) => format!("{} {frame}", entry.label),
+        _ => entry.label.to_string(),
+    };
 
     // A box is never allowed to outgrow the window. Scrolling *through* one is
     // not possible: the cursor cannot be inside virtual rows, so any view that
@@ -1104,21 +1087,35 @@ pub(crate) fn render_comment_rows(
     });
     let visible = body.len().min(max_body_rows);
 
-    if body.len() > max_body_rows {
-        // Say which part is on screen, in the header that is already there,
-        // rather than spending a row on saying it.
-        let shown = format!(
+    // Say which part is on screen, in the header that is already there, rather
+    // than spending a row on saying it.
+    let shown = (body.len() > max_body_rows).then(|| {
+        format!(
             "{}-{} of {}",
             scroll + 1,
             (scroll + visible).min(body.len()),
             body.len()
-        );
-        if let Some(VirtualRow::Comment { text, .. }) = rows.first_mut() {
-            let room = text_width.saturating_sub(shown.chars().count() + 1);
-            let trimmed: String = text.chars().take(room).collect();
-            *text = format!("{trimmed} {shown}");
-        }
-    }
+        )
+    });
+    // The conversation id sits at the right of the rule, so the thread can be
+    // picked up in the agent itself with `--resume <id>`.
+    let header = header_text(
+        &label,
+        index + 1,
+        total,
+        &[shown.as_deref(), thread.agent_session.as_deref()],
+        text_width,
+    );
+
+    let mut rows = vec![VirtualRow::Comment {
+        thread: thread.id,
+        kind: CommentRowKind::Summary,
+        text: header,
+        spans: Vec::new(),
+        attention,
+        mark: RowMark::None,
+        body: None,
+    }];
 
     rows.extend(
         body.into_iter()
@@ -1165,11 +1162,39 @@ fn styled_line(line: CommentLine) -> (String, Vec<CommentSpan>) {
 
 /// `agent 3/5 ─────────` filled to the pane width, so the block reads as one
 /// object rather than as loose lines under the code.
-fn header_text(label: &str, index: usize, total: usize, width: usize) -> String {
+///
+/// `tail` is right-aligned into the rule, in order. A piece that no longer
+/// fits is dropped along with everything after it, so the earlier pieces win
+/// on a narrow pane.
+fn header_text(
+    label: &str,
+    index: usize,
+    total: usize,
+    tail: &[Option<&str>],
+    width: usize,
+) -> String {
     let head = format!("{label} {index}/{total} ");
-    let fill = width.saturating_sub(head.chars().count());
+    rule_with_tail(head, tail, width)
+}
+
+/// `head`, a `─` rule and the `tail` pieces flush right, `width` wide.
+///
+/// Shared with the comment input, whose title row is the same kind of rule.
+pub fn rule_with_tail(head: String, tail: &[Option<&str>], width: usize) -> String {
+    let head_len = head.chars().count();
+    let mut right = String::new();
+    for piece in tail.iter().flatten() {
+        let next = format!("{right} {piece}");
+        // Keep at least one rule character between the head and the tail.
+        if head_len + next.chars().count() + 1 > width {
+            break;
+        }
+        right = next;
+    }
+    let fill = width.saturating_sub(head_len + right.chars().count());
     let mut header = head;
     header.extend(std::iter::repeat('─').take(fill));
+    header.push_str(&right);
     header
 }
 
@@ -1319,6 +1344,23 @@ mod test {
             VirtualRow::Comment { text, .. } => text.clone(),
             other => unreachable!("comment rows only, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn the_header_carries_the_threads_conversation_id() {
+        let mut store = ReviewStore::default();
+        let id = store.draft(PathBuf::from("/r/a.rs"), DiffSide::Working, 1, "why?".into());
+        assert!(!header_of(store.get(id).unwrap(), 60).contains('-'));
+
+        let session = store.ensure_agent_session(id).unwrap();
+        let header = header_of(store.get(id).unwrap(), 60);
+        assert!(header.ends_with(&format!("─ {session}")), "{header}");
+        assert_eq!(header.chars().count(), body_width(60));
+
+        // Too narrow for the id: the rule stays, the id goes.
+        let narrow = header_of(store.get(id).unwrap(), 30);
+        assert!(!narrow.contains(&session), "{narrow}");
+        assert_eq!(narrow.chars().count(), body_width(30));
     }
 
     #[test]

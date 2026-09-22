@@ -38,6 +38,32 @@ fn only_thread_line(app: &Application) -> u32 {
         .line
 }
 
+fn focused_cursor_line(app: &Application) -> usize {
+    let view = app.editor.tree.get(app.editor.tree.focus);
+    let doc = app.editor.document(view.doc).unwrap();
+    doc.selection(view.id)
+        .primary()
+        .cursor_line(doc.text().slice(..))
+}
+
+fn focused_file_name(app: &Application) -> String {
+    let view = app.editor.tree.get(app.editor.tree.focus);
+    let doc = app.editor.document(view.doc).unwrap();
+    doc.path()
+        .and_then(|path| path.file_name())
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+fn place_cursor(app: &mut Application, line: usize) {
+    let view_id = app.editor.tree.focus;
+    let doc_id = app.editor.tree.get(view_id).doc;
+    let doc = app.editor.document_mut(doc_id).unwrap();
+    let last = doc.text().len_lines().saturating_sub(1);
+    let pos = doc.text().line_to_char(line.min(last));
+    doc.set_selection(view_id, Selection::point(pos));
+}
+
 fn focused_review_side(app: &Application) -> DiffSide {
     let view = app.editor.tree.get(app.editor.tree.focus);
     let doc = app.editor.document(view.doc).unwrap();
@@ -1130,6 +1156,133 @@ async fn a_batch_send_quotes_each_comment_s_own_file() -> anyhow::Result<()> {
     // The quoted context must come from the right file too, not just the path.
     assert!(alpha_prompt.1.contains("alpha_one"), "{}", alpha_prompt.1);
     assert!(beta_prompt.1.contains("beta_one"), "{}", beta_prompt.1);
+
+    harness.close(&mut app).await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn bracket_c_jumps_between_review_comments_across_buffers() -> anyhow::Result<()> {
+    // ]C / [C walk every comment in the session. ]c stays inside one diff.
+    let repo = GitRepoFixture::new()?;
+    repo.write_file("alpha.rs", "fn alpha() {}\nfn alpha_two() {}\n")?;
+    repo.write_file("beta.rs", "fn beta() {}\nfn beta_two() {}\n")?;
+    repo.commit_all("initial")?;
+
+    let _cwd = CwdGuard::enter(repo.path()).await?;
+    let alpha = repo.file("alpha.rs");
+    let beta = repo.file("beta.rs");
+
+    let mut app = AppBuilder::new().with_file(&alpha, None).build()?;
+    let mut harness = AppTestHarness::new();
+
+    assert!(harness.send_keys(&mut app, "<space>mRc").await?);
+    assert!(harness.send_keys(&mut app, "about alpha<C-s>").await?);
+    place_cursor(&mut app, 1);
+    assert!(harness.send_keys(&mut app, "<space>mRc").await?);
+    assert!(harness.send_keys(&mut app, "about alpha two<C-s>").await?);
+
+    let open_beta = format!(":open {}<ret>", beta.display());
+    assert!(harness.send_keys(&mut app, &open_beta).await?);
+    place_cursor(&mut app, 1);
+    assert!(harness.send_keys(&mut app, "<space>mRc").await?);
+    assert!(harness.send_keys(&mut app, "about beta<C-s>").await?);
+    assert_eq!(focused_file_name(&app), "beta.rs");
+    assert_eq!(focused_cursor_line(&app), 1);
+
+    assert!(harness.send_keys(&mut app, "[C").await?);
+    assert_eq!(focused_file_name(&app), "alpha.rs");
+    assert_eq!(focused_cursor_line(&app), 1);
+
+    assert!(harness.send_keys(&mut app, "[C").await?);
+    assert_eq!(focused_file_name(&app), "alpha.rs");
+    assert_eq!(focused_cursor_line(&app), 0);
+
+    // Past the first comment, [C wraps to the last one, in the other buffer.
+    assert!(harness.send_keys(&mut app, "[C").await?);
+    assert_eq!(focused_file_name(&app), "beta.rs");
+    assert_eq!(focused_cursor_line(&app), 1);
+    let status = app
+        .editor
+        .get_status()
+        .map(|(text, _)| text.to_string())
+        .unwrap_or_default();
+    assert!(
+        status.contains("beta.rs"),
+        "status should name the buffer just opened: {status}"
+    );
+
+    assert!(harness.send_keys(&mut app, "]C").await?);
+    assert_eq!(focused_file_name(&app), "alpha.rs");
+    assert_eq!(focused_cursor_line(&app), 0);
+
+    // A count steps across the file boundary.
+    assert!(harness.send_keys(&mut app, "2]C").await?);
+    assert_eq!(focused_file_name(&app), "beta.rs");
+    assert_eq!(focused_cursor_line(&app), 1);
+
+    // Close beta. The comment stays in the store; the next ]C reopens it.
+    assert!(harness.send_keys(&mut app, "[C").await?);
+    assert_eq!(focused_file_name(&app), "alpha.rs");
+    assert_eq!(focused_cursor_line(&app), 1);
+    assert!(harness.send_keys(&mut app, "]C").await?);
+    assert_eq!(focused_file_name(&app), "beta.rs");
+    assert!(harness.send_keys(&mut app, ":buffer-close<ret>").await?);
+    assert_eq!(
+        focused_file_name(&app),
+        "alpha.rs",
+        "closing beta returns to the previous buffer"
+    );
+    assert!(harness.send_keys(&mut app, "]C").await?);
+    assert_eq!(focused_file_name(&app), "beta.rs");
+    assert_eq!(focused_cursor_line(&app), 1);
+
+    harness.close(&mut app).await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn bracket_c_leaves_a_diff_to_reach_a_comment_in_another_file() -> anyhow::Result<()> {
+    // A single-pane diff reuses the view. Switching its document in place would
+    // leave the diff describing a file it no longer shows, so ]C has to close it.
+    let repo = GitRepoFixture::new()?;
+    repo.write_file("alpha.rs", "fn alpha() {}\n")?;
+    repo.write_file("beta.rs", "fn beta() {}\n")?;
+    repo.commit_all("initial")?;
+    repo.write_file("alpha.rs", "fn alpha() { changed }\n")?;
+
+    let _cwd = CwdGuard::enter(repo.path()).await?;
+    let alpha = repo.file("alpha.rs");
+    let beta = repo.file("beta.rs");
+    let mut app = AppBuilder::new().with_file(&alpha, None).build()?;
+    let mut harness = AppTestHarness::new();
+
+    assert!(harness.send_keys(&mut app, "<space>mRc").await?);
+    assert!(harness.send_keys(&mut app, "about alpha<C-s>").await?);
+    let open_beta = format!(":open {}<ret>", beta.display());
+    assert!(harness.send_keys(&mut app, &open_beta).await?);
+    assert!(harness.send_keys(&mut app, "<space>mRc").await?);
+    assert!(harness.send_keys(&mut app, "about beta<C-s>").await?);
+
+    assert!(harness.send_keys(&mut app, "[C").await?);
+    assert_eq!(focused_file_name(&app), "alpha.rs");
+
+    assert!(harness.send_keys(&mut app, "<space>g").await?);
+    assert!(harness.wait_for_idle(&mut app).await?);
+    assert!(harness.send_keys(&mut app, "<ret>").await?);
+    assert_eq!(
+        app.editor.diff.views.len(),
+        1,
+        "the changed-file picker should open a diff"
+    );
+
+    assert!(harness.send_keys(&mut app, "]C").await?);
+    assert_eq!(focused_file_name(&app), "beta.rs");
+    assert_eq!(focused_cursor_line(&app), 0);
+    assert!(
+        app.editor.diff.views.is_empty(),
+        "moving to another file must close the diff"
+    );
 
     harness.close(&mut app).await?;
     Ok(())

@@ -1,8 +1,8 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
+use helix_view::editor::Action;
 use helix_view::review::{DiffSide, ReviewAnchor, ThreadId};
-use helix_view::Document;
-use helix_view::Editor;
+use helix_view::{Document, DocumentId, Editor, ViewId};
 
 use crate::commands::Context;
 
@@ -1151,6 +1151,307 @@ pub fn review_delete(cx: &mut Context) {
     cx.editor.set_status("Comment deleted");
 }
 
+/// One review comment `]C` / `[C` can land on.
+#[derive(Clone)]
+struct ReviewStop {
+    file: PathBuf,
+    side: DiffSide,
+    /// Line in the open document when it is loaded, otherwise the stored line.
+    line: usize,
+    id: ThreadId,
+}
+
+/// Where the cursor is, so the next stop can be chosen relative to it.
+struct Here {
+    file: PathBuf,
+    side: DiffSide,
+    line: usize,
+}
+
+fn side_rank(side: DiffSide) -> u8 {
+    match side {
+        DiffSide::Base => 0,
+        DiffSide::Working => 1,
+    }
+}
+
+fn scratch_key(id: DocumentId) -> PathBuf {
+    PathBuf::from(format!("[scratch {id}]"))
+}
+
+fn is_scratch_key(file: &Path) -> bool {
+    file.to_str()
+        .is_some_and(|name| name.starts_with("[scratch "))
+}
+
+/// The open document whose review threads are keyed as `(file, side)`.
+///
+/// A diff state's working path is the store key for both panes. Matching
+/// `base_path` as well would hand a buffer-diff's working document back when
+/// the caller asked about the other file.
+fn document_for_stop<'a>(editor: &'a Editor, file: &Path, side: DiffSide) -> Option<&'a Document> {
+    if let Some(state) = editor
+        .diff
+        .views
+        .values()
+        .find(|state| state.working_path == file)
+    {
+        let id = match side {
+            DiffSide::Base => state.base_doc_id,
+            DiffSide::Working => state.working_doc_id,
+        };
+        if let Some(doc) = editor.document(id) {
+            return Some(doc);
+        }
+    }
+    if side != DiffSide::Working {
+        return None;
+    }
+    if let Some(doc) = editor.document_by_path(file) {
+        if !doc.is_virtual_base {
+            return Some(doc);
+        }
+    }
+    editor
+        .documents()
+        .find(|doc| doc.path().is_none() && scratch_key(doc.id()) == file)
+}
+
+/// A view that already shows this comment. The focused one wins, so a jump
+/// inside the current pane does not leap to another split of the same file.
+fn view_showing(editor: &Editor, file: &Path, side: DiffSide) -> Option<ViewId> {
+    let mut fallback = None;
+    for (view, focused) in editor.tree.views() {
+        let Some(doc) = editor.document(view.doc) else {
+            continue;
+        };
+        let Some((path, view_side)) = view.review_identity(doc, &editor.diff.views) else {
+            continue;
+        };
+        if path == file && view_side == side {
+            if focused {
+                return Some(view.id);
+            }
+            fallback.get_or_insert(view.id);
+        }
+    }
+    fallback
+}
+
+fn resolved_line(editor: &Editor, id: ThreadId, stored: u32, file: &Path, side: DiffSide) -> usize {
+    let Some(doc) = document_for_stop(editor, file, side) else {
+        return stored as usize;
+    };
+    doc.review_anchors
+        .iter()
+        .find(|anchor| anchor.thread == id)
+        .map(|anchor| anchor.line(doc.text()))
+        .unwrap_or(stored as usize)
+}
+
+/// Working-tree comments can be opened. Base-side comments only exist on a
+/// split pane; a single-pane diff reuses the working view, so there is nowhere
+/// to show the base text without tearing that diff down.
+fn stop_is_reachable(editor: &Editor, file: &Path, side: DiffSide) -> bool {
+    if view_showing(editor, file, side).is_some() {
+        return true;
+    }
+    if side != DiffSide::Working {
+        return false;
+    }
+    if document_for_stop(editor, file, side).is_some() {
+        return true;
+    }
+    !is_scratch_key(file) && file.is_file()
+}
+
+fn review_stops(editor: &Editor) -> Vec<ReviewStop> {
+    let pending: Vec<_> = editor
+        .diff
+        .reviews
+        .iter()
+        .map(|thread| (thread.file.clone(), thread.side, thread.line, thread.id))
+        .collect();
+    let mut stops = Vec::new();
+    for (file, side, stored, id) in pending {
+        if !stop_is_reachable(editor, &file, side) {
+            continue;
+        }
+        stops.push(ReviewStop {
+            line: resolved_line(editor, id, stored, &file, side),
+            file,
+            side,
+            id,
+        });
+    }
+    stops.sort_by(|a, b| {
+        a.file
+            .cmp(&b.file)
+            .then(side_rank(a.side).cmp(&side_rank(b.side)))
+            .then(a.line.cmp(&b.line))
+            .then(a.id.cmp(&b.id))
+    });
+    stops
+}
+
+fn stop_key(stop: &ReviewStop) -> (&Path, u8, usize) {
+    (stop.file.as_path(), side_rank(stop.side), stop.line)
+}
+
+fn here_key(here: &Here) -> (&Path, u8, usize) {
+    (here.file.as_path(), side_rank(here.side), here.line)
+}
+
+fn pick_stop_index(
+    stops: &[ReviewStop],
+    here: Option<&Here>,
+    forward: bool,
+    count: usize,
+) -> usize {
+    let len = stops.len();
+    let step = count.max(1).saturating_sub(1) % len;
+    let start = if forward {
+        stops
+            .iter()
+            .position(|stop| match here {
+                Some(here) => stop_key(stop) > here_key(here),
+                None => true,
+            })
+            .unwrap_or(0)
+    } else {
+        stops
+            .iter()
+            .rposition(|stop| match here {
+                Some(here) => stop_key(stop) < here_key(here),
+                None => false,
+            })
+            .unwrap_or(len - 1)
+    };
+    if forward {
+        (start + step) % len
+    } else {
+        (start + len - step) % len
+    }
+}
+
+fn comment_status(stops: &[ReviewStop], index: usize) -> String {
+    let stop = &stops[index];
+    let total = stops.len();
+    let n = index + 1;
+    let several_files = stops
+        .iter()
+        .map(|stop| stop.file.as_path())
+        .collect::<std::collections::HashSet<_>>()
+        .len()
+        > 1;
+    let name = stop
+        .file
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| stop.file.display().to_string());
+    match (several_files, stop.side) {
+        (true, DiffSide::Base) => format!("Comment {n}/{total} · {name} (base)"),
+        (true, DiffSide::Working) => format!("Comment {n}/{total} · {name}"),
+        (false, DiffSide::Base) => format!("Comment {n}/{total} (base)"),
+        (false, DiffSide::Working) => format!("Comment {n}/{total}"),
+    }
+}
+
+fn move_to_review_line(editor: &mut Editor, line: usize, record_jump: bool) {
+    if editor.tree.try_get(editor.tree.focus).is_none() {
+        return;
+    }
+    if record_jump {
+        let (view, doc) = current!(editor);
+        super::push_jump(view, doc);
+    }
+    let (view, doc) = current!(editor);
+    let text = doc.text().slice(..);
+    let line = line.min(text.len_lines().saturating_sub(1));
+    let pos = text.line_to_char(line);
+    doc.set_selection(view.id, helix_core::Selection::point(pos));
+    let scrolloff = editor.config().scrolloff;
+    let (view, doc) = current!(editor);
+    view.ensure_cursor_in_view_center(doc, scrolloff);
+}
+
+/// Focus a pane that already shows `stop`. `switch` would replace the document
+/// under a diff and leave the diff state describing a file it no longer shows.
+fn focus_stop(editor: &mut Editor, stop: &ReviewStop) -> bool {
+    let Some(view_id) = view_showing(editor, &stop.file, stop.side) else {
+        return false;
+    };
+    if editor.tree.focus != view_id {
+        editor.focus(view_id);
+    }
+    move_to_review_line(editor, stop.line, true);
+    true
+}
+
+fn leave_focused_diff(editor: &mut Editor) {
+    let focus = editor.tree.focus;
+    if editor.diff.views.contains_key(&focus) {
+        editor.close_diff_view(focus);
+    }
+    let focus = editor.tree.focus;
+    if editor.tree.try_get(focus).is_some() && editor.diff.merge_views.contains_key(&focus) {
+        editor.close_merge_view(focus);
+    }
+}
+
+fn show_stop(editor: &mut Editor, stop: &ReviewStop) -> bool {
+    if focus_stop(editor, stop) {
+        return true;
+    }
+
+    let focus = editor.tree.focus;
+    if editor.diff.views.contains_key(&focus) || editor.diff.merge_views.contains_key(&focus) {
+        // The next comment is another file. Leave the diff first so the buffer
+        // switch does not retarget a pane the diff still owns.
+        leave_focused_diff(editor);
+        if focus_stop(editor, stop) {
+            return true;
+        }
+    }
+
+    if editor.tree.try_get(editor.tree.focus).is_none() {
+        editor.set_error("No view to show the review comment");
+        return false;
+    }
+    if stop.side != DiffSide::Working {
+        editor.set_error("That review comment is on a diff base that is not open");
+        return false;
+    }
+
+    // Copy the id out before switching: the document borrow cannot live across
+    // `switch`, which needs the editor mutably.
+    let doc_id = document_for_stop(editor, &stop.file, stop.side).map(|doc| doc.id());
+    if let Some(doc_id) = doc_id {
+        let current = editor.tree.get(editor.tree.focus).doc;
+        let switched = current != doc_id;
+        if switched {
+            // `switch` already records the buffer we left.
+            editor.switch(doc_id, Action::Replace);
+        }
+        move_to_review_line(editor, stop.line, !switched);
+        return true;
+    }
+
+    match editor.open(&stop.file, Action::Replace) {
+        Ok(_) => {
+            move_to_review_line(editor, stop.line, false);
+            true
+        }
+        Err(err) => {
+            editor.set_error(format!(
+                "Cannot open {} for its review comment: {err}",
+                stop.file.display()
+            ));
+            false
+        }
+    }
+}
+
 fn goto_review_comment_impl(cx: &mut Context, forward: bool) {
     let threads = threads_in_view(cx);
     if threads.is_empty() {
@@ -1192,12 +1493,45 @@ fn goto_review_comment_impl(cx: &mut Context, forward: bool) {
         .set_status(format!("Comment {index}/{}", threads.len()));
 }
 
+/// `]C` / `[C`: every review comment in the session, switching buffers.
+///
+/// Order is the file path, then the base side before the working side, then
+/// the line. The list wraps. A pane that already shows the comment is focused.
+/// A working-tree file that is not open is opened. A diff or merge pane is
+/// left only when the next comment lives in some other file.
+fn goto_review_comment_across_buffers(cx: &mut Context, forward: bool) {
+    if cx.editor.diff.reviews.hidden {
+        cx.editor.set_error("Review comments are hidden");
+        return;
+    }
+    let stops = review_stops(cx.editor);
+    if stops.is_empty() {
+        cx.editor.set_error("No review comments");
+        return;
+    }
+    let here = identity(cx).map(|(file, side)| Here {
+        file,
+        side,
+        line: cursor_line(cx),
+    });
+    let index = pick_stop_index(&stops, here.as_ref(), forward, cx.count());
+    let stop = stops[index].clone();
+    if !show_stop(cx.editor, &stop) {
+        return;
+    }
+    // Landing is not the same as stopping on the box with `j`. A stale focus
+    // would make `d` act on whatever thread still matched.
+    cx.editor.diff.reviews.focused = None;
+    let status = comment_status(&stops, index);
+    cx.editor.set_status(status);
+}
+
 pub fn goto_next_review_comment(cx: &mut Context) {
-    goto_review_comment_impl(cx, true);
+    goto_review_comment_across_buffers(cx, true);
 }
 
 pub fn goto_prev_review_comment(cx: &mut Context) {
-    goto_review_comment_impl(cx, false);
+    goto_review_comment_across_buffers(cx, false);
 }
 
 /// Whether the cursor has stopped on the box below it.
@@ -1315,12 +1649,12 @@ pub fn review_comment_or_change(cx: &mut Context) {
     }
 }
 
-/// `]c`/`[c` inside a diff view mean review comments; elsewhere they keep their
-/// tree-sitter code-comment meaning. Reviewing is the only context where the
-/// review sense is the more useful of the two.
+/// `]c`/`[c` inside a diff view move between that view's review comments, and
+/// stay in the file. Elsewhere they keep their tree-sitter code-comment
+/// meaning. `]C`/`[C` are the session-wide motion.
 pub fn goto_next_comment_or_review(cx: &mut Context) {
     if cx.editor.diff.views.contains_key(&cx.editor.tree.focus) {
-        goto_next_review_comment(cx);
+        goto_review_comment_impl(cx, true);
     } else {
         super::goto_next_comment(cx);
     }
@@ -1328,7 +1662,7 @@ pub fn goto_next_comment_or_review(cx: &mut Context) {
 
 pub fn goto_prev_comment_or_review(cx: &mut Context) {
     if cx.editor.diff.views.contains_key(&cx.editor.tree.focus) {
-        goto_prev_review_comment(cx);
+        goto_review_comment_impl(cx, false);
     } else {
         super::goto_prev_comment(cx);
     }
@@ -1336,6 +1670,8 @@ pub fn goto_prev_comment_or_review(cx: &mut Context) {
 
 #[cfg(test)]
 mod test {
+    use std::path::PathBuf;
+
     use super::comment_box_ctrl_s;
     use helix_view::input::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -1379,5 +1715,70 @@ mod test {
 
         assert_eq!(comment_box_ctrl_s(key(Char('s'), M::NONE)), None);
         assert_eq!(comment_box_ctrl_s(key(Char('x'), M::CONTROL)), None);
+    }
+
+    fn stop(file: &str, side: super::DiffSide, line: usize) -> super::ReviewStop {
+        super::ReviewStop {
+            file: PathBuf::from(file),
+            side,
+            line,
+            id: super::ThreadId(line as u32 + super::side_rank(side) as u32),
+        }
+    }
+
+    #[test]
+    fn review_stops_walk_files_in_path_order_and_wrap() {
+        use super::DiffSide::{Base, Working};
+        use super::{pick_stop_index, Here};
+
+        let stops = vec![
+            stop("a.rs", Working, 1),
+            stop("a.rs", Working, 8),
+            stop("b.rs", Working, 0),
+        ];
+        let on_second = Here {
+            file: PathBuf::from("a.rs"),
+            side: Working,
+            line: 8,
+        };
+        assert_eq!(pick_stop_index(&stops, Some(&on_second), true, 1), 2);
+        assert_eq!(
+            pick_stop_index(&stops, Some(&on_second), true, 2),
+            0,
+            "a count wraps to the first comment"
+        );
+        let on_first = Here {
+            file: PathBuf::from("a.rs"),
+            side: Working,
+            line: 1,
+        };
+        assert_eq!(pick_stop_index(&stops, Some(&on_first), false, 1), 2);
+        let on_beta = Here {
+            file: PathBuf::from("b.rs"),
+            side: Working,
+            line: 0,
+        };
+        assert_eq!(pick_stop_index(&stops, Some(&on_beta), false, 1), 1);
+
+        // Base comments of a file come before its working comments, so [C
+        // from the first working comment lands on the base side. ]C wraps
+        // back to it once the working side runs out.
+        let with_base = vec![stop("a.rs", Base, 3), stop("a.rs", Working, 1)];
+        let on_working = Here {
+            file: PathBuf::from("a.rs"),
+            side: Working,
+            line: 1,
+        };
+        assert_eq!(pick_stop_index(&with_base, Some(&on_working), false, 1), 0);
+        assert_eq!(pick_stop_index(&with_base, Some(&on_working), true, 1), 0);
+        let on_base = Here {
+            file: PathBuf::from("a.rs"),
+            side: Base,
+            line: 3,
+        };
+        assert_eq!(pick_stop_index(&with_base, Some(&on_base), true, 1), 1);
+
+        assert_eq!(pick_stop_index(&stops, None, true, 1), 0);
+        assert_eq!(pick_stop_index(&stops, None, false, 1), 2);
     }
 }

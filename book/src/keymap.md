@@ -459,7 +459,10 @@ rather than opening what the agent wrote.
 
 Everything else happens on the box itself: `c` and `d` act on it, `C-left` /
 `C-right` walk its history, `C-up` / `C-down` read a long reply, the mouse
-selects from it and `y` copies that, and `]c` / `[c` move between threads.
+selects from it and `y` copies that. `]c` / `[c` move between review
+comments in the current diff, and are code comments in any other buffer.
+`]C` / `[C` move between every review comment in the session, in path order,
+and open or switch to the buffer that holds the next one.
 `Ctrl-Shift-S` in the box sends straight away. After saving with `Ctrl-S`, `c`
 on the line opens that draft for editing again. `Ctrl-S` or `Ctrl-Shift-S` in
 normal mode send the draft on this line; `S` in the review submenu still sends
@@ -517,10 +520,10 @@ These mappings are in the style of [vim-unimpaired](https://github.com/tpope/vim
 | `[t`     | Go to previous type definition (**TS**)      | `goto_prev_class`       |
 | `]a`     | Go to next argument/parameter (**TS**)       | `goto_next_parameter`   |
 | `[a`     | Go to previous argument/parameter (**TS**)   | `goto_prev_parameter`   |
-| `]c`     | Go to next review comment in a diff view, else next code comment (**TS**) | `goto_next_comment_or_review` |
-| `[c`     | Go to previous review comment in a diff view, else previous code comment (**TS**) | `goto_prev_comment_or_review` |
-| `]C`     | Go to next review comment                    | `goto_next_review_comment` |
-| `[C`     | Go to previous review comment                | `goto_prev_review_comment` |
+| `]c`     | Go to next review comment in the current diff, else next code comment (**TS**) | `goto_next_comment_or_review` |
+| `[c`     | Go to previous review comment in the current diff, else previous code comment (**TS**) | `goto_prev_comment_or_review` |
+| `]C`     | Go to the next review comment in any buffer | `goto_next_review_comment` |
+| `[C`     | Go to the previous review comment in any buffer | `goto_prev_review_comment` |
 | `]T`     | Go to next test (**TS**)                     | `goto_next_test`        |
 | `[T`     | Go to previous test (**TS**)                 | `goto_prev_test`        |
 | `]p`     | Go to next paragraph                         | `goto_next_paragraph`   |

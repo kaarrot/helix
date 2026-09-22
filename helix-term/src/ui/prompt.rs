@@ -80,6 +80,19 @@ fn is_word_sep(c: char) -> bool {
     c == std::path::MAIN_SEPARATOR || c.is_whitespace()
 }
 
+/// Byte index of the char boundary at or before `index`.
+///
+/// `str::floor_char_boundary` is still unstable on the 1.82 MSRV
+/// (library feature `round_char_boundary`). An index past `s.len()`
+/// clamps to the end.
+fn floor_char_boundary(s: &str, index: usize) -> usize {
+    let mut index = index.min(s.len());
+    while !s.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
 impl Prompt {
     pub fn new(
         prompt: Cow<'static, str>,
@@ -871,10 +884,8 @@ impl Component for Prompt {
 
         // Anchor is updated while rendering. Clamp so a cleared or narrowed
         // line cannot slice off a char boundary or past the cursor.
-        let cursor = self
-            .line
-            .floor_char_boundary(self.cursor.min(self.line.len()));
-        let anchor = self.line.floor_char_boundary(self.anchor.min(cursor));
+        let cursor = floor_char_boundary(&self.line, self.cursor);
+        let anchor = floor_char_boundary(&self.line, self.anchor.min(cursor));
 
         let mut col = area.left() as usize + self.line[anchor..cursor].width();
 

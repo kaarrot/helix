@@ -59,7 +59,12 @@ pub const ID: &str = "picker";
 
 pub const MIN_AREA_WIDTH_FOR_PREVIEW: u16 = 72;
 pub const MIN_AREA_WIDTH_FOR_SIDE_BY_SIDE: u16 = 100;
-pub const MIN_AREA_HEIGHT_FOR_VERTICAL_PREVIEW: u16 = 15;
+/// Overlay height needed to stack the picker list and a file preview.
+///
+/// Picker box: 2 border + 2 prompt/separator + 1 item. Preview box: 2 border +
+/// 1 content row. `overlaid()` also keeps 2 rows for the statusline, so a
+/// 12-row terminal is the practical floor.
+pub const MIN_AREA_HEIGHT_FOR_VERTICAL_PREVIEW: u16 = 10;
 /// Biggest file size to preview in bytes
 pub const MAX_FILE_SIZE_FOR_PREVIEW: u64 = 10 * 1024 * 1024;
 
@@ -604,7 +609,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
         }
 
         if self.is_vertical(area) {
-            area.height > MIN_AREA_HEIGHT_FOR_VERTICAL_PREVIEW
+            area.height >= MIN_AREA_HEIGHT_FOR_VERTICAL_PREVIEW
         } else {
             area.width > MIN_AREA_WIDTH_FOR_PREVIEW
         }
@@ -1170,12 +1175,13 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
 
 impl<I: 'static + Send + Sync, D: 'static + Send + Sync> Component for Picker<I, D> {
     fn render(&mut self, area: Rect, surface: &mut Surface, cx: &mut Context) {
-        // +---------+ +---------+
-        // |prompt   | |preview  |
-        // +---------+ |         |
-        // |picker   | |         |
-        // |         | |         |
-        // +---------+ +---------+
+        // side-by-side (wide)          stacked (narrow/tall)
+        // +---------+ +---------+      +-------------------+
+        // |prompt   | |preview  |      |prompt             |
+        // +---------+ |         |      |picker             |
+        // |picker   | |         |      +-------------------+
+        // |         | |         |      |preview            |
+        // +---------+ +---------+      +-------------------+
 
         let render_preview = self.should_render_preview(area);
 
@@ -1367,3 +1373,179 @@ impl<T: 'static + Send + Sync, D> Drop for Picker<T, D> {
 }
 
 type PickerCallback<T> = Box<dyn Fn(&mut Context, &T, Action)>;
+
+#[cfg(test)]
+mod tests {
+    use std::{path::PathBuf, sync::Arc, time::Duration};
+
+    use arc_swap::{access::Map, ArcSwap};
+    use helix_core::syntax;
+    use helix_view::{editor::Action, graphics::Rect, theme, Editor};
+    use tempfile::NamedTempFile;
+
+    use crate::{
+        compositor::{Component, Context},
+        config::Config as AppConfig,
+        handlers,
+        job::Jobs,
+        ui::overlay::{overlaid, overlay_area},
+    };
+
+    use super::*;
+
+    const PREVIEW_MARKER: &str = "UNIQUE_VERTICAL_PREVIEW_BODY";
+
+    struct Harness {
+        _runtime: tokio::runtime::Runtime,
+        editor: Editor,
+        jobs: Jobs,
+    }
+
+    impl Harness {
+        fn new(width: u16, height: u16) -> Self {
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            let _guard = runtime.enter();
+
+            let app_config = Arc::new(ArcSwap::from_pointee(AppConfig::default()));
+            let handlers = handlers::setup(Arc::clone(&app_config));
+            let editor_config =
+                Arc::new(Map::new(Arc::clone(&app_config), |config: &AppConfig| {
+                    &config.editor
+                }));
+
+            let mut editor = Editor::new(
+                Rect::new(0, 0, width, height),
+                Arc::new(theme::Loader::new(&[])),
+                Arc::new(ArcSwap::from_pointee(syntax::Loader::default())),
+                editor_config,
+                handlers,
+            );
+            editor.new_file(Action::VerticalSplit);
+
+            Self {
+                _runtime: runtime,
+                editor,
+                jobs: Jobs::new(),
+            }
+        }
+    }
+
+    fn surface_lines(surface: &Surface, area: Rect) -> Vec<String> {
+        (area.top()..area.bottom())
+            .map(|y| {
+                let mut line = String::new();
+                for x in area.left()..area.right() {
+                    if let Some(cell) = surface.get(x, y) {
+                        line.push_str(&cell.symbol);
+                    }
+                }
+                line.trim_end().to_owned()
+            })
+            .collect()
+    }
+
+    fn marker_pos(lines: &[String], marker: &str) -> Option<(usize, usize)> {
+        lines.iter().enumerate().find_map(|(y, line)| {
+            line.find(marker).map(|x| (x, y))
+        })
+    }
+
+    fn render_preview_picker(width: u16, height: u16) -> (Vec<String>, Rect) {
+        let file = NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), format!("{PREVIEW_MARKER}\nsecond line\n")).unwrap();
+        let path = file.path().to_path_buf();
+
+        let mut harness = Harness::new(width, height);
+        let _guard = harness._runtime.enter();
+        let picker = Picker::new(
+            [Column::new("path", |item: &PathBuf, _: &()| {
+                item.file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+                    .into()
+            })],
+            0,
+            [path.clone()],
+            (),
+            |_, _, _| {},
+        )
+        .with_preview(|_editor, path| Some((path.as_path().into(), None)));
+
+        let mut overlay = overlaid(picker);
+        let terminal = Rect::new(0, 0, width, height);
+        overlay.required_size((width, height));
+
+        let mut surface = Surface::empty(terminal);
+        let mut cx = Context {
+            editor: &mut harness.editor,
+            scroll: None,
+            jobs: &mut harness.jobs,
+        };
+
+        let overlay_rect = overlay_area(terminal);
+        for _ in 0..30 {
+            overlay.render(terminal, &mut surface, &mut cx);
+            let lines = surface_lines(&surface, terminal);
+            if marker_pos(&lines, PREVIEW_MARKER).is_some() {
+                return (lines, overlay_rect);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        (surface_lines(&surface, terminal), overlay_rect)
+    }
+
+    #[test]
+    fn phone_sized_picker_shows_preview_below_the_list() {
+        let (lines, overlay) = render_preview_picker(40, 24);
+        let (x, y) = marker_pos(&lines, PREVIEW_MARKER).unwrap_or_else(|| {
+            panic!("preview body missing on 40x24 picker:\n{}", lines.join("\n"))
+        });
+        assert!(
+            y >= overlay.y as usize + overlay.height as usize / 2,
+            "preview should be in the bottom half, got ({x}, {y}) overlay={overlay:?}\n{}",
+            lines.join("\n")
+        );
+        assert!(
+            x < overlay.width as usize / 2 + overlay.x as usize,
+            "narrow screens should stack, not split side-by-side: ({x}, {y})\n{}",
+            lines.join("\n")
+        );
+    }
+
+    #[test]
+    fn short_phone_picker_still_shows_preview() {
+        let (lines, overlay) = render_preview_picker(40, 18);
+        let (_, y) = marker_pos(&lines, PREVIEW_MARKER).unwrap_or_else(|| {
+            panic!("preview body missing on 40x18 picker:\n{}", lines.join("\n"))
+        });
+        assert!(
+            y >= overlay.y as usize + overlay.height as usize / 2,
+            "preview should still stack on a short Termux screen, y={y} overlay={overlay:?}\n{}",
+            lines.join("\n")
+        );
+    }
+
+    #[test]
+    fn wide_picker_shows_preview_on_the_right() {
+        let (lines, overlay) = render_preview_picker(120, 40);
+        let (x, _) = marker_pos(&lines, PREVIEW_MARKER).unwrap_or_else(|| {
+            panic!("preview body missing on 120x40 picker:\n{}", lines.join("\n"))
+        });
+        assert!(
+            x >= overlay.x as usize + overlay.width as usize / 2,
+            "wide screens should keep a side-by-side preview, x={x} overlay={overlay:?}\n{}",
+            lines.join("\n")
+        );
+    }
+
+    #[test]
+    fn tiny_picker_hides_preview_when_there_is_no_room() {
+        let (lines, _) = render_preview_picker(40, 8);
+        assert!(
+            marker_pos(&lines, PREVIEW_MARKER).is_none(),
+            "an 8-row terminal cannot fit a stacked preview:\n{}",
+            lines.join("\n")
+        );
+    }
+}

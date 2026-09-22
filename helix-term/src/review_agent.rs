@@ -1,13 +1,17 @@
-//! Drives a `claude` child process as the answerer for review threads.
+//! Drives a `claude` or `grok` child as the answerer for one review thread.
 //!
-//! Helix owns the process, so writing a comment to its stdin *is* the trigger:
-//! there is no polling step, and no "go and pick up my comments" gesture.
+//! Each thread has its own conversation id. A turn is one process: the first
+//! creates that id with `--session-id`, and a follow-up resumes it with
+//! `--resume`. Two threads therefore cannot see each other's comments or take
+//! each other's reply, and their turns run at the same time. A follow-up on a
+//! thread that already has a turn in flight waits until that process exits, so
+//! one conversation is never driven by two processes at once.
 
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, HashSet, VecDeque},
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
-    process::{Child, ChildStdin, Command, Stdio},
+    process::{Command, Stdio},
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex,
@@ -64,9 +68,19 @@ fn finish_one() {
     });
 }
 
-fn apply(event: AgentEvent) {
+/// Unit tests spawn a child without an editor job queue. Dispatching would
+/// block forever on that queue, so those tests set this and drop the event.
+#[cfg(test)]
+static SUPPRESS_DISPATCH: AtomicBool = AtomicBool::new(false);
+
+fn apply(session: &str, event: AgentEvent) {
+    #[cfg(test)]
+    if SUPPRESS_DISPATCH.load(Ordering::SeqCst) {
+        return;
+    }
+    let session = session.to_string();
     job::dispatch_blocking(move |editor, _| {
-        editor.diff.reviews.apply_agent_event(event);
+        editor.diff.reviews.apply_agent_event_for(&session, event);
     });
     schedule_save();
 }
@@ -124,65 +138,323 @@ fn started_marker(uuid: &str) -> PathBuf {
         .join(format!("{uuid}.started"))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CliKind {
+    Claude,
+    Grok,
+}
+
+impl CliKind {
+    fn program(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Grok => "grok",
+        }
+    }
+}
+
+/// One process per in-flight thread.
+///
+/// Different conversations run together. A second turn for a conversation that
+/// already has a process waits in [`TurnState::waiting`] until that process
+/// exits, then resumes the same id.
+#[derive(Debug, Clone)]
+struct TurnState {
+    kind: CliKind,
+    program: String,
+    worktree: Arc<PathBuf>,
+    /// Prompts waiting on a session, oldest first. Keyed by that thread's UUID.
+    waiting: Arc<Mutex<HashMap<String, VecDeque<(ThreadId, String)>>>>,
+    /// Sessions whose process has been started and not yet reaped.
+    running: Arc<Mutex<HashSet<String>>>,
+    /// Set by shutdown. Turns already running are allowed to finish; nothing
+    /// new is started, and anything still queued is failed.
+    stopped: Arc<AtomicBool>,
+}
+
+impl TurnState {
+    fn new(kind: CliKind, worktree: PathBuf) -> Self {
+        Self::with_program(kind, kind.program().to_string(), worktree)
+    }
+
+    fn with_program(kind: CliKind, program: String, worktree: PathBuf) -> Self {
+        Self {
+            kind,
+            program,
+            worktree: Arc::new(worktree),
+            waiting: Arc::default(),
+            running: Arc::default(),
+            stopped: Arc::default(),
+        }
+    }
+
+    fn send(&self, thread: ThreadId, session: String, prompt: String) -> anyhow::Result<()> {
+        // The in-flight count is taken under the same lock as the enqueue, so a
+        // shutdown that drains the queue cannot miss it or count it twice.
+        if !self.queue(&session, thread, prompt, true) {
+            anyhow::bail!("the agent process is not accepting input");
+        }
+        apply(&session, AgentEvent::Started(thread));
+        self.kick();
+        Ok(())
+    }
+
+    fn shutdown(&self) {
+        self.stopped.store(true, Ordering::SeqCst);
+        let drained: Vec<(String, ThreadId)> = {
+            let mut waiting = self.waiting.lock().unwrap();
+            waiting
+                .drain()
+                .flat_map(|(session, queue)| {
+                    queue
+                        .into_iter()
+                        .map(move |(thread, _)| (session.clone(), thread))
+                })
+                .collect()
+        };
+        for (session, thread) in drained {
+            apply(
+                &session,
+                AgentEvent::Failed(
+                    thread,
+                    String::from("the agent process ended before replying"),
+                ),
+            );
+            finish_one();
+        }
+        // The in-flight child is waited on by its blocking task. Waiting here
+        // would freeze the editor for the rest of a network turn.
+    }
+
+    /// Queue `prompt` unless shutdown has won the race.
+    ///
+    /// `count` counts the turn as in flight. That has to happen before this
+    /// lock is released: shutdown drains under the same lock and drops one
+    /// count per prompt it takes.
+    fn queue(&self, session: &str, thread: ThreadId, prompt: String, count: bool) -> bool {
+        if self.stopped.load(Ordering::SeqCst) {
+            return false;
+        }
+        let mut waiting = self.waiting.lock().unwrap();
+        if self.stopped.load(Ordering::SeqCst) {
+            return false;
+        }
+        waiting
+            .entry(session.to_string())
+            .or_default()
+            .push_back((thread, prompt));
+        if count {
+            start_redraw_ticker();
+        }
+        true
+    }
+
+    #[cfg(test)]
+    fn push_waiting(&self, session: &str, thread: ThreadId, prompt: String) -> bool {
+        self.queue(session, thread, prompt, false)
+    }
+
+    /// Take the next turn whose session has no process yet.
+    ///
+    /// The session is marked running before the lock is released, so two kicks
+    /// cannot start it twice.
+    fn pop_ready(&self) -> Option<(String, ThreadId, String)> {
+        let mut waiting = self.waiting.lock().unwrap();
+        let mut running = self.running.lock().unwrap();
+        if self.stopped.load(Ordering::SeqCst) {
+            return None;
+        }
+        let session = waiting
+            .iter()
+            .find(|(session, queue)| !queue.is_empty() && !running.contains(*session))
+            .map(|(session, _)| session.clone())?;
+        let (thread, prompt) = waiting.get_mut(&session)?.pop_front()?;
+        if waiting.get(&session).is_some_and(|queue| queue.is_empty()) {
+            waiting.remove(&session);
+        }
+        running.insert(session.clone());
+        Some((session, thread, prompt))
+    }
+
+    fn release(&self, session: &str) {
+        self.running.lock().unwrap().remove(session);
+    }
+
+    fn kick(&self) {
+        while let Some((session, thread, prompt)) = self.pop_ready() {
+            self.launch(&session, thread, prompt);
+        }
+    }
+
+    fn fail(&self, session: &str, thread: ThreadId, message: String) {
+        self.release(session);
+        apply(session, AgentEvent::Failed(thread, message));
+        finish_one();
+    }
+
+    fn launch(&self, session: &str, thread: ThreadId, prompt: String) {
+        let resuming = started_marker(session).exists();
+        let prompt_file = if self.kind == CliKind::Grok {
+            match write_prompt_file(&prompt) {
+                Ok(file) => Some(file),
+                Err(err) => {
+                    self.fail(session, thread, err.to_string());
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+
+        let args = match &prompt_file {
+            Some(file) => grok_args(session, resuming, file.path()),
+            None => child_args(session, resuming),
+        };
+
+        let mut command = Command::new(&self.program);
+        command
+            .args(&args)
+            .current_dir(self.worktree.as_path())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        if prompt_file.is_some() {
+            command.stdin(Stdio::null());
+        } else {
+            command.stdin(Stdio::piped());
+        }
+
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(err) => {
+                self.fail(
+                    session,
+                    thread,
+                    format!("Could not start {}: {err}", self.program),
+                );
+                return;
+            }
+        };
+
+        // Claude reads the prompt from stdin and exits on EOF. Writing it on
+        // another task keeps a large prompt from filling the pipe while this
+        // task is still stuck before it starts reading stdout.
+        if prompt_file.is_none() {
+            let Some(mut stdin) = child.stdin.take() else {
+                let _ = child.kill();
+                tokio::task::spawn_blocking(move || {
+                    let _ = child.wait();
+                });
+                self.fail(
+                    session,
+                    thread,
+                    String::from("the agent process is not accepting input"),
+                );
+                return;
+            };
+            tokio::task::spawn_blocking(move || {
+                let _ = stdin.write_all(prompt.as_bytes());
+                let _ = stdin.flush();
+            });
+        }
+
+        let stdout = child.stdout.take();
+        let session = session.to_string();
+        let state = self.clone();
+        tokio::task::spawn_blocking(move || {
+            if let Some(stdout) = stdout {
+                read_turn(stdout, thread, &session);
+            } else {
+                apply(
+                    &session,
+                    AgentEvent::Failed(
+                        thread,
+                        String::from("the agent process ended before replying"),
+                    ),
+                );
+                finish_one();
+            }
+            let _ = child.wait();
+            drop(prompt_file);
+            state.release(&session);
+            if !state.stopped.load(Ordering::SeqCst) {
+                state.kick();
+            }
+        });
+    }
+}
+
+/// Drives `claude -p` once per turn. The prompt is the stdin of that process.
 #[derive(Debug)]
 pub struct ClaudeChildAgent {
-    stdin: Option<ChildStdin>,
-    /// Threads awaiting a reply, oldest first. The child answers turns in the
-    /// order they were written, so a queue is enough to attribute each reply.
-    pending: Arc<Mutex<VecDeque<ThreadId>>>,
+    turns: TurnState,
 }
 
 impl ClaudeChildAgent {
-    pub fn spawn(uuid: &str, worktree: &PathBuf) -> anyhow::Result<Self> {
-        let resuming = started_marker(uuid).exists();
-
-        let child = Command::new("claude")
-            .args(child_args(uuid, resuming))
-            .current_dir(worktree)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()?;
-
-        Ok(Self::from_child(child, uuid.to_string()))
+    pub fn new(worktree: PathBuf) -> Self {
+        Self {
+            turns: TurnState::new(CliKind::Claude, worktree),
+        }
     }
 
-    fn from_child(mut child: Child, uuid: String) -> Self {
-        let stdin = child.stdin.take();
-        let stdout = child.stdout.take();
-        let pending: Arc<Mutex<VecDeque<ThreadId>>> = Arc::default();
-        let pending_for_reader = pending.clone();
-        // A blocking task rather than a bare thread: dispatching back to the
-        // editor goes through `runtime_local!`, which under the integration
-        // test configuration resolves via `Handle::current()` and panics
-        // outside a runtime context. It also reaps the child so shutdown
-        // does not have to `wait()` on the editor thread.
-        tokio::task::spawn_blocking(move || {
-            if let Some(stdout) = stdout {
-                read_replies(stdout, pending_for_reader, uuid);
-            }
-            let _ = child.wait();
-        });
-
-        Self { stdin, pending }
+    #[cfg(test)]
+    fn with_program(program: String, worktree: PathBuf) -> Self {
+        Self {
+            turns: TurnState::with_program(CliKind::Claude, program, worktree),
+        }
     }
 }
 
-/// The child's command line.
+impl ReviewAgent for ClaudeChildAgent {
+    fn send(&mut self, thread: ThreadId, session: String, prompt: String) -> anyhow::Result<()> {
+        self.turns.send(thread, session, prompt)
+    }
+
+    fn shutdown(&mut self) {
+        self.turns.shutdown();
+    }
+}
+
+/// Drives `grok --prompt-file` once per turn.
+#[derive(Debug)]
+pub struct GrokChildAgent {
+    turns: TurnState,
+}
+
+impl GrokChildAgent {
+    pub fn new(worktree: PathBuf) -> Self {
+        Self {
+            turns: TurnState::new(CliKind::Grok, worktree),
+        }
+    }
+}
+
+impl ReviewAgent for GrokChildAgent {
+    fn send(&mut self, thread: ThreadId, session: String, prompt: String) -> anyhow::Result<()> {
+        self.turns.send(thread, session, prompt)
+    }
+
+    fn shutdown(&mut self) {
+        self.turns.shutdown();
+    }
+}
+
+/// Command line for one Claude turn.
 ///
-/// Separated so the permission posture can be asserted in a test: these flags
-/// *are* the read-only guarantee, and losing one would quietly hand an agent
-/// write access to the tree it is reviewing.
+/// The prompt is written to stdin and the pipe is closed; `-p` prints the reply
+/// and exits. Separated so the permission posture can be asserted in a test:
+/// these flags *are* the full-access grant, and losing one would quietly change
+/// what the agent is allowed to do to the tree it is reviewing.
 fn child_args(uuid: &str, resuming: bool) -> Vec<String> {
-    let mut args: Vec<String> = ["-p", "--input-format", "stream-json"]
-        .iter()
-        .map(|arg| arg.to_string())
-        .collect();
-    args.extend(["--output-format", "stream-json", "--verbose"].map(String::from));
-    // Without this a reply arrives as one event when it is finished, so a long
-    // answer is a spinner followed by a wall of text. With it the text comes in
-    // deltas and can be rendered as it is written.
-    args.push("--include-partial-messages".into());
+    let mut args = vec![
+        "-p".into(),
+        "--output-format".into(),
+        "stream-json".into(),
+        "--verbose".into(),
+        // Without this a reply arrives as one event when it is finished, so a
+        // long answer is a spinner followed by a wall of text. With it the text
+        // comes in deltas and can be rendered as it is written.
+        "--include-partial-messages".into(),
+    ];
 
     // A session id can only be used to *create*; reusing one errors with
     // "Session ID ... is already in use", so continuing needs --resume.
@@ -257,163 +529,6 @@ fn mark_session_started(uuid: &str) {
     let _ = std::fs::write(&marker, uuid);
 }
 
-/// Parse the child's NDJSON and turn it into events on the editor thread.
-fn read_replies(
-    stdout: std::process::ChildStdout,
-    pending: Arc<Mutex<VecDeque<ThreadId>>>,
-    uuid: String,
-) {
-    let reader = BufReader::new(stdout);
-    let mut streaming: Option<ThreadId> = None;
-    // A child that starts at all announces itself on stdout straight away; one
-    // that cannot start writes nothing and exits. That is the whole signal.
-    let mut spoke = false;
-    let mut marked = false;
-
-    for line in reader.lines() {
-        let Ok(line) = line else { break };
-        spoke = true;
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
-            continue;
-        };
-
-        match stream_part(&value) {
-            // Text deltas. The complete `assistant` message that follows is
-            // deliberately ignored: it repeats what the deltas already carried,
-            // and appending it too would show the reply twice mid-stream.
-            Some(StreamPart::Chunk(text)) => {
-                let Some(thread) = streaming.or_else(|| pending.lock().unwrap().front().copied())
-                else {
-                    continue;
-                };
-                streaming = Some(thread);
-                apply(AgentEvent::Chunk(thread, text));
-            }
-            Some(StreamPart::Result { is_error, text }) => {
-                let Some(thread) = pending.lock().unwrap().pop_front() else {
-                    continue;
-                };
-                streaming = None;
-                if !is_error && !marked {
-                    // A turn has landed, so the agent now holds this session and
-                    // the next editor must continue it rather than create it.
-                    marked = true;
-                    mark_session_started(&uuid);
-                }
-                apply(if is_error {
-                    AgentEvent::Failed(thread, text)
-                } else {
-                    AgentEvent::Completed(thread, text)
-                });
-                finish_one();
-            }
-            None => {}
-        }
-    }
-
-    // Nothing at all on stdout means the child could not start, and there are
-    // only two ways that happens: we said `--session-id` for a session the agent
-    // already has, or `--resume` for one it no longer has. Both are a
-    // disagreement between our marker and the agent's memory, so flipping the
-    // marker is exactly the repair. The next send starts a fresh child the other
-    // way round.
-    let failed_to_start = !spoke;
-    if failed_to_start {
-        let marker = started_marker(&uuid);
-        if marker.exists() {
-            let _ = std::fs::remove_file(&marker);
-        } else {
-            let _ = std::fs::create_dir_all(marker.parent().unwrap_or(&marker));
-            let _ = std::fs::write(&marker, &uuid);
-        }
-        // Drop the dead child so the next send spawns rather than writing into
-        // a pipe with nothing on the other end.
-        job::dispatch_blocking(move |editor, _| editor.diff.agent = None);
-    }
-
-    // The child exited or the pipe broke. Anything still queued will never be
-    // answered, so say so on the thread rather than leaving it spinning.
-    let orphaned: Vec<ThreadId> = pending.lock().unwrap().drain(..).collect();
-    for thread in orphaned {
-        apply(AgentEvent::Failed(
-            thread,
-            if failed_to_start {
-                "the agent could not start on this conversation; send again to \
-                 start it the other way round"
-                    .into()
-            } else {
-                String::from("the agent process ended before replying")
-            },
-        ));
-        finish_one();
-    }
-}
-
-impl ReviewAgent for ClaudeChildAgent {
-    fn send(&mut self, thread: ThreadId, prompt: String) -> anyhow::Result<()> {
-        let Some(stdin) = self.stdin.as_mut() else {
-            anyhow::bail!("the agent process is not accepting input");
-        };
-
-        let payload = serde_json::json!({
-            "type": "user",
-            "message": { "role": "user", "content": prompt },
-        });
-
-        // Queue before writing: a fast reply could otherwise arrive before the
-        // thread it belongs to is recorded.
-        self.pending.lock().unwrap().push_back(thread);
-        start_redraw_ticker();
-
-        if let Err(err) = writeln!(stdin, "{payload}").and_then(|()| stdin.flush()) {
-            self.pending
-                .lock()
-                .unwrap()
-                .retain(|queued| *queued != thread);
-            finish_one();
-            return Err(err.into());
-        }
-
-        apply(AgentEvent::Started(thread));
-        Ok(())
-    }
-
-    fn shutdown(&mut self) {
-        // Closing stdin is the documented way for the child to finish: it exits
-        // cleanly on EOF. Killing it would lose a reply already in flight.
-        // The stdout task reaps the process; waiting here would freeze the
-        // editor on `:review-session`, agent switch, and DiffSession drop.
-        self.stdin.take();
-    }
-}
-
-/// Drives a `grok` child per turn.
-///
-/// Grok's `-p` / `--prompt-file` is one prompt then exit, and headless mode
-/// does not read stdin. Each send is therefore its own process, chained with
-/// `--session-id` then `--resume` so they still share one conversation. Drafts
-/// queued while a turn is in flight wait until that process finishes.
-#[derive(Debug)]
-pub struct GrokChildAgent {
-    uuid: Arc<String>,
-    worktree: Arc<PathBuf>,
-    queue: Arc<Mutex<VecDeque<(ThreadId, String)>>>,
-    running: Arc<AtomicBool>,
-    shutdown: Arc<AtomicBool>,
-}
-
-impl GrokChildAgent {
-    pub fn new(uuid: String, worktree: PathBuf) -> Self {
-        Self {
-            uuid: Arc::new(uuid),
-            worktree: Arc::new(worktree),
-            queue: Arc::default(),
-            running: Arc::new(AtomicBool::new(false)),
-            shutdown: Arc::new(AtomicBool::new(false)),
-        }
-    }
-}
-
 /// Command line for one Grok turn. `prompt_file` is the path `--prompt-file`
 /// will read; tests pass a placeholder.
 fn grok_args(uuid: &str, resuming: bool, prompt_file: &Path) -> Vec<String> {
@@ -436,96 +551,6 @@ fn grok_args(uuid: &str, resuming: bool, prompt_file: &Path) -> Vec<String> {
     args
 }
 
-fn grok_kick(
-    uuid: Arc<String>,
-    worktree: Arc<PathBuf>,
-    queue: Arc<Mutex<VecDeque<(ThreadId, String)>>>,
-    running: Arc<AtomicBool>,
-    shutdown: Arc<AtomicBool>,
-) {
-    loop {
-        if shutdown.load(Ordering::SeqCst) {
-            return;
-        }
-        if running
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
-        {
-            return;
-        }
-        let next = queue.lock().unwrap().pop_front();
-        let Some((thread, prompt)) = next else {
-            running.store(false, Ordering::SeqCst);
-            if queue.lock().unwrap().is_empty() || shutdown.load(Ordering::SeqCst) {
-                return;
-            }
-            continue;
-        };
-
-        let prompt_file = match write_prompt_file(&prompt) {
-            Ok(file) => file,
-            Err(err) => {
-                apply(AgentEvent::Failed(thread, err.to_string()));
-                finish_one();
-                running.store(false, Ordering::SeqCst);
-                continue;
-            }
-        };
-
-        let resuming = started_marker(uuid.as_str()).exists();
-        let mut child = match Command::new("grok")
-            .args(grok_args(uuid.as_str(), resuming, prompt_file.path()))
-            .current_dir(worktree.as_path())
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-        {
-            Ok(child) => child,
-            Err(err) => {
-                apply(AgentEvent::Failed(
-                    thread,
-                    format!("Could not start grok: {err}"),
-                ));
-                finish_one();
-                running.store(false, Ordering::SeqCst);
-                continue;
-            }
-        };
-
-        let stdout = child.stdout.take();
-        let uuid_for_child = uuid.clone();
-        let worktree_for_child = worktree.clone();
-        let queue_for_child = queue.clone();
-        let running_for_child = running.clone();
-        let shutdown_for_child = shutdown.clone();
-        tokio::task::spawn_blocking(move || {
-            if let Some(stdout) = stdout {
-                read_grok_replies(stdout, thread, uuid_for_child.as_str());
-            } else {
-                apply(AgentEvent::Failed(
-                    thread,
-                    String::from("the agent process ended before replying"),
-                ));
-                finish_one();
-            }
-            let _ = child.wait();
-            drop(prompt_file);
-            running_for_child.store(false, Ordering::SeqCst);
-            if !shutdown_for_child.load(Ordering::SeqCst) {
-                grok_kick(
-                    uuid_for_child,
-                    worktree_for_child,
-                    queue_for_child,
-                    running_for_child,
-                    shutdown_for_child,
-                );
-            }
-        });
-        return;
-    }
-}
-
 fn write_prompt_file(prompt: &str) -> std::io::Result<tempfile::NamedTempFile> {
     let mut file = tempfile::NamedTempFile::new()?;
     file.write_all(prompt.as_bytes())?;
@@ -533,8 +558,12 @@ fn write_prompt_file(prompt: &str) -> std::io::Result<tempfile::NamedTempFile> {
     Ok(file)
 }
 
-/// One Grok process is one turn, so the thread is known before any line arrives.
-fn read_grok_replies(stdout: std::process::ChildStdout, thread: ThreadId, uuid: &str) {
+/// One process is one turn, so the thread is known before any line arrives.
+///
+/// Lines after the terminal `result` are drained and ignored. Stopping at the
+/// result would leave the child blocked once the stdout pipe filled, and
+/// `wait` would never return.
+fn read_turn(stdout: std::process::ChildStdout, thread: ThreadId, session: &str) {
     let reader = BufReader::new(stdout);
     let mut spoke = false;
     let mut finished = false;
@@ -542,90 +571,64 @@ fn read_grok_replies(stdout: std::process::ChildStdout, thread: ThreadId, uuid: 
     for line in reader.lines() {
         let Ok(line) = line else { break };
         spoke = true;
+        if finished {
+            continue;
+        }
         let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
             continue;
         };
         match stream_part(&value) {
             Some(StreamPart::Chunk(text)) => {
-                apply(AgentEvent::Chunk(thread, text));
+                apply(session, AgentEvent::Chunk(thread, text));
             }
             Some(StreamPart::Result { is_error, text }) => {
                 if !is_error {
-                    mark_session_started(uuid);
+                    mark_session_started(session);
                 }
-                apply(if is_error {
-                    AgentEvent::Failed(thread, text)
-                } else {
-                    AgentEvent::Completed(thread, text)
-                });
+                apply(
+                    session,
+                    if is_error {
+                        AgentEvent::Failed(thread, text)
+                    } else {
+                        AgentEvent::Completed(thread, text)
+                    },
+                );
                 finish_one();
                 finished = true;
-                break;
             }
             None => {}
         }
     }
 
     if !finished {
-        apply(AgentEvent::Failed(
-            thread,
-            if spoke {
-                String::from("the agent process ended before replying")
-            } else {
-                "the agent could not start on this conversation; send again to \
-                 start it the other way round"
-                    .into()
-            },
-        ));
+        apply(
+            session,
+            AgentEvent::Failed(
+                thread,
+                if spoke {
+                    String::from("the agent process ended before replying")
+                } else {
+                    "the agent could not start on this conversation; send again to \
+                     start it the other way round"
+                        .into()
+                },
+            ),
+        );
         finish_one();
         if !spoke {
-            let marker = started_marker(uuid);
+            // Nothing at all on stdout means the child could not start, and
+            // there are only two ways that happens: we said `--session-id` for
+            // a session the agent already has, or `--resume` for one it no
+            // longer has. Both are a disagreement between our marker and the
+            // agent's memory, so flipping the marker is the repair. The next
+            // send starts a fresh child the other way round.
+            let marker = started_marker(session);
             if marker.exists() {
                 let _ = std::fs::remove_file(&marker);
             } else {
-                mark_session_started(uuid);
+                mark_session_started(session);
             }
         }
-    }
-}
-
-impl ReviewAgent for GrokChildAgent {
-    fn send(&mut self, thread: ThreadId, prompt: String) -> anyhow::Result<()> {
-        if self.shutdown.load(Ordering::SeqCst) {
-            anyhow::bail!("the agent process is not accepting input");
-        }
-        self.queue.lock().unwrap().push_back((thread, prompt));
-        start_redraw_ticker();
-        apply(AgentEvent::Started(thread));
-        grok_kick(
-            self.uuid.clone(),
-            self.worktree.clone(),
-            self.queue.clone(),
-            self.running.clone(),
-            self.shutdown.clone(),
-        );
-        Ok(())
-    }
-
-    fn shutdown(&mut self) {
-        self.shutdown.store(true, Ordering::SeqCst);
-        let leftover: Vec<ThreadId> = self
-            .queue
-            .lock()
-            .unwrap()
-            .drain(..)
-            .map(|(thread, _)| thread)
-            .collect();
-        for thread in leftover {
-            apply(AgentEvent::Failed(
-                thread,
-                String::from("the agent process ended before replying"),
-            ));
-            finish_one();
-        }
-        // The in-flight child is waited on by its blocking task. Spinning here
-        // would block the editor thread on a network turn; dropping is enough
-        // to refuse further sends, and the running process is allowed to finish.
     }
 }
 
@@ -668,6 +671,47 @@ mod test {
     fn replies_are_streamed_rather_than_arriving_whole() {
         let args = child_args("11111111-2222-5333-8444-555555555555", false);
         assert!(args.iter().any(|arg| arg == "--include-partial-messages"));
+    }
+
+    #[test]
+    fn claude_is_one_prompt_then_exit_not_a_shared_stream() {
+        let args = child_args("11111111-2222-5333-8444-555555555555", false);
+        assert!(args.iter().any(|arg| arg == "-p"), "{args:?}");
+        assert!(
+            !args.iter().any(|arg| arg == "--input-format"),
+            "a shared stdin stream is what let one reply land on another comment: {args:?}"
+        );
+    }
+
+    #[test]
+    fn different_threads_run_together_and_one_thread_stays_in_order() {
+        let turns = TurnState::new(CliKind::Claude, PathBuf::from("."));
+        let first = "00000000-0000-4000-8000-000000000001";
+        let second = "00000000-0000-4000-8000-000000000002";
+        assert!(turns.push_waiting(first, ThreadId(1), "a1".into()));
+        assert!(turns.push_waiting(first, ThreadId(1), "a2".into()));
+        assert!(turns.push_waiting(second, ThreadId(2), "b1".into()));
+
+        let mut ready = vec![turns.pop_ready().unwrap(), turns.pop_ready().unwrap()];
+        assert!(
+            turns.pop_ready().is_none(),
+            "a session with a turn already running waits"
+        );
+        ready.sort_by(|left, right| left.0.cmp(&right.0));
+        assert_eq!(ready[0].2, "a1");
+        assert_eq!(ready[1].2, "b1");
+
+        turns.release(first);
+        let follow = turns.pop_ready().unwrap();
+        assert_eq!(follow.0, first);
+        assert_eq!(follow.2, "a2");
+        assert!(turns.pop_ready().is_none());
+
+        turns.stopped.store(true, Ordering::SeqCst);
+        assert!(
+            !turns.push_waiting(first, ThreadId(1), "later".into()),
+            "shutdown must refuse another turn"
+        );
     }
 
     fn grok_sample(resuming: bool) -> Vec<String> {
@@ -762,27 +806,91 @@ mod test {
     #[cfg(unix)]
     #[tokio::test]
     async fn claude_shutdown_does_not_wait_for_the_child() {
-        // A child that ignores stdin EOF and stays alive: waiting on it in
-        // shutdown would freeze the editor for the full duration. stdout is
-        // discarded so the reply reader (and its editor dispatch) is not
-        // involved; this only times `wait()`.
-        let child = Command::new("sleep")
-            .arg("30")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("sleep should spawn");
-        let pid = child.id();
-        let mut agent = ClaudeChildAgent::from_child(child, "shutdown-test".into());
+        // A turn that ignores stdin and stays alive. Waiting on it in shutdown
+        // would freeze the editor for the full duration.
+        struct Cleanup {
+            pid: u32,
+            running: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+        }
+
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                if self.pid != 0 {
+                    let _ = Command::new("kill")
+                        .args(["-9", &self.pid.to_string()])
+                        .status();
+                }
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                while !self.running.lock().unwrap().is_empty()
+                    && std::time::Instant::now() < deadline
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                SUPPRESS_DISPATCH.store(false, Ordering::SeqCst);
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let pid_path = dir.path().join("pid");
+        let program = dir.path().join("claude");
+        std::fs::write(
+            &program,
+            format!(
+                "#!/bin/sh\necho $$ > '{}'\nexec sleep 30\n",
+                pid_path.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            &program,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+
+        SUPPRESS_DISPATCH.store(true, Ordering::SeqCst);
+        let mut agent = ClaudeChildAgent::with_program(
+            program.to_string_lossy().into_owned(),
+            dir.path().to_path_buf(),
+        );
+        // Declared after the agent so it drops first: kill the child, let the
+        // reader finish (its dispatch is suppressed), then clear the flag.
+        let mut cleanup = Cleanup {
+            pid: 0,
+            running: agent.turns.running.clone(),
+        };
+        agent
+            .turns
+            .send(
+                ThreadId(1),
+                "11111111-2222-4333-8444-555555555555".into(),
+                "hi".into(),
+            )
+            .unwrap();
+
+        let started = std::time::Instant::now();
+        let pid = loop {
+            if let Ok(text) = std::fs::read_to_string(&pid_path) {
+                if let Ok(pid) = text.trim().parse::<u32>() {
+                    break pid;
+                }
+            }
+            if started.elapsed() > std::time::Duration::from_secs(2) {
+                panic!("the turn did not start");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        cleanup.pid = pid;
 
         let start = std::time::Instant::now();
         agent.shutdown();
         let elapsed = start.elapsed();
+        let alive = Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .unwrap()
+            .success();
 
-        // Reap so the background wait returns and the test runtime can exit.
-        let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
-
+        assert!(alive, "shutdown must leave the turn running");
         assert!(
             elapsed < std::time::Duration::from_millis(500),
             "shutdown blocked on the child for {elapsed:?}"

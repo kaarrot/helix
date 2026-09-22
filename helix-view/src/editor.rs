@@ -3057,7 +3057,7 @@ impl Editor {
         if let Some(previous) = &self.diff.session {
             crate::review::session::release(previous);
         }
-        // The running child is bound to the previous conversation's UUID.
+        // Turns already running belong to the previous session's threads.
         self.drop_review_agent();
         let session = crate::review::session::claim(&worktree, name);
         self.load_reviews(&session.uuid);

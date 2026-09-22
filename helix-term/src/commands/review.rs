@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use helix_view::editor::Action;
-use helix_view::review::{DiffSide, ReviewAnchor, ThreadId};
+use helix_view::review::{DiffSide, ReviewAnchor, Role, ThreadId};
 use helix_view::{Document, DocumentId, Editor, ViewId};
 
 use crate::commands::Context;
@@ -581,7 +581,12 @@ const CONTEXT_LINES: usize = 6;
 /// The user's comment stays short and pointed because Helix supplies the
 /// context: with the file, the line and its surroundings attached, the agent
 /// has no need to go looking, and no API for doing so is required.
-fn compose_prompt(editor: &Editor, thread_id: ThreadId, comment: &str) -> String {
+fn compose_prompt(
+    editor: &Editor,
+    thread_id: ThreadId,
+    comment: &str,
+    had_session: bool,
+) -> String {
     // Take the file from the *thread*, not from whatever happens to be focused.
     // A batch send flushes drafts across several files, and quoting the focused
     // buffer for all of them would attach every comment to the wrong place.
@@ -591,10 +596,11 @@ fn compose_prompt(editor: &Editor, thread_id: ThreadId, comment: &str) -> String
     let file = thread.file.clone();
     let side = thread.side;
     let stored_line = thread.line as usize;
-    // The draft has already become a message by this point, so anything beyond
-    // the first means this is a follow-up in a conversation the agent is
-    // already holding.
-    let is_followup = thread.messages.len() > 1;
+    // The draft has already become a message. A follow-up is a later turn in
+    // the conversation this thread already started. Messages left over from
+    // before that conversation existed are not one: the agent has not seen them.
+    let is_followup = had_session && thread.messages.len() > 1;
+    let earlier = earlier_transcript(thread, had_session);
     let side_label = match side {
         DiffSide::Base => "base",
         DiffSide::Working => "working",
@@ -609,18 +615,17 @@ fn compose_prompt(editor: &Editor, thread_id: ThreadId, comment: &str) -> String
         .is_some_and(|thread| thread.rewound);
 
     if is_followup {
-        // The agent is in the same session and still holds the replies that
-        // were dropped, so it has to be told or it will answer as though they
-        // still stood.
+        // This thread's conversation still holds the replies that were dropped,
+        // so it has to be told or it will answer as though they still stood.
         let rewind_note = if rewound {
             "The reviewer has removed part of this thread since your last reply; \
              some of what was said no longer stands, so do not rely on it.\n\n"
         } else {
             ""
         };
-        // No need to resend the quoted context: it is the same thread in the
-        // same session, so the agent already has it. Only the line is worth
-        // repeating, since edits may have moved it since the last turn.
+        // No need to resend the quoted context: this thread's conversation
+        // already has it. Only the line is worth repeating, since edits may
+        // have moved it since the last turn.
         return format!(
             "A follow-up on the review comment at {}:{} (side: {side_label}).\n\n\
              {rewind_note}\
@@ -645,11 +650,37 @@ fn compose_prompt(editor: &Editor, thread_id: ThreadId, comment: &str) -> String
          line: {}\n\
          {range}\n\
          ```\n{quoted}```\n\n\
+         {earlier}\
          comment: {comment}\n\n\
          Answer the comment.",
         file.display(),
         line + 1
     )
+}
+
+/// Messages already on a thread whose agent conversation is only just starting.
+///
+/// A comment saved before each thread had its own conversation still has that
+/// history in the editor. The new conversation has not seen it, and a follow-up
+/// prompt would assume that it had.
+fn earlier_transcript(thread: &helix_view::review::Thread, had_session: bool) -> String {
+    if had_session || thread.messages.len() <= 1 {
+        return String::new();
+    }
+    let mut out = String::from(
+        "Earlier messages from this thread, which this conversation has not seen yet:\n\n",
+    );
+    for message in &thread.messages[..thread.messages.len() - 1] {
+        let who = match message.role {
+            Role::User => "reviewer",
+            Role::Agent => "agent",
+        };
+        out.push_str(who);
+        out.push_str(": ");
+        out.push_str(&message.text);
+        out.push_str("\n\n");
+    }
+    out
 }
 
 /// Quote the document that matches `side`, not whichever buffer happens to be
@@ -773,18 +804,15 @@ fn ensure_agent(editor: &mut Editor) -> Result<(), String> {
     let Some(session) = editor.review_session() else {
         return Err("Cannot start a review session: this buffer is not in a repository".into());
     };
-    let (uuid, worktree) = (session.uuid.clone(), session.worktree.clone());
+    let worktree = session.worktree.clone();
     let kind = editor.diff.agent_kind;
 
     let agent: Box<dyn helix_view::review::agent::ReviewAgent> = match kind {
         helix_view::review::agent::ReviewAgentKind::Claude => {
-            match crate::review_agent::ClaudeChildAgent::spawn(&uuid, &worktree) {
-                Ok(agent) => Box::new(agent),
-                Err(err) => return Err(format!("Could not start the agent: {err}")),
-            }
+            Box::new(crate::review_agent::ClaudeChildAgent::new(worktree))
         }
         helix_view::review::agent::ReviewAgentKind::Grok => {
-            Box::new(crate::review_agent::GrokChildAgent::new(uuid, worktree))
+            Box::new(crate::review_agent::GrokChildAgent::new(worktree))
         }
     };
     editor.diff.agent = Some(agent);
@@ -793,8 +821,8 @@ fn ensure_agent(editor: &mut Editor) -> Result<(), String> {
 
 /// Send every unsent draft, oldest first. Returns how many went out.
 ///
-/// Each draft is its own turn so that each reply lands on the thread that asked
-/// for it; they still share one conversation, so the agent sees them together.
+/// Each draft is its own conversation, so two comments cannot see each other or
+/// take each other's reply. A follow-up resumes the thread it belongs to.
 pub fn send_pending(editor: &mut Editor) -> Result<usize, String> {
     send_pending_ids(editor, None)
 }
@@ -815,15 +843,26 @@ fn send_pending_ids(editor: &mut Editor, only: Option<ThreadId>) -> Result<usize
 
     let mut sent = 0;
     for id in pending {
+        // Captured before the session is created: that is what distinguishes a
+        // follow-up from the first turn, including a thread saved before each
+        // comment had its own conversation.
+        let had_session = editor
+            .diff
+            .reviews
+            .get(id)
+            .is_some_and(|thread| thread.agent_session.is_some());
+        let Some(session) = editor.diff.reviews.ensure_agent_session(id) else {
+            continue;
+        };
         let Some(text) = editor.diff.reviews.take_draft(id) else {
             continue;
         };
-        let prompt = compose_prompt(editor, id, &text);
+        let prompt = compose_prompt(editor, id, &text, had_session);
         if let Some(thread) = editor.diff.reviews.get_mut(id) {
             thread.rewound = false;
         }
         let result = match editor.diff.agent.as_mut() {
-            Some(agent) => agent.send(id, prompt),
+            Some(agent) => agent.send(id, session, prompt),
             None => Err(anyhow::anyhow!("no agent")),
         };
         match result {
@@ -839,8 +878,8 @@ fn send_pending_ids(editor: &mut Editor, only: Option<ThreadId>) -> Result<usize
     Ok(sent)
 }
 
-/// Each comment is its own turn in one shared conversation, so replies land on
-/// the thread that asked while the agent still sees the others.
+/// Each comment is its own conversation. Replies stay on the thread that asked,
+/// and one comment does not see the others.
 pub fn review_send_all(cx: &mut Context) {
     match send_pending(cx.editor) {
         Ok(sent) => cx.editor.set_status(match sent {

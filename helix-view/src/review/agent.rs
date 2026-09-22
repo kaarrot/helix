@@ -1,19 +1,18 @@
 //! The seam between review threads and whatever answers them.
 //!
-//! Helix owns the agent process rather than the other way round, which is what
-//! makes a comment trigger a reply directly: writing to the child's stdin *is*
-//! the trigger, so there is no polling step to make faster. The trait exists so
-//! that a different transport can replace the child without touching the store,
-//! the rendering or the keymap.
+//! Helix owns the agent process rather than the other way round: sending a
+//! comment starts a turn, and the reply is applied back onto that same thread.
+//! The trait exists so that a different transport can replace the child without
+//! touching the store, the rendering or the keymap.
 
 use super::ThreadId;
 use std::fmt;
 
 /// Which child answers review comments.
 ///
-/// Chosen with `:review-session [claude|grok]`, not config: the two CLIs are
-/// not interchangeable (Claude keeps a process open and reads stdin; Grok is
-/// one prompt then exit), so the editor picks the spawn path from this.
+/// Chosen with `:review-session [claude|grok]`, not config. The two CLIs take
+/// the prompt differently, so the editor picks the spawn path from this. Each
+/// comment is its own conversation either way.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ReviewAgentKind {
     #[default]
@@ -47,9 +46,14 @@ impl fmt::Display for ReviewAgentKind {
 /// response would not fit, because a reply arrives in pieces and long after the
 /// call that asked for it.
 pub trait ReviewAgent: Send + std::fmt::Debug {
-    /// Ask for a reply to `thread`. `prompt` is the fully composed message,
-    /// context included — the agent is not expected to go looking for it.
-    fn send(&mut self, thread: ThreadId, prompt: String) -> anyhow::Result<()>;
+    /// Ask for a reply to `thread` in `session`.
+    ///
+    /// `prompt` is the fully composed message, context included — the agent is
+    /// not expected to go looking for it. `session` belongs to that thread
+    /// alone: the first turn creates it (`--session-id`) and a later turn
+    /// resumes it (`--resume`), so two comments never share a conversation and
+    /// a reply cannot be written onto the wrong one.
+    fn send(&mut self, thread: ThreadId, session: String, prompt: String) -> anyhow::Result<()>;
 
     /// Stop accepting work and let the underlying process finish.
     fn shutdown(&mut self);

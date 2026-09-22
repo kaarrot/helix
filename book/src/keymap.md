@@ -407,8 +407,8 @@ removes the thread with it.
 
 Replying while looking at an older entry continues the conversation from that
 point and **discards the entries after it** — the point of going back is to take
-it a different way. The status line says how many were dropped. The agent is in
-the same session and still remembers them, so the next message tells it they no
+it a different way. The status line says how many were dropped. That comment's
+conversation still remembers them, so the next message tells it they no
 longer stand. Inside the box, Enter inserts a newline, `Ctrl-S`
 saves a draft and closes the box, and `Ctrl-Shift-S` saves and sends it straight away.
 `c` on that line opens the saved draft again. A thread shows one
@@ -416,8 +416,9 @@ entry at a time, with a `3/5` counter in its header, so its height stays bounded
 by a single message however long the conversation grows.
 
 `S` sends every unsent comment. The agent is started on the first send. Each
-comment is its own turn in one shared conversation, so replies land on the
-thread that asked while the agent still sees the others.
+comment has its own conversation, so a reply cannot land on another comment and
+one comment does not see the others. A follow-up in the same window resumes
+that conversation.
 
 The agent runs with **full access to the worktree**: it can edit files and run
 commands without asking, because a comment on a line usually implies a change to
@@ -427,11 +428,15 @@ visible, and the conversation is kept — but treat it as you would any agent wi
 write access to your checkout.
 
 The child is **Claude Code** (`claude`) until you pick otherwise with
-`:review-session grok`. `:review-session claude` switches back. The two are not
-the same binary with different flags: Claude keeps one process open and reads
-turns from stdin, Grok is one `grok --prompt-file` process per comment, resumed
-with `--resume` so they still share a conversation. A conversation name and an
-agent can be given together, in either order: `:review-session spike grok`.
+`:review-session grok`. `:review-session claude` switches back. Either way one
+turn is one process, and the UUID stored on that comment decides which
+conversation it is. The first turn passes `--session-id`. Every later turn in
+the same window passes `--resume` with that same UUID. Claude is `claude -p`
+with the prompt on stdin. Grok is `grok --prompt-file`. Turns on different
+comments run at the same time. A follow-up waits until its own previous turn
+has finished, so two processes never resume one conversation together. A
+conversation name and an agent can be given together, in either order:
+`:review-session spike grok`.
 
 Conversations are saved as they change and come back when you reopen Helix on
 the same branch, including comments you drafted but never sent. Ones nothing has

@@ -1602,6 +1602,7 @@ dependencies = [
  "crossterm",
  "filetime",
  "futures-util",
+ "getrandom 0.2.15",
  "helix-core",
  "helix-dap",
  "helix-event",

@@ -119,6 +119,14 @@ pub struct Thread {
     /// collapse point: silently discarding a conversation is worse than showing
     /// one that has lost its footing.
     pub orphaned: bool,
+    /// The agent conversation for this thread alone.
+    ///
+    /// Created on the first send and persisted, so a later reply resumes it
+    /// with `--resume`. Distinct from the review-session UUID, which only names
+    /// the file these threads are saved in. `None` until the thread is sent.
+    /// Absent in saves from before each comment had its own conversation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_session: Option<String>,
 }
 
 /// Plain text of the body rows last drawn for one entry.
@@ -499,6 +507,9 @@ impl ReviewStore {
             // twice: prefer whichever is still unsent.
             target.draft = target.draft.take().or(extra.draft);
             target.orphaned &= extra.orphaned;
+            if target.agent_session.is_none() {
+                target.agent_session = extra.agent_session;
+            }
             target.view = target.entry_count().saturating_sub(1);
         }
     }
@@ -533,9 +544,22 @@ impl ReviewStore {
                 awaiting: false,
                 rewound: false,
                 orphaned: false,
+                agent_session: None,
             },
         );
         id
+    }
+
+    /// The agent conversation for this thread, created on the first send.
+    ///
+    /// Stable afterwards, including across a reload, so a follow-up resumes the
+    /// same conversation instead of starting one that has forgotten it.
+    pub fn ensure_agent_session(&mut self, id: ThreadId) -> Option<String> {
+        let thread = self.threads.get_mut(&id)?;
+        if thread.agent_session.is_none() {
+            thread.agent_session = Some(session::random_uuid());
+        }
+        thread.agent_session.clone()
     }
 
     pub fn get(&self, id: ThreadId) -> Option<&Thread> {
@@ -608,8 +632,8 @@ impl ReviewStore {
         thread.draft = None;
         thread.messages.truncate(index + 1);
         thread.view = thread.entry_count().saturating_sub(1);
-        // The agent is in the same session and still remembers what was dropped,
-        // so it has to be told or it will answer as though it still stood.
+        // This thread's conversation still remembers what was dropped, so it has
+        // to be told or it will answer as though it still stood.
         thread.rewound = true;
         before - thread.entry_count()
     }
@@ -780,6 +804,31 @@ impl ReviewStore {
         // they were folded together.
         store.merge_by_anchor();
         store
+    }
+
+    /// Fold an agent event into the store when it belongs to `session`.
+    ///
+    /// A turn can outlive the review session it was started in: switching
+    /// sessions drops the child only by refusing new work, and a reply already
+    /// in flight still arrives. Thread ids are reused from 1 in every file, so
+    /// without this check that reply would be written onto whichever thread now
+    /// holds the same id. The session id stored on the thread is what the turn
+    /// was actually answering.
+    pub fn apply_agent_event_for(&mut self, session: &str, event: AgentEvent) {
+        let id = match &event {
+            AgentEvent::Started(id)
+            | AgentEvent::Chunk(id, _)
+            | AgentEvent::Completed(id, _)
+            | AgentEvent::Failed(id, _) => *id,
+        };
+        let matches = self
+            .threads
+            .get(&id)
+            .and_then(|thread| thread.agent_session.as_deref())
+            == Some(session);
+        if matches {
+            self.apply_agent_event(event);
+        }
     }
 
     /// Fold an agent event into the store.
@@ -1645,6 +1694,72 @@ mod test {
     }
 
     #[test]
+    fn each_thread_keeps_its_own_agent_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let uuid = "12121212-3434-4545-8686-787878787878";
+        let mut store = ReviewStore::default();
+        let first = store.draft(PathBuf::from("/r/a.rs"), DiffSide::Working, 1, "one".into());
+        let second = store.draft(PathBuf::from("/r/a.rs"), DiffSide::Working, 4, "two".into());
+
+        let first_session = store.ensure_agent_session(first).unwrap();
+        let second_session = store.ensure_agent_session(second).unwrap();
+        assert_ne!(first_session, second_session);
+        assert_eq!(
+            store.ensure_agent_session(first).as_deref(),
+            Some(first_session.as_str()),
+            "a follow-up must resume the session the first send created"
+        );
+
+        store.save_to(dir.path(), uuid).unwrap();
+        let back = ReviewStore::load_from(dir.path(), uuid);
+        assert_eq!(
+            back.get(first).unwrap().agent_session.as_deref(),
+            Some(first_session.as_str())
+        );
+        assert_eq!(
+            back.get(second).unwrap().agent_session.as_deref(),
+            Some(second_session.as_str())
+        );
+
+        // A save from before comments had their own conversations omits the field.
+        let legacy = r#"{
+            "threads": [{
+                "id": 1,
+                "file": "/r/a.rs",
+                "side": "working",
+                "line": 1,
+                "messages": [],
+                "draft": "why?",
+                "collapsed": false,
+                "rewound": false,
+                "orphaned": false
+            }],
+            "next_id": 2
+        }"#;
+        std::fs::write(dir.path().join(format!("{uuid}.threads.json")), legacy).unwrap();
+        let legacy = ReviewStore::load_from(dir.path(), uuid);
+        assert_eq!(legacy.get(ThreadId(1)).unwrap().agent_session, None);
+    }
+
+    #[test]
+    fn an_event_for_another_conversation_is_ignored() {
+        let (mut store, id) = sent_thread();
+        let session = store.ensure_agent_session(id).unwrap();
+        store.apply_agent_event_for(&session, AgentEvent::Started(id));
+        assert!(store.get(id).unwrap().awaiting);
+
+        store.apply_agent_event_for("someone-else", AgentEvent::Chunk(id, "nope".into()));
+        assert_eq!(
+            store.get(id).unwrap().entry_count(),
+            1,
+            "a reply from another conversation must not be written here"
+        );
+
+        store.apply_agent_event_for(&session, AgentEvent::Chunk(id, "yes".into()));
+        assert_eq!(store.get(id).unwrap().entry(1).unwrap().text, "yes");
+    }
+
+    #[test]
     fn a_failure_is_shown_on_the_thread_that_asked() {
         let (mut store, id) = sent_thread();
         store.apply_agent_event(AgentEvent::Started(id));
@@ -1960,6 +2075,7 @@ mod test {
                 awaiting: false,
                 rewound: false,
                 orphaned: false,
+                agent_session: None,
             },
         );
         store.save_to(dir.path(), uuid).unwrap();

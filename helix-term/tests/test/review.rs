@@ -465,13 +465,13 @@ async fn split_diff_prompts_quote_the_matching_side() -> anyhow::Result<()> {
 
     let base_prompt = sent
         .iter()
-        .find(|(_, prompt)| prompt.contains("old two"))
-        .map(|(_, prompt)| prompt.as_str())
+        .find(|(_, prompt, _)| prompt.contains("old two"))
+        .map(|(_, prompt, _)| prompt.as_str())
         .expect("base comment was sent");
     let working_prompt = sent
         .iter()
-        .find(|(_, prompt)| prompt.contains("new two"))
-        .map(|(_, prompt)| prompt.as_str())
+        .find(|(_, prompt, _)| prompt.contains("new two"))
+        .map(|(_, prompt, _)| prompt.as_str())
         .expect("working comment was sent");
 
     assert!(
@@ -1086,12 +1086,18 @@ async fn review_session_picks_the_agent_without_renaming() -> anyhow::Result<()>
 /// exercised without spawning a real agent.
 #[derive(Debug, Default, Clone)]
 struct FakeAgent {
-    sent: std::sync::Arc<std::sync::Mutex<Vec<(helix_view::review::ThreadId, String)>>>,
+    /// `(thread, prompt, agent session)`.
+    sent: std::sync::Arc<std::sync::Mutex<Vec<(helix_view::review::ThreadId, String, String)>>>,
 }
 
 impl helix_view::review::agent::ReviewAgent for FakeAgent {
-    fn send(&mut self, thread: helix_view::review::ThreadId, prompt: String) -> anyhow::Result<()> {
-        self.sent.lock().unwrap().push((thread, prompt));
+    fn send(
+        &mut self,
+        thread: helix_view::review::ThreadId,
+        session: String,
+        prompt: String,
+    ) -> anyhow::Result<()> {
+        self.sent.lock().unwrap().push((thread, prompt, session));
         Ok(())
     }
     fn shutdown(&mut self) {}
@@ -1136,11 +1142,11 @@ async fn a_batch_send_quotes_each_comment_s_own_file() -> anyhow::Result<()> {
 
     let alpha_prompt = sent
         .iter()
-        .find(|(_, prompt)| prompt.contains("about alpha"))
+        .find(|(_, prompt, _)| prompt.contains("about alpha"))
         .expect("alpha comment was sent");
     let beta_prompt = sent
         .iter()
-        .find(|(_, prompt)| prompt.contains("about beta"))
+        .find(|(_, prompt, _)| prompt.contains("about beta"))
         .expect("beta comment was sent");
 
     assert!(
@@ -1156,6 +1162,10 @@ async fn a_batch_send_quotes_each_comment_s_own_file() -> anyhow::Result<()> {
     // The quoted context must come from the right file too, not just the path.
     assert!(alpha_prompt.1.contains("alpha_one"), "{}", alpha_prompt.1);
     assert!(beta_prompt.1.contains("beta_one"), "{}", beta_prompt.1);
+    assert_ne!(
+        alpha_prompt.2, beta_prompt.2,
+        "each comment has its own agent conversation"
+    );
 
     harness.close(&mut app).await?;
     Ok(())
@@ -1380,6 +1390,21 @@ async fn a_thread_grows_through_replies_and_can_be_navigated() -> anyhow::Result
         second.1.contains("follow-up"),
         "a follow-up should not resend the whole context: {}",
         second.1
+    );
+    assert_eq!(
+        sent.lock().unwrap()[0].2,
+        second.2,
+        "a follow-up resumes the conversation the first send created"
+    );
+    assert_eq!(
+        app.editor
+            .diff
+            .reviews
+            .get(id)
+            .unwrap()
+            .agent_session
+            .as_deref(),
+        Some(second.2.as_str())
     );
 
     app.editor

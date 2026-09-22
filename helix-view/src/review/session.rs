@@ -13,6 +13,7 @@ use std::{
     collections::HashMap,
     fs,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -73,7 +74,36 @@ pub fn derive_uuid(worktree: &Path, name: &str) -> String {
     bytes.copy_from_slice(&digest[..16]);
     bytes[6] = (bytes[6] & 0x0f) | 0x50; // version 5
     bytes[8] = (bytes[8] & 0x3f) | 0x80; // RFC 4122 variant
+    format_uuid(&bytes)
+}
 
+/// UUID version 4, for one comment's agent conversation.
+///
+/// A review session keeps every comment on a branch in one file. Each comment
+/// still needs its own id, because that is what `--session-id` / `--resume`
+/// continue, and sharing one would mix the comments together.
+pub fn random_uuid() -> String {
+    let mut bytes = [0u8; 16];
+    if getrandom::getrandom(&mut bytes).is_err() {
+        // Entropy being unavailable should not abort the editor. Mix the clock,
+        // the pid and a counter; the version bits below still make a legal UUID.
+        let mut hasher = Sha1::new();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        hasher.update(nanos.to_le_bytes());
+        hasher.update(std::process::id().to_le_bytes());
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        hasher.update(COUNTER.fetch_add(1, Ordering::Relaxed).to_le_bytes());
+        bytes.copy_from_slice(&hasher.finalize()[..16]);
+    }
+    bytes[6] = (bytes[6] & 0x0f) | 0x40; // version 4
+    bytes[8] = (bytes[8] & 0x3f) | 0x80; // RFC 4122 variant
+    format_uuid(&bytes)
+}
+
+fn format_uuid(bytes: &[u8; 16]) -> String {
     let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
     format!(
         "{}-{}-{}-{}-{}",
@@ -363,6 +393,24 @@ mod test {
         assert!(a.chars().all(|c| c.is_ascii_hexdigit() || c == '-'));
         // Version 5 and the RFC 4122 variant, which `--session-id` requires.
         assert_eq!(a.as_bytes()[14], b'5');
+        assert!(matches!(a.as_bytes()[19], b'8' | b'9' | b'a' | b'b'));
+    }
+
+    #[test]
+    fn random_uuid_is_a_fresh_v4() {
+        let a = random_uuid();
+        let b = random_uuid();
+        assert_ne!(
+            a, b,
+            "two comments must not be handed the same conversation"
+        );
+        assert_eq!(a.len(), 36);
+        assert_eq!(
+            a.split('-').map(str::len).collect::<Vec<_>>(),
+            vec![8, 4, 4, 4, 12]
+        );
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit() || c == '-'));
+        assert_eq!(a.as_bytes()[14], b'4');
         assert!(matches!(a.as_bytes()[19], b'8' | b'9' | b'a' | b'b'));
     }
 

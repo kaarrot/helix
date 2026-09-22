@@ -18,6 +18,25 @@ async fn history_completion() -> anyhow::Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn prompt_reset_anchor() -> anyhow::Result<()> {
+    // Paint once while the line is scrolled (anchor > 0), then clear it.
+    // Input is coalesced into one frame, so both steps have to be separate
+    // sequences or the clear lands before the anchor is ever stored.
+    let line = ":string wider than the terminal window causing the anchor location to be non zero which would panic when the line is deleted";
+    test_key_sequences(
+        &mut AppBuilder::new().build()?,
+        vec![
+            (Some(line), None),
+            (Some("<C-u>"), Some(&|app| assert!(!app.editor.is_err()))),
+        ],
+        false,
+    )
+    .await?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn history_prefix_search() -> anyhow::Result<()> {
     test_key_sequence(
         &mut AppBuilder::new().build()?,

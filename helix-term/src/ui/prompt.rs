@@ -592,6 +592,11 @@ impl Prompt {
             .clip_right(2);
 
         if self.line.is_empty() {
+            // `cursor()` slices `line[anchor..cursor]`. Anchor is a byte index
+            // from the previous frame and is past the end once the line is cleared.
+            self.anchor = 0;
+            self.truncate_start = false;
+            self.truncate_end = false;
             // Show the most recently entered value as a suggestion.
             if let Some(suggestion) = self.first_history_completion(cx.editor) {
                 surface.set_string(
@@ -644,19 +649,22 @@ impl Prompt {
             self.truncate_end = self.line[self.anchor..].width() > line_width;
 
             // if we keep inserting characters just before the end elipsis, we move the anchor
-            // so that those new characters are displayed
-            if self.truncate_end && self.line[self.anchor..self.cursor].width() >= line_width {
-                // Move the anchor forward by one non-zero-width grapheme.
-                self.anchor += self.line[self.anchor..]
+            // so that those new characters are displayed. A zero-width field makes
+            // `width >= line_width` true for an empty range and would walk anchor
+            // past the cursor, which `cursor()` then slices.
+            if line_width > 0
+                && self.truncate_end
+                && self.line[self.anchor..self.cursor].width() >= line_width
+            {
+                if let Some(shift) = self.line[self.anchor..]
                     .grapheme_indices(true)
-                    .find_map(|(idx, g)| {
-                        if g.width() > 0 {
-                            Some(idx + g.len())
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap();
+                    .find_map(|(idx, g)| (g.width() > 0).then_some(idx + g.len()))
+                {
+                    let new_anchor = self.anchor + shift;
+                    if new_anchor <= self.cursor {
+                        self.anchor = new_anchor;
+                    }
+                }
             }
 
             surface.set_string_anchored(
@@ -861,17 +869,22 @@ impl Component for Prompt {
             .clip_left(self.prompt.len() as u16)
             .clip_right(if self.prompt.is_empty() { 2 } else { 0 });
 
-        let mut col = area.left() as usize + self.line[self.anchor..self.cursor].width();
+        // Anchor is updated while rendering. Clamp so a cleared or narrowed
+        // line cannot slice off a char boundary or past the cursor.
+        let cursor = self
+            .line
+            .floor_char_boundary(self.cursor.min(self.line.len()));
+        let anchor = self.line.floor_char_boundary(self.anchor.min(cursor));
+
+        let mut col = area.left() as usize + self.line[anchor..cursor].width();
 
         // ensure the cursor does not go beyond elipses
-        if self.truncate_end
-            && self.line[self.anchor..self.cursor].width() >= self.line_area.width as usize
-        {
-            col -= 1;
+        if self.truncate_end && self.line[anchor..cursor].width() >= self.line_area.width as usize {
+            col = col.saturating_sub(1);
         }
 
-        if self.truncate_start && self.cursor == self.anchor {
-            col += self.line[self.cursor..]
+        if self.truncate_start && cursor == anchor {
+            col += self.line[cursor..]
                 .graphemes(true)
                 .next()
                 .map_or(0, |g| g.width());

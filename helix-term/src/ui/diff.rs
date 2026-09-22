@@ -5,7 +5,7 @@ use crate::ui::{
 use helix_core::{syntax::OverlayHighlights, unicode::width::UnicodeWidthStr, Position};
 use helix_view::{
     annotations::rows::{Attention, CommentRowKind, RowMark, VirtualRow, VirtualRowPlan},
-    graphics::{Color, Rect, Style},
+    graphics::{Color, Modifier, Rect, Style},
     review::MARKER,
     Document, Theme,
 };
@@ -117,6 +117,8 @@ pub(super) struct VirtualRowDecoration {
     /// Backgrounds for the cursor and selection drawn inside a focused box.
     box_cursor_bg: Option<helix_view::graphics::Color>,
     box_selection_bg: Option<helix_view::graphics::Color>,
+    /// The one cell of the cursor row the in-box cursor points at.
+    box_cell: Style,
     user: Style,
     agent: Style,
     pending: Style,
@@ -168,6 +170,10 @@ impl VirtualRowDecoration {
                 .and_then(|style| style.bg)
                 .or_else(|| theme.try_get("ui.selection").and_then(|style| style.bg))
                 .or_else(|| blended_surface(theme, 55, false).bg),
+            box_cell: theme
+                .try_get("ui.cursor.primary")
+                .or_else(|| theme.try_get("ui.cursor"))
+                .unwrap_or_else(|| Style::default().add_modifier(Modifier::REVERSED)),
             spacer: theme
                 .try_get("ui.diff.spacer")
                 .unwrap_or_else(|| blended_bg(theme, 15)),
@@ -258,7 +264,7 @@ impl Decoration for VirtualRowDecoration {
                     // say where `y` would copy from, which is a stronger claim
                     // than which box has the keys.
                     match mark {
-                        RowMark::Cursor => {
+                        RowMark::Cursor { .. } => {
                             if let Some(bg) = self.box_cursor_bg {
                                 style = style.bg(bg);
                             }
@@ -268,7 +274,7 @@ impl Decoration for VirtualRowDecoration {
                                 style = style.bg(bg);
                             }
                         }
-                        RowMark::None => {}
+                        RowMark::Span { .. } | RowMark::None => {}
                     }
                     renderer.set_style(Rect::new(viewport.x, y, viewport.width, 1), style);
                     renderer.set_stringn(viewport.x, y, MARKER, 1, style);
@@ -281,6 +287,21 @@ impl Decoration for VirtualRowDecoration {
                         // tint painted above. Keep the markdown foreground and
                         // emphasis, and let the row keep its own background.
                         paint_comment_spans(renderer, text_x, y, text_width, style, spans);
+                    }
+                    // Part of a row picked out goes on last, over the text.
+                    let (start, end, cell) = match *mark {
+                        RowMark::Cursor { col } => (col, col.saturating_add(1), self.box_cell),
+                        RowMark::Span { start, end } => (
+                            start,
+                            end,
+                            self.box_selection_bg
+                                .map_or(Style::default(), |bg| Style::default().bg(bg)),
+                        ),
+                        RowMark::Selected | RowMark::None => (0, 0, Style::default()),
+                    };
+                    let end = end.min(text_width);
+                    if start < end {
+                        renderer.set_style(Rect::new(text_x + start, y, end - start, 1), cell);
                     }
                 }
             }

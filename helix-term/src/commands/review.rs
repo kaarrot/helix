@@ -1122,6 +1122,288 @@ pub fn review_copy_or_yank_to_clipboard(cx: &mut Context) {
     }
 }
 
+/// `gf` on a focused box opens the path the in-box cursor is on, as `gf` does
+/// on text. Anywhere else it is `gf`.
+pub fn review_goto_file_or_goto_file(cx: &mut Context) {
+    if !is_focused(cx) {
+        super::goto_file(cx);
+        return;
+    }
+    let Some(id) = thread_at_cursor(cx) else {
+        super::goto_file(cx);
+        return;
+    };
+    goto_box_target(cx, id);
+}
+
+/// Ctrl+click on a box row: point the in-box cursor there and open what it is
+/// on, in one go. `true` when the click belonged to a box body.
+pub fn review_mouse_goto(cx: &mut Context, row: u16, column: u16) -> bool {
+    let Some(hit) = cx.editor.diff.reviews.hit_at(row, column) else {
+        return false;
+    };
+    let Some(body) = hit.body else {
+        return false;
+    };
+    focus_thread(cx.editor, hit.view, hit.thread);
+    if let Some(thread) = cx.editor.diff.reviews.get_mut(hit.thread) {
+        thread.cursor = body;
+        thread.cursor_col = box_column(&hit, column);
+        thread.select = None;
+    }
+    cx.editor.diff.reviews.press = None;
+    goto_box_target(cx, hit.thread);
+    true
+}
+
+/// Where something in a box points.
+#[derive(Debug, PartialEq)]
+enum BoxTarget {
+    File(PathBuf, helix_core::Position),
+    Url(url::Url),
+}
+
+/// Open what the in-box cursor of `id` is on: a link covering the cursor
+/// column, else a `path[:line[:col]]` in the row's text that names a file.
+///
+/// No fallback to the document's `gf`: the text cursor sits on the anchored
+/// line, not on anything the reader pointed at, so falling through would open
+/// whatever that line happens to mention.
+fn goto_box_target(cx: &mut Context, id: ThreadId) {
+    let width = box_width(cx);
+    let Some(thread) = cx.editor.diff.reviews.get(id) else {
+        return;
+    };
+    let rows = thread.body_rows(width);
+    let row = thread.cursor.min(rows.len().saturating_sub(1));
+    let links = thread.row_links(width, row);
+    let base = thread.file.parent().map(Path::to_path_buf);
+    let full = helix_view::review::body_width(width);
+    let resolve = |text: &str| resolve_target(text, base.as_deref());
+    let Some(target) = box_target(&rows, &links, row, thread.cursor_col, full, resolve) else {
+        cx.editor
+            .set_error("No file path on this row of the review comment");
+        return;
+    };
+    match target {
+        BoxTarget::Url(url) => super::open_url(cx, url, Action::Replace),
+        BoxTarget::File(path, pos) => open_at(cx.editor, &path, pos),
+    }
+}
+
+/// Open `path` with the cursor at `pos`.
+///
+/// A pane already showing the file is reused, so a path naming the file under
+/// review moves within its diff rather than replacing it. Otherwise a diff pane
+/// is split rather than replaced: the reader is following a reference out of
+/// the review and will want to come back to it.
+fn open_at(editor: &mut Editor, path: &Path, pos: helix_core::Position) {
+    let showing = editor
+        .tree
+        .views()
+        .filter(|(view, _)| {
+            editor
+                .document(view.doc)
+                .and_then(|doc| doc.path())
+                .is_some_and(|shown| shown.as_path() == path)
+        })
+        .map(|(view, focused)| (view.id, focused))
+        .max_by_key(|(_, focused)| *focused)
+        .map(|(view, _)| view);
+    if let Some(view_id) = showing {
+        editor.focus(view_id);
+        let (view, doc) = current!(editor);
+        super::push_jump(view, doc);
+    } else {
+        let focus = editor.tree.focus;
+        let in_diff =
+            editor.diff.views.contains_key(&focus) || editor.diff.merge_views.contains_key(&focus);
+        let action = if in_diff {
+            Action::HorizontalSplit
+        } else {
+            Action::Replace
+        };
+        if let Err(err) = editor.open(path, action) {
+            editor.set_error(format!("Cannot open {}: {err}", path.display()));
+            return;
+        }
+    }
+    let (view, doc) = current!(editor);
+    let at = helix_core::pos_at_coords(doc.text().slice(..), pos, true);
+    doc.set_selection(view.id, helix_core::Selection::point(at));
+    helix_view::align_view(doc, view, helix_view::Align::Center);
+}
+
+/// What a piece of text in a box names, if it names a file that exists (or a
+/// URL). `base` is the reviewed file's directory: a relative path is tried
+/// against the working directory, then the workspace the reviewed file is in,
+/// then that directory itself.
+fn resolve_target(text: &str, base: Option<&Path>) -> Option<BoxTarget> {
+    if let Ok(url) = url::Url::parse(text) {
+        // `C:` and the like parse as a scheme; only take what looks like a URL.
+        if text.contains("://") {
+            return match url.scheme() {
+                "file" => url
+                    .to_file_path()
+                    .ok()
+                    .filter(|path| path.is_file())
+                    .map(|path| BoxTarget::File(path, helix_core::Position::default())),
+                _ => Some(BoxTarget::Url(url)),
+            };
+        }
+    }
+    let (path, pos) = split_target(text);
+    let path = helix_stdx::path::expand(&path).into_owned();
+    let found = if path.is_absolute() {
+        Some(path).filter(|path| path.is_file())
+    } else {
+        let mut bases = vec![helix_stdx::env::current_working_dir()];
+        if let Some(base) = base {
+            bases.push(helix_loader::find_workspace_in(base).0);
+            bases.push(base.to_path_buf());
+        }
+        bases
+            .into_iter()
+            .map(|dir| dir.join(&path))
+            .find(|path| path.is_file())
+    }?;
+    Some(BoxTarget::File(helix_stdx::path::canonicalize(found), pos))
+}
+
+/// `path:line[:col]`, or a link's `path#L12`, into a path and a position.
+fn split_target(text: &str) -> (PathBuf, helix_core::Position) {
+    if let Some((path, fragment)) = text.split_once('#') {
+        let line = fragment
+            .strip_prefix('L')
+            .map(|rest| {
+                rest.chars()
+                    .take_while(char::is_ascii_digit)
+                    .collect::<String>()
+            })
+            .and_then(|digits| digits.parse::<usize>().ok());
+        let (path, pos) = crate::args::parse_file(path);
+        return match line {
+            Some(line) => (path, helix_core::Position::new(line.saturating_sub(1), 0)),
+            None => (path, pos),
+        };
+    }
+    crate::args::parse_file(text)
+}
+
+/// The target at display column `col` of body row `row`.
+///
+/// A link covering the column wins, since a link's text need not look like a
+/// path at all. Otherwise the row's text is searched: the path covering the
+/// column, else the first one on the row. Only candidates `resolve` accepts
+/// count, so an ordinary word is never taken for a file.
+///
+/// A row filled to exactly `full` columns may be a long path broken by the
+/// wrapper, so the rows after it are tried joined on as well.
+fn box_target(
+    rows: &[String],
+    links: &[helix_view::annotations::rows::CommentLink],
+    row: usize,
+    col: usize,
+    full: usize,
+    resolve: impl Fn(&str) -> Option<BoxTarget>,
+) -> Option<BoxTarget> {
+    use helix_core::unicode::width::UnicodeWidthStr;
+
+    if let Some(target) = links
+        .iter()
+        .filter(|link| (link.start..link.end).contains(&col))
+        .find_map(|link| resolve(&link.dest))
+    {
+        return Some(target);
+    }
+
+    let line = rows.get(row)?;
+    let at = byte_at_col(line, col);
+    let mut texts = vec![line.clone()];
+    let mut joined = line.clone();
+    let mut last = line;
+    for next in rows.iter().skip(row + 1).take(2) {
+        if last.width() != full || next.starts_with(char::is_whitespace) {
+            break;
+        }
+        joined.push_str(next);
+        texts.push(joined.clone());
+        last = next;
+    }
+
+    let mut candidates = Vec::new();
+    // Longest text first, so a path that runs on past the row is preferred
+    // to the piece of it the row shows.
+    for text in texts.iter().rev() {
+        for range in paths_in(text) {
+            if range.start >= line.len() {
+                continue;
+            }
+            let found = &text[range.clone()];
+            if candidates.iter().any(|(start, _, _)| *start == range.start) {
+                continue;
+            }
+            if let Some(target) = resolve(found) {
+                candidates.push((range.start, range.end, target));
+            }
+        }
+    }
+    candidates.sort_by_key(|(start, _, _)| *start);
+    let covering = candidates
+        .iter()
+        .position(|(start, end, _)| *start <= at && at <= *end);
+    let pick = covering.unwrap_or(0);
+    (pick < candidates.len()).then(|| candidates.swap_remove(pick).2)
+}
+
+/// Byte offset of display column `col` in `line`, clamped to its end.
+fn byte_at_col(line: &str, col: usize) -> usize {
+    use helix_core::unicode::width::UnicodeWidthChar;
+
+    let mut width = 0;
+    for (byte, ch) in line.char_indices() {
+        width += ch.width().unwrap_or(0);
+        if width > col {
+            return byte;
+        }
+    }
+    line.len()
+}
+
+/// Byte ranges of the paths in `text`, each with its `:line[:col]` if it has
+/// one. The path pattern stops at `:` so that this suffix can be read off.
+fn paths_in(text: &str) -> Vec<std::ops::Range<usize>> {
+    let rope = helix_core::Rope::from(text);
+    helix_stdx::path::find_paths(rope.slice(..), true)
+        .map(|range| {
+            let mut end = range.end;
+            let mut numbers = 0;
+            while numbers < 2 {
+                let rest = &text[end..];
+                let Some(digits) = rest.strip_prefix(':') else {
+                    break;
+                };
+                let len = digits.bytes().take_while(u8::is_ascii_digit).count();
+                if len == 0 {
+                    break;
+                }
+                end += 1 + len;
+                numbers += 1;
+            }
+            // Prose punctuation is allowed inside a path, but not at the end of
+            // one: `see foo.rs.` means `foo.rs`.
+            if numbers == 0 {
+                end = range.start
+                    + text[range.start..end]
+                        .trim_end_matches(['.', ',', ';', '!', '?'])
+                        .len();
+            }
+            range.start..end
+        })
+        .filter(|range| !range.is_empty())
+        .collect()
+}
+
 /// Put the text cursor on a thread's anchored line and make its box the focused
 /// one, which is what the keys that act on a box look for.
 fn focus_thread(editor: &mut Editor, view_id: helix_view::ViewId, thread: ThreadId) {
@@ -1148,16 +1430,25 @@ fn focus_thread(editor: &mut Editor, view_id: helix_view::ViewId, thread: Thread
     editor.diff.reviews.focused = Some(thread);
 }
 
-/// A left press. In a box it points at the row pressed on and waits to see
-/// whether the pointer moves; anywhere else it gives up a selection the reader
-/// has stopped looking at. `true` when the press belonged to a box.
+/// Display column of a screen column inside a box row, after the marker.
+fn box_column(hit: &helix_view::review::BoxHit, column: u16) -> usize {
+    column.saturating_sub(hit.x.saturating_add(1)) as usize
+}
+
+/// A left press. In a box it points at the row and column pressed on and
+/// waits to see whether the pointer moves; anywhere else it gives up a
+/// selection the reader has stopped looking at. `true` when the press belonged
+/// to a box.
 pub fn review_mouse_down(editor: &mut Editor, row: u16, column: u16) -> bool {
     let hit = editor.diff.reviews.hit_at(row, column);
 
-    // Whatever was selected in a box, a press elsewhere ends it.
+    // Whatever was selected in a box, a press elsewhere ends it. A copied id
+    // stops being picked out on any press at all: it has been seen.
     if let Some(id) = editor.diff.reviews.focused {
-        if hit.is_none_or(|hit| hit.thread != id) {
-            if let Some(thread) = editor.diff.reviews.get_mut(id) {
+        let elsewhere = hit.is_none_or(|hit| hit.thread != id);
+        if let Some(thread) = editor.diff.reviews.get_mut(id) {
+            thread.id_marked = false;
+            if elsewhere {
                 thread.select = None;
             }
         }
@@ -1174,15 +1465,48 @@ pub fn review_mouse_down(editor: &mut Editor, row: u16, column: u16) -> bool {
     if let Some(body) = hit.body {
         if let Some(thread) = editor.diff.reviews.get_mut(hit.thread) {
             thread.cursor = body;
+            thread.cursor_col = box_column(&hit, column);
             thread.select = None;
         }
-        editor.diff.reviews.press = Some(helix_view::review::BoxPress {
-            thread: hit.thread,
-            body,
-            dragged: false,
-        });
+    } else {
+        copy_header_id(editor, &hit, column);
     }
+    // A press on the header owns the drag too. Left alone, the drag would reach
+    // the document and select the code under the box.
+    editor.diff.reviews.press = Some(helix_view::review::BoxPress {
+        thread: hit.thread,
+        body: hit.body,
+        dragged: false,
+    });
     true
+}
+
+/// A press on a header that lands on the conversation id copies it, since the
+/// id is only there to be taken to `--resume`. It stays picked out until the
+/// next press, so it is plain what was copied.
+fn copy_header_id(editor: &mut Editor, hit: &helix_view::review::BoxHit, column: u16) {
+    let col = box_column(hit, column);
+    let Some(thread) = editor.diff.reviews.get(hit.thread) else {
+        return;
+    };
+    let Some((start, end)) = thread.header_id_cols() else {
+        return;
+    };
+    if !(start..end).contains(&col) {
+        return;
+    }
+    let Some(id) = thread.agent_session.clone() else {
+        return;
+    };
+    match editor.registers.write('+', vec![id]) {
+        Ok(()) => {
+            if let Some(thread) = editor.diff.reviews.get_mut(hit.thread) {
+                thread.id_marked = true;
+            }
+            editor.set_status("Copied conversation id to the clipboard");
+        }
+        Err(err) => editor.set_error(err.to_string()),
+    }
 }
 
 /// The pointer moving with the button down. The first move is what turns the
@@ -1191,13 +1515,17 @@ pub fn review_mouse_drag(editor: &mut Editor, row: u16) -> bool {
     let Some(press) = editor.diff.reviews.press else {
         return false;
     };
+    // Pressed on the header: nothing to select, but the drag is still ours.
+    let Some(anchor) = press.body else {
+        return true;
+    };
     // Rows outside the box clamp to its nearest one, so dragging past the edge
     // keeps extending rather than stopping dead.
     let Some(body) = editor.diff.reviews.drag_row(press.thread, row) else {
         return false;
     };
     if let Some(thread) = editor.diff.reviews.get_mut(press.thread) {
-        thread.select = Some(press.body);
+        thread.select = Some(anchor);
         thread.cursor = body;
     }
     editor.diff.reviews.press = Some(helix_view::review::BoxPress {
@@ -1889,5 +2217,117 @@ mod test {
 
         assert_eq!(pick_stop_index(&stops, None, true, 1), 0);
         assert_eq!(pick_stop_index(&stops, None, false, 1), 2);
+    }
+
+    mod box_targets {
+        use std::path::{Path, PathBuf};
+
+        use helix_core::Position;
+        use helix_view::annotations::rows::CommentLink;
+
+        use super::super::{box_target, resolve_target, split_target, BoxTarget};
+
+        /// Anything with an extension counts as a file, so the tests do not
+        /// need one on disk.
+        fn fake(text: &str) -> Option<BoxTarget> {
+            let (path, pos) = split_target(text);
+            let is_file = path.extension().is_some();
+            is_file.then_some(BoxTarget::File(path, pos))
+        }
+
+        fn file(path: &str, line: usize, col: usize) -> Option<BoxTarget> {
+            Some(BoxTarget::File(
+                PathBuf::from(path),
+                Position::new(line, col),
+            ))
+        }
+
+        fn rows(rows: &[&str]) -> Vec<String> {
+            rows.iter().map(|row| row.to_string()).collect()
+        }
+
+        #[test]
+        fn a_path_with_its_line_is_found_inside_brackets() {
+            let rows = rows(&["is a helper (/data/x/test_hdas.py:162) that saves"]);
+            let col = rows[0].find("test").unwrap();
+            assert_eq!(
+                box_target(&rows, &[], 0, col, 80, fake),
+                file("/data/x/test_hdas.py", 161, 0)
+            );
+        }
+
+        #[test]
+        fn the_column_picks_between_paths_and_a_word_is_not_a_path() {
+            let rows = rows(&["a.rs:1:4 and b.rs:2"]);
+            let on_b = rows[0].find("b.rs").unwrap() + 1;
+            assert_eq!(
+                box_target(&rows, &[], 0, on_b, 80, fake),
+                file("b.rs", 1, 0)
+            );
+            // Not on either: the first path on the row, never the word `and`.
+            let on_and = rows[0].find("and").unwrap();
+            assert_eq!(
+                box_target(&rows, &[], 0, on_and, 80, fake),
+                file("a.rs", 0, 3)
+            );
+        }
+
+        #[test]
+        fn a_link_under_the_cursor_wins_over_the_text() {
+            let rows = rows(&["see the helper here.rs:3"]);
+            let links = [CommentLink {
+                start: 4,
+                end: 14,
+                dest: "/abs/foo.py#L12".into(),
+            }];
+            assert_eq!(
+                box_target(&rows, &links, 0, 6, 80, fake),
+                file("/abs/foo.py", 11, 0)
+            );
+            // Off the link, the text is searched as usual.
+            assert_eq!(
+                box_target(&rows, &links, 0, 20, 80, fake),
+                file("here.rs", 2, 0)
+            );
+        }
+
+        #[test]
+        fn a_path_broken_across_full_rows_is_joined() {
+            let rows = rows(&["see /very/long/pa", "th/file.rs:3 ok"]);
+            assert_eq!(
+                box_target(&rows, &[], 0, 8, 17, fake),
+                file("/very/long/path/file.rs", 2, 0)
+            );
+            // A row that stops short was wrapped at a space, so it is not joined.
+            assert_eq!(box_target(&rows, &[], 0, 8, 40, fake), None);
+        }
+
+        #[test]
+        fn prose_punctuation_is_not_part_of_the_path() {
+            let rows = rows(&["open foo.rs, then bar.rs."]);
+            assert_eq!(box_target(&rows, &[], 0, 6, 80, fake), file("foo.rs", 0, 0));
+            let on_bar = rows[0].find("bar").unwrap();
+            assert_eq!(
+                box_target(&rows, &[], 0, on_bar, 80, fake),
+                file("bar.rs", 0, 0)
+            );
+        }
+
+        #[test]
+        fn a_relative_path_resolves_against_the_reviewed_files_directory() {
+            let dir = tempfile::tempdir().unwrap();
+            let dir = helix_stdx::path::canonicalize(dir.path());
+            std::fs::write(dir.join("near.py"), "x\ny\n").unwrap();
+
+            assert_eq!(
+                resolve_target("near.py:2", Some(&dir)),
+                Some(BoxTarget::File(dir.join("near.py"), Position::new(1, 0)))
+            );
+            assert_eq!(resolve_target("missing.py:2", Some(&dir)), None);
+            assert_eq!(
+                resolve_target("near.py", Some(Path::new("/nonexistent"))),
+                None
+            );
+        }
     }
 }

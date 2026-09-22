@@ -430,6 +430,7 @@ impl MappableCommand {
         review_toggle_collapse, "Collapse or expand the review thread at the cursor",
         review_toggle_visible, "Hide or show the review comment boxes",
         review_copy_or_yank, "Copy from the focused review box to the clipboard, else yank",
+        review_goto_file_or_goto_file, "Open the path under the focused review box's cursor, else goto file",
         review_copy_or_yank_to_clipboard, "Copy from the focused review box, else yank to the clipboard",
         review_prev_message, "Show the previous entry in the review thread at the cursor",
         review_next_message, "Show the next entry in the review thread at the cursor",

@@ -21,7 +21,9 @@ pub mod session;
 use helix_core::{ChangeSet, Rope};
 use serde::{Deserialize, Serialize};
 
-use crate::annotations::rows::{Attention, CommentLine, CommentSpan, RowMark, VirtualRow};
+use crate::annotations::rows::{
+    Attention, CommentLine, CommentLink, CommentSpan, RowMark, VirtualRow,
+};
 use agent::AgentEvent;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -106,6 +108,15 @@ pub struct Thread {
     /// copies from. Not persisted: it is a reading position.
     #[serde(skip)]
     pub cursor: usize,
+    /// Display column on the cursor row that `gf` looks at, set by clicking.
+    /// Kept when the cursor changes row, so stepping down a list of paths
+    /// stays in the column they start at.
+    #[serde(skip)]
+    pub cursor_col: usize,
+    /// The conversation id in the header was just copied, so it is drawn
+    /// picked out until the next press. Not persisted: it is feedback.
+    #[serde(skip)]
+    pub id_marked: bool,
     /// Where a selection inside the box started, if one is being made. The
     /// selection runs between this row and the cursor, either way round.
     #[serde(skip)]
@@ -137,6 +148,22 @@ pub struct DrawnBody {
     /// Width after the marker column, the same value [`body_width`] returns.
     pub width: usize,
     pub lines: Vec<String>,
+    /// Links on each of `lines`, by the same index.
+    pub links: Vec<Vec<CommentLink>>,
+    /// The header row as drawn, so a click can tell what it landed on.
+    pub header: String,
+}
+
+/// Where `id` sits in `header`, if the header ends with it. The id is the last
+/// piece of the rule's tail, so it is either flush right or not drawn at all.
+fn id_cols(header: &str, id: &str) -> Option<(usize, usize)> {
+    use helix_core::unicode::width::UnicodeWidthStr;
+
+    if id.is_empty() || !header.ends_with(id) {
+        return None;
+    }
+    let end = header.width();
+    Some((end - id.width(), end))
 }
 
 /// One addressable entry of a thread: a sent message, or the unsent draft.
@@ -231,7 +258,29 @@ impl Thread {
     pub fn reset_reading(&mut self) {
         self.scroll.set(0);
         self.cursor = 0;
+        self.cursor_col = 0;
         self.select = None;
+    }
+
+    /// The links drawn on body row `row`, for `gf` to prefer over the row's
+    /// text. Empty when the box has not been drawn at this width.
+    pub fn row_links(&self, width: usize, row: usize) -> Vec<CommentLink> {
+        let text_width = body_width(width);
+        self.drawn
+            .borrow()
+            .as_ref()
+            .filter(|drawn| drawn.view == self.view_index() && drawn.width == text_width)
+            .and_then(|drawn| drawn.links.get(row).cloned())
+            .unwrap_or_default()
+    }
+
+    /// Display columns `[start, end)` of the conversation id in the header as
+    /// last drawn, relative to the text after the marker. `None` when there
+    /// is no id or the pane was too narrow for it to be drawn.
+    pub fn header_id_cols(&self) -> Option<(usize, usize)> {
+        let id = self.agent_session.as_deref()?;
+        let drawn = self.drawn.borrow();
+        id_cols(&drawn.as_ref()?.header, id)
     }
 
     /// The rows of the entry on show, wrapped exactly as they are drawn.
@@ -384,7 +433,11 @@ pub struct BoxPress {
     /// The row pressed on, which becomes the selection's anchor if the pointer
     /// moves. A press on its own selects nothing: clicking into a box is asking
     /// to point at it, and only dragging is asking for a range.
-    pub body: usize,
+    ///
+    /// `None` for a press on the header. It still owns the drag -- otherwise
+    /// the drag reaches the document and selects the code under the box --
+    /// but there is no body row for it to select from.
+    pub body: Option<usize>,
     pub dragged: bool,
 }
 
@@ -540,6 +593,8 @@ impl ReviewStore {
                 scroll: Cell::new(0),
                 drawn: RefCell::new(None),
                 cursor: 0,
+                cursor_col: 0,
+                id_marked: false,
                 select: None,
                 awaiting: false,
                 rewound: false,
@@ -1057,11 +1112,8 @@ pub(crate) fn render_comment_rows(
             .map(CommentLine::plain)
             .collect()
     };
-    thread.drawn.replace(Some(DrawnBody {
-        view: index,
-        width: text_width,
-        lines: body.iter().map(CommentLine::text).collect(),
-    }));
+    let lines: Vec<String> = body.iter().map(CommentLine::text).collect();
+    let links: Vec<Vec<CommentLink>> = body.iter().map(|line| line.links.clone()).collect();
     let max_body_rows = max_body_rows.max(1);
     let last = body.len().saturating_sub(1);
     let cursor = thread.cursor.min(last);
@@ -1106,6 +1158,30 @@ pub(crate) fn render_comment_rows(
         &[shown.as_deref(), thread.agent_session.as_deref()],
         text_width,
     );
+    // Only while the box is focused: the mark is feedback on a click, and moving
+    // away is as good as seeing it.
+    let header_mark = (thread.id_marked && attention == Attention::Focused)
+        .then_some(thread.agent_session.as_deref())
+        .flatten()
+        .and_then(|id| id_cols(&header, id))
+        .map_or(RowMark::None, |(start, end)| RowMark::Span {
+            start: start as u16,
+            end: end as u16,
+        });
+    // The cursor cell never sits past the end of its row, but the column it
+    // asked for is kept so a longer row further on gets it back.
+    let cursor_col = {
+        use helix_core::unicode::width::UnicodeWidthStr;
+        let row_width = lines.get(cursor).map_or(0, |line| line.width());
+        thread.cursor_col.min(row_width.saturating_sub(1)) as u16
+    };
+    thread.drawn.replace(Some(DrawnBody {
+        view: index,
+        width: text_width,
+        lines,
+        links,
+        header: header.clone(),
+    }));
 
     let mut rows = vec![VirtualRow::Comment {
         thread: thread.id,
@@ -1113,7 +1189,7 @@ pub(crate) fn render_comment_rows(
         text: header,
         spans: Vec::new(),
         attention,
-        mark: RowMark::None,
+        mark: header_mark,
         body: None,
     }];
 
@@ -1132,7 +1208,7 @@ pub(crate) fn render_comment_rows(
                     attention,
                     mark: match selected {
                         None => RowMark::None,
-                        Some(_) if row == cursor => RowMark::Cursor,
+                        Some(_) if row == cursor => RowMark::Cursor { col: cursor_col },
                         Some(Some((start, end))) if (start..=end).contains(&row) => {
                             RowMark::Selected
                         }
@@ -1349,7 +1425,12 @@ mod test {
     #[test]
     fn the_header_carries_the_threads_conversation_id() {
         let mut store = ReviewStore::default();
-        let id = store.draft(PathBuf::from("/r/a.rs"), DiffSide::Working, 1, "why?".into());
+        let id = store.draft(
+            PathBuf::from("/r/a.rs"),
+            DiffSide::Working,
+            1,
+            "why?".into(),
+        );
         assert!(!header_of(store.get(id).unwrap(), 60).contains('-'));
 
         let session = store.ensure_agent_session(id).unwrap();
@@ -1382,6 +1463,64 @@ mod test {
         assert_eq!(thread.view_index(), 2);
         assert!(header_of(thread, 40).starts_with("you 3/3 "));
         assert_eq!(body_of(thread, 40), vec!["and Y?"]);
+    }
+
+    #[test]
+    fn the_cursor_cell_stays_on_its_row_and_a_copied_id_is_picked_out() {
+        use crate::annotations::rows::RowMark;
+
+        let mut store = ReviewStore::default();
+        let id = store.draft(
+            PathBuf::from("/r/a.rs"),
+            DiffSide::Working,
+            1,
+            "why?".into(),
+        );
+        store.take_draft(id);
+        store.push_message(id, Role::Agent, "a longer row\nshort".into());
+        let thread = store.get_mut(id).unwrap();
+        thread.agent_session = Some("0123-abcd".into());
+        thread.cursor_col = 9;
+
+        let marks = |thread: &Thread| -> Vec<RowMark> {
+            comment_rows(thread, 40, None, Attention::Focused, usize::MAX)
+                .into_iter()
+                .map(|row| match row {
+                    VirtualRow::Comment { mark, .. } => mark,
+                    other => unreachable!("comment rows only, got {other:?}"),
+                })
+                .collect()
+        };
+
+        assert_eq!(
+            marks(thread),
+            vec![RowMark::None, RowMark::Cursor { col: 9 }, RowMark::None]
+        );
+        // A shorter row clamps the cell but keeps the column asked for.
+        thread.cursor = 1;
+        assert_eq!(marks(thread)[2], RowMark::Cursor { col: 4 });
+        assert_eq!(thread.cursor_col, 9);
+
+        // The id sits flush right in the header, after the marker column.
+        let width = body_width(40);
+        assert_eq!(thread.header_id_cols(), Some((width - 9, width)));
+        thread.id_marked = true;
+        assert_eq!(
+            marks(thread)[0],
+            RowMark::Span {
+                start: (width - 9) as u16,
+                end: width as u16
+            }
+        );
+        // Unfocused, it is not.
+        let idle = comment_rows(thread, 40, None, Attention::Idle, usize::MAX);
+        assert!(matches!(
+            idle[0],
+            VirtualRow::Comment {
+                mark: RowMark::None,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -1481,7 +1620,7 @@ mod test {
 
         assert_eq!(
             marks(Attention::Focused),
-            vec![RowMark::Selected, RowMark::Cursor]
+            vec![RowMark::Selected, RowMark::Cursor { col: 0 }]
         );
         assert_eq!(
             marks(Attention::UnderCursor),
@@ -1511,6 +1650,7 @@ mod test {
                         text: "bold".into(),
                         style: Style::default().add_modifier(Modifier::BOLD),
                     }],
+                    links: Vec::new(),
                 },
                 CommentLine::plain("more"),
             ]
@@ -2113,6 +2253,8 @@ mod test {
                 scroll: Cell::new(0),
                 drawn: RefCell::new(None),
                 cursor: 0,
+                cursor_col: 0,
+                id_marked: false,
                 select: None,
                 awaiting: false,
                 rewound: false,

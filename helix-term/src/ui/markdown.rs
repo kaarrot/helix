@@ -15,7 +15,7 @@ use helix_core::{
     RopeSlice, Syntax,
 };
 use helix_view::{
-    annotations::rows::{CommentLine, CommentSpan},
+    annotations::rows::{CommentLine, CommentLink, CommentSpan},
     graphics::{Margin, Rect, Style, UnderlineStyle},
     theme::Modifier,
     Theme,
@@ -1299,11 +1299,24 @@ fn render_agent_markdown(
 ) -> Vec<CommentLine> {
     let markdown = Markdown::new(text.to_string(), loader);
     let wrap = u16::try_from(width).unwrap_or(u16::MAX);
-    let (rendered, _, _) = markdown.parse_with_map(Some(theme), wrap, true);
+    let (rendered, _, found) = markdown.parse_with_map(Some(theme), wrap, true);
+    // Links are already on the wrapped rows. Kept per row, because the row
+    // shows only a link's text and `gf` needs where it points.
+    let mut links: Vec<Vec<CommentLink>> = vec![Vec::new(); rendered.lines.len()];
+    for link in found {
+        if let Some(row) = links.get_mut(link.line) {
+            row.push(CommentLink {
+                start: link.start_col as usize,
+                end: link.end_col as usize,
+                dest: link.dest,
+            });
+        }
+    }
     let mut lines: Vec<CommentLine> = rendered
         .lines
         .into_iter()
-        .map(|spans| {
+        .zip(links)
+        .map(|(spans, links)| {
             let spans = spans
                 .0
                 .into_iter()
@@ -1316,7 +1329,7 @@ fn render_agent_markdown(
             if spans.is_empty() {
                 CommentLine::plain("")
             } else {
-                CommentLine { spans }
+                CommentLine { spans, links }
             }
         })
         .collect();

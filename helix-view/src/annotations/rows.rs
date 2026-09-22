@@ -27,10 +27,25 @@ pub struct CommentSpan {
     pub style: Style,
 }
 
+/// A markdown link as it landed on one row: the text it shows, in display
+/// columns of that row, and where it points.
+///
+/// Kept because the row only shows the link's text. `the helper](a.py#L12)`
+/// draws as `the helper`, so the destination cannot be found again by reading
+/// the row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommentLink {
+    /// Display columns `[start, end)` of the link text on the row.
+    pub start: usize,
+    pub end: usize,
+    pub dest: String,
+}
+
 /// One screen row of a comment body, already wrapped to the pane.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommentLine {
     pub spans: Vec<CommentSpan>,
+    pub links: Vec<CommentLink>,
 }
 
 impl CommentLine {
@@ -41,6 +56,7 @@ impl CommentLine {
                 text,
                 style: Style::default(),
             }],
+            links: Vec::new(),
         }
     }
 
@@ -91,8 +107,12 @@ pub enum RowMark {
     None,
     /// Within the selection being made inside the box.
     Selected,
-    /// The row the in-box cursor is on.
-    Cursor,
+    /// The row the in-box cursor is on. `col` is the display column it points
+    /// at, drawn as a single cell so it is visible what `gf` will look at.
+    Cursor { col: u16 },
+    /// Display columns `[start, end)` picked out on an otherwise plain row,
+    /// such as the conversation id just copied from a header.
+    Span { start: u16, end: u16 },
 }
 
 /// One virtual row.

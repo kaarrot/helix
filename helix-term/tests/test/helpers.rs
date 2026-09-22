@@ -248,11 +248,24 @@ impl AppTestHarness {
         row: u16,
         column: u16,
     ) -> anyhow::Result<()> {
+        self.mouse_with(app, kind, row, column, termina::event::Modifiers::NONE)
+            .await
+    }
+
+    /// [`Self::mouse`] with modifier keys held.
+    pub async fn mouse_with(
+        &mut self,
+        app: &mut Application,
+        kind: termina::event::MouseEventKind,
+        row: u16,
+        column: u16,
+        modifiers: termina::event::Modifiers,
+    ) -> anyhow::Result<()> {
         self.tx.send(Ok(Event::Mouse(termina::event::MouseEvent {
             kind,
             column,
             row,
-            modifiers: termina::event::Modifiers::NONE,
+            modifiers,
         })))?;
         self.pump(app, Duration::from_millis(200)).await;
         Ok(())

@@ -1197,12 +1197,19 @@ impl EditorView {
 
         match kind {
             MouseEventKind::Down(MouseButton::Left) => {
-                let editor = &mut cxt.editor;
+                // Ctrl+click on a box row follows the path it lands on, the way
+                // `gf` does from the in-box cursor.
+                if modifiers == KeyModifiers::CONTROL
+                    && commands::review::review_mouse_goto(cxt, row, column)
+                {
+                    return EventResult::Consumed(None);
+                }
 
                 // A review box is painted into virtual rows, which no document
                 // position corresponds to, so it has to be asked first: mapping
                 // the click to text would put the cursor somewhere arbitrary
                 // underneath it.
+                let editor = &mut cxt.editor;
                 if commands::review::review_mouse_down(editor, row, column) {
                     return EventResult::Consumed(None);
                 }

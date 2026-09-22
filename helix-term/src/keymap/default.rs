@@ -46,7 +46,7 @@ pub fn default() -> HashMap<Mode, KeyTrie> {
             "g" => goto_file_start,
             "|" => goto_column,
             "e" => goto_last_line,
-            "f" => goto_file,
+            "f" => review_goto_file_or_goto_file,
             "h" => goto_line_start,
             "l" => goto_line_end,
             "s" => goto_first_nonwhitespace,

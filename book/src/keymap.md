@@ -224,7 +224,7 @@ Jumps to various locations.
 | <code>&lt;n&gt;&#124;</code>  | Go to column number `<n>`      | `goto_column`              |
 | <code>&#124;</code>     | Go to the start of line        | `goto_column`              |
 | `e`   | Go to the end of the file                        | `goto_last_line`           |
-| `f`   | Go to files in the selections                    | `goto_file`                |
+| `f`   | Go to the path under a focused review box's cursor, else to files in the selections | `review_goto_file_or_goto_file` |
 | `h`   | Go to the start of the line                      | `goto_line_start`          |
 | `l`   | Go to the end of the line                        | `goto_line_end`            |
 | `s`   | Go to first non-whitespace character of the line | `goto_first_nonwhitespace` |

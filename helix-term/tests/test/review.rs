@@ -2086,6 +2086,238 @@ async fn clicking_below_a_box_lands_on_the_line_clicked() -> anyhow::Result<()> 
     Ok(())
 }
 
+/// An app with one thread on the first line whose agent reply is `reply`.
+#[cfg(not(windows))]
+async fn app_with_reply(
+    file: &std::path::Path,
+    reply: &str,
+) -> anyhow::Result<(Application, AppTestHarness, ThreadId)> {
+    use helix_view::review::agent::AgentEvent;
+
+    let mut app = AppBuilder::new().with_file(file, None).build()?;
+    let mut harness = AppTestHarness::new();
+    let fake = FakeAgent::default();
+    let sent = fake.sent.clone();
+    app.editor.diff.agent = Some(Box::new(fake));
+
+    assert!(harness.send_keys(&mut app, "<space>mRc").await?);
+    assert!(harness.send_keys(&mut app, "why?<C-S-s>").await?);
+    let id = sent.lock().unwrap()[0].0;
+    app.editor
+        .diff
+        .reviews
+        .apply_agent_event(AgentEvent::Completed(id, reply.into()));
+    assert!(harness.send_keys(&mut app, "<esc>").await?);
+    Ok((app, harness, id))
+}
+
+/// Where a box row was painted, as `(row, x)` of its hit.
+#[cfg(not(windows))]
+fn painted(app: &Application, id: ThreadId, body: Option<usize>) -> (u16, u16) {
+    let hits = app.editor.diff.reviews.hits.borrow();
+    let hit = hits
+        .iter()
+        .find(|hit| hit.thread == id && hit.body == body)
+        .unwrap_or_else(|| panic!("no painted row for {body:?}"));
+    (hit.row, hit.x)
+}
+
+#[cfg(not(windows))]
+fn focused_path_and_line(app: &Application) -> (Option<std::path::PathBuf>, usize) {
+    let view = app.editor.tree.get(app.editor.tree.focus);
+    let doc = app.editor.document(view.doc).unwrap();
+    let line = doc
+        .selection(view.id)
+        .primary()
+        .cursor_line(doc.text().slice(..));
+    (doc.path().cloned(), line)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg(not(windows))]
+async fn gf_on_a_reply_opens_the_path_at_its_line() -> anyhow::Result<()> {
+    use termina::event::{MouseButton, MouseEventKind};
+
+    let file = tempfile::NamedTempFile::new()?;
+    std::fs::write(file.path(), "one\ntwo\n")?;
+    let target = tempfile::NamedTempFile::new()?;
+    let lines: String = (0..20).map(|n| format!("target {n}\n")).collect();
+    std::fs::write(target.path(), lines)?;
+    let target_path = helix_stdx::path::canonicalize(target.path());
+
+    let reply = format!("{}:7", target_path.display());
+    let (mut app, mut harness, id) = app_with_reply(file.path(), &reply).await?;
+
+    // Point the in-box cursor into the path, then `gf` as on any text.
+    let (row, x) = painted(&app, id, Some(0));
+    harness
+        .mouse(
+            &mut app,
+            MouseEventKind::Down(MouseButton::Left),
+            row,
+            x + 3,
+        )
+        .await?;
+    harness
+        .mouse(&mut app, MouseEventKind::Up(MouseButton::Left), row, x + 3)
+        .await?;
+    assert_eq!(app.editor.diff.reviews.get(id).unwrap().cursor_col, 2);
+    assert!(harness.send_keys(&mut app, "gf").await?);
+
+    assert_eq!(
+        focused_path_and_line(&app),
+        (Some(target_path.clone()), 6),
+        "`gf` should open the file at the line the reply names"
+    );
+
+    // Back where the review was, as after any jump.
+    assert!(harness.send_keys(&mut app, "<C-o>").await?);
+    let file_path = helix_stdx::path::canonicalize(file.path());
+    assert_eq!(focused_path_and_line(&app).0, Some(file_path));
+
+    harness.close(&mut app).await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg(not(windows))]
+async fn ctrl_click_on_a_reply_opens_the_path_under_the_pointer() -> anyhow::Result<()> {
+    use termina::event::{Modifiers, MouseButton, MouseEventKind};
+
+    let file = tempfile::NamedTempFile::new()?;
+    std::fs::write(file.path(), "one\ntwo\n")?;
+    let target = tempfile::NamedTempFile::new()?;
+    let lines: String = (0..20).map(|n| format!("target {n}\n")).collect();
+    std::fs::write(target.path(), lines)?;
+    let target_path = helix_stdx::path::canonicalize(target.path());
+
+    let reply = format!("{}:12", target_path.display());
+    let (mut app, mut harness, id) = app_with_reply(file.path(), &reply).await?;
+
+    let (row, x) = painted(&app, id, Some(0));
+    harness
+        .mouse_with(
+            &mut app,
+            MouseEventKind::Down(MouseButton::Left),
+            row,
+            x + 3,
+            Modifiers::CONTROL,
+        )
+        .await?;
+    harness
+        .mouse(&mut app, MouseEventKind::Up(MouseButton::Left), row, x + 3)
+        .await?;
+
+    assert_eq!(focused_path_and_line(&app), (Some(target_path), 11));
+
+    harness.close(&mut app).await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg(not(windows))]
+async fn clicking_the_conversation_id_copies_it_and_a_header_drag_selects_no_code(
+) -> anyhow::Result<()> {
+    use termina::event::{MouseButton, MouseEventKind};
+
+    let file = tempfile::NamedTempFile::new()?;
+    let text: String = (0..10).map(|n| format!("line {n}\n")).collect();
+    std::fs::write(file.path(), &text)?;
+    let (mut app, mut harness, id) = app_with_reply(file.path(), "alpha").await?;
+
+    let session = "0f0e-conversation";
+    app.editor.diff.reviews.get_mut(id).unwrap().agent_session = Some(session.into());
+    // Draw again so the header carries the id.
+    assert!(harness.send_keys(&mut app, "<esc>").await?);
+
+    let (header_row, x) = painted(&app, id, None);
+    let (start, _) = app
+        .editor
+        .diff
+        .reviews
+        .get(id)
+        .unwrap()
+        .header_id_cols()
+        .expect("the id should fit in the header");
+    let on_id = x + 1 + start as u16 + 2;
+    harness
+        .mouse(
+            &mut app,
+            MouseEventKind::Down(MouseButton::Left),
+            header_row,
+            on_id,
+        )
+        .await?;
+    harness
+        .mouse(
+            &mut app,
+            MouseEventKind::Up(MouseButton::Left),
+            header_row,
+            on_id,
+        )
+        .await?;
+
+    let clipboard: Vec<String> = app
+        .editor
+        .registers
+        .read('+', &app.editor)
+        .map(|values| values.map(|value| value.to_string()).collect())
+        .unwrap_or_default();
+    assert_eq!(clipboard, vec![session.to_string()]);
+    assert!(app.editor.diff.reviews.get(id).unwrap().id_marked);
+
+    // A drag that starts on the header belongs to the box: the code under it
+    // must not end up selected.
+    let before = {
+        let view = app.editor.tree.get(app.editor.tree.focus);
+        app.editor
+            .document(view.doc)
+            .unwrap()
+            .selection(view.id)
+            .clone()
+    };
+    harness
+        .mouse(
+            &mut app,
+            MouseEventKind::Down(MouseButton::Left),
+            header_row,
+            x + 2,
+        )
+        .await?;
+    assert!(
+        !app.editor.diff.reviews.get(id).unwrap().id_marked,
+        "the next press ends the mark"
+    );
+    harness
+        .mouse(
+            &mut app,
+            MouseEventKind::Drag(MouseButton::Left),
+            header_row + 5,
+            x + 4,
+        )
+        .await?;
+    harness
+        .mouse(
+            &mut app,
+            MouseEventKind::Up(MouseButton::Left),
+            header_row + 5,
+            x + 4,
+        )
+        .await?;
+    let after = {
+        let view = app.editor.tree.get(app.editor.tree.focus);
+        app.editor
+            .document(view.doc)
+            .unwrap()
+            .selection(view.id)
+            .clone()
+    };
+    assert_eq!(after, before);
+
+    harness.close(&mut app).await?;
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[cfg(not(windows))]
 async fn part_of_a_reply_is_selected_with_the_mouse_and_copied() -> anyhow::Result<()> {

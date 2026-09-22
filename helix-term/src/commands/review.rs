@@ -356,6 +356,36 @@ impl CommentInput {
         }
     }
 
+    /// Deletes back over any whitespace, then over one run of either word
+    /// characters or punctuation, the way readline's Alt-Backspace does. At the
+    /// start of a line it joins onto the previous one, like `backspace`.
+    fn delete_word_backward(&mut self) {
+        if self.col == 0 {
+            self.backspace();
+            return;
+        }
+        let line = &mut self.lines[self.row];
+        let chars: Vec<char> = line.chars().collect();
+        let mut start = self.col;
+        while start > 0 && chars[start - 1].is_whitespace() {
+            start -= 1;
+        }
+        if start > 0 {
+            let is_word = |c: char| helix_core::chars::char_is_word(c);
+            let word = is_word(chars[start - 1]);
+            while start > 0
+                && !chars[start - 1].is_whitespace()
+                && is_word(chars[start - 1]) == word
+            {
+                start -= 1;
+            }
+        }
+        let byte = |col: usize| line.char_indices().nth(col).map_or(line.len(), |(i, _)| i);
+        let range = byte(start)..byte(self.col);
+        line.replace_range(range, "");
+        self.col = start;
+    }
+
     fn clamp_col(&mut self) {
         self.col = self.col.min(self.lines[self.row].chars().count());
     }
@@ -488,6 +518,12 @@ impl crate::compositor::Component for CommentInput {
 
         match (key.code, key.modifiers) {
             (KeyCode::Enter, _) => self.newline(),
+            // The same bindings `Prompt` uses. Terminals disagree on what
+            // Ctrl-Backspace sends, so all three are taken.
+            (KeyCode::Backspace, m) if m.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
+                self.delete_word_backward()
+            }
+            (KeyCode::Char('w'), KeyModifiers::CONTROL) => self.delete_word_backward(),
             (KeyCode::Backspace, _) => self.backspace(),
             (KeyCode::Char(c), m) if !m.contains(KeyModifiers::CONTROL) => self.insert(c),
             // Bare arrows move the caret in the box. Ctrl-arrows belong to the
@@ -2152,6 +2188,32 @@ mod test {
 
         assert_eq!(comment_box_ctrl_s(key(Char('s'), M::NONE)), None);
         assert_eq!(comment_box_ctrl_s(key(Char('x'), M::CONTROL)), None);
+    }
+
+    #[test]
+    fn delete_word_backward_takes_one_word_or_punctuation_run() {
+        let mut input =
+            super::CommentInput::new(String::new(), None, "fix  foo.bar  ", |_, _, _| {});
+        input.delete_word_backward();
+        assert_eq!(input.text(), "fix  foo.");
+        input.delete_word_backward();
+        assert_eq!(input.text(), "fix  foo");
+        input.delete_word_backward();
+        assert_eq!(input.text(), "fix  ");
+        input.delete_word_backward();
+        assert_eq!(input.text(), "");
+        assert_eq!(input.col, 0);
+
+        // At the start of a line it joins onto the previous one.
+        let mut input = super::CommentInput::new(String::new(), None, "one\n", |_, _, _| {});
+        input.delete_word_backward();
+        assert_eq!((input.text().as_str(), input.row, input.col), ("one", 0, 3));
+
+        // Mid-line, only what is left of the caret goes.
+        let mut input = super::CommentInput::new(String::new(), None, "ünï cödé", |_, _, _| {});
+        input.col = 3;
+        input.delete_word_backward();
+        assert_eq!((input.text().as_str(), input.col), (" cödé", 0));
     }
 
     fn stop(file: &str, side: super::DiffSide, line: usize) -> super::ReviewStop {

@@ -969,7 +969,13 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
         );
     }
 
-    fn render_preview(&mut self, area: Rect, surface: &mut Surface, cx: &mut Context) {
+    fn render_preview(
+        &mut self,
+        area: Rect,
+        surface: &mut Surface,
+        cx: &mut Context,
+        align_match_to_top: bool,
+    ) {
         // -- Render the frame:
         // clear area
         let background = cx.editor.theme.get("ui.background");
@@ -1022,28 +1028,34 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
 
             let mut offset = ViewPosition::default();
             if let Some((start_line, end_line)) = range {
-                let height = end_line - start_line;
                 let text = doc.text().slice(..);
                 let start = text.line_to_char(start_line);
-                let middle = text.line_to_char(start_line + height / 2);
-                if height < inner.height as usize {
-                    let text_fmt = doc.text_format(inner.width, None);
-                    let annotations = TextAnnotations::default();
-                    (offset.anchor, offset.vertical_offset) = char_idx_at_visual_offset(
-                        text,
-                        middle,
-                        // align to middle
-                        -(inner.height as isize / 2),
-                        0,
-                        &text_fmt,
-                        &annotations,
-                    );
-                    if start < offset.anchor {
-                        offset.anchor = start;
-                        offset.vertical_offset = 0;
-                    }
-                } else {
+                // Stacked (vertical) previews are short on phones; pin the match
+                // to the first line so the following context is visible.
+                if align_match_to_top {
                     offset.anchor = start;
+                } else {
+                    let height = end_line - start_line;
+                    let middle = text.line_to_char(start_line + height / 2);
+                    if height < inner.height as usize {
+                        let text_fmt = doc.text_format(inner.width, None);
+                        let annotations = TextAnnotations::default();
+                        (offset.anchor, offset.vertical_offset) = char_idx_at_visual_offset(
+                            text,
+                            middle,
+                            // align to middle
+                            -(inner.height as isize / 2),
+                            0,
+                            &text_fmt,
+                            &annotations,
+                        );
+                        if start < offset.anchor {
+                            offset.anchor = start;
+                            offset.vertical_offset = 0;
+                        }
+                    } else {
+                        offset.anchor = start;
+                    }
                 }
             }
 
@@ -1122,14 +1134,14 @@ impl<I: 'static + Send + Sync, D: 'static + Send + Sync> Component for Picker<I,
             self.render_picker(picker_area, surface, cx);
 
             let preview_area = area.clip_top(picker_height);
-            self.render_preview(preview_area, surface, cx);
+            self.render_preview(preview_area, surface, cx, true);
         } else {
             let picker_width = area.width / 2;
             let picker_area = area.with_width(picker_width);
             self.completion_height = picker_area.height.saturating_sub(4 + self.header_height());
             self.render_picker(picker_area, surface, cx);
             let preview_area = area.clip_left(picker_width);
-            self.render_preview(preview_area, surface, cx);
+            self.render_preview(preview_area, surface, cx, false);
         }
     }
 
@@ -1371,8 +1383,24 @@ mod tests {
     }
 
     fn render_preview_picker(width: u16, height: u16) -> (Vec<String>, Rect) {
+        render_preview_picker_with(
+            width,
+            height,
+            &format!("{PREVIEW_MARKER}\nsecond line\n"),
+            None,
+            PREVIEW_MARKER,
+        )
+    }
+
+    fn render_preview_picker_with(
+        width: u16,
+        height: u16,
+        contents: &str,
+        range: Option<(usize, usize)>,
+        wait_for: &str,
+    ) -> (Vec<String>, Rect) {
         let file = NamedTempFile::new().unwrap();
-        std::fs::write(file.path(), format!("{PREVIEW_MARKER}\nsecond line\n")).unwrap();
+        std::fs::write(file.path(), contents).unwrap();
         let path = file.path().to_path_buf();
 
         let mut harness = Harness::new(width, height);
@@ -1389,7 +1417,7 @@ mod tests {
             (),
             |_, _, _| {},
         )
-        .with_preview(|_editor, path| Some((path.as_path().into(), None)));
+        .with_preview(move |_editor, path| Some((path.as_path().into(), range)));
 
         let mut overlay = overlaid(picker);
         let terminal = Rect::new(0, 0, width, height);
@@ -1406,13 +1434,25 @@ mod tests {
         for _ in 0..30 {
             overlay.render(terminal, &mut surface, &mut cx);
             let lines = surface_lines(&surface, terminal);
-            if marker_pos(&lines, PREVIEW_MARKER).is_some() {
+            if marker_pos(&lines, wait_for).is_some() {
                 return (lines, overlay_rect);
             }
             std::thread::sleep(Duration::from_millis(10));
         }
 
         (surface_lines(&surface, terminal), overlay_rect)
+    }
+
+    fn ranged_preview_contents() -> (String, usize) {
+        let mut contents = String::new();
+        for i in 0..20 {
+            contents.push_str(&format!("BEFORE_{i}\n"));
+        }
+        contents.push_str("MATCH_LINE_HERE\n");
+        for i in 0..20 {
+            contents.push_str(&format!("AFTER_{i}\n"));
+        }
+        (contents, 20)
     }
 
     #[test]
@@ -1465,6 +1505,69 @@ mod tests {
         assert!(
             marker_pos(&lines, PREVIEW_MARKER).is_none(),
             "an 8-row terminal cannot fit a stacked preview:\n{}",
+            lines.join("\n")
+        );
+    }
+
+    #[test]
+    fn vertical_preview_pins_match_to_the_top_line() {
+        let (contents, match_line) = ranged_preview_contents();
+        let (lines, overlay) = render_preview_picker_with(
+            40,
+            24,
+            &contents,
+            Some((match_line, match_line)),
+            "MATCH_LINE_HERE",
+        );
+        let preview_top = overlay.y as usize + overlay.height as usize / 2;
+        let (_, y) = marker_pos(&lines, "MATCH_LINE_HERE").unwrap_or_else(|| {
+            panic!("match missing from stacked preview:\n{}", lines.join("\n"))
+        });
+        assert_eq!(
+            y,
+            preview_top + 1,
+            "stacked preview should put the match on the first content line, y={y} preview_top={preview_top}\n{}",
+            lines.join("\n")
+        );
+        assert!(
+            lines.iter().any(|line| line.contains("AFTER_0")),
+            "following context should be visible under the match:\n{}",
+            lines.join("\n")
+        );
+        assert!(
+            lines.iter().all(|line| !line.contains("BEFORE_")),
+            "preceding context should be scrolled away on a stacked preview:\n{}",
+            lines.join("\n")
+        );
+    }
+
+    #[test]
+    fn side_by_side_preview_still_centers_the_match() {
+        let (contents, match_line) = ranged_preview_contents();
+        let (lines, overlay) = render_preview_picker_with(
+            120,
+            40,
+            &contents,
+            Some((match_line, match_line)),
+            "MATCH_LINE_HERE",
+        );
+        let (_, y) = marker_pos(&lines, "MATCH_LINE_HERE").unwrap_or_else(|| {
+            panic!("match missing from side-by-side preview:\n{}", lines.join("\n"))
+        });
+        let preview_mid = overlay.y as usize + overlay.height as usize / 2;
+        assert!(
+            y > overlay.y as usize + 4,
+            "wide preview should not pin the match to the top, y={y} overlay={overlay:?}\n{}",
+            lines.join("\n")
+        );
+        assert!(
+            (y as isize - preview_mid as isize).unsigned_abs() <= 3,
+            "wide preview should keep the match near the vertical center, y={y} mid={preview_mid}\n{}",
+            lines.join("\n")
+        );
+        assert!(
+            lines.iter().any(|line| line.contains("BEFORE_")),
+            "centered side-by-side preview should still show preceding context:\n{}",
             lines.join("\n")
         );
     }

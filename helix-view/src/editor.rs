@@ -2186,12 +2186,20 @@ impl Editor {
                     self.close(view_id);
                 }
                 Action::ReplaceDoc(view_id, doc_id) => {
-                    self.replace_document_in_view(view_id, doc_id);
+                    if self.tree.contains(view_id) {
+                        self.replace_document_in_view(view_id, doc_id);
+                    }
                 }
             }
         }
 
-        let doc = self.documents.remove(&doc_id).unwrap();
+        // Closing a view can tear down the diff/merge session it belonged to,
+        // and that teardown closes this same document (`:bc` in a merge
+        // OURS/THEIRS pane or a range-diff pane). The inner close already did
+        // the rest of the work below.
+        let Some(doc) = self.documents.remove(&doc_id) else {
+            return Ok(());
+        };
         if doc.is_virtual_base {
             if let Some(path) = doc.path() {
                 let _ = std::fs::remove_file(path);

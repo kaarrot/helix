@@ -8,6 +8,9 @@ use crate::{
 
 pub(super) fn register_hooks(_handlers: &Handlers) {
     register_hook!(move |event: &mut DocumentDidOpen<'_>| {
+        // The first file opened in a worktree brings back that branch's saved
+        // conversation, so it is on screen before anyone comments.
+        event.editor.peek_reviews(event.doc);
         // Threads reloaded from disk carry only the line they were saved on.
         // Anchoring them as their document opens is what makes them track edits
         // again instead of staying frozen there.

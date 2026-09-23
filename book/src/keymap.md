@@ -449,8 +449,12 @@ with unsaved buffers. `:q!` stops the agent, together with any command it is
 running, and keeps what had arrived of the reply, marked as stopped.
 
 Conversations are saved as they change and come back when you reopen Helix on
-the same branch, including comments you drafted but never sent. Ones nothing has
-touched for a year are deleted automatically.
+the same branch, including comments you drafted but never sent. They are shown
+as soon as the first file in that worktree opens, and track your edits from
+then on; nothing is written back until you comment. If another running Helix
+owns that branch's conversation, this one shows its own `<branch>#2`
+conversation instead. Ones nothing has touched for a year are deleted
+automatically.
 
 The first comment starts a review conversation, named after the branch you were
 on at the time — it is not recomputed afterwards, so switching branches

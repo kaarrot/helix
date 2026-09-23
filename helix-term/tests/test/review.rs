@@ -1699,6 +1699,71 @@ async fn a_comment_outside_a_repo_keeps_the_branch_s_saved_threads() -> anyhow::
     Ok(())
 }
 
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn threads_shown_on_open_give_way_if_another_editor_claims_them() -> anyhow::Result<()> {
+    // The saved conversation is shown before this editor owns it. If another
+    // editor claims it first, this one comments into its own `#2`
+    // conversation, and the other editor's threads must not come along.
+    let repo = GitRepoFixture::new()?;
+    repo.write_file("tracked.rs", "fn one() {}\nfn two() {}\n")?;
+    repo.commit_all("initial")?;
+    repo.checkout_new_branch("claimed-elsewhere")?;
+    let _cwd = CwdGuard::enter(repo.path()).await?;
+    let path = repo.file("tracked.rs");
+
+    let uuid = {
+        let mut app = AppBuilder::new().with_file(&path, None).build()?;
+        let mut harness = AppTestHarness::new();
+        assert!(harness.send_keys(&mut app, "<space>mRc").await?);
+        assert!(harness.send_keys(&mut app, "theirs<C-s>").await?);
+        let uuid = app.editor.diff.session.as_ref().unwrap().uuid.clone();
+        app.editor.save_reviews();
+        harness.close(&mut app).await?;
+        uuid
+    };
+
+    let mut app = AppBuilder::new().with_file(&path, None).build()?;
+    let mut harness = AppTestHarness::new();
+    assert_eq!(app.editor.diff.reviews.len(), 1, "shown on open");
+
+    // Another editor, standing in as PID 1, claims it now.
+    let dir = helix_view::review::session::review_dir();
+    let claim = dir.join(format!("{uuid}.json"));
+    let owner = helix_view::review::session::Ownership {
+        pid: 1,
+        proc_start: None,
+        started_at: 0,
+        name: "claimed-elsewhere".into(),
+        worktree: repo.path().to_string_lossy().into_owned(),
+    };
+    std::fs::write(&claim, serde_json::to_string(&owner)?)?;
+
+    place_cursor(&mut app, 1);
+    assert!(harness.send_keys(&mut app, "<space>mRc").await?);
+    assert!(harness.send_keys(&mut app, "mine<C-s>").await?);
+    let _ = std::fs::remove_file(&claim);
+
+    let session = app.editor.diff.session.clone().expect("claimed");
+    assert_eq!(session.name, "claimed-elsewhere#2");
+    let drafts: Vec<_> = app
+        .editor
+        .diff
+        .reviews
+        .iter()
+        .filter_map(|thread| thread.draft.clone())
+        .collect();
+    assert_eq!(drafts, ["mine"], "the other editor's thread is gone");
+    let view = app.editor.tree.get(app.editor.tree.focus);
+    let doc = app.editor.document(view.doc).unwrap();
+    assert_eq!(doc.review_anchors.len(), 1, "and so is its anchor");
+
+    harness.close(&mut app).await?;
+    let _ = std::fs::remove_file(dir.join(format!("{uuid}.threads.json")));
+    let _ = std::fs::remove_file(dir.join(format!("{}.threads.json", session.uuid)));
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_conversation_comes_back_after_a_restart() -> anyhow::Result<()> {
     use helix_view::review::agent::AgentEvent;
@@ -1744,7 +1809,20 @@ async fn a_conversation_comes_back_after_a_restart() -> anyhow::Result<()> {
     let mut app = AppBuilder::new().with_file(&path, None).build()?;
     let mut harness = AppTestHarness::new();
 
-    // Commenting is what claims the session, and claiming is what reloads.
+    // Opening the file is enough to bring the threads back. Regression: they
+    // stayed hidden until a comment claimed the session.
+    assert_eq!(app.editor.diff.reviews.len(), 2, "shown before commenting");
+    assert!(
+        app.editor.diff.session.is_none(),
+        "opening a file claims nothing"
+    );
+    {
+        let view = app.editor.tree.get(app.editor.tree.focus);
+        let doc = app.editor.document(view.doc).unwrap();
+        assert_eq!(doc.review_anchors.len(), 2, "and they track edits");
+    }
+
+    // Commenting claims that same conversation, without loading it twice.
     assert!(harness.send_keys(&mut app, "<space>mRc").await?);
     assert!(harness.send_keys(&mut app, "<esc>").await?);
 

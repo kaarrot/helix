@@ -365,6 +365,39 @@ pub fn claim_in(dir: &Path, worktree: &Path, base_name: &str) -> ReviewSession {
     }
 }
 
+/// The conversation [`claim`] would give this editor for `base_name`, found
+/// without claiming anything.
+///
+/// Walks the same names in the same order and stops at the first one that no
+/// other live editor holds. Another editor can still claim it in between, so
+/// whoever acts on this has to compare it with what the claim then returns.
+pub fn predict(worktree: &Path, base_name: &str) -> ReviewSession {
+    predict_in(&review_dir(), worktree, base_name)
+}
+
+pub fn predict_in(dir: &Path, worktree: &Path, base_name: &str) -> ReviewSession {
+    let ours = std::process::id();
+    let session = |name: String| ReviewSession {
+        uuid: derive_uuid(worktree, &name),
+        name,
+        worktree: worktree.to_path_buf(),
+    };
+    for suffix in 0..MAX_SUFFIX {
+        let name = if suffix == 0 {
+            base_name.to_string()
+        } else {
+            format!("{base_name}#{}", suffix + 1)
+        };
+        let uuid = derive_uuid(worktree, &name);
+        let held =
+            read_ownership(dir, &uuid).is_some_and(|own| own.pid != ours && owner_is_live(&own));
+        if !held {
+            return session(name);
+        }
+    }
+    session(base_name.to_string())
+}
+
 /// Drop a claim, so the next editor takes the name rather than a suffix.
 pub fn release(session: &ReviewSession) {
     release_in(&review_dir(), session);
@@ -478,6 +511,34 @@ mod test {
             "a live holder must not be silently shared"
         );
         assert_eq!(session.uuid, derive_uuid(worktree, "main#2"));
+    }
+
+    #[test]
+    fn predicting_finds_the_name_a_claim_would_take_without_claiming_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let worktree = Path::new("/repo");
+        assert_eq!(predict_in(dir.path(), worktree, "main").name, "main");
+
+        // PID 1 stands in for another editor holding the plain name.
+        write_ownership(
+            dir.path(),
+            &derive_uuid(worktree, "main"),
+            &Ownership {
+                pid: 1,
+                proc_start: proc_start(1),
+                started_at: 0,
+                name: "main".into(),
+                worktree: "/repo".into(),
+            },
+        )
+        .unwrap();
+        let predicted = predict_in(dir.path(), worktree, "main");
+        assert_eq!(predicted.name, "main#2");
+        assert!(
+            read_ownership(dir.path(), &predicted.uuid).is_none(),
+            "predicting claims nothing"
+        );
+        assert_eq!(claim_in(dir.path(), worktree, "main"), predicted);
     }
 
     #[test]

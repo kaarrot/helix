@@ -3025,10 +3025,77 @@ impl Editor {
             let worktree = self.diff_providers.get_workdir(&path)?;
             let branch = self.review_branch_name(&path);
             let session = crate::review::session::claim(&worktree, &branch);
-            self.load_reviews(&session.uuid);
+            match self.diff.peeked.take() {
+                // Already showing this conversation, loaded when the file
+                // opened. Loading again would show every thread twice.
+                Some(peeked) if peeked.uuid == session.uuid => {}
+                // Showing another one: another editor claimed it meanwhile, or
+                // it belongs to another worktree. Its threads are not ours.
+                Some(peeked) => {
+                    self.remove_review_threads(&peeked.threads);
+                    self.load_reviews(&session.uuid);
+                }
+                None => {
+                    self.load_reviews(&session.uuid);
+                }
+            }
             self.diff.session = Some(session);
         }
         self.diff.session.as_ref()
+    }
+
+    /// Show the saved conversation for a document's worktree and branch as the
+    /// document opens, without claiming it.
+    ///
+    /// Waiting for the first comment to claim a session, as loading used to,
+    /// left a restarted editor showing no threads at all, and edits made in
+    /// the meantime were not tracked, so the threads landed on the wrong lines
+    /// once they did appear. Claiming here instead would take the name for an
+    /// editor that may only be browsing, and push the one that comments to a
+    /// `#2` conversation. So the threads are loaded now and saved only once a
+    /// comment claims the session.
+    pub fn peek_reviews(&mut self, doc_id: DocumentId) {
+        if self.diff.session.is_some() || self.diff.peeked.is_some() {
+            return;
+        }
+        let Some(path) = self
+            .documents
+            .get(&doc_id)
+            .and_then(|doc| doc.path())
+            .cloned()
+        else {
+            return;
+        };
+        let Some(worktree) = self.diff_providers.get_workdir(&path) else {
+            return;
+        };
+        let branch = self.review_branch_name(&path);
+        let predicted = crate::review::session::predict(&worktree, &branch);
+        let threads = self.load_reviews(&predicted.uuid);
+        self.diff.peeked = Some(crate::diff_view::PeekedReviews {
+            uuid: predicted.uuid,
+            threads,
+        });
+    }
+
+    /// Take threads out of the store and their anchors out of the documents.
+    fn remove_review_threads(&mut self, ids: &[crate::review::ThreadId]) {
+        for id in ids {
+            self.diff.reviews.remove(*id);
+        }
+        let reviews = &self.diff.reviews;
+        for doc in self.documents.values_mut() {
+            doc.review_anchors
+                .retain(|anchor| reviews.get(anchor.thread).is_some());
+        }
+        if self
+            .diff
+            .reviews
+            .focused
+            .is_some_and(|id| ids.contains(&id))
+        {
+            self.diff.reviews.focused = None;
+        }
     }
 
     /// Switch to a differently named conversation for the same worktree, or
@@ -3067,6 +3134,7 @@ impl Editor {
 
     fn clear_reviews(&mut self) {
         self.diff.reviews = crate::review::ReviewStore::default();
+        self.diff.peeked = None;
         for doc in self.documents.values_mut() {
             doc.review_anchors.clear();
         }
@@ -3091,14 +3159,14 @@ impl Editor {
     ///
     /// Threads carry the line they were anchored at; the anchors that track
     /// edits are re-established as each document opens.
-    fn load_reviews(&mut self, uuid: &str) {
+    fn load_reviews(&mut self, uuid: &str) -> Vec<crate::review::ThreadId> {
         // Merged into what is already in memory rather than replacing it, which
         // would discard whatever had been typed there. Skipping the load
         // instead would be worse: the session is set regardless, and its next
         // save would replace the saved conversation with what is in memory.
         let dir = crate::review::session::review_dir();
         let loaded = crate::review::ReviewStore::load_from(&dir, uuid);
-        self.diff.reviews.absorb(loaded);
+        let ids = self.diff.reviews.absorb(loaded);
         // A conversation that could not be read is worth saying out loud: the
         // reviewer would otherwise see an empty file list and assume the work
         // was never there.
@@ -3109,6 +3177,7 @@ impl Editor {
         for id in open {
             self.seed_review_anchors(id);
         }
+        ids
     }
 
     /// Give a document anchors for the threads that belong to it, so they track

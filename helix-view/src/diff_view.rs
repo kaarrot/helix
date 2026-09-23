@@ -35,6 +35,11 @@ pub struct DiffSession {
     pub reviews: ReviewStore,
     /// The claimed review conversation, created lazily on the first comment.
     pub session: Option<ReviewSession>,
+    /// Saved threads loaded before any session was claimed, so that reopening
+    /// Helix shows them straight away. Nothing is written back until the
+    /// first comment claims a session; if that claim lands on a different
+    /// conversation, these threads are swapped out for its own.
+    pub peeked: Option<PeekedReviews>,
     /// Whatever answers review comments. Spawned lazily on the first send, so
     /// merely commenting never starts a process.
     pub agent: Option<Box<dyn ReviewAgent>>,
@@ -56,6 +61,14 @@ impl Drop for DiffSession {
             crate::review::session::release(session);
         }
     }
+}
+
+/// Which saved conversation [`DiffSession::peeked`] came from, and the ids its
+/// threads were given in the store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeekedReviews {
+    pub uuid: String,
+    pub threads: Vec<crate::review::ThreadId>,
 }
 
 /// A changed-file listing cached together with the diff range it was computed

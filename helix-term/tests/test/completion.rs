@@ -1,3 +1,4 @@
+use helix_term::application::Application;
 use helix_view::editor::{CompletionDisplay, StatusLineElement};
 
 use super::*;
@@ -59,6 +60,8 @@ fn statusline_completion_config() -> Config {
     config
 }
 
+const DIAGNOSTIC_WORD: &str = "statux";
+
 fn completion_source_text() -> String {
     let mut text = String::from("\n");
 
@@ -72,6 +75,62 @@ fn completion_source_text() -> String {
     }
 
     text
+}
+
+fn diagnostic_source_text() -> String {
+    let mut text = String::from(DIAGNOSTIC_WORD);
+    text.push('\n');
+
+    for _ in 0..OFFSCREEN_BLANK_LINES {
+        text.push('\n');
+    }
+
+    for label in COMPLETION_LABELS {
+        text.push_str(label);
+        text.push('\n');
+    }
+
+    text
+}
+
+fn insert_error_diagnostic(app: &mut Application, start: usize, end: usize, line: usize) {
+    use helix_core::diagnostic::{
+        Diagnostic, DiagnosticProvider, LanguageServerId, Range, Severity,
+    };
+
+    let (_, doc) = helix_view::current!(app.editor);
+    doc.replace_diagnostics(
+        [Diagnostic {
+            range: Range { start, end },
+            ends_at_word: true,
+            starts_at_word: true,
+            zero_width: false,
+            line,
+            message: "undefined".into(),
+            severity: Some(Severity::Error),
+            code: None,
+            provider: DiagnosticProvider::Lsp {
+                server_id: LanguageServerId::default(),
+                identifier: None,
+            },
+            tags: Vec::new(),
+            source: None,
+            data: None,
+        }],
+        &[],
+        None,
+    );
+}
+
+fn click_screen_text(app: &Application, needle: &str, char_offset: usize) -> [u16; 2] {
+    let lines = screen_lines(app);
+    let (row, line) = lines
+        .iter()
+        .enumerate()
+        .find(|(_, line)| line.contains(needle))
+        .unwrap_or_else(|| panic!("expected {needle:?} to be visible"));
+    let column = line.find(needle).expect("expected needle column") + char_offset;
+    [row as u16, column as u16]
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -251,6 +310,89 @@ async fn popup_completion_closes_on_buffer_click() -> anyhow::Result<()> {
 
     for label in COMPLETION_LABELS {
         assert_eq!(0, count_screen_occurrences(&app, label));
+    }
+
+    test_key_sequence(&mut app, Some("<esc>:q!<ret>"), None, true).await?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn statusline_completion_opens_on_diagnostic_click_in_insert_mode() -> anyhow::Result<()> {
+    let file = temp_file_with_contents(diagnostic_source_text())?;
+    let mut config = statusline_completion_config();
+    config.editor.auto_completion = false;
+    let mut app = AppBuilder::new()
+        .with_config(config)
+        .with_file(file.path(), None)
+        .build()?;
+
+    run_event_loop_until_idle(&mut app).await;
+    insert_error_diagnostic(&mut app, 0, DIAGNOSTIC_WORD.chars().count(), 0);
+    dispatch_key_sequence(&mut app, "i").await?;
+
+    for label in COMPLETION_LABELS {
+        assert_eq!(
+            0,
+            count_screen_occurrences(&app, label),
+            "completion should not open before clicking the diagnostic"
+        );
+    }
+
+    // Click a prefix of the underlined word so word completion has a filter.
+    let click_offset = 3;
+    let [row, column] = click_screen_text(&app, DIAGNOSTIC_WORD, click_offset);
+    dispatch_events(&mut app, left_click_events(row, column)).await?;
+
+    let (view, doc) = helix_view::current_ref!(app.editor);
+    let cursor = doc
+        .selection(view.id)
+        .primary()
+        .cursor(doc.text().slice(..));
+    assert_eq!(
+        click_offset, cursor,
+        "clicking the underline should move the insert cursor onto that character"
+    );
+    assert_eq!(helix_view::document::Mode::Insert, app.editor.mode);
+
+    for label in COMPLETION_LABELS {
+        assert!(
+            count_screen_occurrences(&app, label) >= 1,
+            "expected statusline completion label {label:?} after clicking the diagnostic"
+        );
+    }
+
+    test_key_sequence(&mut app, Some("<esc>:q!<ret>"), None, true).await?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn statusline_completion_does_not_open_on_diagnostic_click_in_normal_mode(
+) -> anyhow::Result<()> {
+    let file = temp_file_with_contents(diagnostic_source_text())?;
+    let mut config = statusline_completion_config();
+    config.editor.auto_completion = false;
+    let mut app = AppBuilder::new()
+        .with_config(config)
+        .with_file(file.path(), None)
+        .build()?;
+
+    run_event_loop_until_idle(&mut app).await;
+    insert_error_diagnostic(&mut app, 0, DIAGNOSTIC_WORD.chars().count(), 0);
+    // Enter and leave insert so the buffer is drawn before we sample click coords.
+    dispatch_key_sequence(&mut app, "i<esc>").await?;
+
+    let [row, column] = click_screen_text(&app, DIAGNOSTIC_WORD, 3);
+    dispatch_events(&mut app, left_click_events(row, column)).await?;
+
+    assert_eq!(helix_view::document::Mode::Normal, app.editor.mode);
+    for label in COMPLETION_LABELS {
+        assert_eq!(
+            0,
+            count_screen_occurrences(&app, label),
+            "normal-mode diagnostic clicks should not open statusline completions"
+        );
     }
 
     test_key_sequence(&mut app, Some("<esc>:q!<ret>"), None, true).await?;

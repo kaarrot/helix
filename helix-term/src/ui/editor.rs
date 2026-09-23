@@ -1542,15 +1542,26 @@ impl EditorView {
                     }
 
                     editor.ensure_cursor_in_view(view_id);
-                    if had_completion
-                        && editor.mode == Mode::Insert
+
+                    // In insert mode, a click on an underlined diagnostic should
+                    // request completions at the new cursor. Statusline display
+                    // opens a session even if one was not already active; popup
+                    // display only retriggers an existing session.
+                    let diagnostic_click = editor.mode == Mode::Insert
                         && modifiers != KeyModifiers::ALT
-                        && Self::cursor_overlaps_diagnostic(editor)
-                    {
+                        && Self::cursor_overlaps_diagnostic(editor);
+                    let statusline_completion = matches!(
+                        config.completion_display,
+                        helix_view::editor::CompletionDisplay::Statusline
+                    );
+                    if diagnostic_click && (had_completion || statusline_completion) {
                         Self::trigger_completion_at_cursor(editor);
                     }
 
-                    return EventResult::Consumed(had_completion.then(full_redraw_callback));
+                    return EventResult::Consumed(
+                        (had_completion || (diagnostic_click && statusline_completion))
+                            .then(full_redraw_callback),
+                    );
                 }
 
                 if let Some((coords, view_id)) = gutter_coords_and_view(editor, row, column) {

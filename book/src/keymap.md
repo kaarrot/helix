@@ -444,6 +444,10 @@ session, so do not reply from Helix while it is open there. A
 conversation name and an agent can be given together, in either order:
 `:review-session spike grok`.
 
+`:q` refuses while a reply is still being written, the same way it refuses
+with unsaved buffers. `:q!` stops the agent, together with any command it is
+running, and keeps what had arrived of the reply, marked as stopped.
+
 Conversations are saved as they change and come back when you reopen Helix on
 the same branch, including comments you drafted but never sent. Ones nothing has
 touched for a year are deleted automatically.

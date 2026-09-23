@@ -1314,6 +1314,11 @@ impl Application {
         // Ctrl-S immediately followed by `:q` is not lost.
         crate::review_agent::cancel_scheduled_save();
 
+        // A reply still being written would keep this process alive until the
+        // agent's turn ended. `:q` asks first, so reaching here with one
+        // running means the reviewer chose to stop it.
+        crate::review_agent::stop_all_turns(&mut self.editor).await;
+
         if let Err(err) = self
             .jobs
             .finish(&mut self.editor, Some(&mut self.compositor))

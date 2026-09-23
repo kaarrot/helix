@@ -2969,6 +2969,98 @@ async fn a_late_reply_lands_on_its_thread_after_moving_away() -> anyhow::Result<
     Ok(())
 }
 
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn quitting_asks_while_a_reply_runs_and_q_bang_stops_it() -> anyhow::Result<()> {
+    // Regression: `:q` while the agent worked restored the screen and then
+    // left Helix running until the turn ended, which could take minutes.
+    use std::os::unix::fs::PermissionsExt;
+
+    let bin = tempfile::tempdir()?;
+    let pid_file = bin.path().join("pid");
+    let fake = bin.path().join("claude");
+    std::fs::write(
+        &fake,
+        format!(
+            "#!/bin/sh\necho $$ > '{}'\nexec sleep 30\n",
+            pid_file.display()
+        ),
+    )?;
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755))?;
+    let path = std::env::var("PATH").unwrap_or_default();
+    std::env::set_var("PATH", format!("{}:{path}", bin.path().display()));
+
+    let repo = GitRepoFixture::new()?;
+    repo.write_file("tracked.rs", "a\nb\n")?;
+    repo.commit_all("initial")?;
+    let _cwd = CwdGuard::enter(repo.path()).await?;
+    let file = repo.file("tracked.rs");
+    let mut app = AppBuilder::new().with_file(&file, None).build()?;
+    let mut harness = AppTestHarness::new();
+    app.editor.diff.agent = Some(Box::new(helix_term::review_agent::ClaudeChildAgent::new(
+        repo.path().to_path_buf(),
+    )));
+
+    assert!(harness.send_keys(&mut app, "<space>mRc").await?);
+    assert!(harness.send_keys(&mut app, "why?<C-s>").await?);
+    // The spinner keeps redrawing while the reply runs, so the editor is
+    // never idle and `send_keys` would wait forever.
+    let pump = std::time::Duration::from_millis(300);
+    harness
+        .send_keys_pumping(&mut app, "<space>mRS", pump)
+        .await?;
+    let mut pid = None;
+    for _ in 0..40 {
+        harness
+            .pump(&mut app, std::time::Duration::from_millis(50))
+            .await;
+        pid = std::fs::read_to_string(&pid_file)
+            .ok()
+            .and_then(|text| text.trim().parse::<u32>().ok());
+        if pid.is_some() {
+            break;
+        }
+    }
+    let pid = pid.expect("the agent started");
+
+    harness.send_keys_pumping(&mut app, ":q<ret>", pump).await?;
+    assert_eq!(app.editor.tree.views().count(), 1, ":q must not quit");
+    let status = app
+        .editor
+        .get_status()
+        .map(|(text, _)| text.to_string())
+        .unwrap_or_default();
+    assert!(status.contains("still being written"), "{status}");
+
+    let started = std::time::Instant::now();
+    harness.close(&mut app).await?;
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        ":q! waited {:?} for the agent",
+        started.elapsed()
+    );
+    std::env::set_var("PATH", path);
+
+    let alive = std::process::Command::new("ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .output()
+        .is_ok_and(|out| {
+            let stat = String::from_utf8_lossy(&out.stdout);
+            !stat.trim().is_empty() && !stat.trim().starts_with('Z')
+        });
+    assert!(!alive, "the agent must not outlive Helix");
+
+    let thread = app.editor.diff.reviews.iter().next().expect("thread");
+    assert!(!thread.awaiting);
+    let last = thread.messages.last().expect("messages");
+    assert!(
+        last.text.contains("stopped: Helix quit"),
+        "the cut-short reply says so: {:?}",
+        last.text
+    );
+    Ok(())
+}
+
 /// Opening the reply box on an older entry and cancelling it must not throw
 /// away the entries after it: nothing has been written to replace them.
 #[tokio::test(flavor = "multi_thread")]

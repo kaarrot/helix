@@ -887,6 +887,10 @@ fn force_write_quit(
 /// Results in an error if there are modified buffers remaining and sets editor
 /// error, otherwise returns `Ok(())`. If the current document is unmodified,
 /// and there are modified documents, switches focus to one of them.
+///
+/// A review reply still being written counts too: quitting stops the agent
+/// mid-turn, possibly mid-edit, so it is asked for with `:q!` like unsaved
+/// buffers are.
 pub(super) fn buffers_remaining_impl(editor: &mut Editor) -> anyhow::Result<()> {
     let modified_ids: Vec<_> = editor
         .documents()
@@ -913,6 +917,14 @@ pub(super) fn buffers_remaining_impl(editor: &mut Editor) -> anyhow::Result<()> 
             if modified_names.len() == 1 { "" } else { "s" },
             modified_names,
         );
+    }
+
+    match crate::review_agent::replies_in_flight() {
+        0 => {}
+        1 => bail!("A review reply is still being written; wait for it, or :q! to stop it"),
+        n => {
+            bail!("{n} review replies are still being written; wait for them, or :q! to stop them")
+        }
     }
     Ok(())
 }

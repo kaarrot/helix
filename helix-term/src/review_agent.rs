@@ -12,11 +12,12 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Child, Command, Stdio},
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex,
     },
+    time::Duration,
 };
 
 use helix_view::{
@@ -70,6 +71,133 @@ fn finish_one() {
     let _ = IN_FLIGHT.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
         Some(n.saturating_sub(1))
     });
+}
+
+/// How many replies have been asked for and not yet finished, across every
+/// agent and review session. Quitting asks first while this is not zero.
+pub fn replies_in_flight() -> usize {
+    IN_FLIGHT.load(Ordering::SeqCst)
+}
+
+/// One turn's process, as quitting needs to find it.
+struct LiveTurn {
+    child: Arc<Mutex<Child>>,
+    /// Set when Helix stops the turn itself, so the reader does not take the
+    /// silence that follows for the agent's own failure.
+    stopped: Arc<AtomicBool>,
+}
+
+/// Every turn's process that has not been reaped yet.
+///
+/// Global rather than per agent: switching agent or review session leaves
+/// running turns to finish, so the agent that started one may be gone by the
+/// time Helix quits.
+static LIVE: Lazy<Mutex<HashMap<u64, LiveTurn>>> = Lazy::new(Mutex::default);
+static NEXT_LIVE: AtomicU64 = AtomicU64::new(0);
+
+fn register_live(child: &Arc<Mutex<Child>>) -> (u64, Arc<AtomicBool>) {
+    let key = NEXT_LIVE.fetch_add(1, Ordering::SeqCst);
+    let stopped = Arc::new(AtomicBool::new(false));
+    LIVE.lock().unwrap().insert(
+        key,
+        LiveTurn {
+            child: child.clone(),
+            stopped: stopped.clone(),
+        },
+    );
+    (key, stopped)
+}
+
+/// Wait for the child to exit without holding its lock, so it can still be
+/// killed while this waits.
+fn reap(child: &Mutex<Child>) {
+    loop {
+        match child.lock().unwrap().try_wait() {
+            Ok(None) => {}
+            Ok(Some(_)) | Err(_) => return,
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Signal every live turn. `force` kills outright; otherwise the agent is asked
+/// to stop, which lets it write out its own record of the conversation.
+///
+/// Each turn runs in its own process group, and the whole group is signalled:
+/// a command the agent is running in the worktree keeps the output pipe open
+/// just as the agent does, and Helix cannot exit until that pipe closes.
+fn signal_live(force: bool) {
+    for turn in LIVE.lock().unwrap().values() {
+        turn.stopped.store(true, Ordering::SeqCst);
+        // Holding the child's lock keeps the reader from reaping it, so the
+        // process group cannot have been handed to someone else meanwhile.
+        let mut child = turn.child.lock().unwrap();
+        if !matches!(child.try_wait(), Ok(None)) {
+            continue;
+        }
+        #[cfg(not(windows))]
+        {
+            let signal = if force { libc::SIGKILL } else { libc::SIGTERM };
+            // SAFETY: plain syscall. The group id is the unreaped child's pid,
+            // which `process_group(0)` made the leader of its own group.
+            unsafe {
+                libc::kill(-(child.id() as libc::pid_t), signal);
+            }
+        }
+        #[cfg(windows)]
+        {
+            let _ = force;
+            let _ = child.kill();
+        }
+    }
+}
+
+fn live_count() -> usize {
+    LIVE.lock().unwrap().len()
+}
+
+/// Stop every turn still running, for quitting.
+///
+/// Without this Helix outlives its own exit: the tokio runtime waits for the
+/// task reading each child's output, and that lasts until the agent's turn
+/// ends, which can be minutes. Asked nicely first, then killed. What had
+/// arrived of each reply is kept, marked as cut short, so the conversation
+/// saved next says what happened.
+pub async fn stop_all_turns(editor: &mut Editor) {
+    stop_live_turns().await;
+
+    let cut_short: Vec<ThreadId> = editor
+        .diff
+        .reviews
+        .iter()
+        .filter(|thread| thread.awaiting)
+        .map(|thread| thread.id)
+        .collect();
+    for id in cut_short {
+        editor.diff.reviews.apply_agent_event(AgentEvent::Failed(
+            id,
+            String::from("stopped: Helix quit before this reply finished"),
+        ));
+    }
+}
+
+async fn stop_live_turns() {
+    if live_count() == 0 {
+        return;
+    }
+    signal_live(false);
+    wait_for_live(Duration::from_millis(1000)).await;
+    if live_count() > 0 {
+        signal_live(true);
+        wait_for_live(Duration::from_millis(1000)).await;
+    }
+}
+
+async fn wait_for_live(limit: Duration) {
+    let deadline = std::time::Instant::now() + limit;
+    while live_count() > 0 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 /// Unit tests spawn a child without an editor job queue. Dispatching would
@@ -334,6 +462,13 @@ impl TurnState {
             .current_dir(self.worktree.as_path())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
+        // Its own process group, so quitting can stop the agent together with
+        // whatever it is running (see `signal_live`).
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
         if prompt_file.is_some() {
             command.stdin(Stdio::null());
         } else {
@@ -375,11 +510,13 @@ impl TurnState {
         }
 
         let stdout = child.stdout.take();
+        let child = Arc::new(Mutex::new(child));
+        let (live, stopped) = register_live(&child);
         let session = session.to_string();
         let state = self.clone();
         tokio::task::spawn_blocking(move || {
             if let Some(stdout) = stdout {
-                read_turn(stdout, thread, &session);
+                read_turn(stdout, thread, &session, &stopped);
             } else {
                 apply(
                     &session,
@@ -390,7 +527,8 @@ impl TurnState {
                 );
                 finish_one();
             }
-            let _ = child.wait();
+            reap(&child);
+            LIVE.lock().unwrap().remove(&live);
             drop(prompt_file);
             state.release(&session);
             if !state.stopped.load(Ordering::SeqCst) {
@@ -580,7 +718,16 @@ fn write_prompt_file(prompt: &str) -> std::io::Result<tempfile::NamedTempFile> {
 /// Lines after the terminal `result` are drained and ignored. Stopping at the
 /// result would leave the child blocked once the stdout pipe filled, and
 /// `wait` would never return.
-fn read_turn(stdout: std::process::ChildStdout, thread: ThreadId, session: &str) {
+///
+/// `stopped` is set when Helix ended the turn itself. The reply is then left as
+/// it stands: the editor marks it as cut short, and the silence says nothing
+/// about whether the agent knows this conversation.
+fn read_turn(
+    stdout: std::process::ChildStdout,
+    thread: ThreadId,
+    session: &str,
+    stopped: &AtomicBool,
+) {
     let reader = BufReader::new(stdout);
     let mut spoke = false;
     let mut finished = false;
@@ -615,6 +762,11 @@ fn read_turn(stdout: std::process::ChildStdout, thread: ThreadId, session: &str)
             }
             None => {}
         }
+    }
+
+    if !finished && stopped.load(Ordering::SeqCst) {
+        finish_one();
+        return;
     }
 
     if !finished {
@@ -820,9 +972,106 @@ mod test {
         }
     }
 
+    /// The tests that spawn a real child share `LIVE` and `SUPPRESS_DISPATCH`,
+    /// and one of them stops every live turn, so they take turns.
+    #[cfg(unix)]
+    static CHILD_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    #[cfg(unix)]
+    fn fake_program(dir: &Path, script: &str) -> PathBuf {
+        let program = dir.join("claude");
+        std::fs::write(&program, format!("#!/bin/sh\n{script}")).unwrap();
+        std::fs::set_permissions(
+            &program,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+        program
+    }
+
+    #[cfg(unix)]
+    fn read_pid(path: &Path) -> u32 {
+        let started = std::time::Instant::now();
+        loop {
+            if let Ok(text) = std::fs::read_to_string(path) {
+                if let Ok(pid) = text.trim().parse::<u32>() {
+                    return pid;
+                }
+            }
+            if started.elapsed() > Duration::from_secs(2) {
+                panic!("the turn did not start");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[cfg(unix)]
+    fn is_alive(pid: u32) -> bool {
+        // A zombie still answers signal 0 until it is reaped, so ask ps.
+        Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .is_ok_and(|out| {
+                let stat = String::from_utf8_lossy(&out.stdout);
+                !stat.trim().is_empty() && !stat.trim().starts_with('Z')
+            })
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn quitting_stops_a_turn_and_whatever_it_is_running() {
+        // Regression: Helix stayed alive after `:q!` until the agent's turn
+        // ended, because the runtime waits for the task reading its output.
+        // This agent ignores SIGTERM, and its child holds the output pipe
+        // open, so only killing the whole group lets the reader finish.
+        let _serial = CHILD_TESTS.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let pid_path = dir.path().join("pid");
+        let grandchild_path = dir.path().join("grandchild");
+        let program = fake_program(
+            dir.path(),
+            &format!(
+                "trap '' TERM\necho $$ > '{}'\nsleep 30 &\necho $! > '{}'\nwait\n",
+                pid_path.display(),
+                grandchild_path.display()
+            ),
+        );
+
+        SUPPRESS_DISPATCH.store(true, Ordering::SeqCst);
+        let agent = ClaudeChildAgent::with_program(
+            program.to_string_lossy().into_owned(),
+            dir.path().into(),
+        );
+        agent
+            .turns
+            .send(
+                ThreadId(1),
+                "11111111-2222-4333-8444-666666666666".into(),
+                "hi".into(),
+            )
+            .unwrap();
+        let pid = read_pid(&pid_path);
+        let grandchild = read_pid(&grandchild_path);
+        assert!(live_count() > 0);
+
+        let start = std::time::Instant::now();
+        stop_live_turns().await;
+        let elapsed = start.elapsed();
+        SUPPRESS_DISPATCH.store(false, Ordering::SeqCst);
+
+        assert_eq!(live_count(), 0, "every turn is reaped");
+        assert!(!is_alive(pid), "the agent is stopped");
+        assert!(!is_alive(grandchild), "and so is what it was running");
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "stopping took {elapsed:?}"
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn claude_shutdown_does_not_wait_for_the_child() {
+        let _serial = CHILD_TESTS.lock().await;
         // A turn that ignores stdin and stays alive. Waiting on it in shutdown
         // would freeze the editor for the full duration.
         struct Cleanup {

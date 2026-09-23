@@ -1880,6 +1880,230 @@ async fn a_conversation_comes_back_after_a_restart() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The line the focused document's anchor puts `id` on, if it has one.
+fn anchored_line(app: &Application, id: ThreadId) -> Option<usize> {
+    let view = app.editor.tree.get(app.editor.tree.focus);
+    let doc = app.editor.document(view.doc).unwrap();
+    doc.review_anchors
+        .iter()
+        .find(|anchor| anchor.thread == id)
+        .map(|anchor| anchor.line(doc.text()))
+}
+
+/// Each saved thread's draft and line.
+fn saved_drafts(uuid: &str) -> Vec<(String, u32)> {
+    let dir = helix_view::review::session::review_dir();
+    helix_view::review::ReviewStore::load_from(&dir, uuid)
+        .iter()
+        .map(|thread| (thread.draft.clone().unwrap_or_default(), thread.line))
+        .collect()
+}
+
+fn remove_saved(uuids: &[&str]) {
+    let dir = helix_view::review::session::review_dir();
+    for uuid in uuids {
+        let _ = std::fs::remove_file(dir.join(format!("{uuid}.threads.json")));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_checkout_shows_that_branch_s_threads_each_on_its_own_line() -> anyhow::Result<()> {
+    // Regression: the conversation was fixed when the editor started. After a
+    // checkout the old branch's threads were still shown, a reload carried
+    // them onto the new branch's code, and they were saved at lines their own
+    // branch never had.
+    let repo = GitRepoFixture::new()?;
+    repo.write_file("tracked.rs", "fn a() {}\nfn b() {}\nfn c() {}\nfn d() {}\n")?;
+    repo.commit_all("initial")?;
+    repo.checkout_new_branch("left")?;
+
+    let _cwd = CwdGuard::enter(repo.path()).await?;
+    let path = repo.file("tracked.rs");
+    let mut app = AppBuilder::new().with_file(&path, None).build()?;
+    let mut harness = AppTestHarness::new();
+
+    place_cursor(&mut app, 3);
+    assert!(harness.send_keys(&mut app, "<space>mRc").await?);
+    assert!(harness.send_keys(&mut app, "about d<C-s>").await?);
+    let left = app.editor.diff.session.clone().expect("claimed");
+    assert_eq!(left.branch.as_deref(), Some("left"));
+
+    // Another branch, with two lines added above `d`, checked out outside the
+    // editor. The buffer still holds the left branch's text.
+    repo.checkout_new_branch("right")?;
+    repo.write_file(
+        "tracked.rs",
+        "fn x() {}\nfn y() {}\nfn a() {}\nfn b() {}\nfn c() {}\nfn d() {}\n",
+    )?;
+    repo.commit_all("add x and y")?;
+
+    assert!(harness.send_keys(&mut app, ":reload-all<ret>").await?);
+    assert_eq!(
+        thread_count(&app),
+        0,
+        "left's thread must not be shown on right"
+    );
+    assert!(
+        app.editor.diff.session.is_none(),
+        "claimed by a comment, not by a checkout"
+    );
+    assert_eq!(
+        saved_drafts(&left.uuid),
+        [("about d".to_string(), 3)],
+        "saved on the line it was left on, before the reload could move it"
+    );
+
+    place_cursor(&mut app, 0);
+    assert!(harness.send_keys(&mut app, "<space>mRc").await?);
+    assert!(harness.send_keys(&mut app, "about x<C-s>").await?);
+    let right = app.editor.diff.session.clone().expect("claimed");
+    assert_eq!(right.name, "right");
+    assert_ne!(right.uuid, left.uuid);
+
+    // Back again: left's thread returns, anchored to left's text. The pause
+    // keeps the checkout out of the clock tick the reload read the file's
+    // mtime in, which would hide that the file changed.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    repo.checkout("left")?;
+    assert!(harness.send_keys(&mut app, ":reload-all<ret>").await?);
+    assert_eq!(thread_count(&app), 1);
+    assert_eq!(only_thread_draft(&app), Some("about d"));
+    let id = app.editor.diff.reviews.iter().next().unwrap().id;
+    assert_eq!(
+        anchored_line(&app, id),
+        Some(3),
+        "anchored once the buffer holds this branch's text, not before"
+    );
+    assert_eq!(saved_drafts(&right.uuid), [("about x".to_string(), 0)]);
+
+    harness.close(&mut app).await?;
+    remove_saved(&[&left.uuid, &right.uuid]);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_detached_head_or_a_named_conversation_keeps_its_threads() -> anyhow::Result<()> {
+    let repo = GitRepoFixture::new()?;
+    repo.write_file("tracked.rs", "fn one() {}\nfn two() {}\n")?;
+    repo.commit_all("initial")?;
+    repo.checkout_new_branch("feature")?;
+
+    let _cwd = CwdGuard::enter(repo.path()).await?;
+    let path = repo.file("tracked.rs");
+    let mut app = AppBuilder::new().with_file(&path, None).build()?;
+    let mut harness = AppTestHarness::new();
+
+    assert!(harness.send_keys(&mut app, "<space>mRc").await?);
+    assert!(harness.send_keys(&mut app, "keep me<C-s>").await?);
+    let feature = app.editor.diff.session.clone().expect("claimed");
+
+    // A rebase runs on a detached HEAD. It is still the branch's work, so the
+    // branch's conversation stays.
+    repo.git(&["checkout", "--detach"])?;
+    app.editor.follow_review_branch();
+    assert_eq!(app.editor.diff.session.as_ref(), Some(&feature));
+    assert_eq!(only_thread_draft(&app), Some("keep me"));
+
+    // A conversation named for something other than the branch stays put.
+    assert!(
+        harness
+            .send_keys(&mut app, ":review-session spike<ret>")
+            .await?
+    );
+    let spike = app.editor.diff.session.clone().expect("named");
+    assert_eq!(spike.branch, None);
+    repo.checkout_new_branch("other")?;
+    app.editor.follow_review_branch();
+    assert_eq!(app.editor.diff.session.as_ref(), Some(&spike));
+
+    // Naming it after the branch checked out makes it follow again.
+    assert!(
+        harness
+            .send_keys(&mut app, ":review-session other<ret>")
+            .await?
+    );
+    let other = app.editor.diff.session.clone().expect("named");
+    assert_eq!(other.branch.as_deref(), Some("other"));
+    repo.checkout("feature")?;
+    app.editor.follow_review_branch();
+    assert!(app.editor.diff.session.is_none());
+    assert_eq!(only_thread_draft(&app), Some("keep me"));
+
+    harness.close(&mut app).await?;
+    remove_saved(&[&feature.uuid, &spike.uuid, &other.uuid]);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reply_still_arriving_at_a_checkout_is_marked_cut_short() -> anyhow::Result<()> {
+    use helix_view::review::agent::AgentEvent;
+
+    let repo = GitRepoFixture::new()?;
+    repo.write_file("tracked.rs", "fn one() {}\nfn two() {}\n")?;
+    repo.commit_all("initial")?;
+    repo.checkout_new_branch("asking")?;
+
+    let _cwd = CwdGuard::enter(repo.path()).await?;
+    let path = repo.file("tracked.rs");
+    let mut app = AppBuilder::new().with_file(&path, None).build()?;
+    let mut harness = AppTestHarness::new();
+
+    let fake = FakeAgent::default();
+    let sent = fake.sent.clone();
+    app.editor.diff.agent = Some(Box::new(fake));
+
+    assert!(harness.send_keys(&mut app, "<space>mRc").await?);
+    assert!(harness.send_keys(&mut app, "why?<C-s>").await?);
+    assert!(harness.send_keys(&mut app, "<space>mRS").await?);
+    let (id, _, agent_session) = sent.lock().unwrap()[0].clone();
+    helix_term::review_agent::apply_event(
+        &mut app.editor,
+        &agent_session,
+        AgentEvent::Chunk(id, "because".into()),
+    );
+    let asking = app.editor.diff.session.clone().expect("claimed");
+
+    repo.checkout_new_branch("elsewhere")?;
+    app.editor.follow_review_branch();
+    assert_eq!(thread_count(&app), 0);
+    assert!(
+        app.editor.diff.agent.is_none(),
+        "the agent went with its threads"
+    );
+
+    repo.checkout("asking")?;
+    app.editor.follow_review_branch();
+    let entries = |app: &Application| -> Vec<String> {
+        let thread = app
+            .editor
+            .diff
+            .reviews
+            .get(id)
+            .expect("the thread comes back");
+        (0..thread.entry_count())
+            .map(|index| thread.entry(index).unwrap().text.to_string())
+            .collect()
+    };
+    let cut_short = [
+        "why?",
+        "because",
+        "(failed) stopped waiting: elsewhere was checked out before this reply arrived",
+    ];
+    assert_eq!(entries(&app), cut_short);
+
+    // The rest of that turn arrives too late to be written under the note.
+    helix_term::review_agent::apply_event(
+        &mut app.editor,
+        &agent_session,
+        AgentEvent::Completed(id, "because of X".into()),
+    );
+    assert_eq!(entries(&app), cut_short);
+
+    harness.close(&mut app).await?;
+    remove_saved(&[&asking.uuid]);
+    Ok(())
+}
+
 /// Exercises the real `claude` child: spawning it, the flags it is given, and
 /// the parsing of its actual output.
 ///

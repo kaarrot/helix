@@ -456,11 +456,16 @@ owns that branch's conversation, this one shows its own `<branch>#2`
 conversation instead. Ones nothing has touched for a year are deleted
 automatically.
 
-The first comment starts a review conversation, named after the branch you were
-on at the time — it is not recomputed afterwards, so switching branches
-mid-review does not move you to a different conversation. Reopening Helix on the
-same branch resumes the same one. `:review-session` shows the current
-conversation and agent. `:review-session [name]` names, renames or switches it.
+Each branch has its own conversation, started by the first comment on it.
+Check out another branch and Helix moves to that branch's conversation as soon
+as it notices: when the terminal regains focus, when a file is opened, or on
+`:reload` / `:reload-all`. The conversation it leaves is saved first. Threads on
+a file the checkout changed settle onto its new text once that buffer is
+reloaded. A reply still arriving at that moment is marked as stopped. While
+HEAD is detached, as during a rebase, the conversation stays where it is.
+`:review-session` shows the current conversation and agent.
+`:review-session [name]` names, renames or switches it; a conversation named
+after anything but the branch checked out stays put across checkouts.
 `:review-session grok` or `:review-session claude` picks the agent without
 renaming.
 

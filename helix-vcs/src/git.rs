@@ -409,7 +409,9 @@ fn for_each_change_impl(
 /// `Sync` bound), which hides per-entry I/O latency on network filesystems. A
 /// file is untracked when it exists on disk, is not excluded by any git ignore
 /// source, and is not present in the index. Matches `git status -uall` (each
-/// untracked symlink is reported as an entry, like git).
+/// untracked symlink is reported as an entry, like git), except that a nested
+/// repository is skipped rather than listed as one `nested/` entry, since the
+/// picker opens files. Submodules are skipped too, as git does.
 pub fn for_each_untracked_file(cwd: &Path, f: impl Fn(FileChange) + Sync) -> Result<()> {
     let repo = open_repo(cwd)?.to_thread_local();
     let work_dir = repo
@@ -426,6 +428,15 @@ pub fn for_each_untracked_file(cwd: &Path, f: impl Fn(FileChange) + Sync) -> Res
         .map(|entry| work_dir.join(gix::path::from_bstr(entry.path(&index))))
         .collect();
 
+    // Submodule paths. Their files belong to another repository and are not in
+    // this index, so without pruning every one of them would read as untracked.
+    let gitlinks: std::collections::HashSet<PathBuf> = index
+        .entries()
+        .iter()
+        .filter(|entry| entry.mode == gix::index::entry::Mode::COMMIT)
+        .map(|entry| work_dir.join(gix::path::from_bstr(entry.path(&index))))
+        .collect();
+
     let walker = ignore::WalkBuilder::new(&work_dir)
         .hidden(false) // git scans dotfiles; `.git` is pruned below
         .parents(true)
@@ -433,16 +444,29 @@ pub fn for_each_untracked_file(cwd: &Path, f: impl Fn(FileChange) + Sync) -> Res
         .git_ignore(true)
         .git_global(true)
         .git_exclude(true)
-        .filter_entry(|entry| entry.file_name() != ".git")
+        .filter_entry(move |entry| {
+            if entry.file_name() == ".git" {
+                return false;
+            }
+            // Stop at repository boundaries: a submodule, even an
+            // uninitialized one, or any nested clone (its own `.git`).
+            let is_dir = entry.file_type().is_some_and(|ft| ft.is_dir());
+            !(is_dir
+                && entry.depth() > 0
+                && (gitlinks.contains(entry.path()) || entry.path().join(".git").exists()))
+        })
         .threads(0) // 0 = pick a sensible default based on CPUs
         .build_parallel();
 
     walker.run(|| {
         Box::new(|result| {
             if let Ok(entry) = result {
-                // Files and symlinks (anything that isn't a directory); git
-                // lists an untracked symlink as its own entry.
-                if entry.file_type().map_or(false, |ft| !ft.is_dir()) {
+                // Regular files and symlinks; git lists an untracked symlink as
+                // its own entry. Sockets and FIFOs are skipped, as git does.
+                if entry
+                    .file_type()
+                    .is_some_and(|ft| ft.is_file() || ft.is_symlink())
+                {
                     let path = entry.into_path();
                     if !tracked.contains(&path) {
                         f(FileChange::Untracked { path });

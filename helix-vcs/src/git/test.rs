@@ -361,6 +361,75 @@ fn for_each_untracked_file_matches_git_semantics() {
 }
 
 #[test]
+fn for_each_untracked_file_stops_at_submodules_and_nested_repos() {
+    let upstream = empty_git_repo();
+    write_repo_file(upstream.path(), "lib.rs", "lib\n");
+    create_commit(upstream.path(), true);
+
+    let repo = empty_git_repo();
+    write_repo_file(repo.path(), "tracked.txt", "tracked\n");
+    create_commit(repo.path(), true);
+    exec_git_cmd_args(
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            upstream.path().to_str().unwrap(),
+            "libs/foo",
+        ],
+        repo.path(),
+    );
+    create_commit(repo.path(), true);
+
+    // A clone nobody registered as a submodule.
+    let nested = repo.path().join("nested");
+    fs::create_dir(&nested).unwrap();
+    exec_git_cmd("init", &nested);
+    write_repo_file(&nested, "inner.txt", "inner\n");
+
+    write_repo_file(repo.path(), "untracked.txt", "new\n");
+
+    let found = std::sync::Mutex::new(Vec::new());
+    git::for_each_untracked_file(repo.path(), |change| {
+        if let FileChange::Untracked { path } = change {
+            found.lock().unwrap().push(path);
+        }
+    })
+    .unwrap();
+
+    let found = found.into_inner().unwrap();
+    let has = |name: &str| found.iter().any(|p| p.ends_with(name));
+    assert!(has("untracked.txt"), "expected untracked.txt: {found:?}");
+    assert!(!has("libs/foo/lib.rs"), "submodule file listed: {found:?}");
+    assert!(
+        !has("nested/inner.txt"),
+        "nested repo file listed: {found:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn for_each_untracked_file_skips_fifos() {
+    let repo = empty_git_repo();
+    write_repo_file(repo.path(), "tracked.txt", "tracked\n");
+    create_commit(repo.path(), true);
+
+    let fifo = repo.path().join("pipe");
+    let status = Command::new("mkfifo").arg(&fifo).status().unwrap();
+    assert!(status.success());
+
+    let found = std::sync::Mutex::new(Vec::new());
+    git::for_each_untracked_file(repo.path(), |change| {
+        found.lock().unwrap().push(change.path().to_path_buf());
+    })
+    .unwrap();
+
+    let found = found.into_inner().unwrap();
+    assert!(!found.contains(&fifo), "fifo listed: {found:?}");
+}
+
+#[test]
 fn for_each_changed_file_reports_conflicts_and_gets_merge_versions() {
     let repo = empty_git_repo();
     write_repo_file(repo.path(), "conflict.txt", "base\n");

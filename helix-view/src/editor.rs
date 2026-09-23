@@ -2914,8 +2914,22 @@ impl Editor {
             self.detach_diff_view(focused_view);
         }
 
+        // A file deleted from the working tree has nothing to open: `open`
+        // would make a new, writable buffer at the path, and `:w` would bring
+        // the file back. Show it as an empty read-only pane instead.
+        let mut working_is_virtual = false;
         let working_doc_id = if let Some(id) = self.non_virtual_document_id_by_path(&working_path) {
             id
+        } else if !working_path.exists() {
+            working_is_virtual = true;
+            let working_doc = Document::from_git_revision(
+                Vec::new(),
+                &working_path,
+                "deleted",
+                self.config.clone(),
+                self.syn_loader.clone(),
+            )?;
+            self.new_document(working_doc)
         } else {
             self.open(&working_path, Action::Load)?
         };
@@ -2939,7 +2953,7 @@ impl Editor {
             let base_view_id = self.tree.focus;
             self.switch(working_doc_id, Action::VerticalSplit);
             let working_view_id = self.tree.focus;
-            let diff_state = DiffViewState::new(
+            let mut diff_state = DiffViewState::new(
                 base_doc_id,
                 working_doc_id,
                 base_view_id,
@@ -2953,12 +2967,13 @@ impl Editor {
                 None,
             )
             .close_base_doc_on_close();
+            diff_state.close_working_doc_on_close = working_is_virtual;
             self.diff.views.insert(base_view_id, diff_state.clone());
             self.diff.views.insert(working_view_id, diff_state);
         } else {
             self.switch(working_doc_id, Action::Replace);
             let working_view_id = self.tree.focus;
-            let diff_state = DiffViewState::new(
+            let mut diff_state = DiffViewState::new(
                 base_doc_id,
                 working_doc_id,
                 working_view_id,
@@ -2972,6 +2987,7 @@ impl Editor {
                 None,
             )
             .close_base_doc_on_close();
+            diff_state.close_working_doc_on_close = working_is_virtual;
             self.diff.views.insert(working_view_id, diff_state);
         }
 

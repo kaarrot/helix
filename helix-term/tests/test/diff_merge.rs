@@ -1417,3 +1417,56 @@ async fn quit_in_buffer_diff_keeps_a_view() -> anyhow::Result<()> {
     harness.close(&mut app).await?;
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn changed_file_picker_opens_deleted_file_read_only() -> anyhow::Result<()> {
+    let repo = GitRepoFixture::new()?;
+    repo.write_file("tracked.txt", "tracked\n")?;
+    repo.write_file("doomed.txt", "bye\n")?;
+    repo.commit_all("initial")?;
+    let doomed_path = repo.file("doomed.txt");
+    std::fs::remove_file(&doomed_path)?;
+
+    let _cwd = CwdGuard::enter(repo.path()).await?;
+    let tracked_path = repo.file("tracked.txt");
+    let mut app = AppBuilder::new().with_file(&tracked_path, None).build()?;
+    let mut harness = AppTestHarness::new();
+
+    // The deleted file is the only change, so Enter opens it.
+    assert!(harness.send_keys(&mut app, "<space>g").await?);
+    assert!(harness.wait_for_idle(&mut app).await?);
+    assert!(harness.send_keys(&mut app, "<ret>").await?);
+
+    let diff_state = main_diff_state(&app);
+    assert!(diff_state.close_working_doc_on_close);
+    {
+        let working = app.editor.document(diff_state.working_doc_id).unwrap();
+        assert!(working.path().is_none());
+        assert!(working.is_virtual_base);
+        assert!(working.text().len_chars() == 0);
+        let base = app.editor.document(diff_state.base_doc_id).unwrap();
+        assert_eq!(base.text(), &LineFeedHandling::Native.apply("bye\n"));
+    }
+
+    assert!(harness.send_keys(&mut app, ":w<ret>").await?);
+    assert!(!doomed_path.exists(), ":w recreated the deleted file");
+
+    // Toggling the split reopens both virtual panes.
+    assert!(harness.send_keys(&mut app, "<space>mv").await?);
+    let diff_state = main_diff_state(&app);
+    assert_ne!(diff_state.base_view_id, diff_state.working_view_id);
+    assert!(app
+        .editor
+        .document(diff_state.working_doc_id)
+        .unwrap()
+        .path()
+        .is_none());
+
+    assert!(harness.send_keys(&mut app, "<space>mq").await?);
+    assert!(app.editor.diff.views.is_empty());
+    assert!(app.editor.document(diff_state.working_doc_id).is_none());
+    assert!(!doomed_path.exists());
+
+    harness.close(&mut app).await?;
+    Ok(())
+}

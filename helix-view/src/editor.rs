@@ -2930,13 +2930,16 @@ impl Editor {
             id
         } else if !working_path.exists() {
             working_is_virtual = true;
-            let working_doc = Document::from_git_revision(
+            let mut working_doc = Document::from_git_revision(
                 Vec::new(),
                 &working_path,
                 "deleted",
                 self.config.clone(),
                 self.syn_loader.clone(),
             )?;
+            // Git-revision documents get a cache path so LSP can open them.
+            // A deleted working file has to stay pathless, or `:w` recreates it.
+            working_doc.set_path(None);
             self.new_document(working_doc)
         } else {
             self.open(&working_path, Action::Load)?

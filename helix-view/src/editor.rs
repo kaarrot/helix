@@ -3048,9 +3048,9 @@ impl Editor {
             }
         };
 
-        // load_reviews will not replace a non-empty store, so a first comment
-        // is not overwritten by a disk load. On switch that guard would keep
-        // the old threads; save them, then clear, so the new UUID can load.
+        // The threads in memory belong to the session being left, and
+        // load_reviews adds to them. Save them, then clear, so the new session
+        // shows only its own.
         self.save_reviews();
         self.clear_reviews();
 
@@ -3092,13 +3092,13 @@ impl Editor {
     /// Threads carry the line they were anchored at; the anchors that track
     /// edits are re-established as each document opens.
     fn load_reviews(&mut self, uuid: &str) {
-        // Only ever load onto an empty store. Replacing threads that are already
-        // in memory would discard whatever had been typed but not yet written.
-        if !self.diff.reviews.is_empty() {
-            return;
-        }
+        // Merged into what is already in memory rather than replacing it, which
+        // would discard whatever had been typed there. Skipping the load
+        // instead would be worse: the session is set regardless, and its next
+        // save would replace the saved conversation with what is in memory.
         let dir = crate::review::session::review_dir();
-        self.diff.reviews = crate::review::ReviewStore::load_from(&dir, uuid);
+        let loaded = crate::review::ReviewStore::load_from(&dir, uuid);
+        self.diff.reviews.absorb(loaded);
         // A conversation that could not be read is worth saying out loud: the
         // reviewer would otherwise see an empty file list and assume the work
         // was never there.

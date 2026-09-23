@@ -1628,6 +1628,78 @@ async fn ctrl_left_walks_the_thread_while_the_comment_box_is_open() -> anyhow::R
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_comment_outside_a_repo_keeps_the_branch_s_saved_threads() -> anyhow::Result<()> {
+    // Regression: the comment outside the repository filled the store, so
+    // claiming the branch's session skipped loading it, and the next save
+    // replaced the saved conversation with what was in memory.
+    let repo = GitRepoFixture::new()?;
+    repo.write_file("tracked.rs", "fn one() {}\nfn two() {}\n")?;
+    repo.commit_all("initial")?;
+    repo.checkout_new_branch("keep-saved-threads")?;
+    let _cwd = CwdGuard::enter(repo.path()).await?;
+    let path = repo.file("tracked.rs");
+
+    let uuid = {
+        let mut app = AppBuilder::new().with_file(&path, None).build()?;
+        let mut harness = AppTestHarness::new();
+        assert!(harness.send_keys(&mut app, "<space>mRc").await?);
+        assert!(harness.send_keys(&mut app, "saved earlier<C-s>").await?);
+        let uuid = app.editor.diff.session.as_ref().unwrap().uuid.clone();
+        app.editor.save_reviews();
+        harness.close(&mut app).await?;
+        uuid
+    };
+
+    let notes = tempfile::NamedTempFile::new()?;
+    std::fs::write(notes.path(), "a note\n")?;
+    let mut app = AppBuilder::new().with_file(notes.path(), None).build()?;
+    let mut harness = AppTestHarness::new();
+    assert!(harness.send_keys(&mut app, "<space>mRc").await?);
+    assert!(harness.send_keys(&mut app, "outside<C-s>").await?);
+    assert!(
+        app.editor.diff.session.is_none(),
+        "no repository, no session"
+    );
+
+    let open = format!(":open {}<ret>", path.display());
+    assert!(harness.send_keys(&mut app, &open).await?);
+    place_cursor(&mut app, 1);
+    assert!(harness.send_keys(&mut app, "<space>mRc").await?);
+    assert!(harness.send_keys(&mut app, "new here<C-s>").await?);
+    assert_eq!(
+        app.editor.diff.session.as_ref().map(|s| s.uuid.clone()),
+        Some(uuid.clone())
+    );
+    app.editor.save_reviews();
+
+    let drafts = |store: &helix_view::review::ReviewStore| {
+        let mut drafts: Vec<String> = store.iter().filter_map(|t| t.draft.clone()).collect();
+        drafts.sort();
+        drafts
+    };
+    assert_eq!(
+        drafts(&app.editor.diff.reviews),
+        ["new here", "outside", "saved earlier"]
+    );
+    let dir = helix_view::review::session::review_dir();
+    let on_disk = helix_view::review::ReviewStore::load_from(&dir, &uuid);
+    assert!(
+        drafts(&on_disk).contains(&"saved earlier".to_string()),
+        "the saved conversation must survive the next save: {:?}",
+        drafts(&on_disk)
+    );
+
+    // Reopening the file must not anchor the saved thread twice.
+    let view = app.editor.tree.get(app.editor.tree.focus);
+    let doc = app.editor.document(view.doc).unwrap();
+    assert_eq!(doc.review_anchors.len(), 2);
+
+    harness.close(&mut app).await?;
+    let _ = std::fs::remove_file(dir.join(format!("{uuid}.threads.json")));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_conversation_comes_back_after_a_restart() -> anyhow::Result<()> {
     use helix_view::review::agent::AgentEvent;
 

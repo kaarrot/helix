@@ -891,6 +891,43 @@ impl ReviewStore {
         store
     }
 
+    /// Add the threads of a store loaded from disk to the ones already here.
+    ///
+    /// A thread can exist before its conversation is loaded: a comment left in
+    /// a file outside any repository has no session to load. Replacing it
+    /// would lose that comment, and skipping the load instead would leave the
+    /// saved conversation unseen and then write over it at the next save. So
+    /// the two are combined, and the loaded threads are renumbered when there
+    /// is anything they could collide with.
+    ///
+    /// A load failure travels with the threads, so saving stays refused if the
+    /// file could not be read or moved aside. Returns the ids the loaded
+    /// threads now have.
+    pub fn absorb(&mut self, mut loaded: ReviewStore) -> Vec<ThreadId> {
+        self.save_blocked |= loaded.save_blocked;
+        if let Some(message) = loaded.load_error.take() {
+            self.load_error = Some(message);
+        }
+
+        let renumber = !self.threads.is_empty();
+        let mut next = self.next_id.max(loaded.next_id);
+        let mut ids = Vec::with_capacity(loaded.threads.len());
+        for (_, mut thread) in std::mem::take(&mut loaded.threads) {
+            if renumber {
+                thread.id = ThreadId(next);
+            }
+            next = next.max(thread.id.0 + 1);
+            self.by_file
+                .entry(thread.file.clone())
+                .or_default()
+                .push(thread.id);
+            ids.push(thread.id);
+            self.threads.insert(thread.id, thread);
+        }
+        self.next_id = next;
+        ids
+    }
+
     /// Fold an agent event into the store when it belongs to `session`.
     ///
     /// A turn can outlive the review session it was started in: switching
@@ -2228,6 +2265,57 @@ mod test {
         assert!(header.starts_with("you "), "got {header:?}");
         assert!(header.contains("1/4"), "got {header:?}");
         assert_eq!(body_of(thread, 40), vec!["why?"]);
+    }
+
+    #[test]
+    fn loading_keeps_threads_already_here_and_renumbers_the_saved_ones() {
+        // Regression: a store holding a comment from outside any repository
+        // skipped the load, and the next save replaced the saved threads with
+        // that one comment.
+        let dir = tempfile::tempdir().unwrap();
+        let uuid = "11111111-2222-5333-8444-555555555555";
+        let mut saved = ReviewStore::default();
+        let asked = saved.draft(
+            PathBuf::from("/r/a.rs"),
+            DiffSide::Working,
+            3,
+            "why?".into(),
+        );
+        saved.take_draft(asked);
+        saved.push_message(asked, Role::Agent, "because".into());
+        saved.draft(
+            PathBuf::from("/r/b.rs"),
+            DiffSide::Working,
+            1,
+            "draft".into(),
+        );
+        saved.save_to(dir.path(), uuid).unwrap();
+
+        let mut store = ReviewStore::default();
+        let outside = store.draft(
+            PathBuf::from("/tmp/notes.txt"),
+            DiffSide::Working,
+            0,
+            "note".into(),
+        );
+        let ids = store.absorb(ReviewStore::load_from(dir.path(), uuid));
+
+        assert_eq!(store.len(), 3, "nothing is lost on either side");
+        assert_eq!(store.get(outside).unwrap().draft.as_deref(), Some("note"));
+        assert_eq!(ids.len(), 2);
+        assert!(
+            !ids.contains(&outside),
+            "loaded threads get ids of their own"
+        );
+        assert_eq!(store.for_file(Path::new("/r/a.rs")).count(), 1);
+        assert_eq!(store.for_file(Path::new("/r/b.rs")).count(), 1);
+        let fresh = store.draft(PathBuf::from("/r/c.rs"), DiffSide::Working, 0, "new".into());
+        assert!(![outside].iter().chain(&ids).any(|id| *id == fresh));
+
+        // Into an empty store the saved ids are kept as they were.
+        let mut empty = ReviewStore::default();
+        let kept = empty.absorb(ReviewStore::load_from(dir.path(), uuid));
+        assert_eq!(kept, [asked, ThreadId(asked.0 + 1)]);
     }
 
     #[test]

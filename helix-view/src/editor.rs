@@ -3364,7 +3364,9 @@ impl Editor {
             self.diff.merge_views.insert(result_view_id, state);
 
             // Focus RESULT pane so the user starts editing conflicts immediately.
-            self.tree.focus = result_view_id;
+            // `focus` rather than setting `tree.focus`, so RESULT is marked
+            // focused and THEIRS (the last pane opened) gets its focus-lost event.
+            self.focus(result_view_id);
 
             Ok(())
         }

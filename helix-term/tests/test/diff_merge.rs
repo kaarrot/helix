@@ -1470,3 +1470,56 @@ async fn changed_file_picker_opens_deleted_file_read_only() -> anyhow::Result<()
     harness.close(&mut app).await?;
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn merge_view_focuses_result_and_keeps_sides_read_only() -> anyhow::Result<()> {
+    let repo = GitRepoFixture::new()?;
+    repo.write_file("conflict.txt", "base\n")?;
+    repo.commit_all("base")?;
+
+    repo.checkout_new_branch("feature")?;
+    repo.write_file("conflict.txt", "theirs\n")?;
+    repo.commit_all("feature change")?;
+
+    repo.checkout("main")?;
+    repo.write_file("conflict.txt", "ours\n")?;
+    repo.commit_all("main change")?;
+    repo.merge_expect_conflict("feature")?;
+
+    let _cwd = CwdGuard::enter(repo.path()).await?;
+    let conflict_path = repo.file("conflict.txt");
+    let mut app = AppBuilder::new().with_file(&conflict_path, None).build()?;
+    let mut harness = AppTestHarness::new();
+
+    assert!(harness.send_keys(&mut app, ":merge<ret>").await?);
+    let state = app
+        .editor
+        .diff
+        .merge_views
+        .get(&app.editor.tree.focus)
+        .cloned()
+        .expect("merge session");
+    assert_eq!(app.editor.tree.focus, state.result_view_id);
+
+    // THEIRS is the last pane opened; RESULT must take the focus from it.
+    let focused_at = |doc_id| app.editor.document(doc_id).unwrap().focused_at;
+    assert!(focused_at(state.result_doc_id) > focused_at(state.theirs_doc_id));
+    assert!(focused_at(state.result_doc_id) > focused_at(state.ours_doc_id));
+
+    app.editor.focus(state.ours_view_id);
+    let before = app
+        .editor
+        .document(state.ours_doc_id)
+        .unwrap()
+        .text()
+        .clone();
+    assert!(harness.send_keys(&mut app, "ihello<esc>").await?);
+    let ours = app.editor.document(state.ours_doc_id).unwrap();
+    assert_eq!(ours.text(), &before);
+    assert!(!ours.is_modified());
+
+    // Leave only RESULT so the harness's `:q!` exits.
+    assert!(harness.send_keys(&mut app, "<C-w>q").await?);
+    harness.close(&mut app).await?;
+    Ok(())
+}

@@ -194,6 +194,20 @@ pub fn get_current_head_name(file: &Path) -> Result<Arc<ArcSwap<Box<str>>>> {
     Ok(Arc::new(ArcSwap::from_pointee(name.into_boxed_str())))
 }
 
+/// The branch checked out in the working tree at `workdir`, or `None` while
+/// HEAD is detached.
+///
+/// Read from the repository on every call. A document's head name is taken
+/// when it loads, so it goes stale as soon as another branch is checked out.
+pub fn get_checked_out_branch(workdir: &Path) -> Result<Option<String>> {
+    let repo = open_repo(workdir)
+        .context("failed to open git repo")?
+        .to_thread_local();
+    Ok(repo
+        .head_ref()?
+        .map(|reference| reference.name().shorten().to_string()))
+}
+
 /// Fetch OURS (stage 2) and THEIRS (stage 3) versions of a conflicted file
 /// from the git index. Returns `(ours_bytes, theirs_bytes)`.
 pub fn get_merge_versions(file: &Path) -> Result<(Vec<u8>, Vec<u8>)> {

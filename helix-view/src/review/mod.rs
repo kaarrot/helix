@@ -943,14 +943,19 @@ impl ReviewStore {
             | AgentEvent::Completed(id, _)
             | AgentEvent::Failed(id, _) => *id,
         };
-        let matches = self
-            .threads
-            .get(&id)
-            .and_then(|thread| thread.agent_session.as_deref())
-            == Some(session);
-        if matches {
-            self.apply_agent_event(event);
+        let Some(thread) = self.threads.get(&id) else {
+            return;
+        };
+        if thread.agent_session.as_deref() != Some(session) {
+            return;
         }
+        // A thread that stopped waiting was told its reply was cut short, when
+        // its branch was checked out away from. The rest of that turn comes too
+        // late to be written under that note.
+        if !thread.awaiting && !matches!(event, AgentEvent::Started(_)) {
+            return;
+        }
+        self.apply_agent_event(event);
     }
 
     /// Fold an agent event into the store.

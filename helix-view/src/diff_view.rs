@@ -67,7 +67,8 @@ impl Drop for DiffSession {
 /// threads were given in the store.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeekedReviews {
-    pub uuid: String,
+    /// The conversation a claim is expected to land on. Not claimed.
+    pub session: ReviewSession,
     pub threads: Vec<crate::review::ThreadId>,
 }
 

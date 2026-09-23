@@ -1561,16 +1561,21 @@ fn reload(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> anyh
     }
 
     let scrolloff = cx.editor.config().scrolloff;
+    // Before the text changes, while the threads on screen still sit on the
+    // text they were written against. See `Editor::follow_review_branch`.
+    cx.editor.follow_review_branch();
     let (view, doc) = current!(cx.editor);
     doc.reload(view, &cx.editor.diff_providers).map(|_| {
         view.ensure_cursor_in_view(doc, scrolloff);
     })?;
+    let doc_id = doc.id();
     if let Some(path) = doc.path() {
         cx.editor
             .language_servers
             .file_event_handler
             .file_changed(path.clone());
     }
+    cx.editor.seed_review_anchors(doc_id);
     Ok(())
 }
 
@@ -1581,6 +1586,8 @@ fn reload_all(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> 
 
     let scrolloff = cx.editor.config().scrolloff;
     let view_id = view!(cx.editor).id;
+    // Before the text changes. See `Editor::follow_review_branch`.
+    cx.editor.follow_review_branch();
 
     let docs_view_ids: Vec<(DocumentId, Vec<ViewId>)> = cx
         .editor
@@ -1624,6 +1631,8 @@ fn reload_all(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> 
                 view.ensure_cursor_in_view(doc, scrolloff);
             }
         }
+
+        cx.editor.seed_review_anchors(doc_id);
     }
 
     Ok(())

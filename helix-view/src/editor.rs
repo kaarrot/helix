@@ -3016,19 +3016,30 @@ impl Editor {
     /// The review conversation for the current file, claiming one if this is the
     /// first comment.
     ///
-    /// The name is captured here and never recomputed: deriving it from HEAD on
-    /// every use would silently move the conversation when the branch changes
-    /// mid-review.
+    /// Claims the conversation already on screen when it is this worktree's,
+    /// so a comment joins the threads it is shown beside. Moving to another
+    /// branch's conversation is left to [`Self::follow_review_branch`], which
+    /// runs where a checkout shows up rather than part-way through a command
+    /// that may already hold thread ids.
     pub fn review_session(&mut self) -> Option<&crate::review::session::ReviewSession> {
         if self.diff.session.is_none() {
             let path = self.review_session_path()?;
             let worktree = self.diff_providers.get_workdir(&path)?;
-            let branch = self.review_branch_name(&path);
-            let session = crate::review::session::claim(&worktree, &branch);
+            let branch = match &self.diff.peeked {
+                Some(peeked) if peeked.session.worktree == worktree => {
+                    peeked.session.branch.clone()
+                }
+                _ => None,
+            }
+            .unwrap_or_else(|| self.review_branch_name(&path));
+            let session = crate::review::session::ReviewSession {
+                branch: Some(branch.clone()),
+                ..crate::review::session::claim(&worktree, &branch)
+            };
             match self.diff.peeked.take() {
                 // Already showing this conversation, loaded when the file
                 // opened. Loading again would show every thread twice.
-                Some(peeked) if peeked.uuid == session.uuid => {}
+                Some(peeked) if peeked.session.uuid == session.uuid => {}
                 // Showing another one: another editor claimed it meanwhile, or
                 // it belongs to another worktree. Its threads are not ours.
                 Some(peeked) => {
@@ -3056,6 +3067,9 @@ impl Editor {
     /// comment claims the session.
     pub fn peek_reviews(&mut self, doc_id: DocumentId) {
         if self.diff.session.is_some() || self.diff.peeked.is_some() {
+            // A file opened after a checkout holds the new branch's text, so
+            // the conversation on screen may no longer be the right one.
+            self.follow_review_branch();
             return;
         }
         let Some(path) = self
@@ -3071,11 +3085,119 @@ impl Editor {
         };
         let branch = self.review_branch_name(&path);
         let predicted = crate::review::session::predict(&worktree, &branch);
-        let threads = self.load_reviews(&predicted.uuid);
-        self.diff.peeked = Some(crate::diff_view::PeekedReviews {
-            uuid: predicted.uuid,
-            threads,
+        self.peek_conversation(crate::review::session::ReviewSession {
+            branch: Some(branch),
+            ..predicted
         });
+    }
+
+    /// Load a conversation and show it without claiming it. Returns how many
+    /// threads it brought.
+    fn peek_conversation(&mut self, session: crate::review::session::ReviewSession) -> usize {
+        let threads = self.load_reviews(&session.uuid);
+        let count = threads.len();
+        self.diff.peeked = Some(crate::diff_view::PeekedReviews { session, threads });
+        count
+    }
+
+    /// Move to the conversation of the branch now checked out, when the one on
+    /// screen belongs to another branch.
+    ///
+    /// Each branch keeps its own conversation, and one left on screen after a
+    /// checkout shows its threads on the other branch's code. Helix does not
+    /// watch the repository, so this runs wherever a checkout shows up: the
+    /// terminal regaining focus, a file being opened, a buffer being reloaded.
+    /// On a reload it has to run before the text changes. Reloading moves the
+    /// open threads through the diff onto the new branch's code, and the old
+    /// branch's conversation would then be saved with lines it never had.
+    ///
+    /// The conversation left is saved first. The new one is shown as it is
+    /// when a file opens: loaded, and claimed by the first comment.
+    ///
+    /// Nothing moves while HEAD is detached, so a rebase keeps the branch's
+    /// conversation throughout. Nor while a comment is being typed: its box
+    /// writes back to a thread by id, and that id would then name a thread of
+    /// the other branch. Nor for a conversation named with `:review-session`.
+    pub fn follow_review_branch(&mut self) {
+        if self.diff.reviews.composing.is_some() {
+            return;
+        }
+        let shown = match (&self.diff.session, &self.diff.peeked) {
+            (Some(session), _) => session,
+            (None, Some(peeked)) => &peeked.session,
+            (None, None) => return,
+        };
+        let Some(branch) = shown.branch.clone() else {
+            return;
+        };
+        let worktree = shown.worktree.clone();
+        let Some(checked_out) = self.diff_providers.get_checked_out_branch(&worktree) else {
+            return;
+        };
+        if checked_out == branch {
+            return;
+        }
+
+        let left = self.leave_review_conversation(&checked_out);
+        let predicted = crate::review::session::predict(&worktree, &checked_out);
+        let shown = self.peek_conversation(crate::review::session::ReviewSession {
+            branch: Some(checked_out.clone()),
+            ..predicted
+        });
+        // Say why the threads changed, unless there were none either side. A
+        // failed load has already said something more important.
+        if left + shown > 0 && !self.is_err() {
+            self.set_status(match shown {
+                0 => format!("No review threads on {checked_out}"),
+                1 => format!("1 review thread on {checked_out}"),
+                n => format!("{n} review threads on {checked_out}"),
+            });
+        }
+    }
+
+    /// Put away the conversation on screen, saving it if it was claimed.
+    /// Returns how many threads went with it.
+    ///
+    /// A reply still arriving answers a thread that is leaving. It is marked as
+    /// cut short, so the saved conversation says why it has no answer, and the
+    /// rest of that turn is ignored when it comes.
+    fn leave_review_conversation(&mut self, next_branch: &str) -> usize {
+        if self.diff.session.is_none() {
+            // Only shown, never claimed: there is nothing to save. Threads that
+            // were here besides it, like a comment outside any repository, have
+            // nowhere else to be and stay.
+            let Some(peeked) = self.diff.peeked.take() else {
+                return 0;
+            };
+            self.remove_review_threads(&peeked.threads);
+            return peeked.threads.len();
+        }
+
+        let cut_short: Vec<crate::review::ThreadId> = self
+            .diff
+            .reviews
+            .iter()
+            .filter(|thread| thread.awaiting)
+            .map(|thread| thread.id)
+            .collect();
+        for id in cut_short {
+            self.diff
+                .reviews
+                .apply_agent_event(crate::review::agent::AgentEvent::Failed(
+                    id,
+                    format!(
+                        "stopped waiting: {next_branch} was checked out before this reply arrived"
+                    ),
+                ));
+        }
+        self.drop_review_agent();
+        self.save_reviews();
+        if let Some(session) = self.diff.session.take() {
+            crate::review::session::release(&session);
+        }
+        let left = self.diff.reviews.len();
+        self.clear_reviews();
+        left
     }
 
     /// Take threads out of the store and their anchors out of the documents.
@@ -3127,8 +3249,15 @@ impl Editor {
         // Turns already running belong to the previous session's threads.
         self.drop_review_agent();
         let session = crate::review::session::claim(&worktree, name);
+        // Naming it after the branch checked out asks for that branch's own
+        // conversation, which follows checkouts like any other. A conversation
+        // given any other name stays put.
+        let branch = self
+            .diff_providers
+            .get_checked_out_branch(&worktree)
+            .filter(|branch| branch == name);
         self.load_reviews(&session.uuid);
-        self.diff.session = Some(session);
+        self.diff.session = Some(crate::review::session::ReviewSession { branch, ..session });
         self.diff.session.as_ref()
     }
 
@@ -3205,6 +3334,17 @@ impl Editor {
                 crate::review::ReviewAnchor::for_line(thread.id, &text, thread.line as usize)
             })
             .collect();
+        if anchors.is_empty() {
+            return;
+        }
+        // A file changed on disk since it was loaded, as a checkout changes
+        // every file that differs between the branches, still shows text these
+        // threads were not written against. Anchored there they would sit on
+        // the wrong lines, and reloading would then carry them along with that
+        // text. They are anchored once the document is reloaded instead.
+        if doc.has_newer_file_on_disk().unwrap_or(false) {
+            return;
+        }
 
         if let Some(doc) = self.documents.get_mut(&doc_id) {
             doc.review_anchors.extend(anchors);
@@ -3264,22 +3404,21 @@ impl Editor {
     }
 
     fn review_branch_name(&self, path: &Path) -> String {
-        if let Some(doc_id) = self.non_virtual_document_id_by_path(path) {
-            if let Some(head) = self
-                .documents
-                .get(&doc_id)
-                .and_then(Document::version_control_head)
-            {
-                let head = head.to_string();
-                if !head.is_empty() {
-                    return head;
-                }
-            }
-        }
-        self.diff_providers
+        // The repository before the document: a document's head is read when it
+        // loads, and still names the old branch after a checkout.
+        let current = self
+            .diff_providers
             .get_current_head_name(path)
-            .map(|head| head.load_full().to_string())
+            .map(|head| head.load_full().to_string());
+        let loaded = || {
+            self.non_virtual_document_id_by_path(path)
+                .and_then(|doc_id| self.documents.get(&doc_id))
+                .and_then(Document::version_control_head)
+                .map(|head| head.to_string())
+        };
+        current
             .filter(|head| !head.is_empty())
+            .or_else(|| loaded().filter(|head| !head.is_empty()))
             .unwrap_or_else(|| "review".to_string())
     }
 

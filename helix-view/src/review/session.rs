@@ -34,11 +34,17 @@ const KEEP_FOR: Duration = Duration::from_secs(365 * 24 * 60 * 60);
 /// A claimed review conversation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReviewSession {
-    /// Captured when the session starts and never recomputed: deriving it from
-    /// HEAD on the fly would silently swap conversations on a branch switch.
+    /// Fixed once claimed. The branch can be `feature#2` when another editor
+    /// holds `feature`, so a conversation's name is not always its branch.
     pub name: String,
     pub uuid: String,
     pub worktree: PathBuf,
+    /// The branch this conversation belongs to. When another branch is checked
+    /// out the editor moves to that branch's conversation, so one branch's
+    /// threads are never shown on another's code. `None` for a conversation
+    /// named with `:review-session` after something other than the branch,
+    /// which stays put.
+    pub branch: Option<String>,
 }
 
 /// What is written beside a claimed UUID.
@@ -351,6 +357,7 @@ pub fn claim_in(dir: &Path, worktree: &Path, base_name: &str) -> ReviewSession {
                     name,
                     uuid,
                     worktree: worktree.to_path_buf(),
+                    branch: None,
                 }
             }
         }
@@ -362,6 +369,7 @@ pub fn claim_in(dir: &Path, worktree: &Path, base_name: &str) -> ReviewSession {
         name: base_name.to_string(),
         uuid: derive_uuid(worktree, base_name),
         worktree: worktree.to_path_buf(),
+        branch: None,
     }
 }
 
@@ -381,6 +389,7 @@ pub fn predict_in(dir: &Path, worktree: &Path, base_name: &str) -> ReviewSession
         uuid: derive_uuid(worktree, &name),
         name,
         worktree: worktree.to_path_buf(),
+        branch: None,
     };
     for suffix in 0..MAX_SUFFIX {
         let name = if suffix == 0 {

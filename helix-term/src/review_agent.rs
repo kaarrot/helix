@@ -3,9 +3,10 @@
 //! Each thread has its own conversation id. A turn is one process: the first
 //! creates that id with `--session-id`, and a follow-up resumes it with
 //! `--resume`. Two threads therefore cannot see each other's comments or take
-//! each other's reply, and their turns run at the same time. A follow-up on a
-//! thread that already has a turn in flight waits until that process exits, so
-//! one conversation is never driven by two processes at once.
+//! each other's reply, and their turns run at the same time. A follow-up sent
+//! while its thread's reply is still arriving is held as a draft until that
+//! reply lands (see [`apply_event`]), so one conversation is never driven by two
+//! turns at once and two replies are never written into one entry.
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -18,9 +19,12 @@ use std::{
     },
 };
 
-use helix_view::review::{
-    agent::{AgentEvent, ReviewAgent},
-    ThreadId,
+use helix_view::{
+    review::{
+        agent::{AgentEvent, ReviewAgent},
+        ThreadId,
+    },
+    Editor,
 };
 use once_cell::sync::Lazy;
 
@@ -79,10 +83,23 @@ fn apply(session: &str, event: AgentEvent) {
         return;
     }
     let session = session.to_string();
-    job::dispatch_blocking(move |editor, _| {
-        editor.diff.reviews.apply_agent_event_for(&session, event);
-    });
+    job::dispatch_blocking(move |editor, _| apply_event(editor, &session, event));
     schedule_save();
+}
+
+/// Fold one event from the turn answering `session` into the editor.
+///
+/// A finished turn frees its conversation, so a follow-up that was sent while
+/// the reply was still arriving goes out now.
+pub fn apply_event(editor: &mut Editor, session: &str, event: AgentEvent) {
+    let finished = match &event {
+        AgentEvent::Completed(id, _) | AgentEvent::Failed(id, _) => Some(*id),
+        AgentEvent::Started(_) | AgentEvent::Chunk(..) => None,
+    };
+    editor.diff.reviews.apply_agent_event_for(session, event);
+    if let Some(id) = finished {
+        crate::commands::review::send_queued(editor, id);
+    }
 }
 
 /// Whether a write is already pending, so a burst of changes costs one write.

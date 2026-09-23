@@ -607,13 +607,8 @@ impl CommentInput {
 /// Send the comment just drafted in the box. Other unsent drafts stay pending:
 /// `Space-m-R S` is the send-all path, same as after `Ctrl-S` in normal mode.
 fn send_now_from_box(cx: &mut crate::compositor::Context, id: ThreadId) {
-    match send_pending_ids(cx.editor, Some(id)) {
-        Ok(sent) => cx.editor.set_status(match sent {
-            1 => "Sent 1 comment".to_string(),
-            n => format!("Sent {n} comments"),
-        }),
-        Err(message) => cx.editor.set_error(message),
-    }
+    let outcome = send_pending_ids(cx.editor, Some(id));
+    report_send(cx.editor, outcome);
 }
 
 /// Put the input where the comment will appear, rather than on the status line
@@ -906,15 +901,65 @@ fn ensure_agent(editor: &mut Editor) -> Result<(), String> {
     Ok(())
 }
 
-/// Send every unsent draft, oldest first. Returns how many went out.
+/// What a send did with the drafts it was asked to send.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SendOutcome {
+    /// Went out to the agent.
+    pub sent: usize,
+    /// Held until the reply already arriving on their thread lands.
+    pub queued: usize,
+}
+
+/// Say what a send did, in the status line.
+fn report_send(editor: &mut Editor, outcome: Result<SendOutcome, String>) {
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
+        Err(message) => {
+            editor.set_error(message);
+            return;
+        }
+    };
+    let comments = |n: usize| match n {
+        1 => "1 comment".to_string(),
+        n => format!("{n} comments"),
+    };
+    let status = match (outcome.sent, outcome.queued) {
+        (sent, 0) => format!("Sent {}", comments(sent)),
+        (0, 1) => "A reply is still arriving; this one goes out when it lands".to_string(),
+        (0, queued) => format!(
+            "Replies are still arriving; {} go out when they land",
+            comments(queued)
+        ),
+        (sent, queued) => format!(
+            "Sent {}; {queued} more wait for replies still arriving",
+            comments(sent)
+        ),
+    };
+    editor.set_status(status);
+}
+
+/// Send every unsent draft, oldest first.
 ///
 /// Each draft is its own conversation, so two comments cannot see each other or
 /// take each other's reply. A follow-up resumes the thread it belongs to.
-pub fn send_pending(editor: &mut Editor) -> Result<usize, String> {
+pub fn send_pending(editor: &mut Editor) -> Result<SendOutcome, String> {
     send_pending_ids(editor, None)
 }
 
-fn send_pending_ids(editor: &mut Editor, only: Option<ThreadId>) -> Result<usize, String> {
+/// Send a draft that was held back while its thread's previous reply was
+/// arriving, now that the reply has landed.
+///
+/// Called for every finished turn. Does nothing unless a send was queued on
+/// that thread and its draft is still there.
+pub fn send_queued(editor: &mut Editor, id: ThreadId) {
+    if !editor.diff.reviews.take_queued_send(id) {
+        return;
+    }
+    let outcome = send_pending_ids(editor, Some(id));
+    report_send(editor, outcome);
+}
+
+fn send_pending_ids(editor: &mut Editor, only: Option<ThreadId>) -> Result<SendOutcome, String> {
     let pending: Vec<ThreadId> = editor
         .diff
         .reviews
@@ -928,8 +973,21 @@ fn send_pending_ids(editor: &mut Editor, only: Option<ThreadId>) -> Result<usize
     }
     ensure_agent(editor)?;
 
-    let mut sent = 0;
+    let mut outcome = SendOutcome { sent: 0, queued: 0 };
     for id in pending {
+        // One conversation runs one turn at a time. A second prompt sent while
+        // the first reply streams would be answered into the same entry, so
+        // the draft stays a draft until that reply lands.
+        if let Some(thread) = editor
+            .diff
+            .reviews
+            .get_mut(id)
+            .filter(|thread| thread.awaiting)
+        {
+            thread.send_queued = true;
+            outcome.queued += 1;
+            continue;
+        }
         // Captured before the session is created: that is what distinguishes a
         // follow-up from the first turn, including a thread saved before each
         // comment had its own conversation.
@@ -953,7 +1011,15 @@ fn send_pending_ids(editor: &mut Editor, only: Option<ThreadId>) -> Result<usize
             None => Err(anyhow::anyhow!("no agent")),
         };
         match result {
-            Ok(()) => sent += 1,
+            Ok(()) => {
+                // Marked here rather than left to the agent's `Started`, which
+                // arrives through the job queue: a second send before that job
+                // runs would otherwise see nothing in flight.
+                if let Some(thread) = editor.diff.reviews.get_mut(id) {
+                    thread.awaiting = true;
+                }
+                outcome.sent += 1;
+            }
             Err(err) => {
                 editor.diff.reviews.apply_agent_event(
                     helix_view::review::agent::AgentEvent::Failed(id, err.to_string()),
@@ -962,19 +1028,14 @@ fn send_pending_ids(editor: &mut Editor, only: Option<ThreadId>) -> Result<usize
         }
     }
     crate::review_agent::schedule_save();
-    Ok(sent)
+    Ok(outcome)
 }
 
 /// Each comment is its own conversation. Replies stay on the thread that asked,
 /// and one comment does not see the others.
 pub fn review_send_all(cx: &mut Context) {
-    match send_pending(cx.editor) {
-        Ok(sent) => cx.editor.set_status(match sent {
-            1 => "Sent 1 comment".to_string(),
-            n => format!("Sent {n} comments"),
-        }),
-        Err(message) => cx.editor.set_error(message),
-    }
+    let outcome = send_pending(cx.editor);
+    report_send(cx.editor, outcome);
 }
 
 /// Send the draft on this line if there is one, otherwise save the selection
@@ -993,13 +1054,8 @@ pub fn review_send_or_save_selection(cx: &mut Context) {
                 .get(id)
                 .is_some_and(|thread| thread.is_pending())
             {
-                match send_pending_ids(cx.editor, Some(id)) {
-                    Ok(sent) => cx.editor.set_status(match sent {
-                        1 => "Sent 1 comment".to_string(),
-                        n => format!("Sent {n} comments"),
-                    }),
-                    Err(message) => cx.editor.set_error(message),
-                }
+                let outcome = send_pending_ids(cx.editor, Some(id));
+                report_send(cx.editor, outcome);
                 return;
             }
         }

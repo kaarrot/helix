@@ -90,6 +90,14 @@ pub struct Thread {
     /// restoring this would leave a thread spinning forever.
     #[serde(skip)]
     pub awaiting: bool,
+    /// The draft was sent while a reply was still arriving, so it waits for
+    /// that reply to land and goes out then. Sending it straight away would
+    /// start a second turn on one conversation, and the two replies would be
+    /// written into each other.
+    ///
+    /// Not persisted, like `awaiting`: after a restart nothing is arriving.
+    #[serde(skip)]
+    pub send_queued: bool,
     /// First visible row of the current entry, when it is taller than the box
     /// is allowed to be. Not persisted: it is a reading position.
     ///
@@ -597,6 +605,7 @@ impl ReviewStore {
                 id_marked: false,
                 select: None,
                 awaiting: false,
+                send_queued: false,
                 rewound: false,
                 orphaned: false,
                 agent_session: None,
@@ -667,7 +676,25 @@ impl ReviewStore {
         if let Some(thread) = self.threads.get_mut(&id) {
             thread.draft = Some(text);
             thread.view = thread.entry_count().saturating_sub(1);
+            // Saving over a queued draft is saving, not sending. Sending it
+            // again queues it again.
+            thread.send_queued = false;
         }
+    }
+
+    /// Whether `id` has a queued send that is now free to go: its reply has
+    /// landed and the draft is still there. Clears the queue either way once
+    /// nothing is arriving, so a draft deleted in the meantime is not sent
+    /// later by surprise.
+    pub fn take_queued_send(&mut self, id: ThreadId) -> bool {
+        let Some(thread) = self.threads.get_mut(&id) else {
+            return false;
+        };
+        if !thread.send_queued || thread.awaiting {
+            return false;
+        }
+        thread.send_queued = false;
+        thread.is_pending()
     }
 
     /// Drop everything after `index`, so the conversation continues from there.
@@ -1850,6 +1877,58 @@ mod test {
     }
 
     #[test]
+    fn a_draft_queued_behind_a_reply_goes_out_once_it_lands() {
+        let (mut store, id) = sent_thread();
+        store.apply_agent_event(AgentEvent::Started(id));
+        store.apply_agent_event(AgentEvent::Chunk(id, "because ".into()));
+
+        // A follow-up is written and sent while the reply is still arriving.
+        store.set_draft(id, "and then?".into());
+        store.get_mut(id).unwrap().send_queued = true;
+        assert!(
+            !store.take_queued_send(id),
+            "nothing may go out while the reply is still arriving"
+        );
+
+        store.apply_agent_event(AgentEvent::Chunk(id, "X".into()));
+        let thread = store.get(id).unwrap();
+        assert_eq!(
+            thread.entry(1).unwrap().text,
+            "because X",
+            "the reply keeps streaming into its own entry, past the draft"
+        );
+        assert_eq!(thread.entry(2).unwrap().text, "and then?");
+
+        store.apply_agent_event(AgentEvent::Completed(id, "because X".into()));
+        assert!(store.take_queued_send(id), "the reply landed, so it is due");
+        assert!(!store.take_queued_send(id), "and only once");
+    }
+
+    #[test]
+    fn saving_or_deleting_a_queued_draft_cancels_its_send() {
+        let (mut store, id) = sent_thread();
+        store.apply_agent_event(AgentEvent::Started(id));
+        store.set_draft(id, "and then?".into());
+        store.get_mut(id).unwrap().send_queued = true;
+
+        // Reopened and saved without sending: it is a draft again.
+        store.set_draft(id, "and then, really?".into());
+        store.apply_agent_event(AgentEvent::Completed(id, "because".into()));
+        assert!(!store.take_queued_send(id));
+
+        store.apply_agent_event(AgentEvent::Started(id));
+        store.get_mut(id).unwrap().send_queued = true;
+        let draft = store.get(id).unwrap().entry_count() - 1;
+        store.remove_entry(id, draft);
+        store.apply_agent_event(AgentEvent::Completed(id, "again".into()));
+        assert!(
+            !store.take_queued_send(id),
+            "a draft deleted while queued is not sent"
+        );
+        assert!(!store.get(id).unwrap().send_queued);
+    }
+
+    #[test]
     fn the_final_text_replaces_what_was_streamed() {
         let (mut store, id) = sent_thread();
         store.apply_agent_event(AgentEvent::Started(id));
@@ -2257,6 +2336,7 @@ mod test {
                 id_marked: false,
                 select: None,
                 awaiting: false,
+                send_queued: false,
                 rewound: false,
                 orphaned: false,
                 agent_session: None,

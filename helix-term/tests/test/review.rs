@@ -1444,6 +1444,94 @@ async fn a_thread_grows_through_replies_and_can_be_navigated() -> anyhow::Result
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_follow_up_sent_mid_reply_waits_for_the_reply_to_land() -> anyhow::Result<()> {
+    // Regression: the follow-up went out at once, the first reply was written
+    // under it, and the second reply then arrived as one entry per chunk.
+    use helix_view::review::agent::AgentEvent;
+
+    let repo = GitRepoFixture::new()?;
+    repo.write_file("tracked.rs", "fn one() {}\nfn two() {}\n")?;
+    repo.commit_all("initial")?;
+
+    let _cwd = CwdGuard::enter(repo.path()).await?;
+    let path = repo.file("tracked.rs");
+    let mut app = AppBuilder::new().with_file(&path, None).build()?;
+    let mut harness = AppTestHarness::new();
+
+    let fake = FakeAgent::default();
+    let sent = fake.sent.clone();
+    app.editor.diff.agent = Some(Box::new(fake));
+
+    assert!(harness.send_keys(&mut app, "<space>mRc").await?);
+    assert!(harness.send_keys(&mut app, "why this?<C-s>").await?);
+    assert!(harness.send_keys(&mut app, "<space>mRS").await?);
+    let (id, _, session) = sent.lock().unwrap()[0].clone();
+    helix_term::review_agent::apply_event(
+        &mut app.editor,
+        &session,
+        AgentEvent::Chunk(id, "because ".into()),
+    );
+
+    // Reply and send while the answer is still streaming.
+    assert!(harness.send_keys(&mut app, "<space>mRc").await?);
+    assert!(harness.send_keys(&mut app, "and Y?<C-s>").await?);
+    assert!(harness.send_keys(&mut app, "<space>mRS").await?);
+    assert_eq!(sent.lock().unwrap().len(), 1, "the follow-up must wait");
+    assert_eq!(app.editor.diff.reviews.pending_count(), 1);
+    let status = app
+        .editor
+        .get_status()
+        .map(|(text, _)| text.to_string())
+        .unwrap_or_default();
+    assert!(status.contains("still arriving"), "{status}");
+
+    helix_term::review_agent::apply_event(
+        &mut app.editor,
+        &session,
+        AgentEvent::Chunk(id, "X".into()),
+    );
+    helix_term::review_agent::apply_event(
+        &mut app.editor,
+        &session,
+        AgentEvent::Completed(id, "because X".into()),
+    );
+
+    {
+        let sent = sent.lock().unwrap();
+        assert_eq!(sent.len(), 2, "the follow-up goes out once the reply lands");
+        assert!(sent[1].1.contains("and Y?"), "{}", sent[1].1);
+        assert_eq!(sent[1].2, session, "into the same conversation");
+    }
+    let thread = app.editor.diff.reviews.get(id).unwrap();
+    assert!(thread.awaiting, "the follow-up is now the turn in flight");
+    let texts: Vec<_> = (0..thread.entry_count())
+        .map(|index| thread.entry(index).unwrap().text.to_string())
+        .collect();
+    assert_eq!(texts, ["why this?", "because X", "and Y?"]);
+
+    // The second reply streams into one entry of its own.
+    for chunk in ["Y ", "is ", "fine"] {
+        helix_term::review_agent::apply_event(
+            &mut app.editor,
+            &session,
+            AgentEvent::Chunk(id, chunk.into()),
+        );
+    }
+    helix_term::review_agent::apply_event(
+        &mut app.editor,
+        &session,
+        AgentEvent::Completed(id, "Y is fine".into()),
+    );
+    let thread = app.editor.diff.reviews.get(id).unwrap();
+    assert_eq!(thread.entry_count(), 4);
+    assert_eq!(thread.entry(3).unwrap().text, "Y is fine");
+    assert_eq!(sent.lock().unwrap().len(), 2, "nothing else was queued");
+
+    harness.close(&mut app).await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn ctrl_left_walks_the_thread_while_the_comment_box_is_open() -> anyhow::Result<()> {
     use helix_view::review::agent::AgentEvent;
 

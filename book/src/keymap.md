@@ -433,8 +433,10 @@ turn is one process, and the UUID stored on that comment decides which
 conversation it is. The first turn passes `--session-id`. Every later turn in
 the same window passes `--resume` with that same UUID. Claude is `claude -p`
 with the prompt on stdin. Grok is `grok --prompt-file`. Turns on different
-comments run at the same time. A follow-up waits until its own previous turn
-has finished, so two processes never resume one conversation together. The
+comments run at the same time. A follow-up sent while its comment's reply is
+still arriving stays a draft and goes out once that reply lands, so two
+processes never resume one conversation together. Saving or deleting that
+draft before then cancels the send. The
 UUID is shown at the right of the box's header and of the reply input, so
 running `claude --resume <uuid>` (or `/resume <uuid>`) from the worktree opens
 that one comment's conversation interactively. Helix does not know about that

@@ -442,6 +442,9 @@ async fn changed_file_picker_opens_merge_view_for_conflicts() -> anyhow::Result<
     assert_eq!(app.editor.tree.views().count(), 3);
     assert_current_doc_path(&app, &conflict_path);
 
+    // Closing a pane ends the session and keeps one view; the harness's own
+    // `:q!` then quits.
+    assert!(harness.send_keys(&mut app, ":q!<ret>").await?);
     harness.close(&mut app).await?;
 
     Ok(())
@@ -808,6 +811,9 @@ async fn split_diff_keyboard_and_search_sync_scroll() -> anyhow::Result<()> {
     assert!(harness.send_keys(&mut app, "/needle<esc>").await?);
     assert_eq!(split_diff_anchor_lines(&app), (0, 0));
 
+    // Closing a pane ends the session and keeps one view; the harness's own
+    // `:q!` then quits.
+    assert!(harness.send_keys(&mut app, ":q!<ret>").await?);
     harness.close(&mut app).await?;
 
     Ok(())
@@ -951,6 +957,9 @@ async fn merge_workflow_resolves_conflicts_and_stages_file() -> anyhow::Result<(
                     );
                 }),
             ),
+            // Closing a pane ends the session and keeps one view; the helper's
+            // own `:q!` then quits.
+            (Some(":q!<ret>"), None),
         ],
         false,
     )
@@ -1075,6 +1084,9 @@ async fn git_split_diff_stays_in_sync_after_edits() -> anyhow::Result<()> {
         .to_string();
     assert_eq!(actual_from_base, expected_working);
 
+    // Closing a pane ends the session and keeps one view; the harness's own
+    // `:q!` then quits.
+    assert!(harness.send_keys(&mut app, ":q!<ret>").await?);
     harness.close(&mut app).await?;
     Ok(())
 }
@@ -1264,6 +1276,143 @@ async fn closing_merge_ours_pane_does_not_panic() -> anyhow::Result<()> {
     assert!(app.editor.diff.merge_views.is_empty());
     assert_eq!(app.editor.tree.views().count(), 1);
     assert_current_doc_path(&app, &conflict_path);
+
+    harness.close(&mut app).await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn quit_in_split_diff_working_pane_keeps_unsaved_buffer() -> anyhow::Result<()> {
+    let repo = GitRepoFixture::new()?;
+    repo.write_file("tracked.txt", "before\n")?;
+    repo.commit_all("initial")?;
+    repo.write_file("tracked.txt", "after\n")?;
+
+    let _cwd = CwdGuard::enter(repo.path()).await?;
+    let tracked_path = repo.file("tracked.txt");
+    let mut app = AppBuilder::new().with_file(&tracked_path, None).build()?;
+    let mut harness = AppTestHarness::new();
+
+    assert!(harness.send_keys(&mut app, "<space>g").await?);
+    assert!(harness.wait_for_idle(&mut app).await?);
+    assert!(harness.send_keys(&mut app, "<ret>").await?);
+    assert!(harness.send_keys(&mut app, "<space>mv").await?);
+    let diff_state = main_diff_state(&app);
+    app.editor.focus(diff_state.working_view_id);
+    assert!(harness.send_keys(&mut app, "ihello<esc>").await?);
+
+    // Ends the diff and keeps the edited buffer on screen.
+    assert!(harness.send_keys(&mut app, ":q<ret>").await?);
+    assert!(app.editor.diff.views.is_empty());
+    assert_eq!(app.editor.tree.views().count(), 1);
+    assert_current_doc_path(&app, &tracked_path);
+    assert!(helix_view::doc!(app.editor).is_modified());
+
+    // Now it is the last view, so the unsaved check applies.
+    assert!(harness.send_keys(&mut app, ":q<ret>").await?);
+    assert_eq!(app.editor.tree.views().count(), 1);
+    assert_eq!(app.editor.get_status().unwrap().1, &Severity::Error);
+
+    harness.close(&mut app).await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn window_only_in_split_diff_base_pane_keeps_a_view() -> anyhow::Result<()> {
+    let repo = GitRepoFixture::new()?;
+    repo.write_file("tracked.txt", "before\n")?;
+    repo.commit_all("initial")?;
+    repo.write_file("tracked.txt", "after\n")?;
+
+    let _cwd = CwdGuard::enter(repo.path()).await?;
+    let tracked_path = repo.file("tracked.txt");
+    let mut app = AppBuilder::new().with_file(&tracked_path, None).build()?;
+    let mut harness = AppTestHarness::new();
+
+    assert!(harness.send_keys(&mut app, "<space>g").await?);
+    assert!(harness.wait_for_idle(&mut app).await?);
+    assert!(harness.send_keys(&mut app, "<ret>").await?);
+    assert!(harness.send_keys(&mut app, "<space>mv").await?);
+    let diff_state = main_diff_state(&app);
+    app.editor.focus(diff_state.base_view_id);
+
+    assert!(harness.send_keys(&mut app, "<C-w>o").await?);
+    assert!(app.editor.diff.views.is_empty());
+    assert_eq!(app.editor.tree.views().count(), 1);
+    assert_current_doc_path(&app, &tracked_path);
+
+    harness.close(&mut app).await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn quit_in_merge_result_pane_keeps_result() -> anyhow::Result<()> {
+    let repo = GitRepoFixture::new()?;
+    repo.write_file("conflict.txt", "base\n")?;
+    repo.commit_all("base")?;
+
+    repo.checkout_new_branch("feature")?;
+    repo.write_file("conflict.txt", "theirs\n")?;
+    repo.commit_all("feature change")?;
+
+    repo.checkout("main")?;
+    repo.write_file("conflict.txt", "ours\n")?;
+    repo.commit_all("main change")?;
+    repo.merge_expect_conflict("feature")?;
+
+    let _cwd = CwdGuard::enter(repo.path()).await?;
+    let conflict_path = repo.file("conflict.txt");
+    let mut app = AppBuilder::new().with_file(&conflict_path, None).build()?;
+    let mut harness = AppTestHarness::new();
+
+    assert!(harness.send_keys(&mut app, ":merge<ret>").await?);
+    assert!(harness.send_keys(&mut app, ":q<ret>").await?);
+
+    assert!(app.editor.diff.merge_views.is_empty());
+    assert_eq!(app.editor.tree.views().count(), 1);
+    assert_current_doc_path(&app, &conflict_path);
+
+    harness.close(&mut app).await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn quit_in_buffer_diff_keeps_a_view() -> anyhow::Result<()> {
+    let mut app = AppBuilder::new().build()?;
+    {
+        let (view, doc) = helix_view::current!(app.editor);
+        let tx = Transaction::change(
+            doc.text(),
+            std::iter::once((0, doc.text().len_chars(), Some("base\n".into()))),
+        );
+        doc.apply(&tx, view.id);
+    }
+    let working_doc_id = app.editor.new_file(Action::Replace);
+    {
+        let (view, doc) = helix_view::current!(app.editor);
+        let tx = Transaction::change(
+            doc.text(),
+            std::iter::once((0, doc.text().len_chars(), Some("working\n".into()))),
+        );
+        doc.apply(&tx, view.id);
+    }
+
+    let mut harness = AppTestHarness::new();
+    assert!(harness.send_keys(&mut app, ":diff-buffer<ret>").await?);
+    assert!(harness.wait_for_idle(&mut app).await?);
+    assert!(harness.send_keys(&mut app, "<ret>").await?);
+    assert!(harness.wait_for_idle(&mut app).await?);
+    let diff_state = main_diff_state(&app);
+    assert_eq!(diff_state.working_doc_id, working_doc_id);
+    app.editor.focus(diff_state.working_view_id);
+
+    assert!(harness.send_keys(&mut app, ":q<ret>").await?);
+    assert!(app.editor.diff.views.is_empty());
+    assert_eq!(app.editor.tree.views().count(), 1);
+    assert_eq!(
+        app.editor.tree.get(app.editor.tree.focus).doc,
+        working_doc_id
+    );
 
     harness.close(&mut app).await?;
     Ok(())

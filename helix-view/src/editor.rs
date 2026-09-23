@@ -2112,16 +2112,26 @@ impl Editor {
         if !self.tree.contains(id) {
             return;
         }
+        let views_before = self.tree.views().count();
+        let mut closed_session = false;
         // Clean up any diff/merge session that owns this view.
         if self.diff.views.contains_key(&id) {
-            self.close_diff_view(id);
+            closed_session |= self.close_diff_view(id);
         }
         if self.diff.merge_views.contains_key(&id) {
-            self.close_merge_view(id);
+            closed_session |= self.close_merge_view(id);
         }
         // Session teardown may already have removed this view (e.g. closing the
         // virtual base/OURS/THEIRS pane closes the document, which closes the view).
         if !self.tree.contains(id) {
+            self._refresh();
+            return;
+        }
+        // Closing one pane of a split diff or merge closes its partner panes
+        // too. When that leaves only this view, keep it rather than empty the
+        // tree: that would quit, and `:q` or `C-w q` only check for unsaved
+        // buffers when a single view is open to begin with.
+        if closed_session && views_before > 1 && self.tree.views().count() == 1 {
             self._refresh();
             return;
         }

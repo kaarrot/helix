@@ -15,7 +15,7 @@ use gix::status::{
     plumbing::index_as_worktree::{Change, EntryStatus},
     UntrackedFiles,
 };
-use gix::{Commit, ObjectId, Repository, ThreadSafeRepository};
+use gix::{Commit, ObjectId, Repository, ThreadSafeRepository, Tree};
 
 use crate::FileChange;
 
@@ -52,7 +52,7 @@ pub fn get_diff_base(file: &Path) -> Result<Vec<u8>> {
         .context("failed to open git repo")?
         .to_thread_local();
     let head = repo.head_commit()?;
-    let file_oid = find_file_in_commit(&repo, &head, &file)?;
+    let file_oid = find_file_in_tree(&repo, &head.tree()?, &file)?;
 
     let file_object = repo.find_object(file_oid)?;
     let data = file_object.detach().data;
@@ -82,8 +82,8 @@ pub fn get_diff_base_from_ref(file: &Path, ref_name: &str) -> Result<Vec<u8>> {
         .context("failed to open git repo")?
         .to_thread_local();
 
-    let commit = resolve_commit(&repo, ref_name)?;
-    let file_oid = find_file_in_commit(&repo, &commit, &file)?;
+    let tree = resolve_tree(&repo, ref_name)?;
+    let file_oid = find_file_in_tree(&repo, &tree, &file)?;
 
     let file_object = repo.find_object(file_oid)?;
     let data = file_object.detach().data;
@@ -294,10 +294,11 @@ fn for_each_change_impl(
 
     match target_ref {
         None => {
-            let base_commit = resolve_commit(&repo, base_ref)?;
+            let base_tree = resolve_tree(&repo, base_ref)?;
             let head_commit = repo.head_commit()?;
+            let head_tree = head_commit.tree()?;
 
-            if base_commit.id == head_commit.id {
+            if base_tree.id == head_tree.id {
                 return status(&repo, untracked, f);
             }
 
@@ -307,8 +308,6 @@ fn for_each_change_impl(
                 .to_path_buf();
 
             let mut seen = std::collections::HashSet::new();
-            let base_tree = base_commit.tree()?;
-            let head_tree = head_commit.tree()?;
             let mut cancelled = false;
 
             base_tree.changes()?.for_each_to_obtain_tree(
@@ -356,15 +355,12 @@ fn for_each_change_impl(
             }
         }
         Some(target) => {
-            let base_commit = resolve_commit(&repo, base_ref)?;
-            let target_commit = resolve_commit(&repo, target)?;
+            let base_tree = resolve_tree(&repo, base_ref)?;
+            let target_tree = resolve_commit(&repo, target)?.tree()?;
             let work_dir = repo
                 .workdir()
                 .ok_or_else(|| anyhow::anyhow!("working tree not found"))?
                 .to_path_buf();
-
-            let base_tree = base_commit.tree()?;
-            let target_tree = target_commit.tree()?;
 
             base_tree.changes()?.for_each_to_obtain_tree(
                 &target_tree,
@@ -513,6 +509,19 @@ pub fn for_each_changed_file_between_commits(
     )?;
 
     Ok(())
+}
+
+/// Resolve a diff base to its tree. Like [`resolve_commit`], except that the
+/// parent of a root commit (`ROOT^`, which `Space-m c` builds from a log line)
+/// is the empty tree, so the root commit's own files read as added.
+fn resolve_tree<'a>(repo: &'a Repository, ref_name: &str) -> Result<Tree<'a>> {
+    if let Some(base) = ref_name.strip_suffix('^') {
+        let commit = resolve_commit(repo, base)?;
+        if commit.parent_ids().next().is_none() {
+            return Ok(repo.empty_tree());
+        }
+    }
+    Ok(resolve_commit(repo, ref_name)?.tree()?)
 }
 
 /// Resolve a git reference or commit hash (full or short, with optional `^` parent suffix).
@@ -693,10 +702,9 @@ impl std::fmt::Display for FileNotFoundInRevision {
 impl std::error::Error for FileNotFoundInRevision {}
 
 /// Finds the object that contains the contents of a file at a specific commit.
-fn find_file_in_commit(repo: &Repository, commit: &Commit, file: &Path) -> Result<ObjectId> {
+fn find_file_in_tree(repo: &Repository, tree: &Tree, file: &Path) -> Result<ObjectId> {
     let repo_dir = repo.workdir().context("repo has no worktree")?;
     let rel_path = file.strip_prefix(repo_dir)?;
-    let tree = commit.tree()?;
     let tree_entry = tree
         .lookup_entry_by_path(rel_path)?
         .ok_or(FileNotFoundInRevision)?;

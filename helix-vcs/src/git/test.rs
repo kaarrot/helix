@@ -343,13 +343,43 @@ fn get_merge_versions_fails_without_merge_stages() {
 }
 
 #[test]
-fn parent_ref_suffix_fails_for_root_commit() {
+fn parent_of_root_commit_is_the_empty_tree() {
+    // `Space-m c` on the root commit's log line builds `ROOT^`.
     let repo = empty_git_repo();
     write_repo_file(repo.path(), "root.txt", "root\n");
     create_commit_with_message(repo.path(), "root");
 
-    let err = git::for_each_changed_file_between_refs(repo.path(), "HEAD^", Some("HEAD"), |_| true)
-        .unwrap_err();
+    for target in [Some("HEAD"), None] {
+        let changes = RefCell::new(Vec::new());
+        git::for_each_changed_file_between_refs(repo.path(), "HEAD^", target, |change| {
+            changes.borrow_mut().push(change.unwrap());
+            true
+        })
+        .unwrap();
+        let changes = changes.into_inner();
+        assert!(
+            changes.iter().any(|change| {
+                matches!(change, FileChange::Modified { path } if path.ends_with("root.txt"))
+            }),
+            "root commit's file missing against {target:?}: {changes:?}"
+        );
+    }
+
+    // The base pane of such a diff is empty, as for a newly added file.
+    let root_file = repo.path().join("root.txt");
+    let err = git::get_diff_base_from_ref(&root_file, "HEAD^").unwrap_err();
+    assert!(err.is::<git::FileNotFoundInRevision>(), "{err:?}");
+}
+
+#[test]
+fn grandparent_ref_suffix_fails_for_root_commit() {
+    let repo = empty_git_repo();
+    write_repo_file(repo.path(), "root.txt", "root\n");
+    create_commit_with_message(repo.path(), "root");
+
+    let err =
+        git::for_each_changed_file_between_refs(repo.path(), "HEAD^^", Some("HEAD"), |_| true)
+            .unwrap_err();
     assert!(err.to_string().contains("has no parent"));
 }
 

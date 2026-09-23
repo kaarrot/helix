@@ -476,3 +476,86 @@ async fn popup_completion_closes_on_buffer_click() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn statusline_completion_opens_on_diagnostic_click_in_insert_mode() -> anyhow::Result<()> {
+    let file = temp_file_with_contents(diagnostic_source_text())?;
+    let mut config = statusline_completion_config();
+    config.editor.auto_completion = false;
+    let mut app = AppBuilder::new()
+        .with_config(config)
+        .with_file(file.path(), None)
+        .build()?;
+
+    run_event_loop_until_idle(&mut app).await;
+    insert_error_diagnostic(&mut app, 0, DIAGNOSTIC_WORD.chars().count(), 0);
+    dispatch_key_sequence(&mut app, "i").await?;
+
+    for label in COMPLETION_LABELS {
+        assert_eq!(
+            0,
+            count_screen_occurrences(&app, label),
+            "completion should not open before clicking the diagnostic"
+        );
+    }
+
+    // Click a prefix of the underlined word so word completion has a filter.
+    let click_offset = 3;
+    let [row, column] = click_screen_text(&app, DIAGNOSTIC_WORD, click_offset);
+    dispatch_events(&mut app, left_click_events(row, column)).await?;
+
+    let (view, doc) = helix_view::current_ref!(app.editor);
+    let cursor = doc
+        .selection(view.id)
+        .primary()
+        .cursor(doc.text().slice(..));
+    assert_eq!(
+        click_offset, cursor,
+        "clicking the underline should move the insert cursor onto that character"
+    );
+    assert_eq!(helix_view::document::Mode::Insert, app.editor.mode);
+
+    for label in COMPLETION_LABELS {
+        assert!(
+            count_screen_occurrences(&app, label) >= 1,
+            "expected statusline completion label {label:?} after clicking the diagnostic"
+        );
+    }
+
+    test_key_sequence(&mut app, Some("<esc>:q!<ret>"), None, true).await?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn statusline_completion_does_not_open_on_diagnostic_click_in_normal_mode(
+) -> anyhow::Result<()> {
+    let file = temp_file_with_contents(diagnostic_source_text())?;
+    let mut config = statusline_completion_config();
+    config.editor.auto_completion = false;
+    let mut app = AppBuilder::new()
+        .with_config(config)
+        .with_file(file.path(), None)
+        .build()?;
+
+    run_event_loop_until_idle(&mut app).await;
+    insert_error_diagnostic(&mut app, 0, DIAGNOSTIC_WORD.chars().count(), 0);
+    // Enter and leave insert so the buffer is drawn before we sample click coords.
+    dispatch_key_sequence(&mut app, "i<esc>").await?;
+
+    let [row, column] = click_screen_text(&app, DIAGNOSTIC_WORD, 3);
+    dispatch_events(&mut app, left_click_events(row, column)).await?;
+
+    assert_eq!(helix_view::document::Mode::Normal, app.editor.mode);
+    for label in COMPLETION_LABELS {
+        assert_eq!(
+            0,
+            count_screen_occurrences(&app, label),
+            "normal-mode diagnostic clicks should not open statusline completions"
+        );
+    }
+
+    test_key_sequence(&mut app, Some("<esc>:q!<ret>"), None, true).await?;
+
+    Ok(())
+}

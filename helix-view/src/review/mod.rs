@@ -520,7 +520,11 @@ impl ReviewStore {
         self.threads.len()
     }
 
-    /// The conversation about a particular line, if one has been started.
+    /// The conversation last saved as being on a particular line, if any.
+    ///
+    /// Goes by [`Thread::line`], which is stale while the document is open and
+    /// being edited. Anything asking about the line under the cursor has to go
+    /// through the document's anchors instead.
     pub fn thread_at(&self, file: &Path, side: DiffSide, line: u32) -> Option<ThreadId> {
         self.by_file
             .get(file)?
@@ -575,15 +579,14 @@ impl ReviewStore {
         }
     }
 
-    /// Open a thread with an unsent draft on it.
+    /// Open a new thread with an unsent draft on it.
     ///
-    /// Reuses the conversation already on that line if there is one, so a line
-    /// cannot accumulate rival threads.
+    /// Always a new thread. Replying to the conversation already on a line is
+    /// the caller's decision, made through the open document's anchors: only
+    /// those know where a thread is now. Matching on the saved line number here
+    /// instead handed a new comment to whichever thread had been on that line
+    /// before an edit moved it, replacing that thread's draft.
     pub fn draft(&mut self, file: PathBuf, side: DiffSide, line: u32, text: String) -> ThreadId {
-        if let Some(existing) = self.thread_at(&file, side, line) {
-            self.set_draft(existing, text);
-            return existing;
-        }
         let id = ThreadId(self.next_id);
         self.next_id += 1;
         self.by_file.entry(file.clone()).or_default().push(id);
@@ -2228,26 +2231,22 @@ mod test {
     }
 
     #[test]
-    fn one_line_has_one_conversation() {
+    fn a_new_comment_never_takes_over_a_thread_by_its_saved_line() {
+        // Regression: a thread drafted on line 7 and then pushed down by an
+        // insert above it still has 7 as its saved line. A new comment on the
+        // code now at line 7 replaced that thread's draft.
         let mut store = ReviewStore::default();
         let file = PathBuf::from("/r/a.rs");
         let first = store.draft(file.clone(), DiffSide::Working, 7, "why?".into());
-        store.take_draft(first);
-        store.push_message(first, Role::Agent, "because X".into());
 
-        // A second comment on the same line joins the conversation rather than
-        // starting a rival one beside it.
         let second = store.draft(file.clone(), DiffSide::Working, 7, "and this?".into());
-        assert_eq!(second, first);
-        assert_eq!(store.len(), 1);
-        assert_eq!(store.get(first).unwrap().entry_count(), 3);
-
-        // A different line, and the other side of a diff, stay separate.
-        let elsewhere = store.draft(file.clone(), DiffSide::Working, 8, "over here".into());
-        let other_side = store.draft(file, DiffSide::Base, 7, "old side".into());
-        assert_ne!(elsewhere, first);
-        assert_ne!(other_side, first);
-        assert_eq!(store.len(), 3);
+        assert_ne!(second, first);
+        assert_eq!(store.len(), 2);
+        assert_eq!(store.get(first).unwrap().draft.as_deref(), Some("why?"));
+        assert_eq!(
+            store.get(second).unwrap().draft.as_deref(),
+            Some("and this?")
+        );
     }
 
     #[test]

@@ -878,6 +878,60 @@ async fn reply_after_insert_composes_on_the_remapped_line() -> anyhow::Result<()
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_comment_on_the_line_a_thread_moved_off_starts_its_own() -> anyhow::Result<()> {
+    // Regression: the new comment was matched to the moved thread by its saved
+    // line number, and replaced that thread's draft.
+    let file = tempfile::NamedTempFile::new()?;
+    std::fs::write(file.path(), "one\ntwo\nthree\n")?;
+
+    let mut app = AppBuilder::new().with_file(file.path(), None).build()?;
+    let mut harness = AppTestHarness::new();
+
+    place_cursor(&mut app, 1);
+    assert!(harness.send_keys(&mut app, "<space>mRc").await?);
+    assert!(harness.send_keys(&mut app, "about two<C-s>").await?);
+    // Let the debounced save run now, as it would while the reviewer reads
+    // on. Nothing after the edit below saves again, so the thread's saved
+    // line stays where it was.
+    harness
+        .pump(&mut app, std::time::Duration::from_millis(800))
+        .await;
+    assert_eq!(only_thread_line(&app), 1);
+
+    // Push "two" down a line, then comment on the line it was on.
+    assert!(harness.send_keys(&mut app, "ggO").await?);
+    assert!(harness.send_keys(&mut app, "inserted<esc>").await?);
+    place_cursor(&mut app, 1);
+    assert!(harness.send_keys(&mut app, "<space>mRc").await?);
+    assert!(harness.send_keys(&mut app, "about one<C-s>").await?);
+
+    assert_eq!(thread_count(&app), 2, "the new comment is its own thread");
+    let view = app.editor.tree.get(app.editor.tree.focus);
+    let doc = app.editor.document(view.doc).unwrap();
+    let mut on_lines: Vec<_> = app
+        .editor
+        .diff
+        .reviews
+        .iter()
+        .map(|thread| {
+            (
+                thread.line_in(&doc.review_anchors, doc.text()),
+                thread.draft.clone().unwrap_or_default(),
+            )
+        })
+        .collect();
+    on_lines.sort();
+    assert_eq!(
+        on_lines,
+        [(1, "about one".to_string()), (2, "about two".to_string())]
+    );
+    assert_eq!(doc.review_anchors.len(), 2, "one anchor per thread");
+
+    harness.close(&mut app).await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn the_first_comment_claims_a_session_named_for_the_branch() -> anyhow::Result<()> {
     let repo = GitRepoFixture::new()?;
     repo.write_file("tracked.txt", "one\ntwo\n")?;

@@ -1585,7 +1585,10 @@ impl Document {
         view_id: ViewId,
         emit_lsp_notification: bool,
     ) -> bool {
-        if self.readonly && !transaction.changes().is_empty() {
+        // Only git-revision panes refuse edits. A file the user can't write
+        // stays editable like upstream and fails at `:w`, which also keeps
+        // `:reload` working on it.
+        if self.is_virtual_base && !transaction.changes().is_empty() {
             return false;
         }
 

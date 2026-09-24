@@ -80,141 +80,231 @@ fn thread_picker(
     );
 }
 
-/// Resolve a process name to a single PID by scanning `/proc`.
-/// Matches `/proc/<pid>/comm` or the basename of `argv[0]` from `/proc/<pid>/cmdline`.
-/// Errors when zero or more than one process matches; multi-match output is
-/// sorted with the most recently started process first and includes the full
-/// cmdline so PIDs of the same name can be distinguished at a glance.
-#[cfg(target_os = "linux")]
-fn resolve_process_name(name: &str) -> anyhow::Result<u32> {
-    use std::fs;
-    use std::path::Path;
+/// Prompt history for "process" parameters. It holds process names only (see
+/// `remember_process_name`), so Up/Down recall e.g. `hython-bin`.
+const PROCESS_HISTORY_REGISTER: char = '>';
 
-    /// Returns `/proc/<pid>/stat` field 22 (process start time, in clock ticks
-    /// since boot). Higher = more recently started. 0 on failure so unparseable
-    /// entries sort to the bottom.
-    fn read_starttime(pid: u32) -> u64 {
-        let Ok(stat) = fs::read_to_string(format!("/proc/{}/stat", pid)) else {
-            return 0;
-        };
-        // The `comm` field is wrapped in `(...)` and may contain spaces and
-        // parens; split at the last `)` to skip over it safely.
-        let Some(last_paren) = stat.rfind(')') else {
-            return 0;
-        };
-        // After `)`: state ppid pgrp session tty_nr tpgid flags minflt cminflt
-        // majflt cmajflt utime stime cutime cstime priority nice num_threads
-        // itrealvalue starttime ...    (starttime is the 20th token)
-        stat[last_paren + 1..]
-            .split_whitespace()
-            .nth(19)
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0)
+/// A running process a "process" parameter can refer to.
+struct ProcessInfo {
+    pid: u32,
+    /// Seconds since the process started.
+    age: u64,
+    argv: Vec<String>,
+}
+
+impl ProcessInfo {
+    /// Completion entry: PID, age and the arguments after the executable,
+    /// which for an interpreter start with the script it runs.
+    fn summary(&self) -> String {
+        let args = self.argv.get(1..).filter(|args| !args.is_empty());
+        let args = args.unwrap_or(&self.argv).join(" ");
+        format!("{}  {} ago  {}", self.pid, format_age(self.age), args)
     }
 
-    let own_pid = std::process::id();
-    // (starttime, pid, display_cmdline)
-    let mut matches: Vec<(u64, u32, String)> = Vec::new();
-
-    for entry in fs::read_dir("/proc")?.flatten() {
-        let file_name = entry.file_name();
-        let Some(pid) = file_name.to_str().and_then(|s| s.parse::<u32>().ok()) else {
-            continue;
-        };
-        if pid == own_pid {
-            continue;
+    /// The whole command line, one argument per line, a flag sharing its line
+    /// with the value that follows it.
+    fn describe(&self) -> String {
+        let mut lines: Vec<String> = Vec::new();
+        for arg in &self.argv {
+            match lines.last_mut() {
+                Some(flag)
+                    if flag.starts_with('-') && !flag.contains(' ') && !arg.starts_with('-') =>
+                {
+                    flag.push(' ');
+                    flag.push_str(arg);
+                }
+                _ => lines.push(arg.clone()),
+            }
         }
-
-        let comm = fs::read_to_string(entry.path().join("comm"))
-            .ok()
-            .map(|s| s.trim().to_owned())
-            .unwrap_or_default();
-
-        let cmdline_bytes = fs::read(entry.path().join("cmdline"))
-            .ok()
-            .unwrap_or_default();
-        let cmdline_parts: Vec<&str> = cmdline_bytes
-            .split(|&c| c == 0)
-            .filter_map(|seg| std::str::from_utf8(seg).ok())
-            .filter(|s| !s.is_empty())
-            .collect();
-        let arg0 = cmdline_parts.first().copied().unwrap_or("");
-        let arg0_basename = Path::new(arg0)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or(arg0);
-
-        // For interpreter-style commands (python3 ./script.py, node app.js,
-        // ruby task.rb) `comm` and `argv[0]` are the interpreter, which is
-        // useless for disambiguation. Also check the first non-flag arg —
-        // that's typically the script or module being executed.
-        let script_arg = cmdline_parts
-            .iter()
-            .skip(1)
-            .find(|s| !s.starts_with('-'))
-            .copied();
-        let script_basename =
-            script_arg.and_then(|s| Path::new(s).file_name().and_then(|n| n.to_str()));
-        let script_stem =
-            script_arg.and_then(|s| Path::new(s).file_stem().and_then(|n| n.to_str()));
-
-        let is_match = comm == name
-            || arg0_basename == name
-            || script_basename == Some(name)
-            || script_stem == Some(name);
-
-        if is_match {
-            let display = if cmdline_parts.is_empty() {
-                comm.clone()
-            } else {
-                cmdline_parts.join(" ")
-            };
-            matches.push((read_starttime(pid), pid, display));
-        }
-    }
-
-    // Most recently started first.
-    matches.sort_by(|a, b| b.0.cmp(&a.0));
-
-    match matches.len() {
-        0 => anyhow::bail!("No process found matching '{}'", name),
-        1 => Ok(matches[0].1),
-        _ => {
-            // Per-entry truncation keeps the status line readable.
-            const PER_ENTRY: usize = 60;
-            let preview: Vec<String> = matches
-                .iter()
-                .take(8)
-                .map(|(_, p, d)| {
-                    let snippet: String = d.chars().take(PER_ENTRY).collect();
-                    let ellipsis = if d.chars().count() > PER_ENTRY {
-                        "…"
-                    } else {
-                        ""
-                    };
-                    format!("{}: {}{}", p, snippet, ellipsis)
-                })
-                .collect();
-            let suffix = if matches.len() > 8 {
-                format!(" (+{} more)", matches.len() - 8)
-            } else {
-                String::new()
-            };
-            anyhow::bail!(
-                "Multiple processes match '{}' (newest first): [{}]{} — re-run with a PID",
-                name,
-                preview.join(" | "),
-                suffix
-            )
-        }
+        format!(
+            "PID {}, started {} ago\n{}",
+            self.pid,
+            format_age(self.age),
+            lines.join("\n")
+        )
     }
 }
 
+fn format_age(secs: u64) -> String {
+    match secs {
+        0..=59 => format!("{secs}s"),
+        60..=3599 => format!("{}m", secs / 60),
+        3600..=86399 => format!("{}h", secs / 3600),
+        _ => format!("{}d", secs / 86400),
+    }
+}
+
+/// Reads `/proc/<pid>`: the start time in clock ticks since boot (0 when
+/// unreadable), `comm`, and the process info.
+#[cfg(target_os = "linux")]
+fn read_process(pid: u32, uptime: u64) -> Option<(u64, String, ProcessInfo)> {
+    use std::fs;
+
+    // `/proc` times are in USER_HZ, which Linux fixes at 100 for userspace.
+    const TICKS_PER_SEC: u64 = 100;
+
+    let dir = format!("/proc/{pid}");
+    let comm = fs::read_to_string(format!("{dir}/comm"))
+        .ok()?
+        .trim()
+        .to_owned();
+
+    // Field 22 of `stat`. `comm` is wrapped in `(...)` and may contain spaces
+    // and parens, so count from the last `)`: starttime is the 20th token.
+    let starttime = fs::read_to_string(format!("{dir}/stat"))
+        .ok()
+        .and_then(|stat| {
+            let rest = &stat[stat.rfind(')')? + 1..];
+            rest.split_whitespace().nth(19)?.parse().ok()
+        })
+        .unwrap_or(0);
+
+    let mut argv: Vec<String> = fs::read(format!("{dir}/cmdline"))
+        .unwrap_or_default()
+        .split(|&c| c == 0)
+        .filter_map(|seg| std::str::from_utf8(seg).ok())
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .collect();
+    if argv.is_empty() {
+        argv.push(comm.clone());
+    }
+
+    let age = uptime.saturating_sub(starttime / TICKS_PER_SEC);
+    Some((starttime, comm, ProcessInfo { pid, age, argv }))
+}
+
+#[cfg(target_os = "linux")]
+fn uptime_secs() -> u64 {
+    std::fs::read_to_string("/proc/uptime")
+        .ok()
+        .and_then(|s| s.split_whitespace().next()?.parse::<f64>().ok())
+        .unwrap_or(0.0) as u64
+}
+
+#[cfg(target_os = "linux")]
+fn process_by_pid(pid: u32) -> Option<ProcessInfo> {
+    read_process(pid, uptime_secs()).map(|(_, _, process)| process)
+}
+
+/// Processes whose `comm`, `argv[0]` basename, or first non-flag argument
+/// (basename or stem) is `name`, most recently started first. The last two
+/// cover interpreters, where `comm` is `python3` but the argument is the
+/// script being run.
+#[cfg(target_os = "linux")]
+fn find_processes(name: &str) -> Vec<ProcessInfo> {
+    use std::path::Path;
+
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    let own_pid = std::process::id();
+    let uptime = uptime_secs();
+
+    let mut matches: Vec<(u64, ProcessInfo)> = entries
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
+        .filter(|&pid| pid != own_pid)
+        .filter_map(|pid| read_process(pid, uptime))
+        .filter(|(_, comm, process)| {
+            let basename = |s: &str| Path::new(s).file_name()?.to_str().map(str::to_owned);
+            let stem = |s: &str| Path::new(s).file_stem()?.to_str().map(str::to_owned);
+            let arg0 = &process.argv[0];
+            let script = process.argv.iter().skip(1).find(|s| !s.starts_with('-'));
+
+            comm == name
+                || basename(arg0).as_deref().unwrap_or(arg0) == name
+                || script.and_then(|s| basename(s)).as_deref() == Some(name)
+                || script.and_then(|s| stem(s)).as_deref() == Some(name)
+        })
+        .map(|(starttime, _, process)| (starttime, process))
+        .collect();
+
+    matches.sort_by(|a, b| b.0.cmp(&a.0));
+    matches.into_iter().map(|(_, process)| process).collect()
+}
+
 #[cfg(not(target_os = "linux"))]
-fn resolve_process_name(_name: &str) -> anyhow::Result<u32> {
-    anyhow::bail!(
-        "Process name resolution is only implemented on Linux; please enter a numeric PID"
-    )
+fn process_by_pid(_pid: u32) -> Option<ProcessInfo> {
+    None
+}
+
+#[cfg(not(target_os = "linux"))]
+fn find_processes(_name: &str) -> Vec<ProcessInfo> {
+    Vec::new()
+}
+
+/// Splits a "process" prompt line into its name and PID. The line is a PID,
+/// a name, or a name followed by the PID a Tab completion appended.
+fn parse_process_input(input: &str) -> (Option<&str>, Option<u32>) {
+    let mut tokens = input.split_whitespace();
+    let first = tokens.next();
+    match first.and_then(|t| t.parse().ok()) {
+        Some(pid) => (None, Some(pid)),
+        None => (first, tokens.next().and_then(|t| t.parse().ok())),
+    }
+}
+
+/// Maps a process name to the most recently started process of that name.
+fn resolve_process_name(name: &str) -> anyhow::Result<u32> {
+    if cfg!(not(target_os = "linux")) {
+        bail!("Process name resolution is only implemented on Linux; please enter a numeric PID");
+    }
+    match find_processes(name).first() {
+        Some(process) => Ok(process.pid),
+        None => bail!("No process found matching '{}'", name),
+    }
+}
+
+/// Tab cycles through the processes matching the typed name, newest first.
+/// Each entry is appended after the name, so the name stays on the line for
+/// `remember_process_name`.
+fn process_completer(_editor: &Editor, input: &str) -> Vec<ui::prompt::Completion> {
+    let (Some(name), _) = parse_process_input(input) else {
+        return Vec::new();
+    };
+    let start = input.find(name).unwrap_or(0) + name.len();
+    find_processes(name)
+        .iter()
+        .map(|process| (start.., format!(" {}", process.summary()).into()))
+        .collect()
+}
+
+/// Popup text for a "process" prompt: the full command line of the process
+/// the line picks, or that Enter would pick.
+fn process_doc(input: &str) -> Option<String> {
+    match parse_process_input(input) {
+        (_, Some(pid)) => process_by_pid(pid).map(|process| process.describe()),
+        (Some(name), None) => {
+            let matches = find_processes(name);
+            let newest = matches.first()?;
+            let header = match matches.len() {
+                1 => "Enter attaches to".to_owned(),
+                n => format!("Enter attaches to the newest of {n}, Tab cycles"),
+            };
+            Some(format!("{header}\n{}", newest.describe()))
+        }
+        (None, None) => None,
+    }
+}
+
+/// The prompt stores the whole line in its history, and after a Tab
+/// completion that carries a PID and command line that go stale. Rewrites
+/// the history to the name alone, most recent first and without repeats.
+fn remember_process_name(editor: &mut Editor, input: &str) {
+    let (Some(name), _) = parse_process_input(input) else {
+        return;
+    };
+    let mut history: Vec<String> = editor
+        .registers
+        .read(PROCESS_HISTORY_REGISTER, editor)
+        .map(|values| values.map(Cow::into_owned).collect())
+        .unwrap_or_default();
+    history.retain(|entry| parse_process_input(entry).0.is_some_and(|n| n != name));
+    history.insert(0, name.to_owned());
+    if let Err(err) = editor.registers.write(PROCESS_HISTORY_REGISTER, history) {
+        editor.set_error(err.to_string());
+    }
 }
 
 fn get_breakpoint_at_current_line(editor: &mut Editor) -> Option<(usize, Breakpoint)> {
@@ -268,10 +358,12 @@ fn resolve_parameter(
             .ok()
             .and_then(|pb| pb.into_os_string().into_string().ok())
             .unwrap_or_else(|| value.to_owned()),
-        // Numeric → keep as PID. Non-numeric → look up by name.
-        Some("process") if value.parse::<u32>().is_err() => {
-            resolve_process_name(value)?.to_string()
-        }
+        // A PID is kept, a bare name maps to its newest process.
+        Some("process") => match parse_process_input(value) {
+            (_, Some(pid)) => pid.to_string(),
+            (Some(name), None) => resolve_process_name(name)?.to_string(),
+            (None, None) => value.to_owned(),
+        },
         _ => value.to_owned(),
     })
 }
@@ -555,14 +647,16 @@ fn debug_parameter_prompt(
         "directory" => |editor: &Editor, input: &str| {
             ui::completers::directory_with_git_ignore(editor, input, false)
         },
+        "process" => process_completer,
         _ => ui::completers::none,
     };
+    let is_process = field_type == "process";
 
     // Pre-fill the prompt with the configured default so it is visible (and
     // editable) instead of the user having to guess what an empty input means.
-    let prompt = Prompt::new(
+    let mut prompt = Prompt::new(
         format!("{}: ", name).into(),
-        None,
+        is_process.then_some(PROCESS_HISTORY_REGISTER),
         completer,
         move |cx, input: &str, event: PromptEvent| {
             if event != PromptEvent::Validate {
@@ -572,6 +666,9 @@ fn debug_parameter_prompt(
             let mut value = input.to_owned();
             if value.is_empty() {
                 value = default_val.clone();
+            }
+            if is_process {
+                remember_process_name(cx.editor, &value);
             }
             params.push(value);
 
@@ -599,6 +696,18 @@ fn debug_parameter_prompt(
             }
         },
     );
+
+    if is_process {
+        // Renders on every redraw, so the `/proc` scan is cached per line.
+        let cache = std::cell::RefCell::new((String::new(), None));
+        prompt.doc_fn = Box::new(move |input| {
+            let mut cache = cache.borrow_mut();
+            if cache.0 != input {
+                *cache = (input.to_owned(), process_doc(input));
+            }
+            cache.1.clone().map(Cow::Owned)
+        });
+    }
 
     if default.is_empty() {
         prompt
@@ -1623,6 +1732,29 @@ mod tests {
         // Unreferenced placeholders and plain text are left alone.
         assert_eq!(substitute_params("{2}", &params), "{2}");
         assert_eq!(substitute_params("python3", &[]), "python3");
+    }
+
+    #[test]
+    fn parses_process_input() {
+        assert_eq!(parse_process_input("1234"), (None, Some(1234)));
+        assert_eq!(
+            parse_process_input("hython-bin"),
+            (Some("hython-bin"), None)
+        );
+        // A Tab completion appends the PID, age and arguments after the name.
+        assert_eq!(
+            parse_process_input("hython-bin 1234  2m ago  /a/run.py /a/test.py"),
+            (Some("hython-bin"), Some(1234))
+        );
+        assert_eq!(parse_process_input("  "), (None, None));
+    }
+
+    #[test]
+    fn formats_process_age() {
+        assert_eq!(format_age(59), "59s");
+        assert_eq!(format_age(60), "1m");
+        assert_eq!(format_age(7200), "2h");
+        assert_eq!(format_age(172800), "2d");
     }
 
     #[test]

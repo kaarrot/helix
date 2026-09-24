@@ -989,6 +989,26 @@ fn file_web_link_resolves_remote_commit_and_path() {
 }
 
 #[test]
+fn resolve_commit_id_peels_any_spelling_to_the_full_hash() {
+    let temp_git = empty_git_repo();
+    let repo = temp_git.path();
+    write_repo_file(repo, "src/file.txt", "one");
+    create_commit(repo, true);
+    let first = exec_git_cmd_output("rev-parse HEAD", repo);
+    write_repo_file(repo, "src/file.txt", "two");
+    create_commit(repo, true);
+    let head = exec_git_cmd_output("rev-parse HEAD", repo);
+
+    let file = repo.join("src/file.txt");
+    assert_eq!(git::resolve_commit_id(&file, "HEAD").unwrap(), head);
+    assert_eq!(git::resolve_commit_id(&file, &head[..8]).unwrap(), head);
+    assert_eq!(git::resolve_commit_id(&file, "HEAD^").unwrap(), first);
+    // From the worktree root as well as from a file inside it.
+    assert_eq!(git::resolve_commit_id(repo, "HEAD").unwrap(), head);
+    assert!(git::resolve_commit_id(&file, "no-such-ref").is_err());
+}
+
+#[test]
 fn file_web_link_without_a_remote_fails() {
     let temp_git = empty_git_repo();
     let repo = temp_git.path();

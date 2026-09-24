@@ -194,6 +194,24 @@ pub fn get_current_head_name(file: &Path) -> Result<Arc<ArcSwap<Box<str>>>> {
     Ok(Arc::new(ArcSwap::from_pointee(name.into_boxed_str())))
 }
 
+/// The full hash of the commit `rev` names, in the repository holding `path`.
+///
+/// `rev` takes the same spellings as the diff commands: a ref, a tag, a short
+/// or full hash, with an optional `^`. `path` is a file in the repository or
+/// a directory of it, such as the worktree root.
+pub fn resolve_commit_id(path: &Path, rev: &str) -> Result<String> {
+    let repo_dir = if path.is_dir() {
+        path
+    } else {
+        get_repo_dir(path)?
+    };
+    let repo = open_repo(repo_dir)
+        .context("failed to open git repo")?
+        .to_thread_local();
+    let commit = resolve_commit(&repo, rev)?.id().to_hex().to_string();
+    Ok(commit)
+}
+
 /// Fetch OURS (stage 2) and THEIRS (stage 3) versions of a conflicted file
 /// from the git index. Returns `(ours_bytes, theirs_bytes)`.
 pub fn get_merge_versions(file: &Path) -> Result<(Vec<u8>, Vec<u8>)> {

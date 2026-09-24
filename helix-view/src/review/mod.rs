@@ -42,14 +42,80 @@ pub enum Role {
     Agent,
 }
 
-/// Which pane of a split diff a thread is anchored to. A thread on the base
-/// side comments on the old text, which is a different statement from the same
-/// line number on the working side.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum DiffSide {
-    Base,
-    Working,
+/// Which snapshot of a file a thread is about.
+///
+/// A comment is about a version of the file, not about a pane of whatever
+/// diff happens to be open: a thread left on `abc` is shown on `abc` in every
+/// later view of it, whether as the left pane, the right pane or a buffer on
+/// its own. Written to disk as `"worktree"` or the full commit hash.
+///
+/// Ordered with commits first, so `]C` visits a split diff's old pane before
+/// the working tree beside it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum ReviewRev {
+    /// A commit, by its full hash. Never a ref: `HEAD` moves on and the text a
+    /// comment was written against does not.
+    Commit(String),
+    /// The file on disk, dirty or not. This names the file rather than its
+    /// text, so a comment stays on it through a commit, a stash or a checkout,
+    /// moving with the text or orphaned where its line went away.
+    Worktree,
+}
+
+impl ReviewRev {
+    const WORKTREE: &'static str = "worktree";
+
+    /// A short name for the status line: `worktree`, or an abbreviated hash.
+    pub fn short(&self) -> &str {
+        match self {
+            Self::Commit(commit) => commit.get(..8).unwrap_or(commit),
+            Self::Worktree => Self::WORKTREE,
+        }
+    }
+}
+
+impl Serialize for ReviewRev {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Commit(commit) => serializer.serialize_str(commit),
+            Self::Worktree => serializer.serialize_str(Self::WORKTREE),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ReviewRev {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        Ok(if raw == Self::WORKTREE {
+            Self::Worktree
+        } else {
+            Self::Commit(raw)
+        })
+    }
+}
+
+/// The file and revision whose threads belong on `doc`.
+///
+/// Mostly the document's own [`crate::Document::review_key`]. A pane with no
+/// path -- a scratch buffer in a buffer diff, or a deleted file's empty
+/// working pane -- is named by the diff it is part of.
+pub fn review_key<'a>(
+    doc: &crate::Document,
+    diff_views: impl IntoIterator<Item = &'a crate::diff_view::DiffViewState>,
+) -> Option<(PathBuf, ReviewRev)> {
+    if let Some(key) = doc.review_key() {
+        return Some(key);
+    }
+    diff_views.into_iter().find_map(|state| {
+        let path = if state.base_doc_id == doc.id() {
+            &state.base_path
+        } else if state.working_doc_id == doc.id() {
+            &state.working_path
+        } else {
+            return None;
+        };
+        (!path.as_os_str().is_empty()).then(|| (path.clone(), ReviewRev::Worktree))
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,11 +128,13 @@ pub struct Message {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Thread {
     pub id: ThreadId,
-    /// Always the canonicalized **working-tree** path, for both sides:
-    /// `Document::from_git_revision` clears `path` on base documents, so a base
-    /// pane cannot identify itself.
+    /// The canonicalized working-tree path of the file, whichever revision
+    /// of it the thread is about. A revision snapshot's own `path` is a cache
+    /// file, so it is never used here.
     pub file: PathBuf,
-    pub side: DiffSide,
+    /// The snapshot of `file` this thread is about. With `file`, it decides
+    /// which documents show the thread; `line` then says where.
+    pub rev: ReviewRev,
     /// 0-based line, as last known. Authoritative only until the document is
     /// open; while it is, the document's [`ReviewAnchor`] leads.
     pub line: u32,
@@ -409,7 +477,7 @@ struct StoreSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Composing {
     pub file: PathBuf,
-    pub side: DiffSide,
+    pub rev: ReviewRev,
     pub line: u32,
     pub rows: usize,
 }
@@ -525,14 +593,14 @@ impl ReviewStore {
     /// Goes by [`Thread::line`], which is stale while the document is open and
     /// being edited. Anything asking about the line under the cursor has to go
     /// through the document's anchors instead.
-    pub fn thread_at(&self, file: &Path, side: DiffSide, line: u32) -> Option<ThreadId> {
+    pub fn thread_at(&self, file: &Path, rev: &ReviewRev, line: u32) -> Option<ThreadId> {
         self.by_file
             .get(file)?
             .iter()
             .find(|id| {
                 self.threads
                     .get(id)
-                    .is_some_and(|thread| thread.side == side && thread.line == line)
+                    .is_some_and(|thread| &thread.rev == rev && thread.line == line)
             })
             .copied()
     }
@@ -544,11 +612,11 @@ impl ReviewStore {
     /// separate threads makes the reader reconstruct an order the store already
     /// knows. Entries are interleaved by when they were written.
     fn merge_by_anchor(&mut self) {
-        let mut keep: HashMap<(PathBuf, DiffSide, u32), ThreadId> = HashMap::new();
+        let mut keep: HashMap<(PathBuf, ReviewRev, u32), ThreadId> = HashMap::new();
         let mut absorb: Vec<(ThreadId, ThreadId)> = Vec::new();
 
         for thread in self.threads.values() {
-            let anchor = (thread.file.clone(), thread.side, thread.line);
+            let anchor = (thread.file.clone(), thread.rev.clone(), thread.line);
             match keep.get(&anchor) {
                 // Earliest id wins, so the conversation keeps the identity it
                 // started with.
@@ -586,7 +654,7 @@ impl ReviewStore {
     /// those know where a thread is now. Matching on the saved line number here
     /// instead handed a new comment to whichever thread had been on that line
     /// before an edit moved it, replacing that thread's draft.
-    pub fn draft(&mut self, file: PathBuf, side: DiffSide, line: u32, text: String) -> ThreadId {
+    pub fn draft(&mut self, file: PathBuf, rev: ReviewRev, line: u32, text: String) -> ThreadId {
         let id = ThreadId(self.next_id);
         self.next_id += 1;
         self.by_file.entry(file.clone()).or_default().push(id);
@@ -595,7 +663,7 @@ impl ReviewStore {
             Thread {
                 id,
                 file,
-                side,
+                rev,
                 line,
                 messages: Vec::new(),
                 draft: Some(text),
@@ -641,12 +709,22 @@ impl ReviewStore {
         self.threads.values()
     }
 
+    /// Every thread on `file`, whatever revision of it.
     pub fn for_file<'a>(&'a self, file: &Path) -> impl Iterator<Item = &'a Thread> + 'a {
         self.by_file
             .get(file)
             .into_iter()
             .flatten()
             .filter_map(|id| self.threads.get(id))
+    }
+
+    /// The threads shown on a document that is `rev` of `file`.
+    pub fn for_snapshot<'a>(
+        &'a self,
+        file: &Path,
+        rev: &'a ReviewRev,
+    ) -> impl Iterator<Item = &'a Thread> + 'a {
+        self.for_file(file).filter(move |thread| &thread.rev == rev)
     }
 
     /// Threads with unsent drafts, oldest first — the batch a send flushes.
@@ -856,6 +934,23 @@ impl ReviewStore {
     /// A file that will not parse is treated as absent: losing the threads is
     /// bad, but refusing to start a review because of them would be worse.
     pub fn load_from(dir: &Path, uuid: &str) -> Self {
+        Self::load_upgrading(dir, uuid, None)
+    }
+
+    /// Whether `uuid` has conversations saved, readable or not.
+    pub fn exists_in(dir: &Path, uuid: &str) -> bool {
+        dir.join(format!("{uuid}.threads.json")).exists()
+    }
+
+    /// [`Self::load_from`], reading threads saved before they named a
+    /// revision.
+    ///
+    /// Those carry the diff pane they were left in instead. `working` is the
+    /// file on disk. `base` was whatever the diff was against, which was not
+    /// recorded; `legacy_base` is the best guess at it, usually the commit
+    /// `HEAD` names now. Without one, base-pane threads are dropped rather
+    /// than pinned on a revision they may never have been about.
+    pub fn load_upgrading(dir: &Path, uuid: &str, legacy_base: Option<&str>) -> Self {
         let path = dir.join(format!("{uuid}.threads.json"));
         let raw = match std::fs::read_to_string(&path) {
             Ok(raw) => raw,
@@ -865,7 +960,14 @@ impl ReviewStore {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Self::default(),
             Err(err) => return Self::unreadable(&path, &err.to_string()),
         };
-        let Ok(snapshot) = serde_json::from_str::<StoreSnapshot>(&raw) else {
+        let snapshot = serde_json::from_str::<serde_json::Value>(&raw)
+            .ok()
+            .map(|mut value| {
+                upgrade_legacy_threads(&mut value, legacy_base);
+                value
+            })
+            .and_then(|value| serde_json::from_value::<StoreSnapshot>(value).ok());
+        let Some(snapshot) = snapshot else {
             return Self::unreadable(&path, "the file is not valid review data");
         };
 
@@ -949,9 +1051,8 @@ impl ReviewStore {
         if thread.agent_session.as_deref() != Some(session) {
             return;
         }
-        // A thread that stopped waiting was told its reply was cut short, when
-        // its branch was checked out away from. The rest of that turn comes too
-        // late to be written under that note.
+        // A thread that stopped waiting was told its reply was cut short. The
+        // rest of that turn comes too late to be written under that note.
         if !thread.awaiting && !matches!(event, AgentEvent::Started(_)) {
             return;
         }
@@ -1049,6 +1150,40 @@ impl ReviewStore {
             }
         }
     }
+}
+
+/// Give threads saved with a diff `side` the revision it stood for.
+///
+/// See [`ReviewStore::load_upgrading`]. Threads already carrying a `rev` are
+/// left as they are.
+fn upgrade_legacy_threads(snapshot: &mut serde_json::Value, legacy_base: Option<&str>) {
+    let Some(threads) = snapshot
+        .get_mut("threads")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return;
+    };
+    threads.retain_mut(|thread| {
+        let Some(thread) = thread.as_object_mut() else {
+            return true;
+        };
+        let side = thread.remove("side");
+        if thread.contains_key("rev") {
+            return true;
+        }
+        let rev = match side.as_ref().and_then(serde_json::Value::as_str) {
+            Some("base") => match legacy_base {
+                Some(commit) => commit,
+                None => {
+                    log::warn!("dropping a review thread left on a diff base that is unknown");
+                    return false;
+                }
+            },
+            _ => ReviewRev::WORKTREE,
+        };
+        thread.insert("rev".into(), rev.into());
+        true
+    });
 }
 
 /// Render a thread into the virtual rows it occupies.
@@ -1360,6 +1495,100 @@ mod test {
         Rope::from("alpha\nbeta\ngamma\n")
     }
 
+    const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+    const OTHER_SHA: &str = "89abcdef0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn a_revision_is_saved_as_worktree_or_its_hash() {
+        let worktree = serde_json::to_value(ReviewRev::Worktree).unwrap();
+        let commit = serde_json::to_value(ReviewRev::Commit(SHA.into())).unwrap();
+        assert_eq!(worktree, serde_json::json!("worktree"));
+        assert_eq!(commit, serde_json::json!(SHA));
+        assert_eq!(
+            serde_json::from_value::<ReviewRev>(worktree).unwrap(),
+            ReviewRev::Worktree
+        );
+        assert_eq!(
+            serde_json::from_value::<ReviewRev>(commit).unwrap(),
+            ReviewRev::Commit(SHA.into())
+        );
+    }
+
+    #[test]
+    fn one_line_of_two_revisions_holds_two_conversations() {
+        let dir = tempfile::tempdir().unwrap();
+        let uuid = "77777777-8888-5999-8aaa-bbbbbbbbbbbb";
+        let file = PathBuf::from("/r/a.rs");
+
+        let mut store = ReviewStore::default();
+        let old = store.draft(file.clone(), ReviewRev::Commit(SHA.into()), 3, "old".into());
+        let new = store.draft(
+            file.clone(),
+            ReviewRev::Commit(OTHER_SHA.into()),
+            3,
+            "new".into(),
+        );
+        let disk = store.draft(file.clone(), ReviewRev::Worktree, 3, "disk".into());
+        store.save_to(dir.path(), uuid).unwrap();
+
+        // Folding threads on one line must not fold across revisions.
+        let back = ReviewStore::load_from(dir.path(), uuid);
+        assert_eq!(back.len(), 3);
+        let shown = |rev: ReviewRev| -> Vec<ThreadId> {
+            back.for_snapshot(&file, &rev)
+                .map(|thread| thread.id)
+                .collect()
+        };
+        assert_eq!(shown(ReviewRev::Commit(SHA.into())), [old]);
+        assert_eq!(shown(ReviewRev::Commit(OTHER_SHA.into())), [new]);
+        assert_eq!(shown(ReviewRev::Worktree), [disk]);
+        assert_eq!(
+            back.thread_at(&file, &ReviewRev::Commit(OTHER_SHA.into()), 3),
+            Some(new)
+        );
+    }
+
+    #[test]
+    fn threads_saved_with_a_diff_side_come_back_with_a_revision() {
+        let dir = tempfile::tempdir().unwrap();
+        let uuid = "99999999-aaaa-5bbb-8ccc-dddddddddddd";
+        let thread = |id: u32, side: &str| {
+            serde_json::json!({
+                "id": id,
+                "file": "/r/a.rs",
+                "side": side,
+                "line": id,
+                "messages": [],
+                "draft": format!("on {side}"),
+                "collapsed": false,
+                "orphaned": false,
+            })
+        };
+        let legacy = serde_json::json!({
+            "threads": [thread(1, "working"), thread(2, "base")],
+            "next_id": 3,
+        });
+        std::fs::write(
+            dir.path().join(format!("{uuid}.threads.json")),
+            legacy.to_string(),
+        )
+        .unwrap();
+
+        let upgraded = ReviewStore::load_upgrading(dir.path(), uuid, Some(SHA));
+        assert_eq!(upgraded.get(ThreadId(1)).unwrap().rev, ReviewRev::Worktree);
+        assert_eq!(
+            upgraded.get(ThreadId(2)).unwrap().rev,
+            ReviewRev::Commit(SHA.into())
+        );
+        assert!(upgraded.load_error.is_none());
+
+        // With no idea what the base was, a base-pane thread is dropped rather
+        // than shown on a revision it may not be about.
+        let unknown = ReviewStore::load_from(dir.path(), uuid);
+        assert_eq!(unknown.len(), 1);
+        assert_eq!(unknown.get(ThreadId(1)).unwrap().rev, ReviewRev::Worktree);
+    }
+
     fn anchor_on(text: &Rope, line: usize) -> ReviewAnchor {
         ReviewAnchor::for_line(ThreadId(0), text, line)
     }
@@ -1456,7 +1685,7 @@ mod test {
         let mut store = ReviewStore::default();
         let id = store.draft(
             PathBuf::from("/repo/src/main.rs"),
-            DiffSide::Working,
+            ReviewRev::Worktree,
             41,
             "why this branch?".into(),
         );
@@ -1499,7 +1728,7 @@ mod test {
         let mut store = ReviewStore::default();
         let id = store.draft(
             PathBuf::from("/r/a.rs"),
-            DiffSide::Working,
+            ReviewRev::Worktree,
             1,
             "why?".into(),
         );
@@ -1521,7 +1750,7 @@ mod test {
         let mut store = ReviewStore::default();
         let id = store.draft(
             PathBuf::from("/r/a.rs"),
-            DiffSide::Working,
+            ReviewRev::Worktree,
             1,
             "why?".into(),
         );
@@ -1544,7 +1773,7 @@ mod test {
         let mut store = ReviewStore::default();
         let id = store.draft(
             PathBuf::from("/r/a.rs"),
-            DiffSide::Working,
+            ReviewRev::Worktree,
             1,
             "why?".into(),
         );
@@ -1600,7 +1829,7 @@ mod test {
         let mut store = ReviewStore::default();
         let id = store.draft(
             PathBuf::from("/r/a.rs"),
-            DiffSide::Working,
+            ReviewRev::Worktree,
             1,
             "why?".into(),
         );
@@ -1639,7 +1868,7 @@ mod test {
         let mut store = ReviewStore::default();
         let id = store.draft(
             PathBuf::from("/r/a.rs"),
-            DiffSide::Working,
+            ReviewRev::Worktree,
             1,
             "why?".into(),
         );
@@ -1669,7 +1898,7 @@ mod test {
         let mut store = ReviewStore::default();
         let id = store.draft(
             PathBuf::from("/r/a.rs"),
-            DiffSide::Working,
+            ReviewRev::Worktree,
             1,
             "why?".into(),
         );
@@ -1708,7 +1937,7 @@ mod test {
         let mut store = ReviewStore::default();
         let id = store.draft(
             PathBuf::from("/r/a.rs"),
-            DiffSide::Working,
+            ReviewRev::Worktree,
             1,
             "**keep**".into(),
         );
@@ -1794,7 +2023,7 @@ mod test {
         let mut store = ReviewStore::default();
         let id = store.draft(
             PathBuf::from("/r/a.rs"),
-            DiffSide::Working,
+            ReviewRev::Worktree,
             1,
             "why?".into(),
         );
@@ -1817,7 +2046,7 @@ mod test {
         let mut store = ReviewStore::default();
         let id = store.draft(
             PathBuf::from("/r/a.rs"),
-            DiffSide::Working,
+            ReviewRev::Worktree,
             1,
             "why?".into(),
         );
@@ -1839,7 +2068,7 @@ mod test {
         let mut store = ReviewStore::default();
         let id = store.draft(
             PathBuf::from("/r/a.rs"),
-            DiffSide::Working,
+            ReviewRev::Worktree,
             1,
             "first".into(),
         );
@@ -1862,7 +2091,12 @@ mod test {
     fn a_long_entry_does_not_multiply_with_thread_length() {
         let mut store = ReviewStore::default();
         let long = "word ".repeat(60);
-        let id = store.draft(PathBuf::from("/r/a.rs"), DiffSide::Working, 1, long.clone());
+        let id = store.draft(
+            PathBuf::from("/r/a.rs"),
+            ReviewRev::Worktree,
+            1,
+            long.clone(),
+        );
         store.take_draft(id);
         let one_entry = comment_rows(
             store.get(id).unwrap(),
@@ -1894,7 +2128,7 @@ mod test {
         let mut store = ReviewStore::default();
         let id = store.draft(
             PathBuf::from("/r/a.rs"),
-            DiffSide::Working,
+            ReviewRev::Worktree,
             1,
             "why?".into(),
         );
@@ -2004,8 +2238,18 @@ mod test {
         let dir = tempfile::tempdir().unwrap();
         let uuid = "12121212-3434-4545-8686-787878787878";
         let mut store = ReviewStore::default();
-        let first = store.draft(PathBuf::from("/r/a.rs"), DiffSide::Working, 1, "one".into());
-        let second = store.draft(PathBuf::from("/r/a.rs"), DiffSide::Working, 4, "two".into());
+        let first = store.draft(
+            PathBuf::from("/r/a.rs"),
+            ReviewRev::Worktree,
+            1,
+            "one".into(),
+        );
+        let second = store.draft(
+            PathBuf::from("/r/a.rs"),
+            ReviewRev::Worktree,
+            4,
+            "two".into(),
+        );
 
         let first_session = store.ensure_agent_session(first).unwrap();
         let second_session = store.ensure_agent_session(second).unwrap();
@@ -2084,7 +2328,7 @@ mod test {
         let mut store = ReviewStore::default();
         let asked = store.draft(
             PathBuf::from("/r/a.rs"),
-            DiffSide::Working,
+            ReviewRev::Worktree,
             41,
             "why?".into(),
         );
@@ -2094,7 +2338,7 @@ mod test {
         // A second thread, unsent: the draft is the thing most worth not losing.
         let unsent = store.draft(
             PathBuf::from("/r/b.rs"),
-            DiffSide::Base,
+            ReviewRev::Commit(SHA.into()),
             7,
             "typed, not sent".into(),
         );
@@ -2107,11 +2351,12 @@ mod test {
         assert_eq!(asked_back.entry_count(), 2);
         assert_eq!(asked_back.entry(1).unwrap().text, "because X");
         assert_eq!(asked_back.line, 41);
-        assert_eq!(asked_back.side, DiffSide::Working);
+        assert_eq!(asked_back.rev, ReviewRev::Worktree);
         assert!(asked_back.collapsed, "collapse state is worth keeping");
 
         let unsent_back = back.get(unsent).unwrap();
         assert_eq!(unsent_back.draft.as_deref(), Some("typed, not sent"));
+        assert_eq!(unsent_back.rev, ReviewRev::Commit(SHA.into()));
         assert_eq!(back.pending_count(), 1);
 
         // The per-file index is rebuilt rather than persisted.
@@ -2127,7 +2372,7 @@ mod test {
         let mut store = ReviewStore::default();
         let id = store.draft(
             PathBuf::from("/r/a.rs"),
-            DiffSide::Working,
+            ReviewRev::Worktree,
             1,
             "why?".into(),
         );
@@ -2153,7 +2398,7 @@ mod test {
         let mut store = ReviewStore::default();
         let id = store.draft(
             PathBuf::from("/r/a.rs"),
-            DiffSide::Working,
+            ReviewRev::Worktree,
             1,
             "why?".into(),
         );
@@ -2176,11 +2421,21 @@ mod test {
         let uuid = "33333333-4444-5555-8666-777777777777";
 
         let mut store = ReviewStore::default();
-        let first = store.draft(PathBuf::from("/r/a.rs"), DiffSide::Working, 1, "one".into());
+        let first = store.draft(
+            PathBuf::from("/r/a.rs"),
+            ReviewRev::Worktree,
+            1,
+            "one".into(),
+        );
         store.save_to(dir.path(), uuid).unwrap();
 
         let mut back = ReviewStore::load_from(dir.path(), uuid);
-        let second = back.draft(PathBuf::from("/r/a.rs"), DiffSide::Working, 2, "two".into());
+        let second = back.draft(
+            PathBuf::from("/r/a.rs"),
+            ReviewRev::Worktree,
+            2,
+            "two".into(),
+        );
         assert_ne!(
             first, second,
             "a reloaded store must not hand out a used id"
@@ -2207,7 +2462,7 @@ mod test {
         let mut store = ReviewStore::default();
         let id = store.draft(
             PathBuf::from("/r/a.rs"),
-            DiffSide::Working,
+            ReviewRev::Worktree,
             1,
             "why?".into(),
         );
@@ -2228,7 +2483,7 @@ mod test {
         let mut store = ReviewStore::default();
         let id = store.draft(
             PathBuf::from("/r/a.rs"),
-            DiffSide::Working,
+            ReviewRev::Worktree,
             1,
             "why?".into(),
         );
@@ -2251,7 +2506,7 @@ mod test {
         let mut store = ReviewStore::default();
         let id = store.draft(
             PathBuf::from("/r/a.rs"),
-            DiffSide::Working,
+            ReviewRev::Worktree,
             1,
             "why?".into(),
         );
@@ -2282,7 +2537,7 @@ mod test {
         let mut saved = ReviewStore::default();
         let asked = saved.draft(
             PathBuf::from("/r/a.rs"),
-            DiffSide::Working,
+            ReviewRev::Worktree,
             3,
             "why?".into(),
         );
@@ -2290,7 +2545,7 @@ mod test {
         saved.push_message(asked, Role::Agent, "because".into());
         saved.draft(
             PathBuf::from("/r/b.rs"),
-            DiffSide::Working,
+            ReviewRev::Worktree,
             1,
             "draft".into(),
         );
@@ -2299,7 +2554,7 @@ mod test {
         let mut store = ReviewStore::default();
         let outside = store.draft(
             PathBuf::from("/tmp/notes.txt"),
-            DiffSide::Working,
+            ReviewRev::Worktree,
             0,
             "note".into(),
         );
@@ -2314,7 +2569,12 @@ mod test {
         );
         assert_eq!(store.for_file(Path::new("/r/a.rs")).count(), 1);
         assert_eq!(store.for_file(Path::new("/r/b.rs")).count(), 1);
-        let fresh = store.draft(PathBuf::from("/r/c.rs"), DiffSide::Working, 0, "new".into());
+        let fresh = store.draft(
+            PathBuf::from("/r/c.rs"),
+            ReviewRev::Worktree,
+            0,
+            "new".into(),
+        );
         assert!(![outside].iter().chain(&ids).any(|id| *id == fresh));
 
         // Into an empty store the saved ids are kept as they were.
@@ -2330,9 +2590,9 @@ mod test {
         // code now at line 7 replaced that thread's draft.
         let mut store = ReviewStore::default();
         let file = PathBuf::from("/r/a.rs");
-        let first = store.draft(file.clone(), DiffSide::Working, 7, "why?".into());
+        let first = store.draft(file.clone(), ReviewRev::Worktree, 7, "why?".into());
 
-        let second = store.draft(file.clone(), DiffSide::Working, 7, "and this?".into());
+        let second = store.draft(file.clone(), ReviewRev::Worktree, 7, "and this?".into());
         assert_ne!(second, first);
         assert_eq!(store.len(), 2);
         assert_eq!(store.get(first).unwrap().draft.as_deref(), Some("why?"));
@@ -2401,7 +2661,7 @@ mod test {
         // Built the way the duplicate bug used to leave them: two conversations
         // describing the same line.
         let mut store = ReviewStore::default();
-        let first = store.draft(file.clone(), DiffSide::Working, 7, "why?".into());
+        let first = store.draft(file.clone(), ReviewRev::Worktree, 7, "why?".into());
         store.take_draft(first);
         store.push_message(first, Role::Agent, "because X".into());
         let second = ThreadId(99);
@@ -2411,7 +2671,7 @@ mod test {
             Thread {
                 id: second,
                 file: file.clone(),
-                side: DiffSide::Working,
+                rev: ReviewRev::Worktree,
                 line: 7,
                 messages: vec![Message {
                     role: Role::User,
@@ -2457,9 +2717,9 @@ mod test {
         let mut store = ReviewStore::default();
         let a = PathBuf::from("/repo/a.rs");
         let b = PathBuf::from("/repo/b.rs");
-        let first = store.draft(a.clone(), DiffSide::Working, 1, "one".into());
-        let second = store.draft(a.clone(), DiffSide::Base, 2, "two".into());
-        let third = store.draft(b.clone(), DiffSide::Working, 3, "three".into());
+        let first = store.draft(a.clone(), ReviewRev::Worktree, 1, "one".into());
+        let second = store.draft(a.clone(), ReviewRev::Commit(SHA.into()), 2, "two".into());
+        let third = store.draft(b.clone(), ReviewRev::Worktree, 3, "three".into());
 
         assert_eq!(store.for_file(&a).count(), 2);
         assert_eq!(store.for_file(&b).count(), 1);
@@ -2478,7 +2738,7 @@ mod test {
         let mut store = ReviewStore::default();
         let id = store.draft(
             PathBuf::from("/repo/a.rs"),
-            DiffSide::Working,
+            ReviewRev::Worktree,
             1,
             "q".into(),
         );
@@ -2498,19 +2758,19 @@ mod test {
     fn removing_a_draft_only_thread_does_not_leave_a_ghost() {
         let mut store = ReviewStore::default();
         let file = PathBuf::from("/r/a.rs");
-        let id = store.draft(file.clone(), DiffSide::Working, 7, "why?".into());
+        let id = store.draft(file.clone(), ReviewRev::Worktree, 7, "why?".into());
 
         assert_eq!(store.remove_entry(id, 0), None);
         assert!(store.is_empty(), "the empty thread should be gone");
         assert!(store.get(id).is_none());
-        assert_eq!(store.thread_at(&file, DiffSide::Working, 7), None);
+        assert_eq!(store.thread_at(&file, &ReviewRev::Worktree, 7), None);
     }
 
     #[test]
     fn removing_a_draft_keeps_the_sent_messages() {
         let mut store = ReviewStore::default();
         let file = PathBuf::from("/r/a.rs");
-        let id = store.draft(file.clone(), DiffSide::Working, 7, "why?".into());
+        let id = store.draft(file.clone(), ReviewRev::Worktree, 7, "why?".into());
         store.take_draft(id);
         store.push_message(id, Role::Agent, "because X".into());
         store.set_draft(id, "and Y?".into());
@@ -2523,6 +2783,6 @@ mod test {
             !thread.rewound,
             "the agent never saw the draft, so there is nothing to tell"
         );
-        assert_eq!(store.thread_at(&file, DiffSide::Working, 7), Some(id));
+        assert_eq!(store.thread_at(&file, &ReviewRev::Worktree, 7), Some(id));
     }
 }

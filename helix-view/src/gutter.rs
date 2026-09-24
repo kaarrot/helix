@@ -125,13 +125,12 @@ pub fn diff<'doc>(
         .unwrap_or_else(|| theme.get("ui.linenr.selected"));
     let mut comment_lines: Vec<usize> = Vec::new();
     if !editor.diff.reviews.is_empty() && !editor.diff.reviews.hidden {
-        if let Some((file, side)) = view.review_identity(doc, &editor.diff.views) {
+        if let Some((file, rev)) = view.review_identity(doc, &editor.diff.views) {
             let text = doc.text();
             comment_lines = editor
                 .diff
                 .reviews
-                .for_file(&file)
-                .filter(|thread| thread.side == side)
+                .for_snapshot(&file, &rev)
                 .map(|thread| {
                     doc.review_anchors
                         .iter()

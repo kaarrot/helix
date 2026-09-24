@@ -30,8 +30,7 @@ pub struct DiffSession {
     /// clobber a picker that was reopened in the meantime.
     pub changed_file_request: u64,
     /// Inline review threads. Lives here rather than per-document because a
-    /// conversation outlives the buffer it is anchored in, and a base pane's
-    /// document cannot even name its own file.
+    /// conversation outlives the buffer it is anchored in.
     pub reviews: ReviewStore,
     /// The claimed review conversation, created lazily on the first comment.
     pub session: Option<ReviewSession>,
@@ -51,7 +50,7 @@ pub struct DiffSession {
 
 impl Drop for DiffSession {
     fn drop(&mut self) {
-        // Give the name back on a clean exit, so the next editor on this branch
+        // Give the name back on a clean exit, so the next editor in this worktree
         // takes it rather than a `#2` suffix. A crash skips this, which is what
         // the liveness check in `claim` is for.
         if let Some(agent) = &mut self.agent {

@@ -67,13 +67,12 @@ impl DiffProviderRegistry {
             .find_map(|provider| provider.get_workdir(file).ok())
     }
 
-    /// The branch checked out in `workdir` right now. `None` while HEAD is
-    /// detached, or when the repository cannot be read.
-    pub fn get_checked_out_branch(&self, workdir: &Path) -> Option<String> {
+    /// The full hash of the commit `rev` names, in the repository holding
+    /// `path`. `None` when it names no commit or the repository cannot be read.
+    pub fn resolve_commit_id(&self, path: &Path, rev: &str) -> Option<String> {
         self.providers
             .iter()
-            .find_map(|provider| provider.get_checked_out_branch(workdir).ok())
-            .flatten()
+            .find_map(|provider| provider.resolve_commit_id(path, rev).ok())
     }
 
     /// Fire-and-forget changed file iteration. Runs everything in a background task. Keeps
@@ -145,10 +144,10 @@ impl DiffProvider {
         }
     }
 
-    fn get_checked_out_branch(&self, workdir: &Path) -> Result<Option<String>> {
+    fn resolve_commit_id(&self, path: &Path, rev: &str) -> Result<String> {
         match self {
             #[cfg(feature = "git")]
-            Self::Git => git::get_checked_out_branch(workdir),
+            Self::Git => git::resolve_commit_id(path, rev),
             Self::None => bail!("No diff support compiled in"),
         }
     }

@@ -1,5 +1,5 @@
 use helix_term::application::Application;
-use helix_view::review::{DiffSide, ThreadId};
+use helix_view::review::{session::WORKTREE_STORE, ReviewRev, ThreadId};
 
 use super::*;
 
@@ -7,14 +7,15 @@ fn thread_count(app: &Application) -> usize {
     app.editor.diff.reviews.len()
 }
 
-fn only_thread_side(app: &Application) -> DiffSide {
+fn only_thread_rev(app: &Application) -> ReviewRev {
     app.editor
         .diff
         .reviews
         .iter()
         .next()
         .expect("expected a review thread")
-        .side
+        .rev
+        .clone()
 }
 
 fn only_thread_draft(app: &Application) -> Option<&str> {
@@ -64,7 +65,7 @@ fn place_cursor(app: &mut Application, line: usize) {
     doc.set_selection(view_id, Selection::point(pos));
 }
 
-fn focused_review_side(app: &Application) -> DiffSide {
+fn focused_review_rev(app: &Application) -> ReviewRev {
     let view = app.editor.tree.get(app.editor.tree.focus);
     let doc = app.editor.document(view.doc).unwrap();
     view.review_identity(doc, &app.editor.diff.views)
@@ -125,7 +126,7 @@ async fn comment_renders_in_a_plain_buffer_with_no_diff() -> anyhow::Result<()> 
 #[tokio::test(flavor = "multi_thread")]
 async fn single_pane_diff_keeps_working_side_comments() -> anyhow::Result<()> {
     // Single-pane Space-g reuses the working view for both ids; comments
-    // made in the file must stay Working and visible there.
+    // made in the file must stay on the working tree and visible there.
     let repo = GitRepoFixture::new()?;
     repo.write_file("tracked.rs", "fn one() {}\n")?;
     repo.commit_all("initial")?;
@@ -139,7 +140,7 @@ async fn single_pane_diff_keeps_working_side_comments() -> anyhow::Result<()> {
     assert!(harness.send_keys(&mut app, "<space>mRc").await?);
     assert!(harness.send_keys(&mut app, "why this line?<C-s>").await?);
     assert_eq!(thread_count(&app), 1);
-    assert_eq!(only_thread_side(&app), DiffSide::Working);
+    assert_eq!(only_thread_rev(&app), ReviewRev::Worktree);
     assert!(focused_plan_row_count(&app) > 0);
 
     assert!(harness.send_keys(&mut app, "<space>g").await?);
@@ -162,8 +163,8 @@ async fn single_pane_diff_keeps_working_side_comments() -> anyhow::Result<()> {
         1,
         "opening the diff must not create a second thread"
     );
-    assert_eq!(only_thread_side(&app), DiffSide::Working);
-    assert_eq!(focused_review_side(&app), DiffSide::Working);
+    assert_eq!(only_thread_rev(&app), ReviewRev::Worktree);
+    assert_eq!(focused_review_rev(&app), ReviewRev::Worktree);
     assert!(
         focused_plan_row_count(&app) > 0,
         "in-file comments must still render in a single-pane diff"
@@ -227,7 +228,7 @@ async fn buffer_diff_comments_use_the_real_path() -> anyhow::Result<()> {
     assert_eq!(thread_count(&app), 1);
     let thread = app.editor.diff.reviews.iter().next().unwrap();
     assert_eq!(thread.file, working_path);
-    assert_eq!(thread.side, DiffSide::Working);
+    assert_eq!(thread.rev, ReviewRev::Worktree);
     assert!(focused_plan_row_count(&app) > 0);
 
     let view_id = app.editor.tree.focus;
@@ -261,14 +262,14 @@ async fn buffer_diff_comments_use_the_real_path() -> anyhow::Result<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn split_diff_base_pane_claims_a_session() -> anyhow::Result<()> {
-    // Virtual base docs have path == None, so the first comment from the left
-    // pane used to skip claiming a session, never persist, and seed its
-    // anchors onto the working document.
+    // The first comment from the left pane used to skip claiming a session,
+    // never persist, and seed its anchors onto the working document.
     let repo = GitRepoFixture::new()?;
     repo.write_file("tracked.txt", "one\ntwo\nthree\n")?;
     repo.commit_all("initial")?;
     repo.checkout_new_branch("base-pane")?;
     repo.write_file("tracked.txt", "one\ntwo changed\nthree\n")?;
+    let head = repo.rev_parse("HEAD")?;
 
     let _cwd = CwdGuard::enter(repo.path()).await?;
     let path = repo.file("tracked.txt");
@@ -294,13 +295,11 @@ async fn split_diff_base_pane_claims_a_session() -> anyhow::Result<()> {
         );
         (state.base_view_id, state.base_doc_id, state.working_doc_id)
     };
-    assert!(
-        app.editor.document(base_doc).unwrap().path().is_none(),
-        "the bug is that the virtual base document has no path"
-    );
 
     app.editor.focus(base_view);
-    assert_eq!(focused_review_side(&app), DiffSide::Base);
+    // The pane shows HEAD's text, so it is HEAD's commit, by its hash: `HEAD`
+    // itself moves on at the next commit and the text in the pane does not.
+    assert_eq!(focused_review_rev(&app), ReviewRev::Commit(head.clone()));
 
     harness
         .send_keys_pumping(
@@ -323,10 +322,10 @@ async fn split_diff_base_pane_claims_a_session() -> anyhow::Result<()> {
         .session
         .as_ref()
         .expect("commenting from the base pane must claim a session");
-    assert_eq!(session.name, "base-pane");
+    assert_eq!(session.name, WORKTREE_STORE);
     let uuid = session.uuid.clone();
     assert_eq!(thread_count(&app), 1);
-    assert_eq!(only_thread_side(&app), DiffSide::Base);
+    assert_eq!(only_thread_rev(&app), ReviewRev::Commit(head.clone()));
     assert_eq!(
         app.editor.document(base_doc).unwrap().review_anchors.len(),
         1,
@@ -338,7 +337,7 @@ async fn split_diff_base_pane_claims_a_session() -> anyhow::Result<()> {
             .unwrap()
             .review_anchors
             .is_empty(),
-        "a base-side comment must not seed onto the working document"
+        "a comment on HEAD must not seed onto the working document"
     );
     assert!(focused_plan_row_count(&app) > 0);
 
@@ -364,7 +363,7 @@ async fn split_diff_base_pane_claims_a_session() -> anyhow::Result<()> {
     assert_eq!(
         app.editor.document(base_doc).unwrap().review_anchors.len(),
         1,
-        "reseed must put base-side threads back on the base document"
+        "reseed must put HEAD's threads back on the base document"
     );
     assert!(
         app.editor
@@ -372,7 +371,7 @@ async fn split_diff_base_pane_claims_a_session() -> anyhow::Result<()> {
             .unwrap()
             .review_anchors
             .is_empty(),
-        "reseed must not copy base-side threads onto the working document"
+        "reseed must not copy HEAD's threads onto the working document"
     );
 
     // :q! via harness.close waits for the event loop to exit; a split differ
@@ -384,12 +383,14 @@ async fn split_diff_base_pane_claims_a_session() -> anyhow::Result<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn split_diff_prompts_quote_the_matching_side() -> anyhow::Result<()> {
-    // compose_prompt used to ignore thread.side and always quote the working
-    // tree, so a comment on the old pane sent the new text at that line.
+    // compose_prompt used to ignore which pane a comment was on and always
+    // quote the working tree, so a comment on the old pane sent the new text
+    // at that line.
     let repo = GitRepoFixture::new()?;
     repo.write_file("tracked.txt", "one\ntwo\nthree\n")?;
     repo.commit_all("initial")?;
     repo.write_file("tracked.txt", "one\ntwo changed\nthree\n")?;
+    let head = repo.rev_parse("HEAD")?;
 
     let _cwd = CwdGuard::enter(repo.path()).await?;
     let path = repo.file("tracked.txt");
@@ -475,8 +476,8 @@ async fn split_diff_prompts_quote_the_matching_side() -> anyhow::Result<()> {
         .expect("working comment was sent");
 
     assert!(
-        base_prompt.contains("side: base"),
-        "base comment must be tagged as the old side:\n{base_prompt}"
+        base_prompt.contains(&format!("revision: commit {head}")),
+        "base comment must name the commit it is about:\n{base_prompt}"
     );
     assert!(
         !base_prompt.contains("two changed"),
@@ -488,8 +489,8 @@ async fn split_diff_prompts_quote_the_matching_side() -> anyhow::Result<()> {
     );
 
     assert!(
-        working_prompt.contains("side: working"),
-        "working comment must be tagged as the working side:\n{working_prompt}"
+        working_prompt.contains("revision: working tree"),
+        "working comment must be tagged as the working tree:\n{working_prompt}"
     );
     assert!(
         working_prompt.contains("two changed"),
@@ -932,7 +933,9 @@ async fn a_comment_on_the_line_a_thread_moved_off_starts_its_own() -> anyhow::Re
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn the_first_comment_claims_a_session_named_for_the_branch() -> anyhow::Result<()> {
+async fn the_first_comment_claims_the_worktree_s_session() -> anyhow::Result<()> {
+    // One conversation per worktree, whatever is checked out: the threads in
+    // it each name the revision they are about.
     let repo = GitRepoFixture::new()?;
     repo.write_file("tracked.txt", "one\ntwo\n")?;
     repo.commit_all("initial")?;
@@ -957,7 +960,12 @@ async fn the_first_comment_claims_a_session_named_for_the_branch() -> anyhow::Re
         .session
         .as_ref()
         .expect("first comment should claim a session");
-    assert_eq!(session.name, "feature-x");
+    assert_eq!(session.name, WORKTREE_STORE, "not named for the branch");
+    assert_eq!(
+        session.uuid,
+        helix_view::review::session::derive_uuid(&session.worktree, WORKTREE_STORE),
+        "derived from the worktree alone"
+    );
     let uuid = session.uuid.clone();
 
     // Switching by name gives a different conversation, deterministically.
@@ -973,7 +981,7 @@ async fn the_first_comment_claims_a_session_named_for_the_branch() -> anyhow::Re
     // And switching back resumes the original one.
     assert!(
         harness
-            .send_keys(&mut app, ":review-session feature-x<ret>")
+            .send_keys(&mut app, &format!(":review-session {WORKTREE_STORE}<ret>"))
             .await?
     );
     assert_eq!(app.editor.diff.session.as_ref().unwrap().uuid, uuid);
@@ -1074,7 +1082,7 @@ async fn switching_review_sessions_isolates_their_stores() -> anyhow::Result<()>
 
     assert!(
         harness
-            .send_keys(&mut app, ":review-session feature-x<ret>")
+            .send_keys(&mut app, &format!(":review-session {WORKTREE_STORE}<ret>"))
             .await?
     );
     assert_eq!(thread_count(&app), 1);
@@ -1113,7 +1121,10 @@ async fn review_session_picks_the_agent_without_renaming() -> anyhow::Result<()>
 
     assert!(harness.send_keys(&mut app, "<space>mRc").await?);
     assert!(harness.send_keys(&mut app, "why?<C-s>").await?);
-    assert_eq!(app.editor.diff.session.as_ref().unwrap().name, "feature-x");
+    assert_eq!(
+        app.editor.diff.session.as_ref().unwrap().name,
+        WORKTREE_STORE
+    );
     assert_eq!(app.editor.diff.agent_kind, ReviewAgentKind::Claude);
 
     assert!(
@@ -1121,7 +1132,10 @@ async fn review_session_picks_the_agent_without_renaming() -> anyhow::Result<()>
             .send_keys(&mut app, ":review-session grok<ret>")
             .await?
     );
-    assert_eq!(app.editor.diff.session.as_ref().unwrap().name, "feature-x");
+    assert_eq!(
+        app.editor.diff.session.as_ref().unwrap().name,
+        WORKTREE_STORE
+    );
     assert_eq!(app.editor.diff.agent_kind, ReviewAgentKind::Grok);
 
     assert!(
@@ -1628,9 +1642,9 @@ async fn ctrl_left_walks_the_thread_while_the_comment_box_is_open() -> anyhow::R
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_comment_outside_a_repo_keeps_the_branch_s_saved_threads() -> anyhow::Result<()> {
+async fn a_comment_outside_a_repo_keeps_the_worktree_s_saved_threads() -> anyhow::Result<()> {
     // Regression: the comment outside the repository filled the store, so
-    // claiming the branch's session skipped loading it, and the next save
+    // claiming the worktree's session skipped loading it, and the next save
     // replaced the saved conversation with what was in memory.
     let repo = GitRepoFixture::new()?;
     repo.write_file("tracked.rs", "fn one() {}\nfn two() {}\n")?;
@@ -1734,7 +1748,7 @@ async fn threads_shown_on_open_give_way_if_another_editor_claims_them() -> anyho
         pid: 1,
         proc_start: None,
         started_at: 0,
-        name: "claimed-elsewhere".into(),
+        name: WORKTREE_STORE.into(),
         worktree: repo.path().to_string_lossy().into_owned(),
     };
     std::fs::write(&claim, serde_json::to_string(&owner)?)?;
@@ -1745,7 +1759,7 @@ async fn threads_shown_on_open_give_way_if_another_editor_claims_them() -> anyho
     let _ = std::fs::remove_file(&claim);
 
     let session = app.editor.diff.session.clone().expect("claimed");
-    assert_eq!(session.name, "claimed-elsewhere#2");
+    assert_eq!(session.name, format!("{WORKTREE_STORE}#2"));
     let drafts: Vec<_> = app
         .editor
         .diff
@@ -1805,7 +1819,7 @@ async fn a_conversation_comes_back_after_a_restart() -> anyhow::Result<()> {
         uuid
     };
 
-    // A fresh editor on the same branch: same derived uuid, same conversation.
+    // A fresh editor in the same worktree: same derived uuid, same conversation.
     let mut app = AppBuilder::new().with_file(&path, None).build()?;
     let mut harness = AppTestHarness::new();
 
@@ -1829,7 +1843,7 @@ async fn a_conversation_comes_back_after_a_restart() -> anyhow::Result<()> {
     assert_eq!(
         app.editor.diff.session.as_ref().map(|s| s.uuid.clone()),
         Some(uuid.clone()),
-        "the same branch must derive the same conversation"
+        "the same worktree must derive the same conversation"
     );
     assert_eq!(
         app.editor.diff.reviews.len(),
@@ -1890,15 +1904,6 @@ fn anchored_line(app: &Application, id: ThreadId) -> Option<usize> {
         .map(|anchor| anchor.line(doc.text()))
 }
 
-/// Each saved thread's draft and line.
-fn saved_drafts(uuid: &str) -> Vec<(String, u32)> {
-    let dir = helix_view::review::session::review_dir();
-    helix_view::review::ReviewStore::load_from(&dir, uuid)
-        .iter()
-        .map(|thread| (thread.draft.clone().unwrap_or_default(), thread.line))
-        .collect()
-}
-
 fn remove_saved(uuids: &[&str]) {
     let dir = helix_view::review::session::review_dir();
     for uuid in uuids {
@@ -1906,83 +1911,309 @@ fn remove_saved(uuids: &[&str]) {
     }
 }
 
+/// Threads anchored in `doc`, by id.
+fn anchored_threads(app: &Application, doc: helix_view::DocumentId) -> Vec<ThreadId> {
+    let mut ids: Vec<_> = app
+        .editor
+        .document(doc)
+        .unwrap()
+        .review_anchors
+        .iter()
+        .map(|anchor| anchor.thread)
+        .collect();
+    ids.sort();
+    ids
+}
+
+/// The thread whose draft is `text`.
+fn thread_drafted(app: &Application, text: &str) -> ThreadId {
+    app.editor
+        .diff
+        .reviews
+        .iter()
+        .find(|thread| thread.draft.as_deref() == Some(text))
+        .unwrap_or_else(|| panic!("no thread drafted {text:?}"))
+        .id
+}
+
+/// Leave a comment on `line` of the focused pane. Pumps rather than waiting
+/// for idle, which a split diff's differ can keep from ever arriving.
+async fn comment_on(
+    app: &mut Application,
+    harness: &mut AppTestHarness,
+    line: usize,
+    text: &str,
+) -> anyhow::Result<ThreadId> {
+    place_cursor(app, line);
+    let pause = std::time::Duration::from_millis(300);
+    harness.send_keys_pumping(app, "<space>mRc", pause).await?;
+    harness
+        .send_keys_pumping(app, &format!("{text}<C-s>"), pause)
+        .await?;
+    Ok(thread_drafted(app, text))
+}
+
+/// The two panes of the focused split diff, as `(base, working)` view and
+/// document ids.
+fn split_panes(
+    app: &Application,
+) -> (
+    (helix_view::ViewId, helix_view::DocumentId),
+    (helix_view::ViewId, helix_view::DocumentId),
+) {
+    let state = &app.editor.diff.views[&app.editor.tree.focus];
+    assert_ne!(state.base_view_id, state.working_view_id, "a split diff");
+    (
+        (state.base_view_id, state.base_doc_id),
+        (state.working_view_id, state.working_doc_id),
+    )
+}
+
 #[tokio::test(flavor = "multi_thread")]
-async fn a_checkout_shows_that_branch_s_threads_each_on_its_own_line() -> anyhow::Result<()> {
-    // Regression: the conversation was fixed when the editor started. After a
-    // checkout the old branch's threads were still shown, a reload carried
-    // them onto the new branch's code, and they were saved at lines their own
-    // branch never had.
+async fn each_revision_of_a_file_shows_only_its_own_threads() -> anyhow::Result<()> {
+    // Threads used to be kept by diff pane, so a comment on the left of one
+    // diff was drawn on the left of the next, whatever that pane showed.
     let repo = GitRepoFixture::new()?;
-    repo.write_file("tracked.rs", "fn a() {}\nfn b() {}\nfn c() {}\nfn d() {}\n")?;
-    repo.commit_all("initial")?;
-    repo.checkout_new_branch("left")?;
+    repo.write_file("tracked.rs", "fn one() {}\nfn two() {}\nfn three() {}\n")?;
+    repo.commit_all("first")?;
+    let first = repo.rev_parse("HEAD")?;
+    repo.write_file("tracked.rs", "fn one() {}\nfn two(x) {}\nfn three() {}\n")?;
+    repo.commit_all("second")?;
+    let second = repo.rev_parse("HEAD")?;
+    repo.write_file(
+        "tracked.rs",
+        "fn one() {}\nfn two(x, y) {}\nfn three() {}\n",
+    )?;
 
     let _cwd = CwdGuard::enter(repo.path()).await?;
     let path = repo.file("tracked.rs");
     let mut app = AppBuilder::new().with_file(&path, None).build()?;
     let mut harness = AppTestHarness::new();
+    let pump = std::time::Duration::from_millis(400);
 
-    place_cursor(&mut app, 3);
-    assert!(harness.send_keys(&mut app, "<space>mRc").await?);
-    assert!(harness.send_keys(&mut app, "about d<C-s>").await?);
-    let left = app.editor.diff.session.clone().expect("claimed");
-    assert_eq!(left.branch.as_deref(), Some("left"));
+    // A range diff: both panes are snapshots, each of its own commit.
+    app.editor
+        .open_diff_view_range(&path, &first, Some(&second), Some(true))?;
+    harness.pump(&mut app, pump).await;
+    let ((left_view, _), (right_view, _)) = split_panes(&app);
+    app.editor.focus(left_view);
+    assert_eq!(focused_review_rev(&app), ReviewRev::Commit(first.clone()));
+    let on_first = comment_on(&mut app, &mut harness, 1, "on first").await?;
+    app.editor.focus(right_view);
+    assert_eq!(focused_review_rev(&app), ReviewRev::Commit(second.clone()));
+    let on_second = comment_on(&mut app, &mut harness, 1, "on second").await?;
+    let session = app.editor.diff.session.clone().expect("claimed");
+    assert!(app.editor.close_diff_view(app.editor.tree.focus));
+
+    // The file on disk is neither commit.
+    assert_eq!(focused_review_rev(&app), ReviewRev::Worktree);
+    assert_eq!(focused_plan_row_count(&app), 0, "no commit's threads here");
+    let on_disk = comment_on(&mut app, &mut harness, 1, "on disk").await?;
+    assert_eq!(
+        thread_count(&app),
+        3,
+        "one line, three revisions, three threads"
+    );
+
+    // `second` is now the left pane of another diff, and its thread follows
+    // it there. The right pane is the file on disk.
+    app.editor.open_diff_view(&path, &second, Some(true))?;
+    harness.pump(&mut app, pump).await;
+    let ((_, base_doc), (_, working_doc)) = split_panes(&app);
+    assert_eq!(anchored_threads(&app, base_doc), [on_second]);
+    assert_eq!(anchored_threads(&app, working_doc), [on_disk]);
+    assert!(app.editor.close_diff_view(app.editor.tree.focus));
+
+    // However the revision is spelled, it is the commit it names.
+    app.editor.open_diff_view(&path, &first[..8], Some(true))?;
+    harness.pump(&mut app, pump).await;
+    let ((_, base_doc), _) = split_panes(&app);
+    assert_eq!(anchored_threads(&app, base_doc), [on_first]);
+
+    let _ = app.close().await;
+    remove_saved(&[&session.uuid]);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_checkout_keeps_the_worktree_s_threads_on_the_file() -> anyhow::Result<()> {
+    // Each branch used to have its own conversation, swapped in at a checkout.
+    // Threads now stay with the worktree: those on the file move with its text,
+    // and those on a commit stay on that commit.
+    let repo = GitRepoFixture::new()?;
+    repo.write_file("tracked.rs", "fn a() {}\nfn b() {}\nfn c() {}\nfn d() {}\n")?;
+    repo.commit_all("initial")?;
+    repo.checkout_new_branch("left")?;
+    let left = repo.rev_parse("HEAD")?;
+
+    let _cwd = CwdGuard::enter(repo.path()).await?;
+    let path = repo.file("tracked.rs");
+    let mut app = AppBuilder::new().with_file(&path, None).build()?;
+    let mut harness = AppTestHarness::new();
+    let pump = std::time::Duration::from_millis(400);
+
+    let about_d = comment_on(&mut app, &mut harness, 3, "about d").await?;
+    app.editor.open_diff_view(&path, "HEAD", Some(true))?;
+    harness.pump(&mut app, pump).await;
+    let ((base_view, _), _) = split_panes(&app);
+    app.editor.focus(base_view);
+    let about_left = comment_on(&mut app, &mut harness, 0, "about left's a").await?;
+    assert!(app.editor.close_diff_view(app.editor.tree.focus));
+    let session = app.editor.diff.session.clone().expect("claimed");
 
     // Another branch, with two lines added above `d`, checked out outside the
-    // editor. The buffer still holds the left branch's text.
+    // editor. The pause keeps the checkout out of the clock tick the buffer's
+    // mtime was read in, which would hide that the file changed.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     repo.checkout_new_branch("right")?;
     repo.write_file(
         "tracked.rs",
         "fn x() {}\nfn y() {}\nfn a() {}\nfn b() {}\nfn c() {}\nfn d() {}\n",
     )?;
     repo.commit_all("add x and y")?;
+    let right = repo.rev_parse("HEAD")?;
 
     assert!(harness.send_keys(&mut app, ":reload-all<ret>").await?);
     assert_eq!(
-        thread_count(&app),
-        0,
-        "left's thread must not be shown on right"
+        app.editor.diff.session.as_ref(),
+        Some(&session),
+        "a checkout does not change the conversation"
     );
-    assert!(
-        app.editor.diff.session.is_none(),
-        "claimed by a comment, not by a checkout"
-    );
+    assert_eq!(thread_count(&app), 2);
     assert_eq!(
-        saved_drafts(&left.uuid),
-        [("about d".to_string(), 3)],
-        "saved on the line it was left on, before the reload could move it"
+        anchored_line(&app, about_d),
+        Some(5),
+        "the file's thread moves with its text"
     );
 
-    place_cursor(&mut app, 0);
-    assert!(harness.send_keys(&mut app, "<space>mRc").await?);
-    assert!(harness.send_keys(&mut app, "about x<C-s>").await?);
-    let right = app.editor.diff.session.clone().expect("claimed");
-    assert_eq!(right.name, "right");
-    assert_ne!(right.uuid, left.uuid);
+    // HEAD is `right` now, and has no threads. `left` still has its own.
+    app.editor.open_diff_view(&path, "HEAD", Some(true))?;
+    harness.pump(&mut app, pump).await;
+    let ((base_view, base_doc), (_, working_doc)) = split_panes(&app);
+    app.editor.focus(base_view);
+    assert_eq!(focused_review_rev(&app), ReviewRev::Commit(right));
+    assert!(anchored_threads(&app, base_doc).is_empty());
+    assert_eq!(anchored_threads(&app, working_doc), [about_d]);
+    assert!(app.editor.close_diff_view(app.editor.tree.focus));
 
-    // Back again: left's thread returns, anchored to left's text. The pause
-    // keeps the checkout out of the clock tick the reload read the file's
-    // mtime in, which would hide that the file changed.
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    repo.checkout("left")?;
-    assert!(harness.send_keys(&mut app, ":reload-all<ret>").await?);
-    assert_eq!(thread_count(&app), 1);
-    assert_eq!(only_thread_draft(&app), Some("about d"));
-    let id = app.editor.diff.reviews.iter().next().unwrap().id;
-    assert_eq!(
-        anchored_line(&app, id),
-        Some(3),
-        "anchored once the buffer holds this branch's text, not before"
-    );
-    assert_eq!(saved_drafts(&right.uuid), [("about x".to_string(), 0)]);
+    app.editor.open_diff_view(&path, &left, Some(true))?;
+    harness.pump(&mut app, pump).await;
+    let ((_, base_doc), _) = split_panes(&app);
+    assert_eq!(anchored_threads(&app, base_doc), [about_left]);
 
-    harness.close(&mut app).await?;
-    remove_saved(&[&left.uuid, &right.uuid]);
+    let _ = app.close().await;
+    remove_saved(&[&session.uuid]);
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_detached_head_or_a_named_conversation_keeps_its_threads() -> anyhow::Result<()> {
+async fn a_commit_leaves_the_file_s_threads_on_the_file() -> anyhow::Result<()> {
+    // Comments on the dirty file are about the file on disk. Committing names
+    // its text, but nothing is copied onto that commit: they stay on the file,
+    // and the new commit's snapshot has none.
+    let repo = GitRepoFixture::new()?;
+    repo.write_file("tracked.rs", "fn one() {}\nfn two() {}\n")?;
+    repo.commit_all("initial")?;
+    repo.write_file("tracked.rs", "fn one() {}\nfn two(x) {}\n")?;
+
+    let _cwd = CwdGuard::enter(repo.path()).await?;
+    let path = repo.file("tracked.rs");
+    let mut app = AppBuilder::new().with_file(&path, None).build()?;
+    let mut harness = AppTestHarness::new();
+
+    let dirty = comment_on(&mut app, &mut harness, 1, "about the change").await?;
+    repo.commit_all("commit it")?;
+    let committed = repo.rev_parse("HEAD")?;
+    assert!(harness.send_keys(&mut app, ":reload<ret>").await?);
+
+    assert_eq!(only_thread_rev(&app), ReviewRev::Worktree);
+    assert!(focused_plan_row_count(&app) > 0, "still on the file");
+
+    app.editor.open_diff_view(&path, "HEAD", Some(true))?;
+    harness
+        .pump(&mut app, std::time::Duration::from_millis(400))
+        .await;
+    let ((base_view, base_doc), (_, working_doc)) = split_panes(&app);
+    app.editor.focus(base_view);
+    assert_eq!(focused_review_rev(&app), ReviewRev::Commit(committed));
+    assert!(
+        anchored_threads(&app, base_doc).is_empty(),
+        "the same text under a new name is a different snapshot"
+    );
+    assert_eq!(anchored_threads(&app, working_doc), [dirty]);
+
+    let session = app.editor.diff.session.clone().expect("claimed");
+    let _ = app.close().await;
+    remove_saved(&[&session.uuid]);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stash_moves_the_file_s_threads_with_its_text() -> anyhow::Result<()> {
+    // A stash replaces the file's text, like any change made outside the
+    // editor. The threads stay on the file: one on a line HEAD also has sits
+    // on it, one on a line only the stash had is orphaned. None of them are
+    // put on the stash's commit.
+    let repo = GitRepoFixture::new()?;
+    repo.write_file("tracked.rs", "fn one() {}\nfn two() {}\n")?;
+    repo.commit_all("initial")?;
+    repo.write_file("tracked.rs", "fn one() {}\nfn stashed() {}\nfn two() {}\n")?;
+
+    let _cwd = CwdGuard::enter(repo.path()).await?;
+    let path = repo.file("tracked.rs");
+    let mut app = AppBuilder::new().with_file(&path, None).build()?;
+    let mut harness = AppTestHarness::new();
+
+    let kept = comment_on(&mut app, &mut harness, 2, "about two").await?;
+    let lost = comment_on(&mut app, &mut harness, 1, "about stashed").await?;
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    repo.git(&["stash"])?;
+    let stash = repo.rev_parse("stash@{0}")?;
+    assert!(harness.send_keys(&mut app, ":reload<ret>").await?);
+
+    assert_eq!(thread_count(&app), 2, "a stash deletes nothing");
+    assert!(app
+        .editor
+        .diff
+        .reviews
+        .iter()
+        .all(|thread| thread.rev == ReviewRev::Worktree));
+    let file = helix_stdx::path::canonicalize(&path);
+    assert_eq!(
+        app.editor
+            .diff
+            .reviews
+            .for_snapshot(&file, &ReviewRev::Commit(stash))
+            .count(),
+        0,
+        "nothing is kept under the stash's commit"
+    );
+    assert_eq!(
+        anchored_line(&app, kept),
+        Some(1),
+        "follows fn two up a line"
+    );
+    let orphaned = |id: ThreadId| {
+        let view = app.editor.tree.get(app.editor.tree.focus);
+        let doc = app.editor.document(view.doc).unwrap();
+        doc.review_anchors
+            .iter()
+            .find(|anchor| anchor.thread == id)
+            .is_some_and(|anchor| anchor.orphaned)
+    };
+    assert!(orphaned(lost), "its line went into the stash");
+    assert!(!orphaned(kept));
+
+    let session = app.editor.diff.session.clone().expect("claimed");
+    harness.close(&mut app).await?;
+    remove_saved(&[&session.uuid]);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_detached_head_keeps_the_threads_and_a_named_conversation_its_own() -> anyhow::Result<()>
+{
     let repo = GitRepoFixture::new()?;
     repo.write_file("tracked.rs", "fn one() {}\nfn two() {}\n")?;
     repo.commit_all("initial")?;
@@ -1995,112 +2226,111 @@ async fn a_detached_head_or_a_named_conversation_keeps_its_threads() -> anyhow::
 
     assert!(harness.send_keys(&mut app, "<space>mRc").await?);
     assert!(harness.send_keys(&mut app, "keep me<C-s>").await?);
-    let feature = app.editor.diff.session.clone().expect("claimed");
+    let worktree = app.editor.diff.session.clone().expect("claimed");
 
-    // A rebase runs on a detached HEAD. It is still the branch's work, so the
-    // branch's conversation stays.
     repo.git(&["checkout", "--detach"])?;
-    app.editor.follow_review_branch();
-    assert_eq!(app.editor.diff.session.as_ref(), Some(&feature));
+    assert!(harness.send_keys(&mut app, ":reload-all<ret>").await?);
+    assert_eq!(app.editor.diff.session.as_ref(), Some(&worktree));
     assert_eq!(only_thread_draft(&app), Some("keep me"));
 
-    // A conversation named for something other than the branch stays put.
+    // A named conversation holds only its own threads, whatever is checked
+    // out, until the worktree's is asked for back.
     assert!(
         harness
             .send_keys(&mut app, ":review-session spike<ret>")
             .await?
     );
     let spike = app.editor.diff.session.clone().expect("named");
-    assert_eq!(spike.branch, None);
+    assert_eq!(thread_count(&app), 0);
     repo.checkout_new_branch("other")?;
-    app.editor.follow_review_branch();
+    assert!(harness.send_keys(&mut app, ":reload-all<ret>").await?);
     assert_eq!(app.editor.diff.session.as_ref(), Some(&spike));
+    assert_eq!(thread_count(&app), 0);
 
-    // Naming it after the branch checked out makes it follow again.
     assert!(
         harness
-            .send_keys(&mut app, ":review-session other<ret>")
+            .send_keys(&mut app, &format!(":review-session {WORKTREE_STORE}<ret>"))
             .await?
     );
-    let other = app.editor.diff.session.clone().expect("named");
-    assert_eq!(other.branch.as_deref(), Some("other"));
-    repo.checkout("feature")?;
-    app.editor.follow_review_branch();
-    assert!(app.editor.diff.session.is_none());
+    assert_eq!(app.editor.diff.session.as_ref(), Some(&worktree));
     assert_eq!(only_thread_draft(&app), Some("keep me"));
 
     harness.close(&mut app).await?;
-    remove_saved(&[&feature.uuid, &spike.uuid, &other.uuid]);
+    remove_saved(&[&worktree.uuid, &spike.uuid]);
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_reply_still_arriving_at_a_checkout_is_marked_cut_short() -> anyhow::Result<()> {
-    use helix_view::review::agent::AgentEvent;
-
+async fn a_branch_s_old_conversation_becomes_the_worktree_s() -> anyhow::Result<()> {
+    // Saved before threads named a revision: one conversation per branch, each
+    // thread on a diff side. The branch checked out is brought over, once.
     let repo = GitRepoFixture::new()?;
     repo.write_file("tracked.rs", "fn one() {}\nfn two() {}\n")?;
     repo.commit_all("initial")?;
-    repo.checkout_new_branch("asking")?;
+    repo.checkout_new_branch("legacy")?;
+    let head = repo.rev_parse("HEAD")?;
+    let path = repo.file("tracked.rs");
+
+    let worktree = helix_vcs::DiffProviderRegistry::default()
+        .get_workdir(&path)
+        .expect("a worktree");
+    let dir = helix_view::review::session::review_dir();
+    let old = helix_view::review::session::derive_uuid(&worktree, "legacy");
+    let new = helix_view::review::session::derive_uuid(&worktree, WORKTREE_STORE);
+    let file = helix_stdx::path::canonicalize(&path);
+    let thread = |id: u32, side: &str, line: u32| {
+        serde_json::json!({
+            "id": id,
+            "file": file,
+            "side": side,
+            "line": line,
+            "messages": [],
+            "draft": format!("on {side}"),
+            "collapsed": false,
+            "orphaned": false,
+        })
+    };
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(
+        dir.join(format!("{old}.threads.json")),
+        serde_json::json!({
+            "threads": [thread(1, "working", 1), thread(2, "base", 0)],
+            "next_id": 3,
+        })
+        .to_string(),
+    )?;
 
     let _cwd = CwdGuard::enter(repo.path()).await?;
-    let path = repo.file("tracked.rs");
     let mut app = AppBuilder::new().with_file(&path, None).build()?;
-    let mut harness = AppTestHarness::new();
-
-    let fake = FakeAgent::default();
-    let sent = fake.sent.clone();
-    app.editor.diff.agent = Some(Box::new(fake));
-
-    assert!(harness.send_keys(&mut app, "<space>mRc").await?);
-    assert!(harness.send_keys(&mut app, "why?<C-s>").await?);
-    assert!(harness.send_keys(&mut app, "<space>mRS").await?);
-    let (id, _, agent_session) = sent.lock().unwrap()[0].clone();
-    helix_term::review_agent::apply_event(
-        &mut app.editor,
-        &agent_session,
-        AgentEvent::Chunk(id, "because".into()),
-    );
-    let asking = app.editor.diff.session.clone().expect("claimed");
-
-    repo.checkout_new_branch("elsewhere")?;
-    app.editor.follow_review_branch();
-    assert_eq!(thread_count(&app), 0);
-    assert!(
-        app.editor.diff.agent.is_none(),
-        "the agent went with its threads"
-    );
-
-    repo.checkout("asking")?;
-    app.editor.follow_review_branch();
-    let entries = |app: &Application| -> Vec<String> {
-        let thread = app
-            .editor
+    let revs = |app: &Application| -> Vec<(ReviewRev, u32)> {
+        app.editor
             .diff
             .reviews
-            .get(id)
-            .expect("the thread comes back");
-        (0..thread.entry_count())
-            .map(|index| thread.entry(index).unwrap().text.to_string())
+            .iter()
+            .map(|thread| (thread.rev.clone(), thread.line))
             .collect()
     };
-    let cut_short = [
-        "why?",
-        "because",
-        "(failed) stopped waiting: elsewhere was checked out before this reply arrived",
-    ];
-    assert_eq!(entries(&app), cut_short);
-
-    // The rest of that turn arrives too late to be written under the note.
-    helix_term::review_agent::apply_event(
-        &mut app.editor,
-        &agent_session,
-        AgentEvent::Completed(id, "because of X".into()),
+    assert_eq!(
+        revs(&app),
+        [
+            (ReviewRev::Worktree, 1),
+            (ReviewRev::Commit(head.clone()), 0)
+        ]
     );
-    assert_eq!(entries(&app), cut_short);
+    assert!(
+        dir.join(format!("{new}.threads.json")).exists(),
+        "written under the worktree's conversation"
+    );
+    assert!(
+        dir.join(format!("{old}.threads.json")).exists(),
+        "the branch's is left where it was"
+    );
+    let view = app.editor.tree.get(app.editor.tree.focus);
+    let doc = app.editor.document(view.doc).unwrap();
+    assert_eq!(doc.review_anchors.len(), 1, "only the file's own thread");
 
-    harness.close(&mut app).await?;
-    remove_saved(&[&asking.uuid]);
+    let _ = app.close().await;
+    remove_saved(&[&old, &new]);
     Ok(())
 }
 
@@ -3545,15 +3775,11 @@ async fn a_reply_goes_to_the_focused_box_when_two_share_a_line() -> anyhow::Resu
     assert!(harness.send_keys(&mut app, "<space>mRc").await?);
     assert!(harness.send_keys(&mut app, "top<C-s>").await?);
     let top = app.editor.diff.reviews.pending().next().unwrap().id;
-    let (path, side) = {
+    let (path, rev) = {
         let thread = app.editor.diff.reviews.get(top).unwrap();
-        (thread.file.clone(), thread.side)
+        (thread.file.clone(), thread.rev.clone())
     };
-    let bottom = app
-        .editor
-        .diff
-        .reviews
-        .draft(path, side, 1, "bottom".into());
+    let bottom = app.editor.diff.reviews.draft(path, rev, 1, "bottom".into());
     // `draft` reuses a thread already on the line, so put it there the way an
     // orphaned thread arrives: by its line moving.
     app.editor.diff.reviews.get_mut(bottom).unwrap().line = 0;

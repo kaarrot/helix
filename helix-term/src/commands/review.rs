@@ -1,18 +1,18 @@
 use std::path::{Path, PathBuf};
 
 use helix_view::editor::Action;
-use helix_view::review::{DiffSide, ReviewAnchor, Role, ThreadId};
+use helix_view::review::{ReviewAnchor, ReviewRev, Role, ThreadId};
 use helix_view::{Document, DocumentId, Editor, ViewId};
 
 use crate::commands::Context;
 
-/// The file and side the focused view comments on, plus its document id.
-fn identity_in(editor: &Editor) -> Option<(std::path::PathBuf, DiffSide)> {
+/// The file, and the revision of it, the focused view comments on.
+fn identity_in(editor: &Editor) -> Option<(std::path::PathBuf, ReviewRev)> {
     let (view, doc) = current_ref!(editor);
     view.review_identity(doc, &editor.diff.views)
 }
 
-fn identity(cx: &mut Context) -> Option<(std::path::PathBuf, DiffSide)> {
+fn identity(cx: &mut Context) -> Option<(std::path::PathBuf, ReviewRev)> {
     identity_in(cx.editor)
 }
 
@@ -24,7 +24,7 @@ fn threads_in_view(cx: &mut Context) -> Vec<(usize, ThreadId)> {
     if cx.editor.diff.reviews.hidden {
         return Vec::new();
     }
-    let Some((file, side)) = identity(cx) else {
+    let Some((file, rev)) = identity(cx) else {
         return Vec::new();
     };
     let (view, doc) = current_ref!(cx.editor);
@@ -34,8 +34,7 @@ fn threads_in_view(cx: &mut Context) -> Vec<(usize, ThreadId)> {
         .editor
         .diff
         .reviews
-        .for_file(&file)
-        .filter(|thread| thread.side == side)
+        .for_snapshot(&file, &rev)
         .map(|thread| (thread.line_in(&doc.review_anchors, text), thread.id))
         .collect();
     threads.sort_unstable();
@@ -91,7 +90,7 @@ pub fn review_add(cx: &mut Context) {
     // Claim the conversation first. Claiming is what loads the saved threads,
     // and until it happens the store is empty -- so on a freshly opened editor
     // an existing draft is invisible here and a second thread gets opened on
-    // top of it. It also captures the name from the branch the review began on.
+    // top of it.
     let session = cx
         .editor
         .review_session()
@@ -130,7 +129,7 @@ pub fn review_add(cx: &mut Context) {
             let _ = view;
             cx.editor.diff.reviews.get(id).map(|thread| {
                 let line = thread.line_in(&doc.review_anchors, doc.text()) as u32;
-                (thread.file.clone(), thread.side, line)
+                (thread.file.clone(), thread.rev.clone(), line)
             })
         }) else {
             return;
@@ -197,7 +196,7 @@ pub fn review_add(cx: &mut Context) {
         return;
     }
 
-    let Some((file, side)) = identity(cx) else {
+    let Some((file, rev)) = identity(cx) else {
         cx.editor
             .set_error("Cannot comment here: this buffer has no file path");
         return;
@@ -208,7 +207,7 @@ pub fn review_add(cx: &mut Context) {
         cx,
         "comment: ",
         None,
-        (file.clone(), side, line as u32),
+        (file.clone(), rev.clone(), line as u32),
         "",
         move |cx, input, send_now| {
             if input.trim().is_empty() {
@@ -216,7 +215,7 @@ pub fn review_add(cx: &mut Context) {
             }
             let id = cx.editor.diff.reviews.draft(
                 file.clone(),
-                side,
+                rev.clone(),
                 line as u32,
                 input.trim().to_string(),
             );
@@ -624,7 +623,7 @@ fn prompt_at_cursor(
     cx: &mut Context,
     label: &'static str,
     agent_session: Option<String>,
-    anchor: (std::path::PathBuf, DiffSide, u32),
+    anchor: (std::path::PathBuf, ReviewRev, u32),
     initial: &str,
     callback: impl FnMut(&mut crate::compositor::Context, &str, bool) + 'static,
 ) {
@@ -632,7 +631,7 @@ fn prompt_at_cursor(
     // there. A one-line reply should not leave a tall answer underneath it.
     // A resumed draft may already be several lines, so reserve that up front
     // rather than after the first keystroke.
-    let (file, side, line) = anchor;
+    let (file, rev, line) = anchor;
     let body_lines = if initial.is_empty() {
         1
     } else {
@@ -640,7 +639,7 @@ fn prompt_at_cursor(
     };
     cx.editor.diff.reviews.composing = Some(helix_view::review::Composing {
         file,
-        side,
+        rev,
         line,
         rows: body_lines + 1,
     });
@@ -676,19 +675,19 @@ fn compose_prompt(
         return comment.to_string();
     };
     let file = thread.file.clone();
-    let side = thread.side;
+    let rev = thread.rev.clone();
     let stored_line = thread.line as usize;
     // The draft has already become a message. A follow-up is a later turn in
     // the conversation this thread already started. Messages left over from
     // before that conversation existed are not one: the agent has not seen them.
     let is_followup = had_session && thread.messages.len() > 1;
     let earlier = earlier_transcript(thread, had_session);
-    let side_label = match side {
-        DiffSide::Base => "base",
-        DiffSide::Working => "working",
+    let rev_label = match &rev {
+        ReviewRev::Commit(commit) => format!("commit {commit}"),
+        ReviewRev::Worktree => "working tree".to_string(),
     };
 
-    let (line, quoted) = quote_thread(editor, thread_id, &file, side, stored_line);
+    let (line, quoted) = quote_thread(editor, thread_id, &file, &rev, stored_line);
 
     let rewound = editor
         .diff
@@ -709,7 +708,7 @@ fn compose_prompt(
         // already has it. Only the line is worth repeating, since edits may
         // have moved it since the last turn.
         return format!(
-            "A follow-up on the review comment at {}:{} (side: {side_label}).\n\n\
+            "A follow-up on the review comment at {}:{} (revision: {rev_label}).\n\n\
              {rewind_note}\
              follow-up: {comment}\n\n\
              Answer it.",
@@ -728,7 +727,7 @@ fn compose_prompt(
     format!(
         "A review comment was left in the editor.\n\n\
          file: {}\n\
-         side: {side_label}\n\
+         revision: {rev_label}\n\
          line: {}\n\
          {range}\n\
          ```\n{quoted}```\n\n\
@@ -765,16 +764,16 @@ fn earlier_transcript(thread: &helix_view::review::Thread, had_session: bool) ->
     out
 }
 
-/// Quote the document that matches `side`, not whichever buffer happens to be
-/// the working tree. A base-side comment is about the old text.
+/// Quote the revision the thread is about, not whichever buffer happens to be
+/// the working tree. A comment on a commit is about that commit's text.
 fn quote_thread(
     editor: &Editor,
     thread_id: ThreadId,
     file: &Path,
-    side: DiffSide,
+    rev: &ReviewRev,
     stored_line: usize,
 ) -> (usize, String) {
-    if let Some(doc) = document_for_side(editor, file, side) {
+    if let Some(doc) = document_for_snapshot(editor, file, rev) {
         let text = doc.text();
         let line = doc
             .review_anchors
@@ -783,9 +782,9 @@ fn quote_thread(
             .map_or(stored_line, |anchor| anchor.line(text));
         return (line, quote_rope(text, line));
     }
-    let contents = match side {
-        DiffSide::Base => git_revision_text(editor, file),
-        DiffSide::Working => std::fs::read_to_string(file).ok(),
+    let contents = match rev {
+        ReviewRev::Commit(commit) => commit_text(file, commit),
+        ReviewRev::Worktree => std::fs::read_to_string(file).ok(),
     };
     (
         stored_line,
@@ -793,53 +792,17 @@ fn quote_thread(
     )
 }
 
-fn document_for_side<'a>(editor: &'a Editor, file: &Path, side: DiffSide) -> Option<&'a Document> {
-    if let Some(state) = diff_state_for_file(editor, file) {
-        let id = match side {
-            DiffSide::Base => state.base_doc_id,
-            DiffSide::Working => state.working_doc_id,
-        };
-        return editor.document(id);
-    }
-    (side == DiffSide::Working)
-        .then(|| {
-            editor
-                .documents()
-                .find(|doc| !doc.is_virtual_base && doc.path().map(|p| p.as_path()) == Some(file))
-        })
-        .flatten()
-}
-
-fn diff_state_for_file<'a>(
-    editor: &'a Editor,
-    file: &Path,
-) -> Option<&'a helix_view::diff_view::DiffViewState> {
-    editor.diff.views.values().find(|state| {
-        (!state.working_path.as_os_str().is_empty() && state.working_path == file)
-            || (!state.base_path.as_os_str().is_empty() && state.base_path == file)
-    })
-}
-
-fn git_revision_text(editor: &Editor, file: &Path) -> Option<String> {
-    let git_ref = diff_state_for_file(editor, file)
-        .map(|state| state.base_ref.as_str())
-        .or_else(|| {
-            editor
-                .diff
-                .range
-                .as_ref()
-                .map(|range| range.base_ref.as_str())
-        })
-        .unwrap_or("HEAD");
+/// `file` as `commit` has it, for a thread whose snapshot is not open.
+fn commit_text(file: &Path, commit: &str) -> Option<String> {
     #[cfg(feature = "git")]
     {
-        helix_vcs::git::get_diff_base_from_ref(file, git_ref)
+        helix_vcs::git::get_diff_base_from_ref(file, commit)
             .ok()
             .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
     }
     #[cfg(not(feature = "git"))]
     {
-        let _ = git_ref;
+        let _ = (file, commit);
         None
     }
 }
@@ -1665,7 +1628,7 @@ pub fn review_delete(cx: &mut Context) {
 #[derive(Clone)]
 struct ReviewStop {
     file: PathBuf,
-    side: DiffSide,
+    rev: ReviewRev,
     /// Line in the open document when it is loaded, otherwise the stored line.
     line: usize,
     id: ThreadId,
@@ -1674,15 +1637,8 @@ struct ReviewStop {
 /// Where the cursor is, so the next stop can be chosen relative to it.
 struct Here {
     file: PathBuf,
-    side: DiffSide,
+    rev: ReviewRev,
     line: usize,
-}
-
-fn side_rank(side: DiffSide) -> u8 {
-    match side {
-        DiffSide::Base => 0,
-        DiffSide::Working => 1,
-    }
 }
 
 fn scratch_key(id: DocumentId) -> PathBuf {
@@ -1694,34 +1650,23 @@ fn is_scratch_key(file: &Path) -> bool {
         .is_some_and(|name| name.starts_with("[scratch "))
 }
 
-/// The open document whose review threads are keyed as `(file, side)`.
+/// The open document whose review threads are keyed as `(file, rev)`.
 ///
-/// A diff state's working path is the store key for both panes. Matching
-/// `base_path` as well would hand a buffer-diff's working document back when
-/// the caller asked about the other file.
-fn document_for_stop<'a>(editor: &'a Editor, file: &Path, side: DiffSide) -> Option<&'a Document> {
-    if let Some(state) = editor
-        .diff
-        .views
-        .values()
-        .find(|state| state.working_path == file)
-    {
-        let id = match side {
-            DiffSide::Base => state.base_doc_id,
-            DiffSide::Working => state.working_doc_id,
-        };
-        if let Some(doc) = editor.document(id) {
-            return Some(doc);
-        }
+/// A diff pane is found the same way as a buffer on its own: the snapshot it
+/// shows is what names it, not which side of the diff it is on.
+fn document_for_snapshot<'a>(
+    editor: &'a Editor,
+    file: &Path,
+    rev: &ReviewRev,
+) -> Option<&'a Document> {
+    let found = editor.documents().find(|doc| {
+        helix_view::review::review_key(doc, editor.diff.views.values())
+            .is_some_and(|(path, doc_rev)| path == file && &doc_rev == rev)
+    });
+    if found.is_some() || *rev != ReviewRev::Worktree {
+        return found;
     }
-    if side != DiffSide::Working {
-        return None;
-    }
-    if let Some(doc) = editor.document_by_path(file) {
-        if !doc.is_virtual_base {
-            return Some(doc);
-        }
-    }
+    // A scratch buffer out of the buffer diff that named it.
     editor
         .documents()
         .find(|doc| doc.path().is_none() && scratch_key(doc.id()) == file)
@@ -1729,16 +1674,16 @@ fn document_for_stop<'a>(editor: &'a Editor, file: &Path, side: DiffSide) -> Opt
 
 /// A view that already shows this comment. The focused one wins, so a jump
 /// inside the current pane does not leap to another split of the same file.
-fn view_showing(editor: &Editor, file: &Path, side: DiffSide) -> Option<ViewId> {
+fn view_showing(editor: &Editor, file: &Path, rev: &ReviewRev) -> Option<ViewId> {
     let mut fallback = None;
     for (view, focused) in editor.tree.views() {
         let Some(doc) = editor.document(view.doc) else {
             continue;
         };
-        let Some((path, view_side)) = view.review_identity(doc, &editor.diff.views) else {
+        let Some((path, view_rev)) = view.review_identity(doc, &editor.diff.views) else {
             continue;
         };
-        if path == file && view_side == side {
+        if path == file && &view_rev == rev {
             if focused {
                 return Some(view.id);
             }
@@ -1748,8 +1693,14 @@ fn view_showing(editor: &Editor, file: &Path, side: DiffSide) -> Option<ViewId> 
     fallback
 }
 
-fn resolved_line(editor: &Editor, id: ThreadId, stored: u32, file: &Path, side: DiffSide) -> usize {
-    let Some(doc) = document_for_stop(editor, file, side) else {
+fn resolved_line(
+    editor: &Editor,
+    id: ThreadId,
+    stored: u32,
+    file: &Path,
+    rev: &ReviewRev,
+) -> usize {
+    let Some(doc) = document_for_snapshot(editor, file, rev) else {
         return stored as usize;
     };
     doc.review_anchors
@@ -1759,20 +1710,17 @@ fn resolved_line(editor: &Editor, id: ThreadId, stored: u32, file: &Path, side: 
         .unwrap_or(stored as usize)
 }
 
-/// Working-tree comments can be opened. Base-side comments only exist on a
-/// split pane; a single-pane diff reuses the working view, so there is nowhere
-/// to show the base text without tearing that diff down.
-fn stop_is_reachable(editor: &Editor, file: &Path, side: DiffSide) -> bool {
-    if view_showing(editor, file, side).is_some() {
+/// Working-tree comments can be opened from disk. A comment on a commit is
+/// reachable while that commit's snapshot of the file is open somewhere; it is
+/// not fetched from git just to be stepped through.
+fn stop_is_reachable(editor: &Editor, file: &Path, rev: &ReviewRev) -> bool {
+    if view_showing(editor, file, rev).is_some() {
         return true;
     }
-    if side != DiffSide::Working {
-        return false;
-    }
-    if document_for_stop(editor, file, side).is_some() {
+    if document_for_snapshot(editor, file, rev).is_some() {
         return true;
     }
-    !is_scratch_key(file) && file.is_file()
+    *rev == ReviewRev::Worktree && !is_scratch_key(file) && file.is_file()
 }
 
 fn review_stops(editor: &Editor) -> Vec<ReviewStop> {
@@ -1780,36 +1728,43 @@ fn review_stops(editor: &Editor) -> Vec<ReviewStop> {
         .diff
         .reviews
         .iter()
-        .map(|thread| (thread.file.clone(), thread.side, thread.line, thread.id))
+        .map(|thread| {
+            (
+                thread.file.clone(),
+                thread.rev.clone(),
+                thread.line,
+                thread.id,
+            )
+        })
         .collect();
     let mut stops = Vec::new();
-    for (file, side, stored, id) in pending {
-        if !stop_is_reachable(editor, &file, side) {
+    for (file, rev, stored, id) in pending {
+        if !stop_is_reachable(editor, &file, &rev) {
             continue;
         }
         stops.push(ReviewStop {
-            line: resolved_line(editor, id, stored, &file, side),
+            line: resolved_line(editor, id, stored, &file, &rev),
             file,
-            side,
+            rev,
             id,
         });
     }
     stops.sort_by(|a, b| {
         a.file
             .cmp(&b.file)
-            .then(side_rank(a.side).cmp(&side_rank(b.side)))
+            .then(a.rev.cmp(&b.rev))
             .then(a.line.cmp(&b.line))
             .then(a.id.cmp(&b.id))
     });
     stops
 }
 
-fn stop_key(stop: &ReviewStop) -> (&Path, u8, usize) {
-    (stop.file.as_path(), side_rank(stop.side), stop.line)
+fn stop_key(stop: &ReviewStop) -> (&Path, &ReviewRev, usize) {
+    (stop.file.as_path(), &stop.rev, stop.line)
 }
 
-fn here_key(here: &Here) -> (&Path, u8, usize) {
-    (here.file.as_path(), side_rank(here.side), here.line)
+fn here_key(here: &Here) -> (&Path, &ReviewRev, usize) {
+    (here.file.as_path(), &here.rev, here.line)
 }
 
 fn pick_stop_index(
@@ -1859,11 +1814,13 @@ fn comment_status(stops: &[ReviewStop], index: usize) -> String {
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| stop.file.display().to_string());
-    match (several_files, stop.side) {
-        (true, DiffSide::Base) => format!("Comment {n}/{total} · {name} (base)"),
-        (true, DiffSide::Working) => format!("Comment {n}/{total} · {name}"),
-        (false, DiffSide::Base) => format!("Comment {n}/{total} (base)"),
-        (false, DiffSide::Working) => format!("Comment {n}/{total}"),
+    match (several_files, &stop.rev) {
+        (true, ReviewRev::Commit(_)) => {
+            format!("Comment {n}/{total} · {name} @ {}", stop.rev.short())
+        }
+        (true, ReviewRev::Worktree) => format!("Comment {n}/{total} · {name}"),
+        (false, ReviewRev::Commit(_)) => format!("Comment {n}/{total} @ {}", stop.rev.short()),
+        (false, ReviewRev::Worktree) => format!("Comment {n}/{total}"),
     }
 }
 
@@ -1888,7 +1845,7 @@ fn move_to_review_line(editor: &mut Editor, line: usize, record_jump: bool) {
 /// Focus a pane that already shows `stop`. `switch` would replace the document
 /// under a diff and leave the diff state describing a file it no longer shows.
 fn focus_stop(editor: &mut Editor, stop: &ReviewStop) -> bool {
-    let Some(view_id) = view_showing(editor, &stop.file, stop.side) else {
+    let Some(view_id) = view_showing(editor, &stop.file, &stop.rev) else {
         return false;
     };
     if editor.tree.focus != view_id {
@@ -1928,14 +1885,9 @@ fn show_stop(editor: &mut Editor, stop: &ReviewStop) -> bool {
         editor.set_error("No view to show the review comment");
         return false;
     }
-    if stop.side != DiffSide::Working {
-        editor.set_error("That review comment is on a diff base that is not open");
-        return false;
-    }
-
     // Copy the id out before switching: the document borrow cannot live across
     // `switch`, which needs the editor mutably.
-    let doc_id = document_for_stop(editor, &stop.file, stop.side).map(|doc| doc.id());
+    let doc_id = document_for_snapshot(editor, &stop.file, &stop.rev).map(|doc| doc.id());
     if let Some(doc_id) = doc_id {
         let current = editor.tree.get(editor.tree.focus).doc;
         let switched = current != doc_id;
@@ -1945,6 +1897,15 @@ fn show_stop(editor: &mut Editor, stop: &ReviewStop) -> bool {
         }
         move_to_review_line(editor, stop.line, !switched);
         return true;
+    }
+
+    if stop.rev != ReviewRev::Worktree {
+        editor.set_error(format!(
+            "That review comment is on {} @ {}, which is not open",
+            stop.file.display(),
+            stop.rev.short()
+        ));
+        return false;
     }
 
     match editor.open(&stop.file, Action::Replace) {
@@ -2005,10 +1966,11 @@ fn goto_review_comment_impl(cx: &mut Context, forward: bool) {
 
 /// `]C` / `[C`: every review comment in the session, switching buffers.
 ///
-/// Order is the file path, then the base side before the working side, then
-/// the line. The list wraps. A pane that already shows the comment is focused.
-/// A working-tree file that is not open is opened. A diff or merge pane is
-/// left only when the next comment lives in some other file.
+/// Order is the file path, then its commits' comments before its working
+/// tree's, then the line. The list wraps. A pane that already shows the
+/// comment is focused. A working-tree file that is not open is opened, and a
+/// commit's snapshot that is open but not shown is switched to. A diff or
+/// merge pane is left only when the next comment lives in some other file.
 fn goto_review_comment_across_buffers(cx: &mut Context, forward: bool) {
     if cx.editor.diff.reviews.hidden {
         cx.editor.set_error("Review comments are hidden");
@@ -2019,9 +1981,9 @@ fn goto_review_comment_across_buffers(cx: &mut Context, forward: bool) {
         cx.editor.set_error("No review comments");
         return;
     }
-    let here = identity(cx).map(|(file, side)| Here {
+    let here = identity(cx).map(|(file, rev)| Here {
         file,
-        side,
+        rev,
         line: cursor_line(cx),
     });
     let index = pick_stop_index(&stops, here.as_ref(), forward, cx.count());
@@ -2272,66 +2234,66 @@ mod test {
         assert_eq!((input.text().as_str(), input.col), (" cödé", 0));
     }
 
-    fn stop(file: &str, side: super::DiffSide, line: usize) -> super::ReviewStop {
+    const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    fn stop(file: &str, rev: super::ReviewRev, line: usize) -> super::ReviewStop {
+        let id = super::ThreadId(line as u32 + u32::from(rev == super::ReviewRev::Worktree));
         super::ReviewStop {
             file: PathBuf::from(file),
-            side,
+            rev,
             line,
-            id: super::ThreadId(line as u32 + super::side_rank(side) as u32),
+            id,
+        }
+    }
+
+    fn here(file: &str, rev: super::ReviewRev, line: usize) -> super::Here {
+        super::Here {
+            file: PathBuf::from(file),
+            rev,
+            line,
         }
     }
 
     #[test]
     fn review_stops_walk_files_in_path_order_and_wrap() {
-        use super::DiffSide::{Base, Working};
-        use super::{pick_stop_index, Here};
+        use super::pick_stop_index;
+        use super::ReviewRev::{Commit, Worktree};
 
         let stops = vec![
-            stop("a.rs", Working, 1),
-            stop("a.rs", Working, 8),
-            stop("b.rs", Working, 0),
+            stop("a.rs", Worktree, 1),
+            stop("a.rs", Worktree, 8),
+            stop("b.rs", Worktree, 0),
         ];
-        let on_second = Here {
-            file: PathBuf::from("a.rs"),
-            side: Working,
-            line: 8,
-        };
+        let on_second = here("a.rs", Worktree, 8);
         assert_eq!(pick_stop_index(&stops, Some(&on_second), true, 1), 2);
         assert_eq!(
             pick_stop_index(&stops, Some(&on_second), true, 2),
             0,
             "a count wraps to the first comment"
         );
-        let on_first = Here {
-            file: PathBuf::from("a.rs"),
-            side: Working,
-            line: 1,
-        };
+        let on_first = here("a.rs", Worktree, 1);
         assert_eq!(pick_stop_index(&stops, Some(&on_first), false, 1), 2);
-        let on_beta = Here {
-            file: PathBuf::from("b.rs"),
-            side: Working,
-            line: 0,
-        };
+        let on_beta = here("b.rs", Worktree, 0);
         assert_eq!(pick_stop_index(&stops, Some(&on_beta), false, 1), 1);
 
-        // Base comments of a file come before its working comments, so [C
-        // from the first working comment lands on the base side. ]C wraps
-        // back to it once the working side runs out.
-        let with_base = vec![stop("a.rs", Base, 3), stop("a.rs", Working, 1)];
-        let on_working = Here {
-            file: PathBuf::from("a.rs"),
-            side: Working,
-            line: 1,
-        };
-        assert_eq!(pick_stop_index(&with_base, Some(&on_working), false, 1), 0);
-        assert_eq!(pick_stop_index(&with_base, Some(&on_working), true, 1), 0);
-        let on_base = Here {
-            file: PathBuf::from("a.rs"),
-            side: Base,
-            line: 3,
-        };
-        assert_eq!(pick_stop_index(&with_base, Some(&on_base), true, 1), 1);
+        // A file's comments on a commit come before those on its working tree,
+        // so [C from the first working-tree comment lands on the commit's. ]C
+        // wraps back to it once the working tree's run out.
+        let with_commit = vec![
+            stop("a.rs", Commit(SHA.into()), 3),
+            stop("a.rs", Worktree, 1),
+        ];
+        let on_worktree = here("a.rs", Worktree, 1);
+        assert_eq!(
+            pick_stop_index(&with_commit, Some(&on_worktree), false, 1),
+            0
+        );
+        assert_eq!(
+            pick_stop_index(&with_commit, Some(&on_worktree), true, 1),
+            0
+        );
+        let on_commit = here("a.rs", Commit(SHA.into()), 3);
+        assert_eq!(pick_stop_index(&with_commit, Some(&on_commit), true, 1), 1);
 
         assert_eq!(pick_stop_index(&stops, None, true, 1), 0);
         assert_eq!(pick_stop_index(&stops, None, false, 1), 2);

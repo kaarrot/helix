@@ -619,7 +619,10 @@ async fn opening_working_tree_path_keeps_revision_buffers() -> anyhow::Result<()
         let target_doc = app.editor.document(target_doc_id).unwrap();
         assert!(target_doc.url().is_some());
         assert_eq!(
-            target_doc.git_revision.as_ref().map(|(p, _)| p.as_path()),
+            target_doc
+                .git_revision
+                .as_ref()
+                .map(|revision| revision.path.as_path()),
             Some(tracked_path.as_path())
         );
     }

@@ -449,24 +449,24 @@ conversation name and an agent can be given together, in either order:
 with unsaved buffers. `:q!` stops the agent, together with any command it is
 running, and keeps what had arrived of the reply, marked as stopped.
 
-Conversations are saved as they change and come back when you reopen Helix on
-the same branch, including comments you drafted but never sent. They are shown
-as soon as the first file in that worktree opens, and track your edits from
-then on; nothing is written back until you comment. If another running Helix
-owns that branch's conversation, this one shows its own `<branch>#2`
+Conversations are saved as they change and come back when you reopen Helix in
+the same worktree, including comments you drafted but never sent. They are
+shown as soon as the first file in that worktree opens, and track your edits
+from then on; nothing is written back until you comment. If another running
+Helix owns the worktree's conversation, this one shows its own `worktree#2`
 conversation instead. Ones nothing has touched for a year are deleted
 automatically.
 
-Each branch has its own conversation, started by the first comment on it.
-Check out another branch and Helix moves to that branch's conversation as soon
-as it notices: when the terminal regains focus, when a file is opened, or on
-`:reload` / `:reload-all`. The conversation it leaves is saved first. Threads on
-a file the checkout changed settle onto its new text once that buffer is
-reloaded. A reply still arriving at that moment is marked as stopped. While
-HEAD is detached, as during a rebase, the conversation stays where it is.
+Each worktree has one conversation, whatever is checked out. A comment is about
+the revision it was left on: a file opened from disk, or a diff's working-tree
+pane, is the working tree, and a snapshot such as `foo.rs @ abc1234` is that
+commit, kept by its full hash. It is shown wherever that revision is shown, in
+either pane of any diff. Comments on the working tree stay on the file through
+a commit, a stash or a checkout, and follow its text on `:reload`; nothing is
+copied onto a new commit.
 `:review-session` shows the current conversation and agent.
-`:review-session [name]` names, renames or switches it; a conversation named
-after anything but the branch checked out stays put across checkouts.
+`:review-session [name]` switches to a conversation of that name, kept apart
+from the worktree's; `:review-session worktree` goes back to it.
 `:review-session grok` or `:review-session claude` picks the agent without
 renaming.
 

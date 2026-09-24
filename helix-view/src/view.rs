@@ -703,31 +703,15 @@ impl View {
         }
     }
 
-    /// Which file and diff side this view's review threads belong to.
-    ///
-    /// A split diff's base pane holds a virtual document whose `path` was
-    /// cleared by `Document::from_git_revision`, so it cannot name its own file;
-    /// the diff state is the only thing that can. Ordinary buffers and the
-    /// default single-pane diff (same view id on both sides) are the working
-    /// side of their path.
+    /// Which file and revision this view's review threads belong to: those of
+    /// the document it shows, whichever diff pane it is, if any. See
+    /// [`crate::review::review_key`].
     pub fn review_identity(
         &self,
         doc: &Document,
         diff_views: &std::collections::HashMap<ViewId, crate::diff_view::DiffViewState>,
-    ) -> Option<(std::path::PathBuf, crate::review::DiffSide)> {
-        match diff_views.get(&self.id) {
-            Some(diff_state) if diff_state.is_split() && diff_state.is_base_view(self.id) => {
-                Some((
-                    review_diff_file(diff_state, doc)?,
-                    crate::review::DiffSide::Base,
-                ))
-            }
-            Some(diff_state) => Some((
-                review_diff_file(diff_state, doc)?,
-                crate::review::DiffSide::Working,
-            )),
-            None => Some((doc.path()?.to_path_buf(), crate::review::DiffSide::Working)),
-        }
+    ) -> Option<(std::path::PathBuf, crate::review::ReviewRev)> {
+        crate::review::review_key(doc, diff_views.get(&self.id))
     }
 
     /// Build this view's virtual-row plan.
@@ -773,10 +757,10 @@ impl View {
 
         // Space for an open input, even where no thread exists yet, so the
         // code below moves aside for it rather than being covered by it.
-        if let (Some(composing), Some((file, side))) =
+        if let (Some(composing), Some((file, rev))) =
             (&reviews.composing, self.review_identity(doc, diff_views))
         {
-            if composing.file == file && composing.side == side {
+            if composing.file == file && composing.rev == rev {
                 builder.add_comment_rows(
                     composing.line as usize,
                     vec![crate::annotations::rows::VirtualRow::Composing; composing.rows],
@@ -785,7 +769,7 @@ impl View {
         }
 
         if !reviews.is_empty() && !reviews.hidden {
-            if let Some((file, side)) = self.review_identity(doc, diff_views) {
+            if let Some((file, rev)) = self.review_identity(doc, diff_views) {
                 let width = self.inner_width(doc) as usize;
                 // Never let a box take more than half the window: the code it
                 // is about has to stay visible, and a box taller than the window
@@ -795,7 +779,7 @@ impl View {
                 // Which box the reader is on, so it can be drawn as the one
                 // they are acting on rather than one of several alike.
                 let cursor_line = doc.selection(self.id).primary().cursor_line(text.slice(..));
-                for thread in reviews.for_file(&file).filter(|thread| thread.side == side) {
+                for thread in reviews.for_snapshot(&file, &rev) {
                     // An open document's anchor leads; the stored line is the
                     // fallback for a thread whose document was reopened.
                     let line = thread.line_in(&doc.review_anchors, text);
@@ -838,17 +822,6 @@ impl View {
 /// Git diffs always set `working_path`. Buffer diffs should too; if they do
 /// not, fall back to the document's own path so comments are not stored under
 /// an empty path and then lost when the diff closes.
-fn review_diff_file(
-    diff_state: &crate::diff_view::DiffViewState,
-    doc: &Document,
-) -> Option<std::path::PathBuf> {
-    if !diff_state.working_path.as_os_str().is_empty() {
-        Some(diff_state.working_path.clone())
-    } else {
-        doc.path().cloned()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;

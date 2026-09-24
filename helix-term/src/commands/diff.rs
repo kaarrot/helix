@@ -949,16 +949,35 @@ pub fn diff_commit_from_selection(cx: &mut Context) {
             return;
         };
         let hash = hash.to_string();
-        // Include the selected commit: parent vs working tree.
+        // The selected commit is the base, so its own changes are not shown.
         cx.editor.diff.range = Some(DiffRange {
-            base_ref: format!("{}^", hash),
+            base_ref: hash.clone(),
             target_ref: None,
         });
-        cx.editor
-            .set_status(format!("Diff set: {}^ vs working tree", hash));
+        // With HEAD as the base only uncommitted changes remain, which may be
+        // none at all. Say so, so an empty picker does not look like a bug.
+        let cwd = helix_stdx::env::current_working_dir();
+        let providers = &cx.editor.diff_providers;
+        let is_head = providers
+            .resolve_commit_id(&cwd, &hash)
+            .is_some_and(|id| providers.resolve_commit_id(&cwd, "HEAD") == Some(id));
+        if is_head {
+            cx.editor.set_warning(format!(
+                "Diff set: {} (HEAD) vs working tree: uncommitted changes only, space m C shows the commit",
+                hash
+            ));
+        } else {
+            cx.editor
+                .set_status(format!("Diff set: {} vs working tree", hash));
+        }
     } else {
-        // git log lists newest first. Include both selected endpoints: OLDER^..NEWER.
-        // Typed `:diff-commit A..B` stays exclusive of A; this is log selection.
+        // git log lists newest first. The bottom line is the base and is not
+        // included: OLDER..NEWER, the same as typed `:diff-commit A..B`.
+        //
+        // The two ends are compared as snapshots. On linear history the
+        // line below a commit is its parent, but with merges it may be a
+        // commit from another branch, and the diff then includes that
+        // branch's changes too. Revisit if that turns out to matter.
         let (Some(newer), Some(older)) = (
             extract_commit_hash(lines[0]),
             extract_commit_hash(lines[lines.len() - 1]),
@@ -968,11 +987,11 @@ pub fn diff_commit_from_selection(cx: &mut Context) {
         };
         let (older, newer) = (older.to_string(), newer.to_string());
         cx.editor.diff.range = Some(DiffRange {
-            base_ref: format!("{}^", older),
+            base_ref: older.clone(),
             target_ref: Some(newer.clone()),
         });
         cx.editor
-            .set_status(format!("Diff set: {}^..{}", older, newer));
+            .set_status(format!("Diff set: {}..{}", older, newer));
     }
 }
 

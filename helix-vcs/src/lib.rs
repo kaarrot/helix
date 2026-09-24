@@ -57,6 +57,14 @@ impl DiffProviderRegistry {
             })
     }
 
+    /// The full hash of the commit `rev` names, in the repository holding
+    /// `path`. `None` when it names no commit or the repository cannot be read.
+    pub fn resolve_commit_id(&self, path: &Path, rev: &str) -> Option<String> {
+        self.providers
+            .iter()
+            .find_map(|provider| provider.resolve_commit_id(path, rev).ok())
+    }
+
     /// Fire-and-forget changed file iteration. Runs everything in a background task. Keeps
     /// iteration until `on_change` returns `false`.
     pub fn for_each_changed_file(
@@ -114,6 +122,14 @@ impl DiffProvider {
         match self {
             #[cfg(feature = "git")]
             Self::Git => git::get_current_head_name(_file),
+            Self::None => bail!("No diff support compiled in"),
+        }
+    }
+
+    fn resolve_commit_id(&self, _path: &Path, _rev: &str) -> Result<String> {
+        match self {
+            #[cfg(feature = "git")]
+            Self::Git => git::resolve_commit_id(_path, _rev),
             Self::None => bail!("No diff support compiled in"),
         }
     }

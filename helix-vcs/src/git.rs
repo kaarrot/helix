@@ -408,6 +408,24 @@ fn resolve_commit<'a>(repo: &'a Repository, ref_name: &str) -> Result<Commit<'a>
         .context(format!("'{}' is not a commit", ref_name))
 }
 
+/// The full hash of the commit `rev` names, in the repository holding `path`.
+///
+/// `rev` takes the same spellings as the diff commands: a ref, a tag, a short
+/// or full hash, with an optional `^`. `path` is a file in the repository or
+/// a directory of it, such as the worktree root.
+pub fn resolve_commit_id(path: &Path, rev: &str) -> Result<String> {
+    let repo_dir = if path.is_dir() {
+        path
+    } else {
+        get_repo_dir(path)?
+    };
+    let repo = open_repo(repo_dir)
+        .context("failed to open git repo")?
+        .to_thread_local();
+    let commit = resolve_commit(&repo, rev)?;
+    Ok(commit.id.to_hex().to_string())
+}
+
 fn open_repo(path: &Path) -> Result<ThreadSafeRepository> {
     // custom open options
     let mut git_open_opts_map = gix::sec::trust::Mapping::<gix::open::Options>::default();

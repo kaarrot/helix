@@ -355,7 +355,8 @@ resolution. The commands that open diff or merge views are documented in
 
 ###### Review
 
-Accessed by typing `Space-m-R`. Review comments are anchored to a file and a
+Accessed by typing `Space-m-R`. [Review comments](./review-comments.md) explains
+how they work and walks through a typical review. Review comments are anchored to a file and a
 line, so they work in any buffer — a diff view is simply where they are most
 useful, not a requirement.
 

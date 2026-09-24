@@ -42,6 +42,9 @@ default it shows `HEAD` versus the working tree.
 Selecting a normal entry opens diff view for that file. Selecting a conflicted
 entry opens merge view instead.
 
+To ask an agent about a line while you review, leave a comment on it. See
+[Review comments](./review-comments.md).
+
 ## Split diff controls
 
 Once a diff view is open:

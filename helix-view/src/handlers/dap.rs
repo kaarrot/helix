@@ -345,11 +345,16 @@ impl Editor {
                         });
 
                         if let Err(err) = debugger.disconnect(disconnect_args).await {
-                            self.set_error(format!(
-                                "Cannot disconnect debugger upon terminated event receival {:?}",
-                                err
-                            ));
-                            return false;
+                            // An in-process adapter (debugpy.listen(in_process_debug_adapter=True))
+                            // exits with the debuggee right after `terminated`, so nothing is left
+                            // to answer; the session is over either way.
+                            if !matches!(err, dap::Error::StreamClosed) {
+                                self.set_error(format!(
+                                    "Cannot disconnect debugger upon terminated event receival {:?}",
+                                    err
+                                ));
+                                return false;
+                            }
                         }
 
                         match restart_arg {

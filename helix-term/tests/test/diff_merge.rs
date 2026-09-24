@@ -315,10 +315,10 @@ async fn merge_mode_commit_commands_use_selected_git_log_lines() -> anyhow::Resu
         Some(&|app| {
             assert_status(
                 app,
-                &format!("Diff set: {oldest}^..{newest}"),
+                &format!("Diff set: {oldest}..{newest}"),
                 Severity::Info,
             );
-            assert_diff_range(app, &format!("{oldest}^"), Some(&newest));
+            assert_diff_range(app, &oldest, Some(&newest));
         }),
         false,
     )
@@ -336,10 +336,33 @@ async fn merge_mode_commit_commands_use_selected_git_log_lines() -> anyhow::Resu
         Some(&|app| {
             assert_status(
                 app,
-                &format!("Diff set: {newest}^ vs working tree"),
+                &format!(
+                    "Diff set: {newest} (HEAD) vs working tree: uncommitted changes only, space m C shows the commit"
+                ),
+                Severity::Warning,
+            );
+            assert_diff_range(app, &newest, None);
+        }),
+        false,
+    )
+    .await?;
+
+    let single_older_c = format!("#[{oldest} older commit|]#\n");
+    let mut app = AppBuilder::new()
+        .with_file(repo.file("log.txt"), None)
+        .with_input_text(single_older_c)
+        .build()?;
+
+    test_key_sequence(
+        &mut app,
+        Some("<space>mc"),
+        Some(&|app| {
+            assert_status(
+                app,
+                &format!("Diff set: {oldest} vs working tree"),
                 Severity::Info,
             );
-            assert_diff_range(app, &format!("{newest}^"), None);
+            assert_diff_range(app, &oldest, None);
         }),
         false,
     )

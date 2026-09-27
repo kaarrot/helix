@@ -24,7 +24,7 @@ use tui::{
 };
 
 /// Output rows scrolled per mouse-wheel notch.
-const WHEEL_LINES: usize = 3;
+const WHEEL_LINES: usize = 1;
 
 /// Keep this many rows of context above the source cursor's mapped line.
 const TOP_MARGIN: usize = 3;
@@ -138,8 +138,56 @@ impl MarkdownPreview {
     }
 
     fn scroll_lines(&mut self, delta: isize) {
-        let max = self.total_rows().saturating_sub(1) as isize;
-        self.scroll = (self.scroll as isize + delta).clamp(0, max) as usize;
+        let height = self.area.height.max(1) as usize;
+        let max = self.total_rows().saturating_sub(height) as isize;
+        self.scroll = (self.scroll as isize + delta).clamp(0, max.max(0)) as usize;
+    }
+
+    fn move_cursor(&mut self, delta: isize) -> EventResult {
+        if self.total_lines == 0 {
+            return EventResult::Consumed(None);
+        }
+        let height = self.area.height.max(1) as usize;
+        let max_line = self.total_lines.saturating_sub(1);
+
+        let cursor_row = self.row_starts.get(self.cursor_line).copied().unwrap_or(0);
+        let current_line = if cursor_row < self.scroll {
+            self.rendered_line_at_row(self.scroll)
+        } else if cursor_row >= self.scroll + height {
+            self.rendered_line_at_row((self.scroll + height).saturating_sub(1))
+        } else {
+            self.cursor_line
+        };
+
+        let new_line = (current_line as isize + delta).clamp(0, max_line as isize) as usize;
+        self.cursor_line = new_line;
+
+        let margin = TOP_MARGIN.min(height.saturating_sub(1) / 2);
+        let line_start = self.row_starts.get(new_line).copied().unwrap_or(0);
+        let line_end = self
+            .row_starts
+            .get(new_line + 1)
+            .copied()
+            .unwrap_or(line_start + 1);
+
+        if line_start < self.scroll + margin {
+            self.scroll = line_start.saturating_sub(margin);
+        } else if line_end + margin > self.scroll + height {
+            self.scroll = (line_end + margin).saturating_sub(height);
+        }
+        let max_scroll = self.total_rows().saturating_sub(height);
+        self.scroll = self.scroll.min(max_scroll);
+
+        if let Some(src_line) = self.source_line_for_rendered(new_line) {
+            self.last_source_line = Some(src_line);
+            let view = self.source_view;
+            let doc = self.source_doc;
+            EventResult::Consumed(Some(Box::new(move |_compositor, cx: &mut Context| {
+                goto_source_line(cx.editor, view, doc, src_line, false);
+            })))
+        } else {
+            EventResult::Consumed(None)
+        }
     }
 
     fn rendered_line_at_row(&self, output_row: usize) -> usize {
@@ -153,9 +201,10 @@ impl MarkdownPreview {
         idx.min(self.total_lines - 1)
     }
 
-    fn goto_source(&self, rendered_line: usize) -> EventResult {
+    fn goto_source(&mut self, rendered_line: usize) -> EventResult {
         match self.source_line_for_rendered(rendered_line) {
             Some(src_line) => {
+                self.last_source_line = Some(src_line);
                 let view = self.source_view;
                 let doc = self.source_doc;
                 EventResult::Consumed(Some(Box::new(move |_compositor, cx: &mut Context| {
@@ -224,6 +273,32 @@ impl MarkdownPreview {
                     return self
                         .follow_link_at(self.cursor_line, None)
                         .unwrap_or(EventResult::Ignored(None));
+                }
+                key!('j') | key!(Down) => return self.move_cursor(1),
+                key!('k') | key!(Up) => return self.move_cursor(-1),
+                ctrl!('e') => {
+                    self.scroll_lines(1);
+                    return EventResult::Consumed(None);
+                }
+                ctrl!('y') => {
+                    self.scroll_lines(-1);
+                    return EventResult::Consumed(None);
+                }
+                ctrl!('d') | key!(PageDown) | ctrl!('f') => {
+                    let half = (self.area.height as isize / 2).max(1);
+                    return self.move_cursor(half);
+                }
+                ctrl!('u') | key!(PageUp) | ctrl!('b') => {
+                    let half = (self.area.height as isize / 2).max(1);
+                    return self.move_cursor(-half);
+                }
+                key!(Home) => {
+                    let total = self.total_lines as isize;
+                    return self.move_cursor(-total);
+                }
+                key!(End) => {
+                    let total = self.total_lines as isize;
+                    return self.move_cursor(total);
                 }
                 _ => {}
             }
@@ -309,11 +384,7 @@ impl Component for MarkdownPreview {
         };
         self.side_by_side = side_by_side;
 
-        let title = if side_by_side {
-            "Markdown preview  (q/Esc close · Enter follow link)"
-        } else {
-            "Markdown preview  (q/Esc close · navigate source · Enter follow link)"
-        };
+        let title = "Markdown preview  (q/Esc close · j/k scroll · Enter follow link)";
         let block = Block::bordered().title(title);
         let inner = block.inner(panel);
         surface.clear_with(panel, cx.editor.theme.get("ui.popup"));
@@ -366,10 +437,27 @@ impl Component for MarkdownPreview {
 
         if let Some(source_line) = self.source_cursor_line(cx.editor) {
             if self.last_source_line != Some(source_line) {
+                let first_open = self.last_source_line.is_none();
                 self.last_source_line = Some(source_line);
                 if let Some(rendered) = self.rendered_line_for_source(source_line) {
                     self.cursor_line = rendered;
-                    self.scroll = self.row_starts[rendered].saturating_sub(TOP_MARGIN);
+                    let target_start = self.row_starts.get(rendered).copied().unwrap_or(0);
+                    let target_end = self
+                        .row_starts
+                        .get(rendered + 1)
+                        .copied()
+                        .unwrap_or(target_start + 1);
+                    if first_open {
+                        self.scroll = target_start.saturating_sub(TOP_MARGIN);
+                    } else {
+                        let height = inner.height as usize;
+                        let margin = TOP_MARGIN.min(height.saturating_sub(1) / 2);
+                        if target_start < self.scroll + margin {
+                            self.scroll = target_start.saturating_sub(margin);
+                        } else if target_end + margin > self.scroll + height {
+                            self.scroll = (target_end + margin).saturating_sub(height);
+                        }
+                    }
                 }
             }
         }
@@ -507,3 +595,75 @@ fn open_path_in_editor(compositor: &mut Compositor, cx: &mut Context, path: &Pat
         true
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_preview(total_lines: usize, height: u16) -> MarkdownPreview {
+        let mut preview = MarkdownPreview::new(
+            ViewId::default(),
+            DocumentId::default(),
+            PathBuf::new(),
+            false,
+        );
+        preview.total_lines = total_lines;
+        preview.row_starts = (0..=total_lines).collect();
+        preview.area = Rect::new(0, 0, 80, height);
+        preview
+    }
+
+    #[test]
+    fn mouse_wheel_scrolls_single_line() {
+        assert_eq!(WHEEL_LINES, 1);
+        let mut preview = test_preview(50, 10);
+        assert_eq!(preview.scroll, 0);
+
+        preview.scroll_lines(WHEEL_LINES as isize);
+        assert_eq!(preview.scroll, 1);
+
+        preview.scroll_lines(WHEEL_LINES as isize);
+        assert_eq!(preview.scroll, 2);
+
+        preview.scroll_lines(-(WHEEL_LINES as isize));
+        assert_eq!(preview.scroll, 1);
+    }
+
+    #[test]
+    fn move_cursor_scrolls_smoothly_line_by_line() {
+        let mut preview = test_preview(50, 10);
+        // Start cursor at row 0, scroll at 0. Margin is TOP_MARGIN (3).
+        assert_eq!(preview.cursor_line, 0);
+        assert_eq!(preview.scroll, 0);
+
+        // Moving down within the viewport: cursor moves, scroll does not jump.
+        preview.move_cursor(1);
+        assert_eq!(preview.cursor_line, 1);
+        assert_eq!(preview.scroll, 0);
+
+        preview.move_cursor(1);
+        assert_eq!(preview.cursor_line, 2);
+        assert_eq!(preview.scroll, 0);
+
+        // Move to row 6 (line_end = 7, 7 + 3 = 10 == scroll + height). Still no scroll.
+        preview.move_cursor(4);
+        assert_eq!(preview.cursor_line, 6);
+        assert_eq!(preview.scroll, 0);
+
+        // Moving to row 7: 8 + 3 = 11 > 10. Scrolls down by 1 row smoothly.
+        preview.move_cursor(1);
+        assert_eq!(preview.cursor_line, 7);
+        assert_eq!(preview.scroll, 1);
+
+        // Move down another row: scrolls down another row smoothly.
+        preview.move_cursor(1);
+        assert_eq!(preview.cursor_line, 8);
+        assert_eq!(preview.scroll, 2);
+
+        // Move up: cursor moves up, scroll stays at 2 until hitting top margin.
+        preview.move_cursor(-1);
+        assert_eq!(preview.cursor_line, 7);
+        assert_eq!(preview.scroll, 2);
+    }
+}
+

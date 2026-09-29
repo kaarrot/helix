@@ -2,8 +2,8 @@
 
 Leave a comment on any line of code and an AI agent answers it right there, in a
 box under that line. You keep editing as normal while it works. The
-conversation stays attached to the line as the code moves, and it is still there
-the next time you open Helix in the same worktree.
+conversation stays attached to the line as the code moves, and a comment on your
+working changes is still there the next time you open Helix on the same branch.
 
 ```
    41 │ fn resolve_commit(repo, rev) {
@@ -14,15 +14,17 @@ the next time you open Helix in the same worktree.
    42 │     let commit = ...
 ```
 
-Comments work in any buffer. They are most useful in a [diff view](./diff-and-merge.md),
-where you are already reading changes line by line, but you do not need one.
+Comments work in any buffer, on any file, inside the project or not. They are
+most useful in a [diff view](./diff-and-merge.md), where you are already reading
+changes line by line, but you do not need one.
 
-> **The agent can change your files.** It runs with full access to the
-> worktree: it can edit files and run commands without asking, because a
-> comment on a line usually asks for a change to it. A process started by Helix
-> has no terminal to ask you in, so there is no approval step. Its edits show
-> up in the diff you are reviewing. Treat it like any agent with write access to
-> your checkout.
+> **The agent can change your files.** It runs in the project with full
+> access: it can edit files and run commands without asking, because a comment
+> on a line usually asks for a change to it. A process started by Helix has no
+> terminal to ask you in, so there is no approval step. Its edits show up in the
+> diff you are reviewing. A file outside the project is marked in the prompt as
+> being there for reference, but nothing stops the agent editing it. Treat it
+> like any agent with write access to your checkout.
 
 <!-- toc -->
 
@@ -35,11 +37,13 @@ Everything else follows from three ideas:
 | Idea | What it is | How many |
 | --- | --- | --- |
 | **Thread** | One comment and the replies to it, anchored to one line of one revision of a file. Shown as one box. | One per commented line of each revision |
-| **Review conversation** | Every thread in one worktree, on any file and any revision, saved together in one file. | One per worktree |
+| **Review conversation** | Every thread on the project's working tree while one branch is checked out, saved together in one file. | One per branch |
 | **Agent conversation** | The agent's own memory of one thread. Each thread gets its own, so the agent answering one comment never sees another. | One per thread |
 
-So a worktree with five comments has one review conversation that holds five
-threads, and each of those threads has its own agent conversation.
+So a branch with five comments has one review conversation that holds five
+threads, and each of those threads has its own agent conversation. A thread on a
+commit or outside the project belongs to no review conversation: it lasts until
+Helix exits (see [Which comments are kept](#which-comments-are-kept)).
 
 ### Where things are stored
 
@@ -50,7 +54,7 @@ state directory, plus `review`):
 | --- | --- | --- |
 | `<uuid>.threads.json` | Every thread of one review conversation: file, revision, line, messages, any unsent draft | Shortly after anything changes, at most every 0.5 seconds |
 | `<uuid>.json` | A lock: which running Helix owns this review conversation | On your first comment, removed when Helix exits |
-| `<uuid>.started` | A marker that one thread's agent conversation exists, so the next turn continues it rather than starting afresh | After that thread's first reply |
+| `<uuid>.started` | A marker that one thread's agent conversation exists, so the next turn continues it rather than starting afresh | After a kept thread's first reply; a temporary thread keeps it in memory |
 
 The agent's full transcript is not kept by Helix. It lives wherever the agent
 keeps its own sessions. Files nothing has touched for a year are deleted
@@ -62,18 +66,19 @@ The file name of a review conversation is not looked up anywhere. It is
 **computed** from where you are:
 
 ```
-uuid = UUIDv5( "helix-review" : <worktree path> : worktree )
+uuid = UUIDv5( "helix-review" : <project path> : <branch> )
 ```
 
-The same worktree always gives the same UUID, whatever is checked out, so
-reopening Helix finds the same file with nothing to configure. Another worktree
-gives another UUID, and therefore a separate conversation. `worktree` is the
-conversation's name; `:review-session <name>` puts a name of your own in its
-place.
+The project is the worktree of the repository Helix was started in. It is
+worked out once, so `:cd` does not change it. The same branch of the same
+project always gives the same UUID, so reopening Helix finds the same file with
+nothing to configure. Another branch or another worktree gives another UUID, and
+therefore a separate conversation. The branch is the conversation's name;
+`:review-session <name>` puts a name of your own in its place.
 
-When the first file of a worktree opens, Helix works out the UUID, loads that
-file and shows the threads that belong on it. This is only looking: nothing is
-saved and nothing is locked until you leave a comment.
+When the first file opens, Helix works out the UUID, loads that file and shows
+the threads that belong on it. This is only looking: nothing is saved and
+nothing is locked until you leave a comment that is kept.
 
 ### From comment to reply
 
@@ -110,54 +115,78 @@ is written back, so the thread reopens in the right place. If the line itself is
 deleted, the thread is kept and drawn dimmed where the line used to be, rather
 than thrown away.
 
-### Which revision a comment is about
+### Which comments are kept
 
-A comment is about one version of a file, and is shown wherever that version is
-shown:
+Only comments on your working changes are kept. Everything else is a note for
+now:
 
-| Where you comment | The thread is about | It is shown on |
+| Where you comment | The thread is about | It lasts |
 | --- | --- | --- |
-| A file opened from disk, or the working-tree pane of a diff | The working tree | That file, opened from disk, in a diff or not |
-| A snapshot such as `foo.rs @ abc1234`: the old pane of a diff, or either pane of a commit or range diff | That commit | That commit's snapshot of the file, in either pane of any diff |
+| A file of the project, opened from disk or in the working-tree pane of a diff | The working tree | Saved with the branch's conversation |
+| A snapshot such as `foo.rs @ abc1234`: the old pane of a diff, or either pane of a commit or range diff | That commit | Until Helix exits |
+| A file outside the project: another repository, a library's source, a file in no repository | The file | Until Helix exits |
+| Anywhere while HEAD is detached, or with Helix started outside any repository | The working tree | Until Helix exits |
 
-- **A commit is kept by its full hash.** The pane can say `foo.rs @ HEAD`, but a
-  comment on it is about the commit `HEAD` named when the pane opened, and it
-  stays on that commit after `HEAD` moves on.
+The comment box says `comment (this session only)` for a comment that will not
+be kept. Closing its buffer does not remove it: it comes back if you open that
+file or snapshot again, until you quit.
+
+- **A comment on a commit is shown wherever that commit is shown**, in either
+  pane of any diff. The commit is kept by its full hash: the pane can say
+  `foo.rs @ HEAD`, but a comment on it is about the commit `HEAD` named when the
+  pane opened, and stays there after `HEAD` moves on.
 - **A comment on the working tree is about the file, not its text.** It stays on
-  the file when you commit, stash or check out another branch. When the text
-  changes under it, it follows its line on `:reload`, or is kept dimmed where
-  the line went away. Nothing is copied onto the commit you made:
-  `foo.rs @ <new commit>` shows no comments, even though its text is the same.
-- **Rewriting a commit gives it a new hash.** After a rebase or an amend, the
-  comments stay on the old commit.
+  the file when you commit or stash. When the text changes under it, it follows
+  its line on `:reload`, or is kept dimmed where the line went away. Nothing is
+  copied onto the commit you made: `foo.rs @ <new commit>` shows no comments,
+  even though its text is the same.
 - **`:diff-base` does not matter.** It changes what the gutter compares the
   file with, not which file is shown, so the comments stay on the working tree.
+- **The agent answers every comment from the project**, whatever file it is on,
+  since a question about a library is usually about how the project uses it.
+  Outside any repository it runs where Helix was started.
 
-Helix does not watch the repository, so nothing changes at a checkout: the
-conversation stays the same, and so does the text in open buffers until they are
-reloaded.
+### Switching branches
+
+Each branch has its own conversation. Check out another branch and Helix moves
+to that branch's conversation as soon as it notices. Helix does not watch the
+repository, so that is when the terminal regains focus, when a file is opened,
+when you start a comment, and on `:reload` / `:reload-all`.
+
+- **The conversation it leaves is saved first**, before any reload moves its
+  threads onto the other branch's text.
+- **A buffer the checkout changed** gets the new branch's threads once it is
+  reloaded, not on the text it still holds from the old branch.
+- **A reply still arriving** for a thread that leaves is marked as stopped.
+- **Detaching HEAD**, as a rebase does, puts the conversation away, and comments
+  made until you are back on a branch last for the session.
+- **Comments that last for the session** belong to no branch, and stay where
+  they are.
+- **A conversation named with `:review-session`** stays put across checkouts.
+  Naming the branch checked out goes back to following it.
 
 ### Conversations from before
 
-Conversations used to be kept per branch, with each comment on one side of a
-diff. The first time a worktree's conversation is opened, the conversation of
-the branch checked out then is copied into it. Comments on the working side
-stay on the working tree. Comments on the old side are put on the commit `HEAD`
-names at that moment, the closest guess, because which commit they were about
-was never recorded. Other branches' conversations are left on disk as they are.
+For a while there was one conversation per worktree, whatever was checked out,
+and comments on commits were saved in it too. The first time a branch's
+conversation is loaded, the worktree's comments on the working tree are moved
+into it, since which branch each was left on was never recorded. The worktree's
+file is then renamed to `<uuid>.threads.json.adopted`, so this happens once.
+Comments on a commit, and those on the old pane of a diff from before
+comments named a revision, are not brought back.
 
-### Two Helix windows on one worktree
+### Two Helix windows on one branch
 
-The first one to comment takes the lock on the worktree's review conversation.
-The second sees the lock is held by a running Helix and uses `worktree#2`
-instead, so the two never write into each other's file. A lock left behind by a
+The first one to leave a kept comment takes the lock on the branch's review
+conversation. The second sees the lock is held by a running Helix and uses
+`<branch>#2` instead, so the two never write into each other's file. A lock left behind by a
 Helix that crashed is ignored.
 
 ## Features
 
-- **Comments on any line of any buffer**, on either side of a split diff. A
-  comment on a commit's snapshot is about that commit's text, and is shown
-  wherever that commit is.
+- **Comments on any line of any buffer**, on either side of a split diff, in
+  the project or outside it. A comment on a commit's snapshot is about that
+  commit's text, and is shown wherever that commit is.
 - **Conversations, not one-off questions.** Reply to a thread as often as you
   like; the agent remembers the whole thread.
 - **Replies stream in** as they are written, with a spinner in the box header
@@ -177,7 +206,7 @@ Helix that crashed is ignored.
 - **Open a path from a reply.** `gf` or Ctrl+click on a `path:line` or a link in
   a reply opens that file at that line.
 - **Continue in a terminal.** The thread's conversation id is at the right of its
-  header; click it to copy it, then run `claude --resume <uuid>` in the worktree.
+  header; click it to copy it, then run `claude --resume <uuid>` in the project.
   Do not reply from Helix while that session is open elsewhere.
 - **Choice of agent.** Claude Code (`claude`) by default, or Grok with
   `:review-session grok`.
@@ -238,7 +267,7 @@ goes straight through. These keys work once a box is focused:
 | Command | What it does |
 | --- | --- |
 | `:review-session` | Show the current conversation and agent |
-| `:review-session <name>` | Switch to a conversation of that name, kept apart from the worktree's; `:review-session worktree` goes back |
+| `:review-session <name>` | Switch to a conversation of that name, which stays put across checkouts; `:review-session <branch checked out>` goes back to following the branch |
 | `:review-session grok` / `claude` | Choose the agent for this Helix, without renaming the conversation |
 | `:review-session <name> grok` | Both at once, in either order |
 
@@ -268,8 +297,9 @@ arrived, marked as stopped.
    diff in front of you. Press `Space g` again to see every file it touched.
 9. **Tidy up.** Delete entries with `d` once they are dealt with, or hide all
    boxes with `Space m R h` to read the result without them.
-10. **Come back later.** Close Helix whenever you like. Opening any file in the
-    same worktree brings the threads back where you left them.
+10. **Come back later.** Close Helix whenever you like. Opening any file on the
+    same branch brings the threads on your working changes back where you left
+    them.
 
 ## Status line and theme
 

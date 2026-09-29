@@ -65,43 +65,39 @@ pub(crate) fn review_session(
         }
     };
 
-    if parsed.name.is_none() && parsed.agent.is_none() {
-        let agent = cx.editor.diff.agent_kind;
-        let message = match cx.editor.review_session() {
-            Some(session) => format!(
-                "Review session: {} ({}) · agent {agent}",
-                session.name, session.uuid
-            ),
-            None => "No review session; this buffer is not in a repository".to_string(),
-        };
-        cx.editor.set_status(message);
-        return Ok(());
-    }
-
     if let Some(name) = parsed.name.as_deref() {
-        match cx.editor.set_review_session(name) {
-            Some(_) => {}
-            None => {
-                cx.editor
-                    .set_error("Cannot start a review session: this buffer is not in a repository");
-                return Ok(());
-            }
+        // Before switching, so a conversation left behind by a checkout is
+        // saved as the branch it belongs to.
+        cx.editor.follow_review_branch();
+        if cx.editor.set_review_session(name).is_none() {
+            cx.editor
+                .set_error("Cannot start a review session: Helix was not started in a repository");
+            return Ok(());
         }
-    } else if cx.editor.review_session().is_none() {
-        cx.editor
-            .set_error("Cannot start a review session: this buffer is not in a repository");
-        return Ok(());
     }
-
     if let Some(kind) = parsed.agent {
         cx.editor.set_review_agent(kind);
     }
 
-    let Some(session) = cx.editor.diff.session.as_ref() else {
+    // Reporting claims nothing: the conversation on screen is the one a
+    // comment would be kept in.
+    let agent = cx.editor.diff.agent_kind;
+    let Some(session) = cx.editor.shown_review_conversation() else {
+        cx.editor.set_status(format!(
+            "No review conversation: comments last for this session \
+             (not in a repository, or HEAD is detached) · agent {agent}"
+        ));
         return Ok(());
     };
+    if parsed.name.is_none() {
+        let message = format!(
+            "Review session: {} ({}) · agent {agent}",
+            session.name, session.uuid
+        );
+        cx.editor.set_status(message);
+        return Ok(());
+    }
     let claimed = session.name.clone();
-    let agent = cx.editor.diff.agent_kind;
     let message = match parsed.name.as_deref() {
         Some(asked) if claimed != asked => {
             format!("Review session: {claimed} ({asked} is held by another editor) · agent {agent}")

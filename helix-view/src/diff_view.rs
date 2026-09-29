@@ -32,12 +32,17 @@ pub struct DiffSession {
     /// Inline review threads. Lives here rather than per-document because a
     /// conversation outlives the buffer it is anchored in.
     pub reviews: ReviewStore,
-    /// The claimed review conversation, created lazily on the first comment.
+    /// The worktree review conversations are kept for: the one Helix was
+    /// started in. `None` until first asked for, `Some(None)` outside any
+    /// repository. See [`crate::Editor::review_project`].
+    pub project: Option<Option<PathBuf>>,
+    /// The claimed review conversation, claimed by the first comment that is
+    /// kept in it.
     pub session: Option<ReviewSession>,
-    /// Saved threads loaded before any session was claimed, so that reopening
-    /// Helix shows them straight away. Nothing is written back until the
-    /// first comment claims a session; if that claim lands on a different
-    /// conversation, these threads are swapped out for its own.
+    /// The checked-out branch's saved threads, loaded before any session was
+    /// claimed, so that reopening Helix shows them straight away. Nothing is
+    /// written back until a comment claims the session; if that claim lands on
+    /// a different conversation, these threads are swapped out for its own.
     pub peeked: Option<PeekedReviews>,
     /// Whatever answers review comments. Spawned lazily on the first send, so
     /// merely commenting never starts a process.
@@ -50,7 +55,7 @@ pub struct DiffSession {
 
 impl Drop for DiffSession {
     fn drop(&mut self) {
-        // Give the name back on a clean exit, so the next editor in this worktree
+        // Give the name back on a clean exit, so the next editor on this branch
         // takes it rather than a `#2` suffix. A crash skips this, which is what
         // the liveness check in `claim` is for.
         if let Some(agent) = &mut self.agent {

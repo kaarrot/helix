@@ -87,14 +87,21 @@ fn thread_at_cursor(cx: &mut Context) -> Option<ThreadId> {
 /// there discards the draft along with everything after that entry. Nothing is
 /// discarded until the reply is saved, so `Esc` leaves the thread as it was.
 pub fn review_add(cx: &mut Context) {
-    // Claim the conversation first. Claiming is what loads the saved threads,
-    // and until it happens the store is empty -- so on a freshly opened editor
-    // an existing draft is invisible here and a second thread gets opened on
-    // top of it.
-    let session = cx
-        .editor
-        .review_session()
-        .map(|session| session.name.clone());
+    // Before any thread id is taken: a checkout since the last look means the
+    // conversation on screen is another branch's.
+    cx.editor.follow_review_branch();
+    // Claim the conversation first, when this comment is kept in it. Claiming
+    // can swap the threads on screen for another conversation's, and an id
+    // taken before that would name a thread that is gone. A comment that lasts
+    // for the session claims nothing.
+    let keeps = identity(cx).is_some_and(|(file, rev)| cx.editor.review_keeps(&file, &rev));
+    let session = if keeps {
+        cx.editor
+            .review_session()
+            .map(|session| session.name.clone())
+    } else {
+        None
+    };
 
     // Asking to comment is asking to see them.
     cx.editor.diff.reviews.hidden = false;
@@ -148,10 +155,11 @@ pub fn review_add(cx: &mut Context) {
                 } else {
                     thread.draft.clone().unwrap_or_default()
                 },
-                if thread.messages.is_empty() {
-                    "comment: "
-                } else {
-                    "reply: "
+                match (thread.messages.is_empty(), thread.temporary) {
+                    (true, false) => "comment: ",
+                    (true, true) => TEMPORARY_COMMENT,
+                    (false, false) => "reply: ",
+                    (false, true) => "reply (this session only): ",
                 },
                 thread.agent_session.clone(),
             ),
@@ -205,7 +213,11 @@ pub fn review_add(cx: &mut Context) {
 
     prompt_at_cursor(
         cx,
-        "comment: ",
+        if keeps {
+            "comment: "
+        } else {
+            TEMPORARY_COMMENT
+        },
         None,
         (file.clone(), rev.clone(), line as u32),
         "",
@@ -219,6 +231,9 @@ pub fn review_add(cx: &mut Context) {
                 line as u32,
                 input.trim().to_string(),
             );
+            if let Some(thread) = cx.editor.diff.reviews.get_mut(id) {
+                thread.temporary = !keeps;
+            }
             // Anchor it in the open document so it tracks edits from here on.
             let doc = doc_mut!(cx.editor);
             let anchor = ReviewAnchor::for_line(id, doc.text(), line);
@@ -228,7 +243,7 @@ pub fn review_add(cx: &mut Context) {
             crate::review_agent::schedule_save();
             cx.editor.set_status(match session.clone() {
                 Some(name) => format!("Comment drafted ({pending} pending) · {name}"),
-                None => format!("Comment drafted ({pending} pending)"),
+                None => format!("Comment drafted ({pending} pending) · for this session only"),
             });
             if send_now {
                 send_now_from_box(cx, id);
@@ -236,6 +251,10 @@ pub fn review_add(cx: &mut Context) {
         },
     );
 }
+
+/// The comment box's title for a comment that is not saved: one on a commit,
+/// on a file outside the project, or while no conversation is shown.
+const TEMPORARY_COMMENT: &str = "comment (this session only): ";
 
 /// How `Ctrl-S` / `Ctrl-Shift-S` should finish the comment box.
 ///
@@ -724,12 +743,20 @@ fn compose_prompt(
         None => "no diff range is set; this is the working tree\n".to_string(),
     };
 
+    let outside = if in_project(editor, &file) {
+        ""
+    } else {
+        "This file is outside the project you are working in, and is here for \
+         reference: do not change it unless the comment asks you to.\n"
+    };
+
     format!(
         "A review comment was left in the editor.\n\n\
          file: {}\n\
          revision: {rev_label}\n\
          line: {}\n\
-         {range}\n\
+         {range}\
+         {outside}\n\
          ```\n{quoted}```\n\n\
          {earlier}\
          comment: {comment}\n\n\
@@ -737,6 +764,16 @@ fn compose_prompt(
         file.display(),
         line + 1
     )
+}
+
+/// Whether `file` is in the project the agent runs in.
+fn in_project(editor: &Editor, file: &Path) -> bool {
+    editor
+        .diff
+        .project
+        .clone()
+        .flatten()
+        .is_some_and(|project| editor.diff_providers.get_workdir(file) == Some(project))
 }
 
 /// Messages already on a thread whose agent conversation is only just starting.
@@ -846,10 +883,12 @@ fn ensure_agent(editor: &mut Editor) -> Result<(), String> {
     if editor.diff.agent.is_some() {
         return Ok(());
     }
-    let Some(session) = editor.review_session() else {
-        return Err("Cannot start a review session: this buffer is not in a repository".into());
-    };
-    let worktree = session.worktree.clone();
+    // The project, whichever file the comment is on: a question about a
+    // library's code is usually about how the project uses it. Its path is in
+    // the prompt. Outside any repository, where Helix was started.
+    let worktree = editor
+        .review_project()
+        .unwrap_or_else(helix_stdx::env::current_working_dir);
     let kind = editor.diff.agent_kind;
 
     let agent: Box<dyn helix_view::review::agent::ReviewAgent> = match kind {
@@ -965,6 +1004,14 @@ fn send_pending_ids(editor: &mut Editor, only: Option<ThreadId>) -> Result<SendO
         let Some(text) = editor.diff.reviews.take_draft(id) else {
             continue;
         };
+        if editor
+            .diff
+            .reviews
+            .get(id)
+            .is_some_and(|thread| thread.temporary)
+        {
+            crate::review_agent::keep_in_memory(&session);
+        }
         let prompt = compose_prompt(editor, id, &text, had_session);
         if let Some(thread) = editor.diff.reviews.get_mut(id) {
             thread.rewound = false;

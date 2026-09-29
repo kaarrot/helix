@@ -212,6 +212,20 @@ pub fn resolve_commit_id(path: &Path, rev: &str) -> Result<String> {
     Ok(commit)
 }
 
+/// The branch checked out in the working tree at `workdir`, or `None` while
+/// HEAD is detached.
+///
+/// Read from the repository on every call. A document's head name is taken
+/// when it loads, so it goes stale as soon as another branch is checked out.
+pub fn get_checked_out_branch(workdir: &Path) -> Result<Option<String>> {
+    let repo = open_repo(workdir)
+        .context("failed to open git repo")?
+        .to_thread_local();
+    Ok(repo
+        .head_ref()?
+        .map(|reference| reference.name().shorten().to_string()))
+}
+
 /// Fetch OURS (stage 2) and THEIRS (stage 3) versions of a conflicted file
 /// from the git index. Returns `(ours_bytes, theirs_bytes)`.
 pub fn get_merge_versions(file: &Path) -> Result<(Vec<u8>, Vec<u8>)> {
@@ -665,8 +679,15 @@ fn is_file_mode(mode: gix::index::entry::Mode) -> bool {
 
 /// The working-tree root containing `file`, via the same repository discovery
 /// the diff machinery uses.
+/// The root of the working tree holding `file`, which may also be a directory
+/// inside it, such as the editor's working directory.
 pub fn workdir(file: &Path) -> Result<PathBuf> {
-    let repo = open_repo(get_repo_dir(file)?)?.to_thread_local();
+    let repo_dir = if file.is_dir() {
+        file
+    } else {
+        get_repo_dir(file)?
+    };
+    let repo = open_repo(repo_dir)?.to_thread_local();
     repo.workdir()
         .map(Path::to_path_buf)
         .ok_or_else(|| anyhow::anyhow!("working tree not found"))

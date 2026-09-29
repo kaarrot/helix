@@ -47,7 +47,9 @@ pub enum Role {
 /// A comment is about a version of the file, not about a pane of whatever
 /// diff happens to be open: a thread left on `abc` is shown on `abc` in every
 /// later view of it, whether as the left pane, the right pane or a buffer on
-/// its own. Written to disk as `"worktree"` or the full commit hash.
+/// its own. Only threads on the working tree are saved, as `"worktree"`; a
+/// commit's last for the session (see [`Thread::temporary`]). Saves from
+/// before that can still name a commit by its full hash.
 ///
 /// Ordered with commits first, so `]C` visits a split diff's old pane before
 /// the working tree beside it.
@@ -166,6 +168,15 @@ pub struct Thread {
     /// Not persisted, like `awaiting`: after a restart nothing is arriving.
     #[serde(skip)]
     pub send_queued: bool,
+    /// Lasts for this session only: never written with the conversation, and
+    /// not part of it, so a checkout that swaps the conversation out leaves it
+    /// where it is.
+    ///
+    /// Comments on a commit, on a file outside the project, or made while no
+    /// conversation is shown (HEAD detached, say) are exploratory. Saving them
+    /// per branch would bring them back on code they were never about.
+    #[serde(skip)]
+    pub temporary: bool,
     /// First visible row of the current entry, when it is taller than the box
     /// is allowed to be. Not persisted: it is a reading position.
     ///
@@ -677,6 +688,7 @@ impl ReviewStore {
                 select: None,
                 awaiting: false,
                 send_queued: false,
+                temporary: false,
                 rewound: false,
                 orphaned: false,
                 agent_session: None,
@@ -862,9 +874,16 @@ impl ReviewStore {
     /// An explicit shape rather than the store's own fields: `by_file` is an
     /// index that can be rebuilt, and persisting it would be one more thing
     /// able to disagree with the threads it points at.
+    ///
+    /// Only the conversation's own threads: the temporary ones stay in memory.
     fn snapshot(&self) -> StoreSnapshot {
         StoreSnapshot {
-            threads: self.threads.values().cloned().collect(),
+            threads: self
+                .threads
+                .values()
+                .filter(|thread| !thread.temporary && thread.rev == ReviewRev::Worktree)
+                .cloned()
+                .collect(),
             next_id: self.next_id,
         }
     }
@@ -929,28 +948,22 @@ impl ReviewStore {
         }
     }
 
-    /// Reload the conversations for `uuid`, or an empty store if there are none.
-    ///
-    /// A file that will not parse is treated as absent: losing the threads is
-    /// bad, but refusing to start a review because of them would be worse.
-    pub fn load_from(dir: &Path, uuid: &str) -> Self {
-        Self::load_upgrading(dir, uuid, None)
-    }
-
     /// Whether `uuid` has conversations saved, readable or not.
     pub fn exists_in(dir: &Path, uuid: &str) -> bool {
         dir.join(format!("{uuid}.threads.json")).exists()
     }
 
-    /// [`Self::load_from`], reading threads saved before they named a
-    /// revision.
+    /// Reload the conversations for `uuid`, or an empty store if there are none.
     ///
-    /// Those carry the diff pane they were left in instead. `working` is the
-    /// file on disk. `base` was whatever the diff was against, which was not
-    /// recorded; `legacy_base` is the best guess at it, usually the commit
-    /// `HEAD` names now. Without one, base-pane threads are dropped rather
-    /// than pinned on a revision they may never have been about.
-    pub fn load_upgrading(dir: &Path, uuid: &str, legacy_base: Option<&str>) -> Self {
+    /// A file that will not parse is treated as absent: losing the threads is
+    /// bad, but refusing to start a review because of them would be worse.
+    ///
+    /// Only threads on the working tree come back. Older saves also hold
+    /// threads on a commit, or on the base pane of a diff whose revision was
+    /// never recorded. Those were exploratory, and are left behind rather than
+    /// shown for one more session: a conversation shown and put away again is
+    /// never saved, so they would come back each time it was loaded.
+    pub fn load_from(dir: &Path, uuid: &str) -> Self {
         let path = dir.join(format!("{uuid}.threads.json"));
         let raw = match std::fs::read_to_string(&path) {
             Ok(raw) => raw,
@@ -963,7 +976,7 @@ impl ReviewStore {
         let snapshot = serde_json::from_str::<serde_json::Value>(&raw)
             .ok()
             .map(|mut value| {
-                upgrade_legacy_threads(&mut value, legacy_base);
+                upgrade_legacy_threads(&mut value);
                 value
             })
             .and_then(|value| serde_json::from_value::<StoreSnapshot>(value).ok());
@@ -976,6 +989,9 @@ impl ReviewStore {
             ..Self::default()
         };
         for mut thread in snapshot.threads {
+            if thread.rev != ReviewRev::Worktree {
+                continue;
+            }
             // `view` is not persisted, so it deserialises to zero -- the oldest
             // entry. A conversation should come back showing its latest word,
             // not its first.
@@ -1028,6 +1044,44 @@ impl ReviewStore {
         }
         self.next_id = next;
         ids
+    }
+
+    /// Fold in the threads of a conversation that has taken this one's place,
+    /// replacing the copies of them this one still holds.
+    ///
+    /// For moving a worktree's conversation, from when there was only one,
+    /// into a branch's. The worktree's began as a copy of that branch's and
+    /// went on from there, so a thread in both is the same conversation, and
+    /// the worktree's copy is the later one. Returns how many threads came.
+    pub fn take_over(&mut self, newer: ReviewStore) -> usize {
+        let key = |thread: &Thread| {
+            thread
+                .agent_session
+                .clone()
+                .or_else(|| {
+                    thread
+                        .messages
+                        .first()
+                        .map(|message| format!("{:?}", message.created_at))
+                })
+                .or_else(|| thread.draft.clone())
+                .map(|key| (thread.file.clone(), key))
+        };
+        let incoming: std::collections::HashSet<_> =
+            newer.threads.values().filter_map(key).collect();
+        let stale: Vec<ThreadId> = self
+            .threads
+            .values()
+            .filter(|thread| key(thread).is_some_and(|key| incoming.contains(&key)))
+            .map(|thread| thread.id)
+            .collect();
+        for id in stale {
+            self.remove(id);
+        }
+        let count = newer.threads.len();
+        self.absorb(newer);
+        self.merge_by_anchor();
+        count
     }
 
     /// Fold an agent event into the store when it belongs to `session`.
@@ -1154,9 +1208,10 @@ impl ReviewStore {
 
 /// Give threads saved with a diff `side` the revision it stood for.
 ///
-/// See [`ReviewStore::load_upgrading`]. Threads already carrying a `rev` are
-/// left as they are.
-fn upgrade_legacy_threads(snapshot: &mut serde_json::Value, legacy_base: Option<&str>) {
+/// See [`ReviewStore::load_from`]. A working-pane thread is on the working
+/// tree. A base-pane thread is dropped: which revision that pane showed was
+/// never recorded. Threads already carrying a `rev` are left as they are.
+fn upgrade_legacy_threads(snapshot: &mut serde_json::Value) {
     let Some(threads) = snapshot
         .get_mut("threads")
         .and_then(serde_json::Value::as_array_mut)
@@ -1171,17 +1226,10 @@ fn upgrade_legacy_threads(snapshot: &mut serde_json::Value, legacy_base: Option<
         if thread.contains_key("rev") {
             return true;
         }
-        let rev = match side.as_ref().and_then(serde_json::Value::as_str) {
-            Some("base") => match legacy_base {
-                Some(commit) => commit,
-                None => {
-                    log::warn!("dropping a review thread left on a diff base that is unknown");
-                    return false;
-                }
-            },
-            _ => ReviewRev::WORKTREE,
-        };
-        thread.insert("rev".into(), rev.into());
+        if side.as_ref().and_then(serde_json::Value::as_str) == Some("base") {
+            return false;
+        }
+        thread.insert("rev".into(), ReviewRev::WORKTREE.into());
         true
     });
 }
@@ -1516,10 +1564,7 @@ mod test {
 
     #[test]
     fn one_line_of_two_revisions_holds_two_conversations() {
-        let dir = tempfile::tempdir().unwrap();
-        let uuid = "77777777-8888-5999-8aaa-bbbbbbbbbbbb";
         let file = PathBuf::from("/r/a.rs");
-
         let mut store = ReviewStore::default();
         let old = store.draft(file.clone(), ReviewRev::Commit(SHA.into()), 3, "old".into());
         let new = store.draft(
@@ -1529,13 +1574,13 @@ mod test {
             "new".into(),
         );
         let disk = store.draft(file.clone(), ReviewRev::Worktree, 3, "disk".into());
-        store.save_to(dir.path(), uuid).unwrap();
 
         // Folding threads on one line must not fold across revisions.
-        let back = ReviewStore::load_from(dir.path(), uuid);
-        assert_eq!(back.len(), 3);
+        store.merge_by_anchor();
+        assert_eq!(store.len(), 3);
         let shown = |rev: ReviewRev| -> Vec<ThreadId> {
-            back.for_snapshot(&file, &rev)
+            store
+                .for_snapshot(&file, &rev)
                 .map(|thread| thread.id)
                 .collect()
         };
@@ -1543,13 +1588,38 @@ mod test {
         assert_eq!(shown(ReviewRev::Commit(OTHER_SHA.into())), [new]);
         assert_eq!(shown(ReviewRev::Worktree), [disk]);
         assert_eq!(
-            back.thread_at(&file, &ReviewRev::Commit(OTHER_SHA.into()), 3),
+            store.thread_at(&file, &ReviewRev::Commit(OTHER_SHA.into()), 3),
             Some(new)
         );
     }
 
     #[test]
-    fn threads_saved_with_a_diff_side_come_back_with_a_revision() {
+    fn a_commit_s_threads_in_an_older_save_are_left_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let uuid = "77777777-8888-5999-8aaa-bbbbbbbbbbbb";
+        let file = PathBuf::from("/r/a.rs");
+        let mut store = ReviewStore::default();
+        store.draft(file.clone(), ReviewRev::Commit(SHA.into()), 3, "old".into());
+        let disk = store.draft(file.clone(), ReviewRev::Worktree, 3, "disk".into());
+        // Written as a save from before commits' threads were left out.
+        let snapshot = StoreSnapshot {
+            threads: store.threads.values().cloned().collect(),
+            next_id: store.next_id,
+        };
+        std::fs::write(
+            dir.path().join(format!("{uuid}.threads.json")),
+            serde_json::to_string(&snapshot).unwrap(),
+        )
+        .unwrap();
+
+        let back = ReviewStore::load_from(dir.path(), uuid);
+        let ids: Vec<ThreadId> = back.iter().map(|thread| thread.id).collect();
+        assert_eq!(ids, [disk]);
+        assert!(back.load_error.is_none());
+    }
+
+    #[test]
+    fn threads_saved_with_a_diff_side_come_back_on_the_working_tree() {
         let dir = tempfile::tempdir().unwrap();
         let uuid = "99999999-aaaa-5bbb-8ccc-dddddddddddd";
         let thread = |id: u32, side: &str| {
@@ -1574,19 +1644,13 @@ mod test {
         )
         .unwrap();
 
-        let upgraded = ReviewStore::load_upgrading(dir.path(), uuid, Some(SHA));
+        // Which revision the base pane showed was never recorded, so a
+        // base-pane thread is dropped rather than shown on one it may not be
+        // about.
+        let upgraded = ReviewStore::load_from(dir.path(), uuid);
+        assert_eq!(upgraded.len(), 1);
         assert_eq!(upgraded.get(ThreadId(1)).unwrap().rev, ReviewRev::Worktree);
-        assert_eq!(
-            upgraded.get(ThreadId(2)).unwrap().rev,
-            ReviewRev::Commit(SHA.into())
-        );
         assert!(upgraded.load_error.is_none());
-
-        // With no idea what the base was, a base-pane thread is dropped rather
-        // than shown on a revision it may not be about.
-        let unknown = ReviewStore::load_from(dir.path(), uuid);
-        assert_eq!(unknown.len(), 1);
-        assert_eq!(unknown.get(ThreadId(1)).unwrap().rev, ReviewRev::Worktree);
     }
 
     fn anchor_on(text: &Rope, line: usize) -> ReviewAnchor {
@@ -2338,7 +2402,7 @@ mod test {
         // A second thread, unsent: the draft is the thing most worth not losing.
         let unsent = store.draft(
             PathBuf::from("/r/b.rs"),
-            ReviewRev::Commit(SHA.into()),
+            ReviewRev::Worktree,
             7,
             "typed, not sent".into(),
         );
@@ -2356,12 +2420,84 @@ mod test {
 
         let unsent_back = back.get(unsent).unwrap();
         assert_eq!(unsent_back.draft.as_deref(), Some("typed, not sent"));
-        assert_eq!(unsent_back.rev, ReviewRev::Commit(SHA.into()));
         assert_eq!(back.pending_count(), 1);
 
         // The per-file index is rebuilt rather than persisted.
         assert_eq!(back.for_file(Path::new("/r/a.rs")).count(), 1);
         assert_eq!(back.for_file(Path::new("/r/b.rs")).count(), 1);
+    }
+
+    #[test]
+    fn only_the_conversation_s_own_threads_are_saved() {
+        let dir = tempfile::tempdir().unwrap();
+        let uuid = "12121212-3434-5565-8787-909090909090";
+
+        let mut store = ReviewStore::default();
+        let kept = store.draft(
+            PathBuf::from("/r/a.rs"),
+            ReviewRev::Worktree,
+            1,
+            "kept".into(),
+        );
+        store.draft(
+            PathBuf::from("/r/a.rs"),
+            ReviewRev::Commit(SHA.into()),
+            1,
+            "on a commit".into(),
+        );
+        let outside = store.draft(
+            PathBuf::from("/elsewhere/b.rs"),
+            ReviewRev::Worktree,
+            1,
+            "outside".into(),
+        );
+        store.get_mut(outside).unwrap().temporary = true;
+
+        store.save_to(dir.path(), uuid).unwrap();
+        assert_eq!(store.len(), 3, "saving drops nothing from memory");
+        let back = ReviewStore::load_from(dir.path(), uuid);
+        let ids: Vec<ThreadId> = back.iter().map(|thread| thread.id).collect();
+        assert_eq!(ids, [kept]);
+    }
+
+    #[test]
+    fn taking_over_replaces_the_copies_of_threads_and_keeps_the_rest() {
+        let file = PathBuf::from("/r/a.rs");
+        let mut branch = ReviewStore::default();
+        let copied = branch.draft(file.clone(), ReviewRev::Worktree, 2, "asked".into());
+        branch.take_draft(copied);
+        branch.ensure_agent_session(copied);
+        branch.draft(file.clone(), ReviewRev::Worktree, 5, "branch only".into());
+
+        // The worktree's conversation started as a copy of the branch's, and
+        // the copied thread moved on and got a reply there.
+        let mut worktree = ReviewStore::default();
+        for thread in branch.iter().filter(|thread| thread.id == copied) {
+            let mut thread = thread.clone();
+            thread.line = 3;
+            worktree
+                .by_file
+                .entry(file.clone())
+                .or_default()
+                .push(thread.id);
+            worktree.threads.insert(thread.id, thread);
+        }
+        worktree.next_id = branch.next_id;
+        worktree.push_message(copied, Role::Agent, "because".into());
+        worktree.draft(file.clone(), ReviewRev::Worktree, 9, "worktree only".into());
+
+        assert_eq!(branch.take_over(worktree), 2);
+        assert_eq!(branch.len(), 3, "the copy is not kept twice");
+        let asked: Vec<&Thread> = branch
+            .iter()
+            .filter(|thread| thread.messages.first().is_some_and(|m| m.text == "asked"))
+            .collect();
+        assert_eq!(asked.len(), 1);
+        assert_eq!(asked[0].line, 3, "the later copy wins");
+        assert_eq!(asked[0].entry_count(), 2);
+        let mut drafts: Vec<&str> = branch.iter().filter_map(|t| t.draft.as_deref()).collect();
+        drafts.sort();
+        assert_eq!(drafts, ["branch only", "worktree only"]);
     }
 
     #[test]
@@ -2689,6 +2825,7 @@ mod test {
                 select: None,
                 awaiting: false,
                 send_queued: false,
+                temporary: false,
                 rewound: false,
                 orphaned: false,
                 agent_session: None,

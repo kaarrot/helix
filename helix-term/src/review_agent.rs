@@ -283,6 +283,39 @@ fn started_marker(uuid: &str) -> PathBuf {
         .join(format!("{uuid}.started"))
 }
 
+/// Conversations of temporary threads, whose started state is kept here rather
+/// than in a marker: a comment that lasts for the session leaves nothing in
+/// the state directory.
+static IN_MEMORY_ONLY: Lazy<Mutex<HashSet<String>>> = Lazy::new(Default::default);
+
+/// The temporary threads' conversations that have been started.
+static STARTED_IN_MEMORY: Lazy<Mutex<HashSet<String>>> = Lazy::new(Default::default);
+
+/// Record this conversation's start in memory only. See [`IN_MEMORY_ONLY`].
+pub fn keep_in_memory(uuid: &str) {
+    IN_MEMORY_ONLY.lock().unwrap().insert(uuid.to_string());
+}
+
+fn in_memory_only(uuid: &str) -> bool {
+    IN_MEMORY_ONLY.lock().unwrap().contains(uuid)
+}
+
+/// Whether this conversation has been started, by its marker or in memory.
+fn session_started(uuid: &str) -> bool {
+    if in_memory_only(uuid) {
+        return STARTED_IN_MEMORY.lock().unwrap().contains(uuid);
+    }
+    started_marker(uuid).exists()
+}
+
+fn unmark_session_started(uuid: &str) {
+    if in_memory_only(uuid) {
+        STARTED_IN_MEMORY.lock().unwrap().remove(uuid);
+        return;
+    }
+    let _ = std::fs::remove_file(started_marker(uuid));
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CliKind {
     Claude,
@@ -438,7 +471,7 @@ impl TurnState {
     }
 
     fn launch(&self, session: &str, thread: ThreadId, prompt: String) {
-        let resuming = started_marker(session).exists();
+        let resuming = session_started(session);
         let prompt_file = if self.kind == CliKind::Grok {
             match write_prompt_file(&prompt) {
                 Ok(file) => Some(file),
@@ -679,6 +712,10 @@ fn stream_part(value: &serde_json::Value) -> Option<StreamPart> {
 }
 
 fn mark_session_started(uuid: &str) {
+    if in_memory_only(uuid) {
+        STARTED_IN_MEMORY.lock().unwrap().insert(uuid.to_string());
+        return;
+    }
     let marker = started_marker(uuid);
     let _ = std::fs::create_dir_all(marker.parent().unwrap_or(&marker));
     let _ = std::fs::write(&marker, uuid);
@@ -791,9 +828,8 @@ fn read_turn(
             // longer has. Both are a disagreement between our marker and the
             // agent's memory, so flipping the marker is the repair. The next
             // send starts a fresh child the other way round.
-            let marker = started_marker(session);
-            if marker.exists() {
-                let _ = std::fs::remove_file(&marker);
+            if session_started(session) {
+                unmark_session_started(session);
             } else {
                 mark_session_started(session);
             }
@@ -804,6 +840,18 @@ fn read_turn(
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn a_temporary_thread_s_start_is_kept_in_memory() {
+        let uuid = helix_view::review::session::random_uuid();
+        keep_in_memory(&uuid);
+        assert!(!session_started(&uuid));
+        mark_session_started(&uuid);
+        assert!(session_started(&uuid), "the next turn resumes it");
+        assert!(!started_marker(&uuid).exists(), "and nothing is written");
+        unmark_session_started(&uuid);
+        assert!(!session_started(&uuid));
+    }
 
     #[test]
     fn the_child_is_given_full_access_deliberately() {

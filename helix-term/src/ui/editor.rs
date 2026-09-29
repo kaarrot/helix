@@ -2201,6 +2201,12 @@ impl Component for EditorView {
             Event::IdleTimeout => self.handle_idle_timeout(&mut cx),
             Event::FocusGained => {
                 self.terminal_focused = true;
+                // Coming back from a terminal is where a checkout usually shows
+                // up, so the review threads move to the branch now checked out.
+                // Before any auto-reload: reloading moves open threads through
+                // the diff onto the new branch's code. See
+                // `Editor::follow_review_branch`.
+                cx.editor.follow_review_branch();
                 self.auto_reload_current_buffer(&mut cx);
                 EventResult::Consumed(None)
             }

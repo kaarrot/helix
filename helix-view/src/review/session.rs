@@ -1,11 +1,11 @@
 //! Identity and ownership of a review conversation.
 //!
-//! A conversation is identified by a UUID derived from the worktree and a name,
-//! so reopening the editor in the same worktree continues the same
-//! conversation with no bookkeeping, while another worktree gets its own. The
-//! name is [`WORKTREE_STORE`] unless `:review-session` chose another; it does
-//! not follow the branch. Each thread names the revision it is about, so one
-//! store holds every snapshot's threads.
+//! A conversation is identified by a UUID derived from the project's worktree
+//! and a name, so reopening the editor on the same branch continues the same
+//! conversation with no bookkeeping, while another branch or worktree gets its
+//! own. The name is the branch checked out, unless `:review-session` chose
+//! another. Only comments on the project's working tree are kept in it: those
+//! on a commit, or on a file outside the project, last for the session.
 //!
 //! The UUID is also claimed on disk, because two editors deriving the same one
 //! would otherwise drive a single conversation and interleave their turns into
@@ -27,25 +27,32 @@ use sha1::{Digest, Sha1};
 /// renames every existing conversation.
 const NAMESPACE: &str = "helix-review";
 
-/// The name of a worktree's own conversation, the one used unless
-/// `:review-session` names another.
-pub const WORKTREE_STORE: &str = "worktree";
+/// The name of the one conversation a worktree had while conversations did
+/// not follow the branch. Its threads are moved into a branch's the first time
+/// one is loaded.
+pub const LEGACY_WORKTREE_STORE: &str = "worktree";
 
 /// How many `#n` suffixes to try before giving up on finding a free name.
 const MAX_SUFFIX: usize = 64;
 
 /// Conversations untouched for this long are deleted. Nothing prunes them
-/// otherwise, and one accumulates per worktree and name, forever.
+/// otherwise, and one accumulates per branch per worktree, forever.
 const KEEP_FOR: Duration = Duration::from_secs(365 * 24 * 60 * 60);
 
 /// A claimed review conversation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReviewSession {
-    /// Fixed once claimed. It can be `worktree#2` when another editor holds
-    /// `worktree`, so a conversation's name is not always the one asked for.
+    /// Fixed once claimed. It can be `feature#2` when another editor holds
+    /// `feature`, so a conversation's name is not always its branch.
     pub name: String,
     pub uuid: String,
     pub worktree: PathBuf,
+    /// The branch this conversation belongs to. When another branch is checked
+    /// out the editor moves to that branch's conversation, so one branch's
+    /// threads are never shown on another's code. `None` for a conversation
+    /// named with `:review-session` after something other than the branch,
+    /// which stays put.
+    pub branch: Option<String>,
 }
 
 /// What is written beside a claimed UUID.
@@ -86,7 +93,7 @@ pub fn derive_uuid(worktree: &Path, name: &str) -> String {
 
 /// UUID version 4, for one comment's agent conversation.
 ///
-/// A review session keeps every comment in a worktree in one file. Each comment
+/// A review session keeps every comment on a branch in one file. Each comment
 /// still needs its own id, because that is what `--session-id` / `--resume`
 /// continue, and sharing one would mix the comments together.
 pub fn random_uuid() -> String {
@@ -358,6 +365,7 @@ pub fn claim_in(dir: &Path, worktree: &Path, base_name: &str) -> ReviewSession {
                     name,
                     uuid,
                     worktree: worktree.to_path_buf(),
+                    branch: None,
                 }
             }
         }
@@ -369,6 +377,7 @@ pub fn claim_in(dir: &Path, worktree: &Path, base_name: &str) -> ReviewSession {
         name: base_name.to_string(),
         uuid: derive_uuid(worktree, base_name),
         worktree: worktree.to_path_buf(),
+        branch: None,
     }
 }
 
@@ -388,6 +397,7 @@ pub fn predict_in(dir: &Path, worktree: &Path, base_name: &str) -> ReviewSession
         uuid: derive_uuid(worktree, &name),
         name,
         worktree: worktree.to_path_buf(),
+        branch: None,
     };
     for suffix in 0..MAX_SUFFIX {
         let name = if suffix == 0 {

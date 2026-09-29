@@ -40,7 +40,7 @@ pub async fn select_thread_id(editor: &mut Editor, thread_id: ThreadId, force: b
     debugger.thread_id = Some(thread_id);
     fetch_stack_trace(debugger, thread_id).await;
 
-    let frame = debugger.stack_frames[&thread_id].first().cloned();
+    let frame = debugger.current_stack_frame().cloned();
     if let Some(frame) = &frame {
         jump_to_stack_frame(editor, frame);
     }
@@ -51,8 +51,14 @@ pub async fn fetch_stack_trace(debugger: &mut Client, thread_id: ThreadId) {
         Ok(frames) => frames,
         Err(_) => return,
     };
+    // `active_frame` indexes the current thread's frames, so fetching another
+    // thread's stack must leave it alone. An adapter can also report no frames at
+    // all -- debugpy with `justMyCode` for a thread stopped in library code -- and
+    // then there is no frame to select.
+    if debugger.thread_id == Some(thread_id) {
+        debugger.active_frame = (!frames.is_empty()).then_some(0);
+    }
     debugger.stack_frames.insert(thread_id, frames);
-    debugger.active_frame = Some(0);
 }
 
 pub fn jump_to_stack_frame(editor: &mut Editor, frame: &helix_dap::StackFrame) {

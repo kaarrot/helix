@@ -1009,6 +1009,33 @@ fn resolve_commit_id_peels_any_spelling_to_the_full_hash() {
 }
 
 #[test]
+fn the_checked_out_branch_is_read_afresh_and_none_while_detached() {
+    let temp_git = empty_git_repo();
+    let repo = temp_git.path();
+    write_repo_file(repo, "file.txt", "one");
+    create_commit(repo, true);
+    exec_git_cmd("checkout -b feature", repo);
+    assert_eq!(
+        git::get_checked_out_branch(repo).unwrap().as_deref(),
+        Some("feature")
+    );
+    exec_git_cmd("checkout --detach", repo);
+    assert_eq!(git::get_checked_out_branch(repo).unwrap(), None);
+}
+
+#[test]
+fn the_worktree_root_is_found_from_the_root_itself() {
+    let temp_git = empty_git_repo();
+    let repo = temp_git.path();
+    write_repo_file(repo, "src/file.txt", "one");
+    let root = gix::path::realpath(repo).unwrap();
+    let found = |path: &Path| gix::path::realpath(git::workdir(path).unwrap()).unwrap();
+    assert_eq!(found(repo), root);
+    assert_eq!(found(&repo.join("src")), root);
+    assert_eq!(found(&repo.join("src/file.txt")), root);
+}
+
+#[test]
 fn file_web_link_without_a_remote_fails() {
     let temp_git = empty_git_repo();
     let repo = temp_git.path();

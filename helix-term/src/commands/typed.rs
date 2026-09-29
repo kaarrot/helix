@@ -1561,6 +1561,9 @@ fn reload(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> anyh
     }
 
     let scrolloff = cx.editor.config().scrolloff;
+    // Before the text changes, while the threads on screen still sit on the
+    // text they were written against. See `Editor::follow_review_branch`.
+    cx.editor.follow_review_branch();
     let (view, doc) = current!(cx.editor);
     doc.reload(view, &cx.editor.diff_providers).map(|_| {
         view.ensure_cursor_in_view(doc, scrolloff);
@@ -1583,6 +1586,8 @@ fn reload_all(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> 
 
     let scrolloff = cx.editor.config().scrolloff;
     let view_id = view!(cx.editor).id;
+    // Before the text changes. See `Editor::follow_review_branch`.
+    cx.editor.follow_review_branch();
 
     let docs_view_ids: Vec<(DocumentId, Vec<ViewId>)> = cx
         .editor

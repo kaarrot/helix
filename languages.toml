@@ -1074,8 +1074,10 @@ quirks = { full-value-expression = "repr({})" }
 # Requires `pip install debugpy` and ptrace permission on Linux
 # (kernel.yama.ptrace_scope = 0, or CAP_SYS_PTRACE).
 # Use: `space G l` -> Attach to PID -> enter PID (e.g. 12345) or name (e.g. gunicorn).
-# Name lookup matches /proc/<pid>/comm or basename of argv[0]; ambiguous names
-# (multiple matches) are rejected with a list of candidate PIDs.
+# Name lookup matches /proc/<pid>/comm, the basename of argv[0], or the script
+# an interpreter runs. Enter attaches to the newest match; Tab cycles through
+# them all. Up/Down recall names used before, also in earlier sessions (kept in
+# the cache directory as `dap-process-history`); a PID is remembered by name.
 [[language.debugger.templates]]
 name = "Attach to PID"
 request = "attach"

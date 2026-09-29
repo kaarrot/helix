@@ -81,8 +81,11 @@ fn thread_picker(
 }
 
 /// Prompt history for "process" parameters. It holds process names only (see
-/// `remember_process_name`), so Up/Down recall e.g. `hython-bin`.
+/// `remember_process_name`), so Up/Down recall e.g. `hython-bin`, also in later
+/// sessions.
 const PROCESS_HISTORY_REGISTER: char = '>';
+const PROCESS_HISTORY_FILE: &str = "dap-process-history";
+const PROCESS_HISTORY_LIMIT: usize = 100;
 
 /// A running process a "process" parameter can refer to.
 struct ProcessInfo {
@@ -187,6 +190,36 @@ fn process_by_pid(pid: u32) -> Option<ProcessInfo> {
     read_process(pid, uptime_secs()).map(|(_, _, process)| process)
 }
 
+/// The name that finds the process with this PID again later, when the PID
+/// itself is long gone. See `process_name`.
+#[cfg(target_os = "linux")]
+fn process_name_by_pid(pid: u32) -> Option<String> {
+    read_process(pid, 0).map(|(_, comm, process)| process_name(&comm, &process.argv))
+}
+
+/// The first non-flag argument, which for an interpreter is the script it runs
+/// (or, after `-m`, the module).
+fn script_argument(argv: &[String]) -> Option<&str> {
+    argv.iter()
+        .skip(1)
+        .find(|arg| !arg.starts_with('-'))
+        .map(String::as_str)
+}
+
+/// A name `find_processes` matches the process by. For a Python interpreter
+/// that is the script's stem, since every Python process shares `python3`;
+/// otherwise `comm`, e.g. `hython-bin`. A `-c` snippet is no name at all.
+fn process_name(comm: &str, argv: &[String]) -> String {
+    let interpreter = comm.starts_with("python") || comm.starts_with("pypy");
+    let script = script_argument(argv)
+        .and_then(|script| std::path::Path::new(script).file_stem()?.to_str())
+        .filter(|stem| !stem.is_empty() && !stem.contains(char::is_whitespace));
+    match script {
+        Some(stem) if interpreter => stem.to_owned(),
+        _ => comm.to_owned(),
+    }
+}
+
 /// Processes whose `comm`, `argv[0]` basename, or first non-flag argument
 /// (basename or stem) is `name`, most recently started first. The last two
 /// cover interpreters, where `comm` is `python3` but the argument is the
@@ -210,7 +243,7 @@ fn find_processes(name: &str) -> Vec<ProcessInfo> {
             let basename = |s: &str| Path::new(s).file_name()?.to_str().map(str::to_owned);
             let stem = |s: &str| Path::new(s).file_stem()?.to_str().map(str::to_owned);
             let arg0 = &process.argv[0];
-            let script = process.argv.iter().skip(1).find(|s| !s.starts_with('-'));
+            let script = script_argument(&process.argv);
 
             comm == name
                 || basename(arg0).as_deref().unwrap_or(arg0) == name
@@ -226,6 +259,11 @@ fn find_processes(name: &str) -> Vec<ProcessInfo> {
 
 #[cfg(not(target_os = "linux"))]
 fn process_by_pid(_pid: u32) -> Option<ProcessInfo> {
+    None
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_name_by_pid(_pid: u32) -> Option<String> {
     None
 }
 
@@ -290,21 +328,38 @@ fn process_doc(input: &str) -> Option<String> {
 
 /// The prompt stores the whole line in its history, and after a Tab
 /// completion that carries a PID and command line that go stale. Rewrites
-/// the history to the name alone, most recent first and without repeats.
+/// the history to the name alone, most recent first and without repeats, and
+/// saves it for later sessions. A bare PID is remembered by its process's
+/// name, since the PID will point at nothing, or at something else, by then.
 fn remember_process_name(editor: &mut Editor, input: &str) {
-    let (Some(name), _) = parse_process_input(input) else {
-        return;
+    let name = match parse_process_input(input) {
+        (Some(name), _) => Some(name.to_owned()),
+        (None, Some(pid)) => process_name_by_pid(pid),
+        (None, None) => None,
     };
     let mut history: Vec<String> = editor
         .registers
         .read(PROCESS_HISTORY_REGISTER, editor)
         .map(|values| values.map(Cow::into_owned).collect())
         .unwrap_or_default();
-    history.retain(|entry| parse_process_input(entry).0.is_some_and(|n| n != name));
-    history.insert(0, name.to_owned());
+    history.retain(|entry| {
+        parse_process_input(entry)
+            .0
+            .is_some_and(|n| Some(n) != name.as_deref())
+    });
+    if let Some(name) = name {
+        history.insert(0, name);
+    }
     if let Err(err) = editor.registers.write(PROCESS_HISTORY_REGISTER, history) {
         editor.set_error(err.to_string());
+        return;
     }
+    save_history(
+        editor,
+        PROCESS_HISTORY_REGISTER,
+        PROCESS_HISTORY_FILE,
+        PROCESS_HISTORY_LIMIT,
+    );
 }
 
 fn get_breakpoint_at_current_line(editor: &mut Editor) -> Option<(usize, Breakpoint)> {
@@ -618,7 +673,7 @@ pub fn dap_restart(cx: &mut Context) {
 }
 
 fn debug_parameter_prompt(
-    editor: &Editor,
+    editor: &mut Editor,
     completions: Vec<DebugConfigCompletion>,
     config_name: String,
     mut params: Vec<String>,
@@ -651,6 +706,9 @@ fn debug_parameter_prompt(
         _ => ui::completers::none,
     };
     let is_process = field_type == "process";
+    if is_process {
+        load_history(editor, PROCESS_HISTORY_REGISTER, PROCESS_HISTORY_FILE);
+    }
 
     // Pre-fill the prompt with the configured default so it is visible (and
     // editable) instead of the user having to guess what an empty input means.
@@ -909,11 +967,12 @@ fn expression_from(text: RopeSlice, range: Range) -> String {
 /// Register backing the eval prompt's history. `=` mirrors vim's expression
 /// register and is not otherwise used by Helix.
 const EVAL_HISTORY_REGISTER: char = '=';
+const EVAL_HISTORY_FILE: &str = "dap-eval-history";
 /// How many past expressions to keep on disk.
 const EVAL_HISTORY_LIMIT: usize = 500;
 
-fn eval_history_file() -> PathBuf {
-    helix_loader::cache_dir().join("dap-eval-history")
+fn history_file(name: &str) -> PathBuf {
+    helix_loader::cache_dir().join(name)
 }
 
 /// Parse the history file, whose entries run oldest first, into the newest-first
@@ -928,12 +987,12 @@ fn history_from_file(contents: &str) -> Vec<String> {
 }
 
 /// Render newest-first history, as `Registers::read` yields it, into the file's
-/// oldest-first order, capped at the most recent `EVAL_HISTORY_LIMIT` entries.
+/// oldest-first order, capped at the most recent `limit` entries.
 /// A pasted newline would corrupt the line-per-entry format, so drop those.
-fn history_to_file(values: impl Iterator<Item = String>) -> String {
+fn history_to_file(values: impl Iterator<Item = String>, limit: usize) -> String {
     let mut entries: Vec<String> = values.filter(|value| !value.contains('\n')).collect();
     entries.reverse();
-    entries.drain(..entries.len().saturating_sub(EVAL_HISTORY_LIMIT));
+    entries.drain(..entries.len().saturating_sub(limit));
 
     entries
         .iter()
@@ -941,18 +1000,19 @@ fn history_to_file(values: impl Iterator<Item = String>) -> String {
         .collect()
 }
 
-/// Seed the history register from disk, so the prompt recalls expressions from
-/// earlier sessions. Only fills an empty register, i.e. once per session.
-fn load_eval_history(editor: &mut Editor) {
+/// Seed a prompt's history register from `file` in the cache directory, so the
+/// prompt recalls entries from earlier sessions. Only fills an empty register,
+/// i.e. once per session.
+fn load_history(editor: &mut Editor, register: char, file: &str) {
     let loaded = editor
         .registers
-        .read(EVAL_HISTORY_REGISTER, editor)
+        .read(register, editor)
         .is_some_and(|values| values.len() > 0);
     if loaded {
         return;
     }
 
-    let Ok(contents) = std::fs::read_to_string(eval_history_file()) else {
+    let Ok(contents) = std::fs::read_to_string(history_file(file)) else {
         return;
     };
 
@@ -961,25 +1021,25 @@ fn load_eval_history(editor: &mut Editor) {
         return;
     }
 
-    if let Err(err) = editor.registers.write(EVAL_HISTORY_REGISTER, entries) {
-        log::error!("Failed to restore debug eval history: {}", err);
+    if let Err(err) = editor.registers.write(register, entries) {
+        log::error!("Failed to restore {} history: {}", file, err);
     }
 }
 
-/// Mirror the history register to disk. The prompt pushes the new expression
-/// before invoking us, so the file always matches what the prompt recalls.
-fn save_eval_history(editor: &Editor) {
-    let Some(values) = editor.registers.read(EVAL_HISTORY_REGISTER, editor) else {
+/// Mirror a history register to `file`. The prompt pushes the new entry before
+/// invoking its callback, so the file always matches what the prompt recalls.
+fn save_history(editor: &Editor, register: char, file: &str, limit: usize) {
+    let Some(values) = editor.registers.read(register, editor) else {
         return;
     };
 
-    let contents = history_to_file(values.map(|value| value.to_string()));
+    let contents = history_to_file(values.map(|value| value.to_string()), limit);
 
-    let path = eval_history_file();
+    let path = history_file(file);
     let written = std::fs::create_dir_all(helix_loader::cache_dir())
         .and_then(|_| std::fs::write(&path, contents));
     if let Err(err) = written {
-        log::error!("Failed to save debug eval history to {:?}: {}", path, err);
+        log::error!("Failed to save history to {:?}: {}", path, err);
     }
 }
 
@@ -1187,7 +1247,7 @@ pub fn dap_evaluate(cx: &mut Context) {
         expression_from(doc.text().slice(..), doc.selection(view.id).primary())
     };
 
-    load_eval_history(cx.editor);
+    load_history(cx.editor, EVAL_HISTORY_REGISTER, EVAL_HISTORY_FILE);
 
     let prompt = Prompt::new(
         "eval: ".into(),
@@ -1198,7 +1258,12 @@ pub fn dap_evaluate(cx: &mut Context) {
                 return;
             }
 
-            save_eval_history(cx.editor);
+            save_history(
+                cx.editor,
+                EVAL_HISTORY_REGISTER,
+                EVAL_HISTORY_FILE,
+                EVAL_HISTORY_LIMIT,
+            );
 
             let debugger = match cx.editor.debug_adapters.get_active_client() {
                 Some(debugger) => debugger,
@@ -1749,6 +1814,38 @@ mod tests {
     }
 
     #[test]
+    fn names_process_for_history() {
+        let argv = |args: &[&str]| args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
+
+        // Every Python process is `python3`, so the script tells them apart.
+        assert_eq!(
+            process_name("python3", &argv(&["python3", "-u", "/srv/app/worker.py"])),
+            "worker"
+        );
+        assert_eq!(
+            process_name("python3.11", &argv(&["python3", "-m", "pytest", "-x"])),
+            "pytest"
+        );
+        // A `-c` snippet is no name, nor is a bare interpreter.
+        assert_eq!(
+            process_name(
+                "python3",
+                &argv(&["python3", "-c", "import time; time.sleep(9)"])
+            ),
+            "python3"
+        );
+        assert_eq!(process_name("python3", &argv(&["python3"])), "python3");
+        // Anything else is known by `comm`, even when it runs a script.
+        assert_eq!(
+            process_name(
+                "hython-bin",
+                &argv(&["/opt/hfs/bin/hython-bin", "/a/test.py"])
+            ),
+            "hython-bin"
+        );
+    }
+
+    #[test]
     fn formats_process_age() {
         assert_eq!(format_age(59), "59s");
         assert_eq!(format_age(60), "1m");
@@ -1861,21 +1958,27 @@ mod tests {
     #[test]
     fn history_round_trips_newest_first() {
         // `Registers::read` hands back the newest entry first.
-        let contents = history_to_file(["x + 1", "len(items)"].map(String::from).into_iter());
+        let contents = history_to_file(
+            ["x + 1", "len(items)"].map(String::from).into_iter(),
+            EVAL_HISTORY_LIMIT,
+        );
         // The file reads oldest first, like a log.
         assert_eq!(contents, "len(items)\nx + 1\n");
         assert_eq!(history_from_file(&contents), vec!["x + 1", "len(items)"]);
 
         // Entries that would break the line-per-entry format are dropped.
         assert_eq!(
-            history_to_file(["a\nb", "c"].map(String::from).into_iter()),
+            history_to_file(
+                ["a\nb", "c"].map(String::from).into_iter(),
+                EVAL_HISTORY_LIMIT
+            ),
             "c\n"
         );
         assert!(history_from_file("\n\n").is_empty());
 
         // Only the most recent entries are kept.
         let many = (0..EVAL_HISTORY_LIMIT + 10).map(|i| i.to_string());
-        let kept = history_from_file(&history_to_file(many));
+        let kept = history_from_file(&history_to_file(many, EVAL_HISTORY_LIMIT));
         assert_eq!(kept.len(), EVAL_HISTORY_LIMIT);
         assert_eq!(kept[0], "0", "the newest entry survives");
         assert_eq!(

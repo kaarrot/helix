@@ -7,6 +7,7 @@ use crate::{DocumentId, Editor, ViewId};
 
 pub mod completion;
 pub mod dap;
+pub mod dap_console;
 pub mod diagnostics;
 pub mod lsp;
 pub mod word_index;

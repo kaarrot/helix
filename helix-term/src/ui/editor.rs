@@ -3,10 +3,11 @@ use super::diff;
 use crate::{
     commands::{self, OnKeyCallback, OnKeyCallbackKind},
     compositor::{Callback, Component, Context, Event, EventResult},
+    ctrl,
     events::{OnModeSwitch, PostCommand},
     handlers::completion::CompletionItem,
     key,
-    keymap::{KeymapResult, Keymaps},
+    keymap::{KeyTrie, KeyTrieNode, KeymapResult, Keymaps},
     ui::{
         document::{render_document, LinePos, TextRenderer},
         statusline,
@@ -61,6 +62,12 @@ pub struct EditorView {
     spinners: ProgressSpinners,
     /// Tracks if the terminal window is focused by reaction to terminal focus events
     terminal_focused: bool,
+    /// The sticky debug menu, set aside while the debug console has focus so keys
+    /// type and move there, and put back when focus leaves it.
+    parked_sticky: Option<KeyTrieNode>,
+    /// Whether the debug console had focus at the last look, to tell focus moving
+    /// into or out of it from a sticky menu entered while inside.
+    console_had_focus: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -95,6 +102,8 @@ impl EditorView {
             last_left_click: None,
             spinners: ProgressSpinners::default(),
             terminal_focused: true,
+            parked_sticky: None,
+            console_had_focus: false,
         }
     }
 
@@ -1034,6 +1043,175 @@ impl EditorView {
         None
     }
 
+    /// Parks the sticky debug menu while the debug console has focus, and puts it
+    /// back once focus has moved elsewhere -- so using the console never leaves
+    /// debug mode.
+    ///
+    /// Only the move in and out does this. A sticky menu entered from inside the
+    /// console, `<space>G` or `Z`, works there as anywhere else.
+    fn sync_dap_console_sticky(&mut self, editor: &mut Editor) {
+        let focused = editor.is_dap_console_focused();
+        match (self.console_had_focus, focused) {
+            (false, true) => {
+                if let Some(sticky) = self.keymaps.sticky.take() {
+                    self.parked_sticky = Some(sticky);
+                    editor.autoinfo = None;
+                }
+            }
+            (true, false) => {
+                // A menu entered inside the console and still open wins.
+                if let Some(sticky) = self.parked_sticky.take() {
+                    if self.keymaps.sticky.is_none() {
+                        editor.autoinfo = Some(sticky.infobox());
+                        self.keymaps.sticky = Some(sticky);
+                    }
+                }
+            }
+            _ => (),
+        }
+        self.console_had_focus = focused;
+    }
+
+    /// Whether `key` opens and closes the debug console. It is bound in the debug
+    /// menu, so that is where to look -- a rebinding there moves both ends.
+    ///
+    /// A toggle bound to a plain character, `x` say, is text while typing: it only
+    /// closes the console from normal mode.
+    fn is_dap_console_toggle(&self, mode: Mode, key: KeyEvent) -> bool {
+        if mode == Mode::Insert && matches!(key.code, KeyCode::Char(_)) && key.modifiers.is_empty()
+        {
+            return false;
+        }
+        let is_toggle = |node: &KeyTrieNode| matches!(node.get(&key), Some(KeyTrie::MappableCommand(cmd)) if cmd.name() == "dap_console_toggle");
+        match &self.parked_sticky {
+            Some(node) => is_toggle(node),
+            None => self.keymaps.map()[&Mode::Normal]
+                .search(&[key!(' '), key!('G')])
+                .and_then(KeyTrie::node)
+                .is_some_and(is_toggle),
+        }
+    }
+
+    /// The keys that belong to the debug console rather than to editing: the
+    /// toggle, and on the input line `<ret>`, history and completion. Returns
+    /// whether the key was taken.
+    fn handle_dap_console_key(
+        &mut self,
+        cx: &mut commands::Context,
+        mode: Mode,
+        key: KeyEvent,
+    ) -> bool {
+        use commands::dap::console;
+
+        if self.is_dap_console_toggle(mode, key) {
+            if self.completion.is_some() {
+                self.clear_completion(cx.editor);
+            }
+            commands::dap_console_toggle(cx);
+            let new_mode = cx.editor.mode();
+            if new_mode != mode {
+                helix_event::dispatch(OnModeSwitch {
+                    old_mode: mode,
+                    new_mode,
+                    cx,
+                });
+            }
+            return true;
+        }
+        // Keys a half-typed command is waiting for, e.g. the register after `C-r`,
+        // are not the console's, nor are those of a sticky menu opened in it.
+        if !self.keymaps.pending().is_empty()
+            || self.on_next_key.is_some()
+            || self.keymaps.sticky.is_some()
+        {
+            return false;
+        }
+
+        match (mode, key) {
+            // With nothing picked in the completion menu, `<ret>` would insert a
+            // line break into the input; run it instead.
+            (Mode::Insert, key!(Enter))
+                if self
+                    .completion
+                    .as_ref()
+                    .is_some_and(|completion| !completion.has_selection()) =>
+            {
+                self.clear_completion(cx.editor);
+                console::submit(cx);
+                true
+            }
+            // An open completion menu keeps its keys.
+            (Mode::Insert, _) if self.completion.is_some() => false,
+            (Mode::Insert, key!(Enter)) => {
+                console::submit(cx);
+                true
+            }
+            (Mode::Insert, key!(Up) | ctrl!('p')) if console::on_input_line(cx.editor) => {
+                console::history(cx.editor, true);
+                true
+            }
+            (Mode::Insert, key!(Down) | ctrl!('n')) if console::on_input_line(cx.editor) => {
+                console::history(cx.editor, false);
+                true
+            }
+            (Mode::Insert, key!(Tab)) if console::on_input_line(cx.editor) => {
+                self.complete_in_dap_console(cx.editor);
+                true
+            }
+            (Mode::Insert, key) if key.char().is_some() => {
+                console::snap_to_input(cx.editor);
+                false
+            }
+            (Mode::Normal, key!(Esc)) => {
+                console::leave(cx.editor);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// `Tab` on the debug console's input line: complete from the debug adapter. A
+    /// single candidate is taken straight away; several open the completion menu.
+    fn complete_in_dap_console(&mut self, editor: &mut Editor) {
+        use helix_core::completion::CompletionProvider;
+        use helix_view::handlers::completion::ResponseContext;
+
+        let items = match commands::dap::console::completions(editor) {
+            Ok(items) => items,
+            Err(err) => {
+                editor.set_error(err.to_string());
+                return;
+            }
+        };
+
+        let (view, doc) = current!(editor);
+        match items.len() {
+            0 => editor.set_status("No completions"),
+            1 => {
+                doc.apply(&items[0].transaction, view.id);
+            }
+            _ => {
+                // The menu rewinds to this point before applying what is picked.
+                let savepoint = doc.savepoint(view);
+                let trigger_offset = doc
+                    .selection(view.id)
+                    .primary()
+                    .cursor(doc.text().slice(..));
+                editor.handlers.completions.active_completions.insert(
+                    CompletionProvider::Debugger,
+                    ResponseContext {
+                        is_incomplete: false,
+                        priority: 0,
+                        savepoint,
+                    },
+                );
+                let items = items.into_iter().map(CompletionItem::Other).collect();
+                let area = editor.tree.area();
+                self.set_completion(editor, items, trigger_offset, area);
+            }
+        }
+    }
+
     fn insert_mode(&mut self, cx: &mut commands::Context, event: KeyEvent) {
         if let Some(keyresult) = self.handle_keymap_event(Mode::Insert, cx, event) {
             match keyresult {
@@ -1440,8 +1618,8 @@ impl EditorView {
                     // searched.
                     commands::dap::append_eval_result(cxt.editor, &result);
                     let status = match result.value.contains("...") {
-                        true => "yanked evaluate result to clipboard and buffer (adapter elided the value)",
-                        false => "yanked evaluate result to clipboard and buffer",
+                        true => "yanked evaluate result to clipboard and debug console (adapter elided the value)",
+                        false => "yanked evaluate result to clipboard and debug console",
                     };
                     cxt.editor.set_status(status);
                     return EventResult::Consumed(None);
@@ -1811,6 +1989,19 @@ impl Component for EditorView {
         };
 
         match event {
+            // Pasting into the debug console reads as typing on its input line.
+            Event::Paste(contents) if cx.editor.is_dap_console_focused() => {
+                self.handle_non_key_input(&mut cx, false);
+                if self.completion.is_some() {
+                    self.clear_completion(cx.editor);
+                }
+                commands::dap::console::paste(&mut cx, contents);
+
+                let config = cx.editor.config();
+                let (view, doc) = current!(cx.editor);
+                view.ensure_cursor_in_view(doc, config.scrolloff);
+                EventResult::Consumed(None)
+            }
             Event::Paste(contents) => {
                 self.handle_non_key_input(&mut cx, false);
                 cx.count = cx.editor.count;
@@ -1848,7 +2039,12 @@ impl Component for EditorView {
 
                 let mode = cx.editor.mode();
 
-                if !self.on_next_key(OnKeyCallbackKind::PseudoPending, &mut cx, key) {
+                self.sync_dap_console_sticky(cx.editor);
+                let console_key = cx.editor.is_dap_console_focused()
+                    && self.handle_dap_console_key(&mut cx, mode, key);
+
+                if !console_key && !self.on_next_key(OnKeyCallbackKind::PseudoPending, &mut cx, key)
+                {
                     match mode {
                         Mode::Insert => {
                             // let completion swallow the event if necessary
@@ -1909,6 +2105,15 @@ impl Component for EditorView {
                     Some((_, OnKeyCallbackKind::PseudoPending)) => self.pseudo_pending.push(key),
                     _ => self.pseudo_pending.clear(),
                 }
+
+                // Typing in the console always happens on its input line.
+                if mode != Mode::Insert
+                    && cx.editor.mode() == Mode::Insert
+                    && cx.editor.is_dap_console_focused()
+                {
+                    commands::dap::console::snap_to_input(cx.editor);
+                }
+                self.sync_dap_console_sticky(cx.editor);
 
                 // appease borrowck
                 let callbacks = take(&mut cx.callback);
@@ -1973,6 +2178,10 @@ impl Component for EditorView {
     }
 
     fn render(&mut self, area: Rect, surface: &mut Surface, cx: &mut Context) {
+        // Focus can also move without a key reaching this view: a `:` command, a
+        // picker, a mouse click.
+        self.sync_dap_console_sticky(cx.editor);
+
         // clear with background color
         surface.set_style(area, cx.editor.theme.get("ui.background"));
         let config = cx.editor.config();

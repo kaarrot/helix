@@ -17,6 +17,8 @@ pub enum CompletionProvider {
     Lsp(LanguageServerId),
     Path,
     Word,
+    /// The debug adapter, completing in the debug console.
+    Debugger,
 }
 
 impl From<LanguageServerId> for CompletionProvider {

@@ -220,6 +220,10 @@ pub struct Document {
     pub char_diff_minus_side: bool,
     /// The paired document in a split diff session.
     pub linked_diff_doc: Option<DocumentId>,
+    /// A buffer the editor writes itself, such as the debug console. Nothing in it
+    /// needs saving, so it never counts as modified, and it is kept rather than
+    /// discarded when another file replaces it in a view, although it has no path.
+    pub is_transcript: bool,
 
     pub previous_diagnostic_id: Option<String>,
 
@@ -752,6 +756,7 @@ impl Document {
             char_diff_enabled: false,
             char_diff_minus_side: false,
             linked_diff_doc: None,
+            is_transcript: false,
             jump_labels: HashMap::new(),
             color_swatches: None,
             color_swatch_controller: TaskController::new(),
@@ -1846,6 +1851,9 @@ impl Document {
 
     /// If there are unsaved modifications.
     pub fn is_modified(&self) -> bool {
+        if self.is_transcript {
+            return false;
+        }
         let history = self.history.take();
         let current_revision = history.current_revision();
         self.history.set(history);

@@ -6,11 +6,10 @@ use crate::{
 };
 use dap::{StackFrame, Thread, ThreadStates};
 use helix_core::syntax::config::{DebugArgumentValue, DebugConfigCompletion, DebugTemplate};
-use helix_core::{Range, RopeSlice, Selection, Transaction};
+use helix_core::{Range, RopeSlice};
 use helix_dap::{self as dap, requests::TerminateArguments};
 use helix_lsp::block_on;
-use helix_view::editor::{Action, Breakpoint, DapEvalResult};
-use helix_view::DocumentId;
+use helix_view::editor::{Breakpoint, DapEvalResult};
 
 use serde_json::{to_value, Value};
 
@@ -23,6 +22,9 @@ use std::path::PathBuf;
 use anyhow::{anyhow, bail};
 
 use helix_view::handlers::dap::{breakpoints_changed, jump_to_stack_frame, select_thread_id};
+
+pub(crate) mod console;
+pub use console::dap_console_toggle;
 
 fn thread_picker(
     cx: &mut Context,
@@ -493,6 +495,10 @@ pub fn dap_start_impl(
         (None, None) => None,
     };
 
+    // A line the previous session's program left unfinished is written out now
+    // rather than run into the new session's first output.
+    cx.editor.dap_console_flush_output();
+
     let id = cx
         .editor
         .debug_adapters
@@ -790,10 +796,23 @@ pub fn dap_toggle_breakpoint(cx: &mut Context) {
 }
 
 pub fn dap_toggle_breakpoint_impl(cx: &mut Context, path: PathBuf, line: usize) {
+    if let Err(err) = toggle_breakpoint(cx.editor, path, line) {
+        cx.editor.set_error(err.to_string());
+    }
+}
+
+/// Sets a breakpoint on `line` (0-based) of `path`, or clears the one there, and
+/// tells the debugger when one is running. The debugger may move a breakpoint it
+/// sets to a line it can stop on.
+pub(crate) fn toggle_breakpoint(
+    editor: &mut Editor,
+    path: PathBuf,
+    line: usize,
+) -> anyhow::Result<()> {
     // TODO: need to map breakpoints over edits and update them?
     // we shouldn't really allow editing while debug is running though
 
-    let breakpoints = cx.editor.breakpoints.entry(path.clone()).or_default();
+    let breakpoints = editor.breakpoints.entry(path.clone()).or_default();
     // TODO: always keep breakpoints sorted and use binary search to determine insertion point
     if let Some(pos) = breakpoints
         .iter()
@@ -807,31 +826,58 @@ pub fn dap_toggle_breakpoint_impl(cx: &mut Context, path: PathBuf, line: usize) 
         });
     }
 
-    let debugger = debugger!(cx.editor);
+    // Without a session the breakpoint waits to be sent when one starts.
+    let Some(debugger) = editor.debug_adapters.get_active_client_mut() else {
+        return Ok(());
+    };
+    breakpoints_changed(debugger, path, breakpoints)
+        .map_err(|err| anyhow!("Failed to set breakpoints: {err}"))
+}
 
-    if let Err(e) = breakpoints_changed(debugger, path, breakpoints) {
-        cx.editor
-            .set_error(format!("Failed to set breakpoints: {}", e));
+/// The ways of moving execution on from where it stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Step {
+    Over,
+    In,
+    Out,
+    Continue,
+}
+
+/// Moves the stopped thread on. The debugger answers with a "stopped" event when
+/// it gets there, which is what moves the cursor.
+pub(crate) fn step(editor: &mut Editor, jobs: &mut Jobs, step: Step) -> anyhow::Result<()> {
+    let debugger = editor
+        .debug_adapters
+        .get_active_client_mut()
+        .ok_or_else(|| anyhow!("Debugger is not running"))?;
+    let thread_id = debugger
+        .thread_id
+        .ok_or_else(|| anyhow!("Currently active thread is not stopped. Switch the thread."))?;
+
+    let request: std::pin::Pin<Box<dyn Future<Output = helix_dap::Result<Value>> + Send>> =
+        match step {
+            Step::Over => Box::pin(debugger.next(thread_id)),
+            Step::In => Box::pin(debugger.step_in(thread_id)),
+            Step::Out => Box::pin(debugger.step_out(thread_id)),
+            Step::Continue => Box::pin(debugger.continue_thread(thread_id)),
+        };
+    dap_callback(jobs, request, |editor, _compositor, _response: Value| {
+        debugger!(editor).resume_application();
+    });
+    Ok(())
+}
+
+fn step_command(cx: &mut Context, kind: Step) {
+    if cx.editor.debug_adapters.get_active_client().is_none() {
+        return;
+    }
+    if let Err(err) = step(cx.editor, cx.jobs, kind) {
+        cx.editor.set_error(err.to_string());
     }
 }
 
 pub fn dap_continue(cx: &mut Context) {
-    let debugger = debugger!(cx.editor);
-
-    if let Some(thread_id) = debugger.thread_id {
-        let request = debugger.continue_thread(thread_id);
-
-        dap_callback(
-            cx.jobs,
-            request,
-            |editor, _compositor, _response: dap::requests::ContinueResponse| {
-                debugger!(editor).resume_application();
-            },
-        );
-    } else {
-        cx.editor
-            .set_error("Currently active thread is not stopped. Switch the thread.");
-    }
+    step_command(cx, Step::Continue)
 }
 
 pub fn dap_pause(cx: &mut Context) {
@@ -846,65 +892,21 @@ pub fn dap_pause(cx: &mut Context) {
 }
 
 pub fn dap_step_in(cx: &mut Context) {
-    let debugger = debugger!(cx.editor);
-
-    if let Some(thread_id) = debugger.thread_id {
-        let request = debugger.step_in(thread_id);
-
-        dap_callback(cx.jobs, request, |editor, _compositor, _response: ()| {
-            debugger!(editor).resume_application();
-        });
-    } else {
-        cx.editor
-            .set_error("Currently active thread is not stopped. Switch the thread.");
-    }
+    step_command(cx, Step::In)
 }
 
 pub fn dap_step_out(cx: &mut Context) {
-    let debugger = debugger!(cx.editor);
-
-    if let Some(thread_id) = debugger.thread_id {
-        let request = debugger.step_out(thread_id);
-        dap_callback(cx.jobs, request, |editor, _compositor, _response: ()| {
-            debugger!(editor).resume_application();
-        });
-    } else {
-        cx.editor
-            .set_error("Currently active thread is not stopped. Switch the thread.");
-    }
+    step_command(cx, Step::Out)
 }
 
 pub fn dap_next(cx: &mut Context) {
-    let debugger = debugger!(cx.editor);
-
-    if let Some(thread_id) = debugger.thread_id {
-        let request = debugger.next(thread_id);
-        dap_callback(cx.jobs, request, |editor, _compositor, _response: ()| {
-            debugger!(editor).resume_application();
-        });
-    } else {
-        cx.editor
-            .set_error("Currently active thread is not stopped. Switch the thread.");
-    }
+    step_command(cx, Step::Over)
 }
 
 pub fn dap_goto_line(cx: &mut Context) {
-    let debugger = debugger!(cx.editor);
-
-    if debugger.capabilities().supports_goto_targets_request != Some(true) {
-        cx.editor
-            .set_error("Debugger does not support jumping to a line");
+    if cx.editor.debug_adapters.get_active_client().is_none() {
         return;
     }
-
-    let thread_id = match debugger.thread_id {
-        Some(thread_id) => thread_id,
-        None => {
-            cx.editor
-                .set_error("Currently active thread is not stopped. Switch the thread.");
-            return;
-        }
-    };
 
     let (view, doc) = current!(cx.editor);
     let path = match doc.path() {
@@ -915,24 +917,48 @@ pub fn dap_goto_line(cx: &mut Context) {
         }
     };
     let text = doc.text().slice(..);
-    // DAP lines are 1-indexed.
-    let line = doc.selection(view.id).primary().cursor_line(text) + 1;
+    let line = doc.selection(view.id).primary().cursor_line(text);
+
+    if let Err(err) = goto_line(cx.editor, cx.jobs, path, line) {
+        cx.editor.set_error(err.to_string());
+    }
+}
+
+/// Moves execution to `line` (0-based) of `path` without running what lies
+/// between.
+pub(crate) fn goto_line(
+    editor: &mut Editor,
+    jobs: &mut Jobs,
+    path: PathBuf,
+    line: usize,
+) -> anyhow::Result<()> {
+    let debugger = editor
+        .debug_adapters
+        .get_active_client_mut()
+        .ok_or_else(|| anyhow!("Debugger is not running"))?;
+
+    if debugger.capabilities().supports_goto_targets_request != Some(true) {
+        bail!("Debugger does not support jumping to a line");
+    }
+    let thread_id = debugger
+        .thread_id
+        .ok_or_else(|| anyhow!("Currently active thread is not stopped. Switch the thread."))?;
 
     let source = dap::Source {
         path: Some(path),
         ..Default::default()
     };
 
-    let debugger = debugger!(cx.editor);
-    let request = debugger.goto_targets(source, line, None);
+    // DAP lines are 1-indexed.
+    let request = debugger.goto_targets(source, line + 1, None);
     dap_callback(
-        cx.jobs,
+        jobs,
         request,
         move |editor, _compositor, response: dap::requests::GotoTargetsResponse| {
             let target = match response.targets.first() {
                 Some(target) => target,
                 None => {
-                    editor.set_error("No valid jump target on this line");
+                    report_error(editor, "No valid jump target on this line");
                     return;
                 }
             };
@@ -940,10 +966,18 @@ pub fn dap_goto_line(cx: &mut Context) {
             let request = debugger.goto(thread_id, target.id);
             // A successful goto emits a "stopped" event that moves the cursor.
             if let Err(e) = block_on(request) {
-                editor.set_error(format!("Failed to jump: {}", e));
+                report_error(editor, &format!("Failed to jump: {}", e));
             }
         },
     );
+    Ok(())
+}
+
+/// Reports a failure that surfaced after the command that caused it returned: on
+/// the status line, and in the debug console where one is open.
+pub(crate) fn report_error(editor: &mut Editor, message: &str) {
+    editor.set_error(message.to_string());
+    editor.dap_console_print(&format!("*** {message}"));
 }
 
 /// The expression to seed the eval prompt with: the primary selection, when
@@ -971,8 +1005,13 @@ const EVAL_HISTORY_FILE: &str = "dap-eval-history";
 /// How many past expressions to keep on disk.
 const EVAL_HISTORY_LIMIT: usize = 500;
 
-fn history_file(name: &str) -> PathBuf {
-    helix_loader::cache_dir().join(name)
+/// Where a history is kept between sessions. Integration tests run without
+/// one, so they neither read nor add to the developer's own.
+fn history_file(name: &str) -> Option<PathBuf> {
+    if cfg!(feature = "integration") {
+        return None;
+    }
+    Some(helix_loader::cache_dir().join(name))
 }
 
 /// Parse the history file, whose entries run oldest first, into the newest-first
@@ -1012,7 +1051,7 @@ fn load_history(editor: &mut Editor, register: char, file: &str) {
         return;
     }
 
-    let Ok(contents) = std::fs::read_to_string(history_file(file)) else {
+    let Some(Ok(contents)) = history_file(file).map(std::fs::read_to_string) else {
         return;
     };
 
@@ -1035,12 +1074,28 @@ fn save_history(editor: &Editor, register: char, file: &str, limit: usize) {
 
     let contents = history_to_file(values.map(|value| value.to_string()), limit);
 
-    let path = history_file(file);
+    let Some(path) = history_file(file) else {
+        return;
+    };
     let written = std::fs::create_dir_all(helix_loader::cache_dir())
         .and_then(|_| std::fs::write(&path, contents));
     if let Err(err) = written {
         log::error!("Failed to save history to {:?}: {}", path, err);
     }
+}
+
+/// The eval history, shared by the eval prompt and the debug console.
+fn load_eval_history(editor: &mut Editor) {
+    load_history(editor, EVAL_HISTORY_REGISTER, EVAL_HISTORY_FILE);
+}
+
+fn save_eval_history(editor: &Editor) {
+    save_history(
+        editor,
+        EVAL_HISTORY_REGISTER,
+        EVAL_HISTORY_FILE,
+        EVAL_HISTORY_LIMIT,
+    );
 }
 
 /// Adapters fold long values down with an ellipsis -- pydevd caps how many
@@ -1112,6 +1167,12 @@ fn unquote(value: &str) -> Cow<'_, str> {
 /// to report the value that was just stored. `None` for anything that is not a
 /// plain assignment statement.
 fn assignment_target(expression: &str) -> Option<&str> {
+    split_assignment(expression).map(|(target, _, _)| target)
+}
+
+/// An assignment statement split into its target, its operator (`=`, `+=`, ...)
+/// and the value assigned.
+fn split_assignment(expression: &str) -> Option<(&str, &str, &str)> {
     let mut depth = 0usize;
     let mut quote: Option<char> = None;
 
@@ -1140,10 +1201,13 @@ fn assignment_target(expression: &str) -> Option<&str> {
                 }
 
                 // Peel the operator of an augmented assignment off the target.
-                let target = before
+                let target_end = before
                     .trim_end_matches(|ch| "+-*/%&|^@<>~".contains(ch))
-                    .trim();
-                return (!target.is_empty()).then_some(target);
+                    .len();
+                let target = before[..target_end].trim();
+                let operator = expression[target_end..=i].trim();
+                let value = expression[i + 1..].trim();
+                return (!target.is_empty()).then_some((target, operator, value));
             }
             _ => (),
         }
@@ -1186,54 +1250,117 @@ fn status_line_value(result: &str) -> String {
     }
 }
 
-/// The buffer that evaluate results are written to, created on first use and
-/// reused afterwards. A long collection is only useful when it can be scrolled and
-/// searched, and one shared buffer keeps repeated lookups from piling up scratch
-/// buffers. Splits it into view, or focuses the split it is already in.
-fn eval_result_buffer(editor: &mut Editor) -> DocumentId {
-    let existing = editor
-        .dap_eval_buffer
-        .filter(|id| editor.documents.contains_key(id));
-
-    let doc_id = match existing {
-        Some(doc_id) => doc_id,
-        None => {
-            let doc_id = editor.new_file(Action::HorizontalSplit);
-            editor.dap_eval_buffer = Some(doc_id);
-            return doc_id;
-        }
-    };
-
-    match editor.tree.traverse().find(|(_, view)| view.doc == doc_id) {
-        Some((view_id, _)) => editor.focus(view_id),
-        None => editor.switch(doc_id, Action::HorizontalSplit),
-    }
-    doc_id
+/// The id of the stack frame expressions are evaluated in: the one selected in
+/// the stopped thread.
+pub(crate) fn selected_frame_id(debugger: &dap::Client) -> anyhow::Result<usize> {
+    debugger
+        .current_stack_frame()
+        .map(|frame| frame.id)
+        .ok_or_else(|| anyhow!("Cannot find current stack frame to access variables"))
 }
 
-/// Append an evaluated value to the shared evaluate-result buffer and put the
-/// cursor on the start of the entry, so the whole value is there to scroll through
-/// rather than the screenful the status line can hold.
+/// Evaluates or executes `input` in the selected frame. Returns the complete value,
+/// or `None` for a statement that evaluates to nothing.
+///
+/// An assignment evaluates to nothing, so its target is read back to report what
+/// was stored. An adapter that cannot execute statements refuses a plain
+/// assignment outright; for those it is retried as a `setExpression`. Adapters
+/// that do run statements (the `repl-statements` quirk) are not retried: their
+/// failure may come after the value was computed, and a retry would compute it,
+/// side effects and all, a second time.
+pub(crate) fn evaluate(editor: &Editor, input: &str) -> anyhow::Result<Option<String>> {
+    let debugger = editor
+        .debug_adapters
+        .get_active_client()
+        .ok_or_else(|| anyhow!("Debugger is not running"))?;
+    let frame_id = selected_frame_id(debugger)?;
+
+    let result = match eval_complete(debugger, input, frame_id) {
+        Ok(value) if value.is_empty() => {
+            let stored = assignment_target(input)
+                .and_then(|target| eval_complete(debugger, target, frame_id).ok());
+            Ok(stored.filter(|value| !value.is_empty()))
+        }
+        Ok(value) => Ok(Some(value)),
+        Err(err) => match split_assignment(input) {
+            Some((target, "=", value))
+                if !debugger.quirks.repl_statements && debugger.supports_set_expression() =>
+            {
+                block_on(debugger.set_expression(
+                    target.to_owned(),
+                    value.to_owned(),
+                    Some(frame_id),
+                ))
+                .map(|response| Some(response.value))
+                .map_err(|_| err)
+            }
+            _ => Err(err),
+        },
+    };
+
+    result.map_err(|err| anyhow!("{err}"))
+}
+
+/// Records an evaluation from the eval prompt: the whole value goes to the system
+/// clipboard, a screenful of it to the status line, and the lot to the debug
+/// console when one is open.
+fn report_evaluation(editor: &mut Editor, input: &str, result: anyhow::Result<Option<String>>) {
+    use helix_view::handlers::dap_console::PROMPT;
+
+    match result {
+        Ok(None) => {
+            // Statements evaluate to nothing. Say so rather than leaving the
+            // previous result on the status line, which reads as if nothing had
+            // happened.
+            editor.dap_eval_result = None;
+            editor.set_status("evaluated");
+            editor.dap_console_print(&format!("{PROMPT}{input}"));
+        }
+        Ok(Some(value)) => {
+            // The status line can only ever show a screenful, so hand the whole
+            // value to the clipboard for pasting elsewhere.
+            if let Err(err) = editor.registers.write('+', vec![value.clone()]) {
+                editor.set_error(format!("Failed to yank result: {}", err));
+            }
+
+            let entry = editor.dap_console_print(&format!("{PROMPT}{input}\n{value}"));
+            let status = status_line_value(&value);
+            editor.dap_eval_result = Some(DapEvalResult {
+                expression: input.to_string(),
+                value,
+                console_entry: editor.dap_console_doc().zip(entry),
+            });
+            editor.set_status(status);
+        }
+        Err(e) => {
+            // A traceback's last line says what went wrong; the console has room
+            // for the rest.
+            let message = e.to_string();
+            let summary = message.lines().last().unwrap_or_default();
+            editor.dap_eval_result = None;
+            editor.set_error(format!("Failed to evaluate: {}", summary));
+            editor.dap_console_print(&format!("{PROMPT}{input}\n*** {message}"));
+        }
+    }
+}
+
+/// Writes a double-clicked evaluate result to the debug console, putting the
+/// console on screen -- but not in focus -- when it is not showing. A long
+/// collection is only useful once it can be scrolled and searched.
 pub fn append_eval_result(editor: &mut Editor, result: &DapEvalResult) {
-    let entry = format!("eval: {}\n{}\n\n", result.expression, result.value);
+    use helix_view::handlers::dap_console::PROMPT;
 
-    let doc_id = eval_result_buffer(editor);
-    let view_id = editor.tree.focus;
-
-    let doc = doc_mut!(editor, &doc_id);
-    doc.ensure_view_init(view_id);
-    let end = doc.text().len_chars();
-    let transaction = Transaction::change(doc.text(), [(end, end, Some(entry.into()))].into_iter())
-        .with_selection(Selection::point(end));
-    doc.apply(&transaction, view_id);
-
-    let view = view_mut!(editor);
-    doc.append_changes_to_history(view);
-    // Nothing here is worth saving, and a modified buffer would make `:q` complain
-    // about unsaved changes on the way out.
-    doc.reset_modified();
-
-    editor.ensure_cursor_in_view(view_id);
+    editor.dap_console_show(false);
+    // An evaluation made while this console existed is in it already; bring it
+    // into view rather than writing it twice.
+    match result.console_entry {
+        Some((doc_id, at)) if editor.dap_console_doc() == Some(doc_id) => {
+            editor.dap_console_reveal(at)
+        }
+        _ => {
+            editor.dap_console_print(&format!("{PROMPT}{}\n{}", result.expression, result.value));
+        }
+    }
 }
 
 pub fn dap_evaluate(cx: &mut Context) {
@@ -1247,7 +1374,7 @@ pub fn dap_evaluate(cx: &mut Context) {
         expression_from(doc.text().slice(..), doc.selection(view.id).primary())
     };
 
-    load_history(cx.editor, EVAL_HISTORY_REGISTER, EVAL_HISTORY_FILE);
+    load_eval_history(cx.editor);
 
     let prompt = Prompt::new(
         "eval: ".into(),
@@ -1258,70 +1385,9 @@ pub fn dap_evaluate(cx: &mut Context) {
                 return;
             }
 
-            save_history(
-                cx.editor,
-                EVAL_HISTORY_REGISTER,
-                EVAL_HISTORY_FILE,
-                EVAL_HISTORY_LIMIT,
-            );
-
-            let debugger = match cx.editor.debug_adapters.get_active_client() {
-                Some(debugger) => debugger,
-                None => {
-                    cx.editor.set_error("Debugger is not running");
-                    return;
-                }
-            };
-            let frame_id = match debugger.current_stack_frame() {
-                Some(frame) => frame.id,
-                None => {
-                    cx.editor
-                        .set_error("Cannot find current stack frame to access variables");
-                    return;
-                }
-            };
-            let mut result = eval_complete(debugger, input, frame_id);
-
-            // An assignment evaluates to nothing, so read the target back to
-            // report what was stored rather than a bare "evaluated".
-            if matches!(&result, Ok(value) if value.is_empty()) {
-                if let Some(target) = assignment_target(input) {
-                    if let Ok(value) = eval_complete(debugger, target, frame_id) {
-                        if !value.is_empty() {
-                            result = Ok(value);
-                        }
-                    }
-                }
-            }
-
-            match result {
-                Ok(value) if value.is_empty() => {
-                    // Statements evaluate to nothing. Say so rather than leaving
-                    // the previous result on the status line, which reads as if
-                    // nothing had happened.
-                    cx.editor.dap_eval_result = None;
-                    cx.editor.set_status("evaluated");
-                }
-                Ok(value) => {
-                    // The status line can only ever show a screenful, so hand the
-                    // whole value to the clipboard for pasting elsewhere.
-                    if let Err(err) = cx.editor.registers.write('+', vec![value.clone()]) {
-                        cx.editor
-                            .set_error(format!("Failed to yank result: {}", err));
-                    }
-
-                    let status = status_line_value(&value);
-                    cx.editor.dap_eval_result = Some(DapEvalResult {
-                        expression: input.to_string(),
-                        value,
-                    });
-                    cx.editor.set_status(status);
-                }
-                Err(e) => {
-                    cx.editor.dap_eval_result = None;
-                    cx.editor.set_error(format!("Failed to evaluate: {}", e));
-                }
-            }
+            save_eval_history(cx.editor);
+            let result = evaluate(cx.editor, input);
+            report_evaluation(cx.editor, input, result);
         },
     );
     let prompt = match expression.is_empty() {
@@ -1753,13 +1819,8 @@ pub fn dap_switch_stack_frame(cx: &mut Context) {
         let pos = debugger.stack_frames[&thread_id]
             .iter()
             .position(|f| f.id == frame.id);
-        debugger.active_frame = pos;
-
-        let frame = debugger.stack_frames[&thread_id]
-            .get(pos.unwrap_or(0))
-            .cloned();
-        if let Some(frame) = &frame {
-            jump_to_stack_frame(cx.editor, frame);
+        if let Err(err) = select_frame(cx.editor, pos.unwrap_or(0)) {
+            cx.editor.set_error(err.to_string());
         }
     })
     .with_preview(move |_editor, frame| {
@@ -1778,6 +1839,30 @@ pub fn dap_switch_stack_frame(cx: &mut Context) {
             })
     });
     cx.push_layer(Box::new(picker))
+}
+
+/// Makes frame `index` of the stopped thread's stack (0 is innermost) the one
+/// that evaluation and the source view follow, clamped to the stack. Returns the
+/// index selected.
+pub(crate) fn select_frame(editor: &mut Editor, index: usize) -> anyhow::Result<usize> {
+    let debugger = editor
+        .debug_adapters
+        .get_active_client_mut()
+        .ok_or_else(|| anyhow!("Debugger is not running"))?;
+    let thread_id = debugger
+        .thread_id
+        .ok_or_else(|| anyhow!("No thread is currently stopped"))?;
+    let frames = debugger
+        .stack_frames
+        .get(&thread_id)
+        .filter(|frames| !frames.is_empty())
+        .ok_or_else(|| anyhow!("The stopped thread has no stack frames"))?;
+
+    let index = index.min(frames.len() - 1);
+    let frame = frames[index].clone();
+    debugger.active_frame = Some(index);
+    jump_to_stack_frame(editor, &frame);
+    Ok(index)
 }
 
 #[cfg(test)]
@@ -1875,6 +1960,19 @@ mod tests {
         assert_eq!(assignment_target("\"a=b\""), None);
         // Nothing to read back without a target.
         assert_eq!(assignment_target("= 5"), None);
+    }
+
+    #[test]
+    fn splits_an_assignment_into_target_operator_and_value() {
+        assert_eq!(split_assignment("x = 1"), Some(("x", "=", "1")));
+        assert_eq!(split_assignment("x=1"), Some(("x", "=", "1")));
+        assert_eq!(
+            split_assignment("self.count += len(xs)"),
+            Some(("self.count", "+=", "len(xs)"))
+        );
+        assert_eq!(split_assignment("bits <<= 1"), Some(("bits", "<<=", "1")));
+        assert_eq!(split_assignment("d['k'] = v"), Some(("d['k']", "=", "v")));
+        assert_eq!(split_assignment("a == b"), None);
     }
 
     #[test]

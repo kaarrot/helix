@@ -717,6 +717,7 @@ impl MappableCommand {
         dap_next, "Step to next",
         dap_goto_line, "Jump execution to current line",
         dap_evaluate, "Evaluate expression",
+        dap_console_toggle, "Open or close the debug console",
         dap_variables, "List and set variables",
         dap_terminate, "End debug session",
         dap_edit_condition, "Edit breakpoint condition on current line",

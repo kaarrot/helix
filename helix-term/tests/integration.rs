@@ -21,6 +21,7 @@ mod test {
     mod command_line;
     mod commands;
     mod completion;
+    mod dap_console;
     mod diff_merge;
     mod languages;
     mod long_lines;

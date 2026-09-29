@@ -196,7 +196,7 @@ impl Transport {
                 self.id, res.message, res.body, res.request_seq, res.command
             );
 
-            Err(Error::Other(anyhow::format_err!("{:?}", res.body)))
+            Err(Error::Other(anyhow::anyhow!(error_message(&res))))
         }
     }
 
@@ -320,5 +320,79 @@ impl Transport {
                 }
             }
         }
+    }
+}
+
+/// What went wrong, for a failed response: the structured error if the adapter
+/// sent one, else its short message -- for debugpy, the traceback of a failed
+/// evaluation.
+fn error_message(res: &Response) -> String {
+    let structured = res.body.as_ref().and_then(|body| body.get("error"));
+    match (structured, &res.message) {
+        (Some(error), message) => match error.get("format").and_then(Value::as_str) {
+            Some(format) => fill_placeholders(format, error.get("variables")),
+            None => message
+                .clone()
+                .unwrap_or_else(|| format!("{} failed", res.command)),
+        },
+        (None, Some(message)) => message.trim_end().to_string(),
+        (None, None) => format!("{} failed", res.command),
+    }
+}
+
+/// An error message's `format` with its `{name}` placeholders replaced by the
+/// values in `variables`; placeholders without a value are left as they are.
+fn fill_placeholders(format: &str, variables: Option<&Value>) -> String {
+    let Some(variables) = variables.and_then(Value::as_object) else {
+        return format.to_string();
+    };
+    variables
+        .iter()
+        .fold(format.to_string(), |message, (name, value)| {
+            let value = value
+                .as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| value.to_string());
+            message.replace(&format!("{{{name}}}"), &value)
+        })
+}
+
+#[cfg(test)]
+mod error_message_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn failed(message: Option<&str>, body: Option<Value>) -> Response {
+        Response {
+            request_seq: 1,
+            success: false,
+            command: "evaluate".to_string(),
+            message: message.map(str::to_string),
+            body,
+        }
+    }
+
+    #[test]
+    fn prefers_the_structured_error_with_its_variables_filled_in() {
+        let body = json!({"error": {"id": 1, "format": "No thread {id} in {where}",
+            "variables": {"id": "7", "where": "process"}}});
+        assert_eq!(
+            error_message(&failed(Some("raw"), Some(body))),
+            "No thread 7 in process"
+        );
+
+        // A placeholder without a value stays visible.
+        let body = json!({"error": {"id": 1, "format": "Bad {thing}"}});
+        assert_eq!(error_message(&failed(None, Some(body))), "Bad {thing}");
+    }
+
+    #[test]
+    fn falls_back_to_the_message_then_the_command() {
+        let traceback = "Traceback (most recent call last):\nNameError: x\n";
+        assert_eq!(
+            error_message(&failed(Some(traceback), None)),
+            traceback.trim_end()
+        );
+        assert_eq!(error_message(&failed(None, None)), "evaluate failed");
     }
 }

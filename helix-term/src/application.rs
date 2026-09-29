@@ -279,6 +279,9 @@ impl Application {
     }
 
     async fn render(&mut self) {
+        // Program output the debug console gathered since the last frame.
+        self.editor.dap_console_write_unwritten();
+
         if self.compositor.full_redraw {
             self.terminal.clear().expect("Cannot clear the terminal");
             self.compositor.full_redraw = false;

@@ -1,5 +1,7 @@
+use crate::document::DocumentOpenError;
 use crate::editor::{Action, Breakpoint};
-use crate::{align_view, Align, Editor};
+use crate::tree::Direction;
+use crate::{align_view, Align, Editor, ViewId};
 use dap::requests::DisconnectArguments;
 use helix_core::Selection;
 use helix_dap::{
@@ -72,12 +74,25 @@ pub fn jump_to_stack_frame(editor: &mut Editor, frame: &helix_dap::StackFrame) {
         return;
     };
 
-    if let Err(e) = editor.open(&path, Action::Replace) {
-        editor.set_error(format!("Unable to jump to stack frame: {}", e));
-        return;
-    }
+    // Stepping from the debug console shows the source beside it rather than in
+    // its place, and leaves the console focused for the next command.
+    let shown = if editor.is_dap_console_focused() {
+        show_beside_console(editor, &path)
+    } else {
+        editor
+            .open(&path, Action::Replace)
+            .map(|_| editor.tree.focus)
+    };
+    let view_id = match shown {
+        Ok(view_id) => view_id,
+        Err(e) => {
+            editor.set_error(format!("Unable to jump to stack frame: {}", e));
+            return;
+        }
+    };
 
-    let (view, doc) = current!(editor);
+    let view = editor.tree.get(view_id);
+    let doc = editor.documents.get_mut(&view.doc).unwrap();
 
     let text_end = doc.text().len_chars().saturating_sub(1);
     let start = dap_pos_to_pos(doc.text(), frame.line, frame.column).unwrap_or(0);
@@ -89,6 +104,35 @@ pub fn jump_to_stack_frame(editor: &mut Editor, frame: &helix_dap::StackFrame) {
     let selection = Selection::single(start.min(text_end), end.min(text_end));
     doc.set_selection(view.id, selection);
     align_view(doc, view, Align::Center);
+}
+
+/// Opens `path` in the view the console reserves for source (see
+/// `Editor::dap_source_view`) without taking focus from the console, splitting one
+/// off when the console is alone on screen. Returns that view.
+fn show_beside_console(
+    editor: &mut Editor,
+    path: &std::path::Path,
+) -> Result<ViewId, DocumentOpenError> {
+    let console_view = editor.tree.focus;
+    let mode = editor.mode;
+    // Loading neither moves focus nor leaves insert mode.
+    let doc_id = editor.open(path, Action::Load)?;
+
+    if let Some(view_id) = editor.dap_source_view(Some(path)) {
+        if editor.tree.get(view_id).doc != doc_id {
+            editor.replace_document_in_view(view_id, doc_id);
+        }
+        return Ok(view_id);
+    }
+
+    // Splitting and refocusing both drop back to normal mode on the way; the
+    // console was focused throughout as far as the user is concerned.
+    editor.switch(doc_id, Action::HorizontalSplit);
+    editor.swap_split_in_direction(Direction::Up);
+    let view_id = editor.tree.focus;
+    editor.focus(console_view);
+    editor.mode = mode;
+    Ok(view_id)
 }
 
 pub fn breakpoints_changed(
@@ -136,8 +180,11 @@ pub fn breakpoints_changed(
                 breakpoint.message = dap_breakpoint.message;
                 // TODO: handle breakpoint.message
                 // TODO: verify source matches
-                breakpoint.line = dap_breakpoint.line.unwrap_or(0).saturating_sub(1); // convert to 0-indexing
-                                                                                      // TODO: no unwrap
+                // An adapter that cannot place a breakpoint may leave its line out;
+                // keep the one asked for rather than moving it to the first line.
+                if let Some(line) = dap_breakpoint.line {
+                    breakpoint.line = line.saturating_sub(1); // convert to 0-indexing
+                }
                 breakpoint.column = dap_breakpoint.column;
                 // TODO: verify end_linef/col instruction reference, offset
             }
@@ -220,6 +267,9 @@ impl Editor {
 
                         self.set_status(status);
                         self.debug_adapters.set_active_client(id);
+
+                        self.dap_console_flush_output();
+                        self.dap_console_print_location();
                     }
                     Event::Continued(events::ContinuedBody { thread_id, .. }) => {
                         let debugger = match self.debug_adapters.get_client_mut(id) {
@@ -297,9 +347,9 @@ impl Editor {
                     Event::Output(events::OutputBody {
                         category, output, ..
                     }) => {
-                        let prefix = match category {
+                        let prefix = match &category {
                             Some(category) => {
-                                if &category == "telemetry" {
+                                if category == "telemetry" {
                                     return false;
                                 }
                                 format!("Debug ({}):", category)
@@ -307,6 +357,22 @@ impl Editor {
                             None => "Debug:".to_owned(),
                         };
 
+                        let category = category.as_deref().unwrap_or("console");
+                        let program_output = matches!(category, "stdout" | "stderr");
+                        if self.dap_console_doc().is_some() {
+                            // Gathered and written once per frame, which also
+                            // renders it; a chatty program would otherwise cost an
+                            // edit and a frame per line.
+                            self.dap_console_output(category, &output);
+                            return false;
+                        }
+                        if program_output {
+                            // Without a console there is nowhere to show a program's
+                            // own output that would not bury the debugger's messages
+                            // on the status line. It still goes to its terminal.
+                            log::debug!("{}", output);
+                            return false;
+                        }
                         log::info!("{}", output);
                         self.set_status(format!("{} {}", prefix, output));
                     }
@@ -329,6 +395,9 @@ impl Editor {
                         }; // TODO: do we need to handle error?
                     }
                     Event::Terminated(terminated) => {
+                        // Nothing more is coming to finish a line the program left
+                        // open, e.g. `print("done", end="")`.
+                        self.dap_console_flush_output();
                         let debugger = match self.debug_adapters.get_client_mut(id) {
                             Some(debugger) => debugger,
                             None => return false,
@@ -406,6 +475,7 @@ impl Editor {
                         }
                     }
                     Event::Exited(resp) => {
+                        self.dap_console_flush_output();
                         let exit_code = resp.exit_code;
                         if exit_code != 0 {
                             self.set_error(format!(

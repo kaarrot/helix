@@ -96,7 +96,7 @@
 | `ensure_selections_forward` | Ensure all selections face forward | normal: `` <A-:> ``, select: `` <A-:> `` |
 | `insert_mode` | Insert before selection | normal: `` i ``, select: `` i `` |
 | `append_mode` | Append after selection | normal: `` a ``, select: `` a `` |
-| `command_mode` | Enter command mode | normal: `` : ``, select: `` : `` |
+| `command_mode` | Enter command mode | normal: `` : ``, `` <space>G: ``, select: `` : ``, `` <space>G: `` |
 | `file_picker` | Open file picker | normal: `` <space>f ``, select: `` <space>f `` |
 | `file_picker_in_current_buffer_directory` | Open file picker at current buffer's directory | normal: `` <space>F ``, select: `` <space>F `` |
 | `file_picker_in_current_directory` | Open file picker at current working directory |  |
@@ -301,6 +301,7 @@
 | `dap_next` | Step to next | normal: `` <space>Gn ``, select: `` <space>Gn `` |
 | `dap_goto_line` | Jump execution to current line | normal: `` <space>Gj ``, select: `` <space>Gj `` |
 | `dap_evaluate` | Evaluate expression | normal: `` <space>Gp ``, select: `` <space>Gp `` |
+| `dap_console_toggle` | Open or close the debug console | normal: `` <space>G<C-d> ``, select: `` <space>G<C-d> `` |
 | `dap_variables` | List and set variables | normal: `` <space>Gv ``, select: `` <space>Gv `` |
 | `dap_terminate` | End debug session | normal: `` <space>Gt ``, select: `` <space>Gt `` |
 | `dap_edit_condition` | Edit breakpoint condition on current line | normal: `` <space>G<C-c> ``, select: `` <space>G<C-c> `` |

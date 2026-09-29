@@ -117,7 +117,9 @@ fn show_completion(
 
 pub fn trigger_auto_completion(editor: &Editor, trigger_char_only: bool) {
     let config = editor.config.load();
-    if !config.auto_completion {
+    // The debug console completes from the debugger, on `Tab`. Words from the
+    // transcript popping up unasked would only get in the way of `<ret>`.
+    if !config.auto_completion || editor.is_dap_console_focused() {
         return;
     }
     let (view, doc): (&helix_view::View, &helix_view::Document) = current_ref!(editor);

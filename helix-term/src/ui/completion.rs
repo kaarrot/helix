@@ -465,6 +465,11 @@ impl Completion {
             .index_at(self.popup.child_area(), row, column)
     }
 
+    /// Whether an item has been picked, so that accepting would insert it.
+    pub fn has_selection(&self) -> bool {
+        self.popup.contents().selection().is_some()
+    }
+
     pub fn replace_item(
         &mut self,
         old_item: &impl PartialEq<CompletionItem>,

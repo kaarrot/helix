@@ -26,5 +26,6 @@ mod test {
     mod languages;
     mod long_lines;
     mod movement;
+    mod review;
     mod splits;
 }

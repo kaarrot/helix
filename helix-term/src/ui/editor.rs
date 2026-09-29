@@ -124,23 +124,42 @@ impl EditorView {
         let area = view.area;
         let theme = &editor.theme;
         let config = editor.config();
-        let loader = editor.syn_loader.load();
 
         let view_offset = doc.view_offset(view.id);
 
-        let mut text_annotations = view.text_annotations(doc, Some(theme));
-        view.apply_diff_alignment(
+        // One plan drives everything: `text_annotations` reserves the rows from
+        // it, the decoration below paints them, and the coordinate maths reads
+        // the same plan back, so a click lands where the row was drawn. It is
+        // published to the view first, since building the annotations is what
+        // picks it up.
+        // Agent replies are laid out with the markdown preview renderer. The
+        // source is not written back, so the reply stays read-only; delete
+        // still removes the entry.
+        let syn_loader = editor.syn_loader.clone();
+        let mut layout_agent = |text: &str, width: usize| {
+            crate::ui::layout_agent_markdown(text, width, theme, syn_loader.clone())
+        };
+        let virtual_row_plan = view.virtual_row_plan(
             doc,
-            &mut text_annotations,
             &editor.diff.views,
             &editor.documents,
+            &editor.diff.reviews,
+            crate::review_agent::spinner_frame(),
+            Some(&mut layout_agent),
         );
+        *view.virtual_rows.borrow_mut() = virtual_row_plan.clone();
+
+        let loader = editor.syn_loader.load();
+        let text_annotations = view.text_annotations(doc, Some(theme));
         let mut decorations = DecorationManager::default();
 
-        if editor.diff.views.contains_key(&view.id) {
-            if let Some(diff_handle) = doc.diff_handle() {
-                decorations.add_decoration(diff::DiffSpacerDecoration::new(diff_handle, theme));
-            }
+        if let Some(plan) = &virtual_row_plan {
+            decorations.add_decoration(diff::VirtualRowDecoration::new(
+                plan.clone(),
+                theme,
+                view.id,
+                editor.diff.reviews.hits.clone(),
+            ));
         }
 
         if is_focused && config.cursorline.from_mode(editor.mode) {
@@ -1685,7 +1704,22 @@ impl EditorView {
                     return EventResult::Consumed(None);
                 }
 
+                // Ctrl+click on a box row follows the path it lands on, the way
+                // `gf` does from the in-box cursor.
+                if modifiers == KeyModifiers::CONTROL
+                    && commands::review::review_mouse_goto(cxt, row, column)
+                {
+                    return EventResult::Consumed(None);
+                }
+
+                // A review box is painted into virtual rows, which no document
+                // position corresponds to, so it has to be asked first: mapping
+                // the click to text would put the cursor somewhere arbitrary
+                // underneath it.
                 let editor = &mut cxt.editor;
+                if commands::review::review_mouse_down(editor, row, column) {
+                    return EventResult::Consumed(None);
+                }
 
                 if let Some((pos, view_id)) = pos_and_view(editor, row, column, true) {
                     let had_completion = self.clear_completion_for_mouse_reposition(editor);
@@ -1804,6 +1838,10 @@ impl EditorView {
                     return EventResult::Consumed(None);
                 }
 
+                if commands::review::review_mouse_drag(cxt.editor, row) {
+                    return EventResult::Consumed(None);
+                }
+
                 let (view, doc) = current!(cxt.editor);
 
                 let pos = match view.pos_at_screen_coords(doc, row, column, true) {
@@ -1868,6 +1906,12 @@ impl EditorView {
                         return EventResult::Consumed(Some(full_redraw_callback()));
                     }
 
+                    return EventResult::Consumed(None);
+                }
+
+                // Ending a drag inside a box: the document's selection never
+                // moved, so none of what follows applies to it.
+                if commands::review::review_mouse_up(cxt.editor) {
                     return EventResult::Consumed(None);
                 }
 

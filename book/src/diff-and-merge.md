@@ -31,8 +31,10 @@ default it shows `HEAD` versus the working tree.
 - `:diff-commit REF` changes `Space-g` to compare `REF` with the working tree.
 - `:diff-commit REF!` limits `Space-g` to the changes introduced by one commit.
 - `:diff-commit REF1..REF2` compares two refs directly.
-- `Space-m c` reads selected git log lines and sets the picker range to
-  `OLDER..NEWER`.
+- `Space-m c` reads selected git log lines. The bottom line is the base and is
+  not included: one line becomes `COMMIT` versus the working tree; two or more
+  lines become `OLDER..NEWER`. This matches typed `:diff-commit`. On `HEAD`
+  only uncommitted changes remain, possibly none, and the status line says so.
 - `Space-m C` reads one selected git log line and sets the picker range to
   `COMMIT^..COMMIT`.
 - `:diff-files REF` opens a one-off picker for files changed between `REF` and
@@ -40,6 +42,9 @@ default it shows `HEAD` versus the working tree.
 
 Selecting a normal entry opens diff view for that file. Selecting a conflicted
 entry opens merge view instead.
+
+To ask an agent about a line while you review, leave a comment on it. See
+[Review comments](./review-comments.md).
 
 ## Split diff controls
 

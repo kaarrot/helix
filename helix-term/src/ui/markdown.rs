@@ -15,6 +15,7 @@ use helix_core::{
     RopeSlice, Syntax,
 };
 use helix_view::{
+    annotations::rows::{CommentLine, CommentLink, CommentSpan},
     graphics::{Margin, Rect, Style, UnderlineStyle},
     theme::Modifier,
     Theme,
@@ -1272,6 +1273,120 @@ impl Component for Markdown {
     }
 }
 
+/// Lay out an agent reply with the markdown preview renderer.
+///
+/// The comment box paints these rows. The source string is not modified, so
+/// rendering a reply does not make it editable.
+pub fn layout_agent_markdown(
+    text: &str,
+    width: usize,
+    theme: &Theme,
+    loader: Arc<ArcSwap<syntax::Loader>>,
+) -> Vec<CommentLine> {
+    if let Some(hit) = cached_agent_markdown(text, width, theme.name()) {
+        return hit;
+    }
+    let lines = render_agent_markdown(text, width, theme, loader);
+    store_agent_markdown(text, width, theme.name(), &lines);
+    lines
+}
+
+fn render_agent_markdown(
+    text: &str,
+    width: usize,
+    theme: &Theme,
+    loader: Arc<ArcSwap<syntax::Loader>>,
+) -> Vec<CommentLine> {
+    let markdown = Markdown::new(text.to_string(), loader);
+    let wrap = u16::try_from(width).unwrap_or(u16::MAX);
+    let (rendered, _, found) = markdown.parse_with_map(Some(theme), wrap, true);
+    // Links are already on the wrapped rows. Kept per row, because the row
+    // shows only a link's text and `gf` needs where it points.
+    let mut links: Vec<Vec<CommentLink>> = vec![Vec::new(); rendered.lines.len()];
+    for link in found {
+        if let Some(row) = links.get_mut(link.line) {
+            row.push(CommentLink {
+                start: link.start_col as usize,
+                end: link.end_col as usize,
+                dest: link.dest,
+            });
+        }
+    }
+    let mut lines: Vec<CommentLine> = rendered
+        .lines
+        .into_iter()
+        .zip(links)
+        .map(|(spans, links)| {
+            let spans = spans
+                .0
+                .into_iter()
+                .filter(|span| !span.content.is_empty())
+                .map(|span| CommentSpan {
+                    text: span.content.into_owned(),
+                    style: span.style,
+                })
+                .collect::<Vec<_>>();
+            if spans.is_empty() {
+                CommentLine::plain("")
+            } else {
+                CommentLine { spans, links }
+            }
+        })
+        .collect();
+    // A paragraph closer leaves one trailing blank. Dropping that single row
+    // keeps a reply that is just lines of text the same height as its source.
+    // Interior blanks stay, so separate paragraphs still have a gap.
+    if lines.len() > 1 && lines.last().is_some_and(|line| line.text().is_empty()) {
+        lines.pop();
+    }
+    if lines.is_empty() {
+        vec![CommentLine::plain("")]
+    } else {
+        lines
+    }
+}
+
+fn agent_markdown_key(text: &str, width: usize, theme: &str) -> (u64, usize, usize, String) {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    text.hash(&mut hasher);
+    (hasher.finish(), text.len(), width, theme.to_string())
+}
+
+fn agent_markdown_cache(
+) -> &'static std::sync::Mutex<Vec<((u64, usize, usize, String), Vec<CommentLine>)>> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<Vec<((u64, usize, usize, String), Vec<CommentLine>)>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+fn cached_agent_markdown(text: &str, width: usize, theme: &str) -> Option<Vec<CommentLine>> {
+    let key = agent_markdown_key(text, width, theme);
+    let cache = agent_markdown_cache()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    cache
+        .iter()
+        .find(|(cached, _)| cached == &key)
+        .map(|(_, lines)| lines.clone())
+}
+
+fn store_agent_markdown(text: &str, width: usize, theme: &str, lines: &[CommentLine]) {
+    let key = agent_markdown_key(text, width, theme);
+    let mut cache = agent_markdown_cache()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    if cache.iter().any(|(cached, _)| cached == &key) {
+        return;
+    }
+    if cache.len() >= 32 {
+        cache.remove(0);
+    }
+    cache.push((key, lines.to_vec()));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1503,6 +1618,49 @@ mod tests {
             .expect("table cell dest stored");
         assert_eq!(link.line, line);
         assert!(link.end_col > link.start_col, "{link:?} lines={lines:?}");
+    }
+
+    #[test]
+    fn plain_agent_lines_stay_separate_rows() {
+        let loader = Arc::new(ArcSwap::from_pointee(syntax::Loader::default()));
+        let lines = layout_agent_markdown("alpha\nbeta\ngamma", 40, &Theme::default(), loader);
+        let text: Vec<_> = lines.iter().map(CommentLine::text).collect();
+        assert_eq!(
+            text,
+            vec!["alpha".to_string(), "beta".into(), "gamma".into()]
+        );
+    }
+
+    #[test]
+    fn agent_reply_renders_markdown_and_leaves_markers_behind() {
+        let loader = Arc::new(ArcSwap::from_pointee(syntax::Loader::default()));
+        let lines = layout_agent_markdown(
+            "**bold** and `code`\n\n- alpha\n- beta\n",
+            40,
+            &Theme::default(),
+            loader,
+        );
+        let text: Vec<String> = lines.iter().map(CommentLine::text).collect();
+        let joined = text.join("\n");
+        assert!(joined.contains("bold"), "{text:?}");
+        assert!(!joined.contains("**"), "{text:?}");
+        assert!(joined.contains("code"), "{text:?}");
+        assert!(!joined.contains('`'), "{text:?}");
+        assert!(
+            text.iter()
+                .any(|line| line.contains('•') && line.contains("alpha")),
+            "{text:?}"
+        );
+        let bold = lines
+            .iter()
+            .find(|line| line.text().contains("bold"))
+            .expect("bold row");
+        assert!(
+            bold.spans.iter().any(|span| {
+                span.text.contains("bold") && span.style.add_modifier.contains(Modifier::BOLD)
+            }),
+            "{bold:?}"
+        );
     }
 
     #[test]

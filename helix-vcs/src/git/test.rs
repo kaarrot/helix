@@ -247,6 +247,89 @@ fn for_each_changed_file_reports_renames_as_untracked_plus_deleted() {
 }
 
 #[test]
+fn for_each_changed_file_reports_staged_changes() {
+    // `git add` makes the index match the worktree, so an index<->worktree scan
+    // alone reports nothing and the file silently vanishes from the changed-file
+    // listing while the change is plainly still there against HEAD.
+    let repo = empty_git_repo();
+    write_repo_file(repo.path(), "tracked.txt", "one\n");
+    create_commit(repo.path(), true);
+
+    write_repo_file(repo.path(), "tracked.txt", "one\ntwo\n");
+    exec_git_cmd("add tracked.txt", repo.path());
+
+    let changes = RefCell::new(Vec::new());
+    git::for_each_changed_file(repo.path(), |change| {
+        changes.borrow_mut().push(change.unwrap());
+        true
+    })
+    .unwrap();
+
+    let changes = changes.into_inner();
+    assert!(
+        changes.iter().any(|change| {
+            matches!(change, FileChange::Modified { path } if path.ends_with("tracked.txt"))
+        }),
+        "staged change missing from the listing: {changes:?}"
+    );
+}
+
+#[test]
+fn for_each_changed_file_reports_staged_new_file_once() {
+    // A staged addition is tracked, so it must be reported as a change against
+    // HEAD rather than as untracked, and exactly once even though the head-tree
+    // and worktree halves of the scan can both see it.
+    let repo = empty_git_repo();
+    write_repo_file(repo.path(), "tracked.txt", "tracked\n");
+    create_commit(repo.path(), true);
+
+    write_repo_file(repo.path(), "added.txt", "brand new\n");
+    exec_git_cmd("add added.txt", repo.path());
+
+    let changes = RefCell::new(Vec::new());
+    git::for_each_changed_file(repo.path(), |change| {
+        changes.borrow_mut().push(change.unwrap());
+        true
+    })
+    .unwrap();
+
+    let changes = changes.into_inner();
+    let matching: Vec<_> = changes
+        .iter()
+        .filter(|change| change.path().ends_with("added.txt"))
+        .collect();
+    assert_eq!(matching.len(), 1, "expected exactly one entry: {changes:?}");
+    assert!(
+        matches!(matching[0], FileChange::Modified { .. }),
+        "staged addition should be tracked, not untracked: {matching:?}"
+    );
+}
+
+#[test]
+fn for_each_changed_file_reports_staged_deletion() {
+    let repo = empty_git_repo();
+    write_repo_file(repo.path(), "doomed.txt", "bye\n");
+    create_commit(repo.path(), true);
+
+    exec_git_cmd("rm doomed.txt", repo.path());
+
+    let changes = RefCell::new(Vec::new());
+    git::for_each_changed_file(repo.path(), |change| {
+        changes.borrow_mut().push(change.unwrap());
+        true
+    })
+    .unwrap();
+
+    let changes = changes.into_inner();
+    assert!(
+        changes.iter().any(|change| {
+            matches!(change, FileChange::Deleted { path } if path.ends_with("doomed.txt"))
+        }),
+        "staged deletion missing from the listing: {changes:?}"
+    );
+}
+
+#[test]
 fn for_each_untracked_file_matches_git_semantics() {
     let repo = empty_git_repo();
     write_repo_file(repo.path(), "tracked.txt", "tracked\n");
@@ -275,6 +358,75 @@ fn for_each_untracked_file_matches_git_semantics() {
     );
     assert!(!has("tracked.txt"), "tracked file must not appear");
     assert!(!has("debug.log"), "ignored file must not appear");
+}
+
+#[test]
+fn for_each_untracked_file_stops_at_submodules_and_nested_repos() {
+    let upstream = empty_git_repo();
+    write_repo_file(upstream.path(), "lib.rs", "lib\n");
+    create_commit(upstream.path(), true);
+
+    let repo = empty_git_repo();
+    write_repo_file(repo.path(), "tracked.txt", "tracked\n");
+    create_commit(repo.path(), true);
+    exec_git_cmd_args(
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            upstream.path().to_str().unwrap(),
+            "libs/foo",
+        ],
+        repo.path(),
+    );
+    create_commit(repo.path(), true);
+
+    // A clone nobody registered as a submodule.
+    let nested = repo.path().join("nested");
+    fs::create_dir(&nested).unwrap();
+    exec_git_cmd("init", &nested);
+    write_repo_file(&nested, "inner.txt", "inner\n");
+
+    write_repo_file(repo.path(), "untracked.txt", "new\n");
+
+    let found = std::sync::Mutex::new(Vec::new());
+    git::for_each_untracked_file(repo.path(), |change| {
+        if let FileChange::Untracked { path } = change {
+            found.lock().unwrap().push(path);
+        }
+    })
+    .unwrap();
+
+    let found = found.into_inner().unwrap();
+    let has = |name: &str| found.iter().any(|p| p.ends_with(name));
+    assert!(has("untracked.txt"), "expected untracked.txt: {found:?}");
+    assert!(!has("libs/foo/lib.rs"), "submodule file listed: {found:?}");
+    assert!(
+        !has("nested/inner.txt"),
+        "nested repo file listed: {found:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn for_each_untracked_file_skips_fifos() {
+    let repo = empty_git_repo();
+    write_repo_file(repo.path(), "tracked.txt", "tracked\n");
+    create_commit(repo.path(), true);
+
+    let fifo = repo.path().join("pipe");
+    let status = Command::new("mkfifo").arg(&fifo).status().unwrap();
+    assert!(status.success());
+
+    let found = std::sync::Mutex::new(Vec::new());
+    git::for_each_untracked_file(repo.path(), |change| {
+        found.lock().unwrap().push(change.path().to_path_buf());
+    })
+    .unwrap();
+
+    let found = found.into_inner().unwrap();
+    assert!(!found.contains(&fifo), "fifo listed: {found:?}");
 }
 
 #[test]
@@ -343,13 +495,43 @@ fn get_merge_versions_fails_without_merge_stages() {
 }
 
 #[test]
-fn parent_ref_suffix_fails_for_root_commit() {
+fn parent_of_root_commit_is_the_empty_tree() {
+    // `Space-m c` on the root commit's log line builds `ROOT^`.
     let repo = empty_git_repo();
     write_repo_file(repo.path(), "root.txt", "root\n");
     create_commit_with_message(repo.path(), "root");
 
-    let err = git::for_each_changed_file_between_refs(repo.path(), "HEAD^", Some("HEAD"), |_| true)
-        .unwrap_err();
+    for target in [Some("HEAD"), None] {
+        let changes = RefCell::new(Vec::new());
+        git::for_each_changed_file_between_refs(repo.path(), "HEAD^", target, |change| {
+            changes.borrow_mut().push(change.unwrap());
+            true
+        })
+        .unwrap();
+        let changes = changes.into_inner();
+        assert!(
+            changes.iter().any(|change| {
+                matches!(change, FileChange::Modified { path } if path.ends_with("root.txt"))
+            }),
+            "root commit's file missing against {target:?}: {changes:?}"
+        );
+    }
+
+    // The base pane of such a diff is empty, as for a newly added file.
+    let root_file = repo.path().join("root.txt");
+    let err = git::get_diff_base_from_ref(&root_file, "HEAD^").unwrap_err();
+    assert!(err.is::<git::FileNotFoundInRevision>(), "{err:?}");
+}
+
+#[test]
+fn grandparent_ref_suffix_fails_for_root_commit() {
+    let repo = empty_git_repo();
+    write_repo_file(repo.path(), "root.txt", "root\n");
+    create_commit_with_message(repo.path(), "root");
+
+    let err =
+        git::for_each_changed_file_between_refs(repo.path(), "HEAD^^", Some("HEAD"), |_| true)
+            .unwrap_err();
     assert!(err.to_string().contains("has no parent"));
 }
 
@@ -804,6 +986,26 @@ fn file_web_link_resolves_remote_commit_and_path() {
             .commit,
         head
     );
+}
+
+#[test]
+fn resolve_commit_id_peels_any_spelling_to_the_full_hash() {
+    let temp_git = empty_git_repo();
+    let repo = temp_git.path();
+    write_repo_file(repo, "src/file.txt", "one");
+    create_commit(repo, true);
+    let first = exec_git_cmd_output("rev-parse HEAD", repo);
+    write_repo_file(repo, "src/file.txt", "two");
+    create_commit(repo, true);
+    let head = exec_git_cmd_output("rev-parse HEAD", repo);
+
+    let file = repo.join("src/file.txt");
+    assert_eq!(git::resolve_commit_id(&file, "HEAD").unwrap(), head);
+    assert_eq!(git::resolve_commit_id(&file, &head[..8]).unwrap(), head);
+    assert_eq!(git::resolve_commit_id(&file, "HEAD^").unwrap(), first);
+    // From the worktree root as well as from a file inside it.
+    assert_eq!(git::resolve_commit_id(repo, "HEAD").unwrap(), head);
+    assert!(git::resolve_commit_id(&file, "no-such-ref").is_err());
 }
 
 #[test]

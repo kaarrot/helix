@@ -107,6 +107,21 @@ fn setup_integration_logging() {
 }
 
 impl Application {
+    /// The last frame the test backend was sent, one string per terminal row,
+    /// so a test can check where something was actually drawn.
+    #[cfg(feature = "integration")]
+    pub fn screen_rows(&self) -> Vec<String> {
+        let buffer = self.terminal.backend().buffer();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .filter_map(|x| buffer.get(x, y))
+                    .map(|cell| cell.symbol.as_str())
+                    .collect()
+            })
+            .collect()
+    }
+
     pub fn new(args: Args, config: Config, lang_loader: syntax::Loader) -> Result<Self, Error> {
         #[cfg(feature = "integration")]
         setup_integration_logging();
@@ -1468,6 +1483,16 @@ impl Application {
         //        errors along the way
         let mut errs = Vec::new();
 
+        // Review saves are a 500ms tokio debounce, not a helix job. Cancel it
+        // so it cannot dispatch after this loop is gone, then write now so a
+        // Ctrl-S immediately followed by `:q` is not lost.
+        crate::review_agent::cancel_scheduled_save();
+
+        // A reply still being written would keep this process alive until the
+        // agent's turn ended. `:q` asks first, so reaching here with one
+        // running means the reviewer chose to stop it.
+        crate::review_agent::stop_all_turns(&mut self.editor).await;
+
         if let Err(err) = self
             .jobs
             .finish(&mut self.editor, Some(&mut self.compositor))
@@ -1476,6 +1501,8 @@ impl Application {
             log::error!("Error executing job: {}", err);
             errs.push(err);
         };
+
+        self.editor.save_reviews();
 
         if let Err(err) = self.editor.flush_writes().await {
             log::error!("Error writing: {}", err);

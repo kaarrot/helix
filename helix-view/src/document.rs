@@ -139,6 +139,21 @@ pub enum DocumentOpenError {
     IoError(#[from] io::Error),
 }
 
+/// The file and revision a virtual revision document shows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitRevision {
+    /// The file in the working tree, canonicalized. The document's own
+    /// `path` is a cache file, so that LSP can open the snapshot.
+    pub path: PathBuf,
+    /// The revision as it was asked for (`HEAD`, a branch, a short hash), for
+    /// display.
+    pub git_ref: String,
+    /// The full hash `git_ref` resolved to when the snapshot was read. This,
+    /// not the ref, names the snapshot: `HEAD` moves on and the text here does
+    /// not. `None` when the text is not a commit's, like an index stage.
+    pub commit: Option<String>,
+}
+
 pub struct Document {
     pub(crate) id: DocumentId,
     text: Rope,
@@ -210,8 +225,8 @@ pub struct Document {
 
     /// True when this document holds a read-only git revision (virtual base doc).
     pub is_virtual_base: bool,
-    /// Real path and git ref for a virtual revision document (`filename @ ref`).
-    pub git_revision: Option<(PathBuf, String)>,
+    /// What a virtual revision document (`filename @ ref`) is a snapshot of.
+    pub git_revision: Option<GitRevision>,
     /// Override the display name shown in the bufferline / statusline.
     pub display_name_override: Option<String>,
     /// Character-level diff highlighting enabled for this document.
@@ -224,6 +239,11 @@ pub struct Document {
     /// needs saving, so it never counts as modified, and it is kept rather than
     /// discarded when another file replaces it in a view, although it has no path.
     pub is_transcript: bool,
+    /// Live positions of the review threads anchored in this document, kept in
+    /// step with edits by the `DocumentDidChange` hook. The threads themselves
+    /// live on `Editor`; only their positions can be maintained here, because
+    /// that event carries no `&mut Editor`.
+    pub review_anchors: Vec<crate::review::ReviewAnchor>,
 
     pub previous_diagnostic_id: Option<String>,
 
@@ -718,6 +738,7 @@ impl Document {
         Self {
             id: DocumentId::default(),
             active_snippet: None,
+            review_anchors: Vec::new(),
             path: None,
             relative_path: OnceCell::new(),
             scratch_buffer_name: None,
@@ -1659,7 +1680,10 @@ impl Document {
         view_id: ViewId,
         emit_lsp_notification: bool,
     ) -> bool {
-        if self.readonly && !transaction.changes().is_empty() {
+        // Only git-revision panes refuse edits. A file the user can't write
+        // stays editable like upstream and fails at `:w`, which also keeps
+        // `:reload` working on it.
+        if self.is_virtual_base && !transaction.changes().is_empty() {
             return false;
         }
 
@@ -2008,10 +2032,14 @@ impl Document {
     }
 
     /// Create a read-only virtual document from raw bytes fetched from a git revision.
+    ///
+    /// `commit` is the full hash `git_ref` resolved to when the content was
+    /// read, or `None` for content that is not a commit's, like an index stage.
     pub fn from_git_revision(
         content: Vec<u8>,
         real_path: &Path,
         git_ref: &str,
+        commit: Option<String>,
         config: Arc<dyn DynAccess<Config>>,
         syn_loader: Arc<ArcSwap<syntax::Loader>>,
     ) -> anyhow::Result<Self> {
@@ -2020,7 +2048,11 @@ impl Document {
         let mut doc = Self::from(text, Some((encoding, has_bom)), config, syn_loader.clone());
         doc.is_virtual_base = true;
         doc.readonly = true;
-        doc.git_revision = Some((real_path.to_path_buf(), git_ref.to_string()));
+        doc.git_revision = Some(GitRevision {
+            path: real_path.to_path_buf(),
+            git_ref: git_ref.to_string(),
+            commit,
+        });
         let filename = real_path
             .file_name()
             .and_then(|n| n.to_str())
@@ -2034,6 +2066,28 @@ impl Document {
         doc.path = Self::materialize_git_revision(real_path, git_ref, &content);
         doc.relative_path = OnceCell::new();
         Ok(doc)
+    }
+
+    /// Which review threads belong on this document: the file it shows and
+    /// the revision it shows it at.
+    ///
+    /// A snapshot of a commit is that commit's, whichever diff pane it sits
+    /// in or none. Anything else read from disk is the working tree's. `None`
+    /// for a buffer with no path, which only a diff can name (see
+    /// [`crate::review::review_key`]).
+    pub fn review_key(&self) -> Option<(PathBuf, crate::review::ReviewRev)> {
+        if let Some(GitRevision {
+            path,
+            commit: Some(commit),
+            ..
+        }) = &self.git_revision
+        {
+            return Some((
+                path.clone(),
+                crate::review::ReviewRev::Commit(commit.clone()),
+            ));
+        }
+        Some((self.path()?.clone(), crate::review::ReviewRev::Worktree))
     }
 
     pub fn diff_handle(&self) -> Option<&DiffHandle> {

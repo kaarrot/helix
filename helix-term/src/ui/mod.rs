@@ -1,5 +1,5 @@
 mod completion;
-mod diff;
+pub(crate) mod diff;
 mod document;
 pub(crate) mod editor;
 mod info;
@@ -23,7 +23,7 @@ pub use completion::Completion;
 pub use editor::EditorView;
 use helix_stdx::rope;
 use helix_view::theme::Style;
-pub use markdown::{Markdown, MarkdownLink};
+pub use markdown::{layout_agent_markdown, Markdown, MarkdownLink};
 pub use markdown_preview::MarkdownPreview;
 pub use menu::Menu;
 pub use picker::{Column as PickerColumn, FileLocation, Picker};
@@ -480,6 +480,14 @@ pub mod completers {
     /// offered mainly to make the alternative to `url` discoverable.
     pub fn copy_path_kind(_editor: &Editor, input: &str) -> Vec<Completion> {
         fuzzy_match(input, ["url", "absolute"], false)
+            .into_iter()
+            .map(|(name, _)| ((0..), name.into()))
+            .collect()
+    }
+
+    /// Agents `:review-session` accepts as the child that answers comments.
+    pub fn review_agent(_editor: &Editor, input: &str) -> Vec<Completion> {
+        fuzzy_match(input, ["claude", "grok"], false)
             .into_iter()
             .map(|(name, _)| ((0..), name.into()))
             .collect()

@@ -10,6 +10,7 @@ pub mod dap;
 pub mod dap_console;
 pub mod diagnostics;
 pub mod lsp;
+mod review;
 pub mod word_index;
 
 #[derive(Debug)]
@@ -60,4 +61,5 @@ impl Handlers {
 pub fn register_hooks(handlers: &Handlers) {
     lsp::register_hooks(handlers);
     word_index::register_hooks(handlers);
+    review::register_hooks(handlers);
 }

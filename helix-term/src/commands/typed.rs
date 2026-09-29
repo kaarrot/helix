@@ -591,11 +591,11 @@ fn focused_file_revision(editor: &Editor) -> (Option<PathBuf>, Option<String>) {
         }
     }
 
-    if let Some((path, rev)) = editor
+    if let Some(revision) = editor
         .document(view.doc)
         .and_then(|doc| doc.git_revision.clone())
     {
-        return (Some(path), Some(rev));
+        return (Some(revision.path), Some(revision.git_ref));
     }
 
     // Merge panes are index stages rather than commits, so only the path of the
@@ -904,6 +904,10 @@ fn force_write_quit(
 /// Results in an error if there are modified buffers remaining and sets editor
 /// error, otherwise returns `Ok(())`. If the current document is unmodified,
 /// and there are modified documents, switches focus to one of them.
+///
+/// A review reply still being written counts too: quitting stops the agent
+/// mid-turn, possibly mid-edit, so it is asked for with `:q!` like unsaved
+/// buffers are.
 pub(super) fn buffers_remaining_impl(editor: &mut Editor) -> anyhow::Result<()> {
     let modified_ids: Vec<_> = editor
         .documents()
@@ -930,6 +934,14 @@ pub(super) fn buffers_remaining_impl(editor: &mut Editor) -> anyhow::Result<()> 
             if modified_names.len() == 1 { "" } else { "s" },
             modified_names,
         );
+    }
+
+    match crate::review_agent::replies_in_flight() {
+        0 => {}
+        1 => bail!("A review reply is still being written; wait for it, or :q! to stop it"),
+        n => {
+            bail!("{n} review replies are still being written; wait for them, or :q! to stop them")
+        }
     }
     Ok(())
 }
@@ -1570,12 +1582,14 @@ fn reload(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> anyh
     doc.reload(view, &cx.editor.diff_providers).map(|_| {
         view.ensure_cursor_in_view(doc, scrolloff);
     })?;
+    let doc_id = doc.id();
     if let Some(path) = doc.path() {
         cx.editor
             .language_servers
             .file_event_handler
             .file_changed(path.clone());
     }
+    cx.editor.seed_review_anchors(doc_id);
     Ok(())
 }
 
@@ -1629,6 +1643,8 @@ fn reload_all(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> 
                 view.ensure_cursor_in_view(doc, scrolloff);
             }
         }
+
+        cx.editor.seed_review_anchors(doc_id);
     }
 
     Ok(())
@@ -3620,6 +3636,17 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         completer: CommandCompleter::none(),
         signature: Signature {
             positionals: (0, Some(0)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "review-session",
+        aliases: &[],
+        doc: "Show the review conversation, switch it by name, and/or pick its agent (`claude` or `grok`).",
+        fun: typed_diff::review_session,
+        completer: CommandCompleter::all(completers::review_agent),
+        signature: Signature {
+            positionals: (0, Some(2)),
             ..Signature::DEFAULT
         },
     },

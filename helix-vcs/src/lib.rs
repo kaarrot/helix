@@ -59,6 +59,22 @@ impl DiffProviderRegistry {
             })
     }
 
+    /// The working-tree root containing `file`, used to key review sessions so
+    /// that separate checkouts of one repository stay separate conversations.
+    pub fn get_workdir(&self, file: &Path) -> Option<PathBuf> {
+        self.providers
+            .iter()
+            .find_map(|provider| provider.get_workdir(file).ok())
+    }
+
+    /// The full hash of the commit `rev` names, in the repository holding
+    /// `path`. `None` when it names no commit or the repository cannot be read.
+    pub fn resolve_commit_id(&self, path: &Path, rev: &str) -> Option<String> {
+        self.providers
+            .iter()
+            .find_map(|provider| provider.resolve_commit_id(path, rev).ok())
+    }
+
     /// Fire-and-forget changed file iteration. Runs everything in a background task. Keeps
     /// iteration until `on_change` returns `false`.
     pub fn for_each_changed_file(
@@ -112,10 +128,26 @@ impl DiffProvider {
         }
     }
 
+    fn get_workdir(&self, file: &Path) -> Result<PathBuf> {
+        match self {
+            #[cfg(feature = "git")]
+            Self::Git => git::workdir(file),
+            Self::None => bail!("No version control system found"),
+        }
+    }
+
     fn get_current_head_name(&self, _file: &Path) -> Result<Arc<ArcSwap<Box<str>>>> {
         match self {
             #[cfg(feature = "git")]
             Self::Git => git::get_current_head_name(_file),
+            Self::None => bail!("No diff support compiled in"),
+        }
+    }
+
+    fn resolve_commit_id(&self, path: &Path, rev: &str) -> Result<String> {
+        match self {
+            #[cfg(feature = "git")]
+            Self::Git => git::resolve_commit_id(path, rev),
             Self::None => bail!("No diff support compiled in"),
         }
     }

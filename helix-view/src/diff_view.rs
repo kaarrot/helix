@@ -1,3 +1,8 @@
+use crate::review::{
+    agent::{ReviewAgent, ReviewAgentKind},
+    session::ReviewSession,
+    ReviewStore,
+};
 use crate::{
     editor::{DiffRange, MergeViewState},
     DocumentId, ViewId,
@@ -24,6 +29,46 @@ pub struct DiffSession {
     /// still matches, so a slow refresh from an earlier invocation can't
     /// clobber a picker that was reopened in the meantime.
     pub changed_file_request: u64,
+    /// Inline review threads. Lives here rather than per-document because a
+    /// conversation outlives the buffer it is anchored in.
+    pub reviews: ReviewStore,
+    /// The claimed review conversation, created lazily on the first comment.
+    pub session: Option<ReviewSession>,
+    /// Saved threads loaded before any session was claimed, so that reopening
+    /// Helix shows them straight away. Nothing is written back until the
+    /// first comment claims a session; if that claim lands on a different
+    /// conversation, these threads are swapped out for its own.
+    pub peeked: Option<PeekedReviews>,
+    /// Whatever answers review comments. Spawned lazily on the first send, so
+    /// merely commenting never starts a process.
+    pub agent: Option<Box<dyn ReviewAgent>>,
+    /// Which child to spawn. Set by `:review-session [claude|grok]`; default
+    /// Claude. Changing it drops a running child so the next send starts the
+    /// other one.
+    pub agent_kind: ReviewAgentKind,
+}
+
+impl Drop for DiffSession {
+    fn drop(&mut self) {
+        // Give the name back on a clean exit, so the next editor in this worktree
+        // takes it rather than a `#2` suffix. A crash skips this, which is what
+        // the liveness check in `claim` is for.
+        if let Some(agent) = &mut self.agent {
+            agent.shutdown();
+        }
+        if let Some(session) = &self.session {
+            crate::review::session::release(session);
+        }
+    }
+}
+
+/// Which saved conversation [`DiffSession::peeked`] came from, and the ids its
+/// threads were given in the store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeekedReviews {
+    /// The conversation a claim is expected to land on. Not claimed.
+    pub session: ReviewSession,
+    pub threads: Vec<crate::review::ThreadId>,
 }
 
 /// A changed-file listing cached together with the diff range it was computed
@@ -136,5 +181,12 @@ impl DiffViewState {
 
     pub fn is_working_view(&self, view_id: ViewId) -> bool {
         view_id == self.working_view_id
+    }
+
+    /// True when this is a two-pane split. The default single-pane diff
+    /// stores the same view id for both sides, so `is_base_view` would
+    /// otherwise be true of the working document the user is reviewing.
+    pub fn is_split(&self) -> bool {
+        self.base_view_id != self.working_view_id
     }
 }

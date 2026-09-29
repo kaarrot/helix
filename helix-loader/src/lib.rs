@@ -132,6 +132,20 @@ pub fn cache_dir() -> PathBuf {
     path
 }
 
+/// Directory for state that should survive a restart but is not configuration
+/// and is not a disposable cache: review session ownership, for instance.
+///
+/// `$XDG_RUNTIME_DIR` would be tempting for ownership files, since it is
+/// cleared at logout, but it does not exist on every platform this runs on and
+/// the base-directory strategy already gives a portable answer.
+pub fn state_dir() -> PathBuf {
+    let strategy = choose_base_strategy().expect("Unable to find the state directory!");
+    // Not every platform distinguishes state from data; fall back where it does not.
+    let mut path = strategy.state_dir().unwrap_or_else(|| strategy.data_dir());
+    path.push("helix");
+    path
+}
+
 pub fn config_file() -> PathBuf {
     CONFIG_FILE.get().map(|path| path.to_path_buf()).unwrap()
 }

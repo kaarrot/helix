@@ -42,6 +42,127 @@ pub(crate) fn diff_base(
     Ok(())
 }
 
+/// Show, name, or switch the review conversation, and/or pick its agent.
+///
+/// `:review-session` with no arguments reports the current conversation and
+/// agent. A lone `claude` or `grok` selects the child without renaming.
+/// Anything else is a conversation name. Both together, in either order:
+/// `:review-session spike grok`.
+pub(crate) fn review_session(
+    cx: &mut compositor::Context,
+    args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+
+    let parsed = match parse_review_session_args(&args) {
+        Ok(parsed) => parsed,
+        Err(message) => {
+            cx.editor.set_error(message);
+            return Ok(());
+        }
+    };
+
+    if parsed.name.is_none() && parsed.agent.is_none() {
+        let agent = cx.editor.diff.agent_kind;
+        let message = match cx.editor.review_session() {
+            Some(session) => format!(
+                "Review session: {} ({}) · agent {agent}",
+                session.name, session.uuid
+            ),
+            None => "No review session; this buffer is not in a repository".to_string(),
+        };
+        cx.editor.set_status(message);
+        return Ok(());
+    }
+
+    if let Some(name) = parsed.name.as_deref() {
+        match cx.editor.set_review_session(name) {
+            Some(_) => {}
+            None => {
+                cx.editor
+                    .set_error("Cannot start a review session: this buffer is not in a repository");
+                return Ok(());
+            }
+        }
+    } else if cx.editor.review_session().is_none() {
+        cx.editor
+            .set_error("Cannot start a review session: this buffer is not in a repository");
+        return Ok(());
+    }
+
+    if let Some(kind) = parsed.agent {
+        cx.editor.set_review_agent(kind);
+    }
+
+    let Some(session) = cx.editor.diff.session.as_ref() else {
+        return Ok(());
+    };
+    let claimed = session.name.clone();
+    let agent = cx.editor.diff.agent_kind;
+    let message = match parsed.name.as_deref() {
+        Some(asked) if claimed != asked => {
+            format!("Review session: {claimed} ({asked} is held by another editor) · agent {agent}")
+        }
+        _ => format!("Review session: {claimed} · agent {agent}"),
+    };
+    cx.editor.set_status(message);
+
+    Ok(())
+}
+
+struct ReviewSessionArgs {
+    name: Option<String>,
+    agent: Option<helix_view::review::agent::ReviewAgentKind>,
+}
+
+fn parse_review_session_args(args: &Args) -> Result<ReviewSessionArgs, &'static str> {
+    use helix_view::review::agent::ReviewAgentKind;
+
+    match args.len() {
+        0 => Ok(ReviewSessionArgs {
+            name: None,
+            agent: None,
+        }),
+        1 => {
+            let arg = args.get(0).unwrap();
+            Ok(match ReviewAgentKind::parse(arg) {
+                Some(agent) => ReviewSessionArgs {
+                    name: None,
+                    agent: Some(agent),
+                },
+                None => ReviewSessionArgs {
+                    name: Some(arg.to_string()),
+                    agent: None,
+                },
+            })
+        }
+        2 => {
+            let first = args.get(0).unwrap();
+            let second = args.get(1).unwrap();
+            match (
+                ReviewAgentKind::parse(first),
+                ReviewAgentKind::parse(second),
+            ) {
+                // Last word is the agent so `:review-session grok claude`
+                // names a conversation "grok" rather than being ambiguous.
+                (_, Some(agent)) => Ok(ReviewSessionArgs {
+                    name: Some(first.to_string()),
+                    agent: Some(agent),
+                }),
+                (Some(agent), None) => Ok(ReviewSessionArgs {
+                    name: Some(second.to_string()),
+                    agent: Some(agent),
+                }),
+                (None, None) => Err("review agent must be `claude` or `grok`"),
+            }
+        }
+        _ => Err("usage: review-session [name] [claude|grok]"),
+    }
+}
+
 pub(crate) fn toggle_char_diff(
     cx: &mut compositor::Context,
     _args: Args,

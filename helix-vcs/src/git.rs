@@ -15,7 +15,7 @@ use gix::status::{
     plumbing::index_as_worktree::{Change, EntryStatus},
     UntrackedFiles,
 };
-use gix::{Commit, ObjectId, Repository, ThreadSafeRepository};
+use gix::{Commit, ObjectId, Repository, ThreadSafeRepository, Tree};
 
 use crate::FileChange;
 
@@ -52,7 +52,7 @@ pub fn get_diff_base(file: &Path) -> Result<Vec<u8>> {
         .context("failed to open git repo")?
         .to_thread_local();
     let head = repo.head_commit()?;
-    let file_oid = find_file_in_commit(&repo, &head, &file)?;
+    let file_oid = find_file_in_tree(&repo, &head.tree()?, &file)?;
 
     let file_object = repo.find_object(file_oid)?;
     let data = file_object.detach().data;
@@ -82,8 +82,8 @@ pub fn get_diff_base_from_ref(file: &Path, ref_name: &str) -> Result<Vec<u8>> {
         .context("failed to open git repo")?
         .to_thread_local();
 
-    let commit = resolve_commit(&repo, ref_name)?;
-    let file_oid = find_file_in_commit(&repo, &commit, &file)?;
+    let tree = resolve_tree(&repo, ref_name)?;
+    let file_oid = find_file_in_tree(&repo, &tree, &file)?;
 
     let file_object = repo.find_object(file_oid)?;
     let data = file_object.detach().data;
@@ -194,6 +194,24 @@ pub fn get_current_head_name(file: &Path) -> Result<Arc<ArcSwap<Box<str>>>> {
     Ok(Arc::new(ArcSwap::from_pointee(name.into_boxed_str())))
 }
 
+/// The full hash of the commit `rev` names, in the repository holding `path`.
+///
+/// `rev` takes the same spellings as the diff commands: a ref, a tag, a short
+/// or full hash, with an optional `^`. `path` is a file in the repository or
+/// a directory of it, such as the worktree root.
+pub fn resolve_commit_id(path: &Path, rev: &str) -> Result<String> {
+    let repo_dir = if path.is_dir() {
+        path
+    } else {
+        get_repo_dir(path)?
+    };
+    let repo = open_repo(repo_dir)
+        .context("failed to open git repo")?
+        .to_thread_local();
+    let commit = resolve_commit(&repo, rev)?.id().to_hex().to_string();
+    Ok(commit)
+}
+
 /// Fetch OURS (stage 2) and THEIRS (stage 3) versions of a conflicted file
 /// from the git index. Returns `(ours_bytes, theirs_bytes)`.
 pub fn get_merge_versions(file: &Path) -> Result<(Vec<u8>, Vec<u8>)> {
@@ -294,10 +312,11 @@ fn for_each_change_impl(
 
     match target_ref {
         None => {
-            let base_commit = resolve_commit(&repo, base_ref)?;
+            let base_tree = resolve_tree(&repo, base_ref)?;
             let head_commit = repo.head_commit()?;
+            let head_tree = head_commit.tree()?;
 
-            if base_commit.id == head_commit.id {
+            if base_tree.id == head_tree.id {
                 return status(&repo, untracked, f);
             }
 
@@ -307,8 +326,6 @@ fn for_each_change_impl(
                 .to_path_buf();
 
             let mut seen = std::collections::HashSet::new();
-            let base_tree = base_commit.tree()?;
-            let head_tree = head_commit.tree()?;
             let mut cancelled = false;
 
             base_tree.changes()?.for_each_to_obtain_tree(
@@ -356,15 +373,12 @@ fn for_each_change_impl(
             }
         }
         Some(target) => {
-            let base_commit = resolve_commit(&repo, base_ref)?;
-            let target_commit = resolve_commit(&repo, target)?;
+            let base_tree = resolve_tree(&repo, base_ref)?;
+            let target_tree = resolve_commit(&repo, target)?.tree()?;
             let work_dir = repo
                 .workdir()
                 .ok_or_else(|| anyhow::anyhow!("working tree not found"))?
                 .to_path_buf();
-
-            let base_tree = base_commit.tree()?;
-            let target_tree = target_commit.tree()?;
 
             base_tree.changes()?.for_each_to_obtain_tree(
                 &target_tree,
@@ -413,7 +427,9 @@ fn for_each_change_impl(
 /// `Sync` bound), which hides per-entry I/O latency on network filesystems. A
 /// file is untracked when it exists on disk, is not excluded by any git ignore
 /// source, and is not present in the index. Matches `git status -uall` (each
-/// untracked symlink is reported as an entry, like git).
+/// untracked symlink is reported as an entry, like git), except that a nested
+/// repository is skipped rather than listed as one `nested/` entry, since the
+/// picker opens files. Submodules are skipped too, as git does.
 pub fn for_each_untracked_file(cwd: &Path, f: impl Fn(FileChange) + Sync) -> Result<()> {
     let repo = open_repo(cwd)?.to_thread_local();
     let work_dir = repo
@@ -430,6 +446,15 @@ pub fn for_each_untracked_file(cwd: &Path, f: impl Fn(FileChange) + Sync) -> Res
         .map(|entry| work_dir.join(gix::path::from_bstr(entry.path(&index))))
         .collect();
 
+    // Submodule paths. Their files belong to another repository and are not in
+    // this index, so without pruning every one of them would read as untracked.
+    let gitlinks: std::collections::HashSet<PathBuf> = index
+        .entries()
+        .iter()
+        .filter(|entry| entry.mode == gix::index::entry::Mode::COMMIT)
+        .map(|entry| work_dir.join(gix::path::from_bstr(entry.path(&index))))
+        .collect();
+
     let walker = ignore::WalkBuilder::new(&work_dir)
         .hidden(false) // git scans dotfiles; `.git` is pruned below
         .parents(true)
@@ -437,16 +462,29 @@ pub fn for_each_untracked_file(cwd: &Path, f: impl Fn(FileChange) + Sync) -> Res
         .git_ignore(true)
         .git_global(true)
         .git_exclude(true)
-        .filter_entry(|entry| entry.file_name() != ".git")
+        .filter_entry(move |entry| {
+            if entry.file_name() == ".git" {
+                return false;
+            }
+            // Stop at repository boundaries: a submodule, even an
+            // uninitialized one, or any nested clone (its own `.git`).
+            let is_dir = entry.file_type().is_some_and(|ft| ft.is_dir());
+            !(is_dir
+                && entry.depth() > 0
+                && (gitlinks.contains(entry.path()) || entry.path().join(".git").exists()))
+        })
         .threads(0) // 0 = pick a sensible default based on CPUs
         .build_parallel();
 
     walker.run(|| {
         Box::new(|result| {
             if let Ok(entry) = result {
-                // Files and symlinks (anything that isn't a directory); git
-                // lists an untracked symlink as its own entry.
-                if entry.file_type().map_or(false, |ft| !ft.is_dir()) {
+                // Regular files and symlinks; git lists an untracked symlink as
+                // its own entry. Sockets and FIFOs are skipped, as git does.
+                if entry
+                    .file_type()
+                    .is_some_and(|ft| ft.is_file() || ft.is_symlink())
+                {
                     let path = entry.into_path();
                     if !tracked.contains(&path) {
                         f(FileChange::Untracked { path });
@@ -513,6 +551,19 @@ pub fn for_each_changed_file_between_commits(
     )?;
 
     Ok(())
+}
+
+/// Resolve a diff base to its tree. Like [`resolve_commit`], except that the
+/// parent of a root commit (`ROOT^`, which `Space-m c` builds from a log line)
+/// is the empty tree, so the root commit's own files read as added.
+fn resolve_tree<'a>(repo: &'a Repository, ref_name: &str) -> Result<Tree<'a>> {
+    if let Some(base) = ref_name.strip_suffix('^') {
+        let commit = resolve_commit(repo, base)?;
+        if commit.parent_ids().next().is_none() {
+            return Ok(repo.empty_tree());
+        }
+    }
+    Ok(resolve_commit(repo, ref_name)?.tree()?)
 }
 
 /// Resolve a git reference or commit hash (full or short, with optional `^` parent suffix).
@@ -604,12 +655,30 @@ fn open_repo(path: &Path) -> Result<ThreadSafeRepository> {
     Ok(res)
 }
 
+/// Whether an index entry is a regular file or symlink, as opposed to a
+/// submodule or sparse directory. Mirrors the `is_blob` filtering the tree-diff
+/// paths above apply, for which index entry modes have no direct equivalent.
+fn is_file_mode(mode: gix::index::entry::Mode) -> bool {
+    mode.to_tree_entry_mode()
+        .is_some_and(|mode| mode.is_blob_or_symlink())
+}
+
+/// The working-tree root containing `file`, via the same repository discovery
+/// the diff machinery uses.
+pub fn workdir(file: &Path) -> Result<PathBuf> {
+    let repo = open_repo(get_repo_dir(file)?)?.to_thread_local();
+    repo.workdir()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| anyhow::anyhow!("working tree not found"))
+}
+
 /// Emulates the result of running `git status` from the command line.
 ///
 /// `untracked` selects how new files are reported. Callers that enumerate
 /// untracked files separately (via [`for_each_untracked_file`], which uses a
 /// parallel walker) pass [`UntrackedFiles::None`] so gix does no directory
-/// walk at all — leaving only the fast index<->worktree modification pass.
+/// walk at all — leaving only the fast head-tree<->index and index<->worktree
+/// modification passes.
 fn status(
     repo: &Repository,
     untracked: UntrackedFiles,
@@ -619,6 +688,13 @@ fn status(
         .workdir()
         .ok_or_else(|| anyhow::anyhow!("working tree not found"))?
         .to_path_buf();
+
+    // HEAD^{tree} is compared against the index as well as the index against the
+    // worktree. Without the head tree, staged work is invisible here: `git add`
+    // makes the index match the worktree, so an index<->worktree scan alone
+    // reports nothing while the change is plainly still there against HEAD.
+    // `or_empty` covers an unborn HEAD, where every indexed file reads as added.
+    let head_tree_id = repo.head_tree_id_or_empty()?;
 
     let status_platform = repo
         .status(gix::progress::Discard)?
@@ -632,46 +708,110 @@ fn status(
         // measured as roughly half the total scan time on a large repo with a
         // few thousand untracked files, worse still on network filesystems. A
         // renamed file surfaces as an untracked + deleted pair instead.
-        .index_worktree_rewrites(None::<Rewrites>);
+        .index_worktree_rewrites(None::<Rewrites>)
+        .head_tree(head_tree_id)
+        // Likewise off between head tree and index, for consistency with the
+        // above rather than cost: both sides are already-hashed objects here, so
+        // this one is cheap. A staged rename surfaces as a deletion + addition.
+        .tree_index_track_renames(gix::status::tree_index::TrackRenames::Disabled);
 
     // No filtering based on path
     let empty_patterns = vec![];
 
-    let status_iter = status_platform.into_index_worktree_iter(empty_patterns)?;
+    // Yields head-tree<->index and index<->worktree changes. Under the `parallel`
+    // feature the two run concurrently with the dirwalk, so the added comparison
+    // costs no extra filesystem I/O: it reads objects, never the worktree.
+    let status_iter = status_platform.into_iter(empty_patterns)?;
+
+    // A file can be reported by both halves (staged, then modified again). Emit
+    // it once. Ordering between the halves is explicitly undefined under
+    // `parallel`, so which half labels it is not guaranteed; every label here
+    // means "changed", and the picker keys on the path.
+    let mut seen = std::collections::HashSet::new();
 
     for item in status_iter {
         let Ok(item) = item.map_err(|err| f(Err(err.into()))) else {
             continue;
         };
         let change = match item {
-            Item::Modification {
-                rela_path, status, ..
-            } => {
-                let path = work_dir.join(rela_path.to_path()?);
-                match status {
-                    EntryStatus::Conflict { .. } => FileChange::Conflict { path },
-                    EntryStatus::Change(Change::Removed) => FileChange::Deleted { path },
-                    EntryStatus::Change(Change::Modification { .. }) => {
-                        FileChange::Modified { path }
+            gix::status::Item::IndexWorktree(item) => match item {
+                Item::Modification {
+                    rela_path, status, ..
+                } => {
+                    let path = work_dir.join(rela_path.to_path()?);
+                    match status {
+                        EntryStatus::Conflict { .. } => FileChange::Conflict { path },
+                        EntryStatus::Change(Change::Removed) => FileChange::Deleted { path },
+                        EntryStatus::Change(Change::Modification { .. }) => {
+                            FileChange::Modified { path }
+                        }
+                        _ => continue,
                     }
-                    _ => continue,
                 }
-            }
-            Item::DirectoryContents { entry, .. } if entry.status == Status::Untracked => {
-                FileChange::Untracked {
-                    path: work_dir.join(entry.rela_path.to_path()?),
+                Item::DirectoryContents { entry, .. } if entry.status == Status::Untracked => {
+                    FileChange::Untracked {
+                        path: work_dir.join(entry.rela_path.to_path()?),
+                    }
                 }
-            }
-            Item::Rewrite {
-                source,
-                dirwalk_entry,
-                ..
-            } => FileChange::Renamed {
-                from_path: work_dir.join(source.rela_path().to_path()?),
-                to_path: work_dir.join(dirwalk_entry.rela_path.to_path()?),
+                Item::Rewrite {
+                    source,
+                    dirwalk_entry,
+                    ..
+                } => FileChange::Renamed {
+                    from_path: work_dir.join(source.rela_path().to_path()?),
+                    to_path: work_dir.join(dirwalk_entry.rela_path.to_path()?),
+                },
+                _ => continue,
             },
-            _ => continue,
+            gix::status::Item::TreeIndex(change) => {
+                use gix::diff::index::ChangeRef;
+                match change {
+                    // Staged additions are tracked, so they are a modification
+                    // against HEAD rather than an untracked file.
+                    ChangeRef::Addition {
+                        location,
+                        entry_mode,
+                        ..
+                    }
+                    | ChangeRef::Modification {
+                        location,
+                        entry_mode,
+                        ..
+                    } => {
+                        if !is_file_mode(entry_mode) {
+                            continue;
+                        }
+                        FileChange::Modified {
+                            path: work_dir.join(gix::path::from_bstr(location.as_ref())),
+                        }
+                    }
+                    ChangeRef::Deletion {
+                        location,
+                        entry_mode,
+                        ..
+                    } => {
+                        if !is_file_mode(entry_mode) {
+                            continue;
+                        }
+                        FileChange::Deleted {
+                            path: work_dir.join(gix::path::from_bstr(location.as_ref())),
+                        }
+                    }
+                    ChangeRef::Rewrite {
+                        source_location,
+                        location,
+                        ..
+                    } => FileChange::Renamed {
+                        from_path: work_dir.join(gix::path::from_bstr(source_location.as_ref())),
+                        to_path: work_dir.join(gix::path::from_bstr(location.as_ref())),
+                    },
+                }
+            }
         };
+
+        if !seen.insert(change.path().to_path_buf()) {
+            continue;
+        }
         if !f(Ok(change)) {
             break;
         }
@@ -693,10 +833,9 @@ impl std::fmt::Display for FileNotFoundInRevision {
 impl std::error::Error for FileNotFoundInRevision {}
 
 /// Finds the object that contains the contents of a file at a specific commit.
-fn find_file_in_commit(repo: &Repository, commit: &Commit, file: &Path) -> Result<ObjectId> {
+fn find_file_in_tree(repo: &Repository, tree: &Tree, file: &Path) -> Result<ObjectId> {
     let repo_dir = repo.workdir().context("repo has no worktree")?;
     let rel_path = file.strip_prefix(repo_dir)?;
-    let tree = commit.tree()?;
     let tree_entry = tree
         .lookup_entry_by_path(rel_path)?
         .ok_or(FileNotFoundInRevision)?;

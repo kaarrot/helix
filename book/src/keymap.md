@@ -64,7 +64,7 @@ Normal mode is the default mode when you launch helix. You can return to it from
 | `Ctrl-d`              | Move cursor and page half page down                | `page_cursor_half_down`     |
 | `Ctrl-i`              | Jump forward on the jumplist                       | `jump_forward`              |
 | `Ctrl-o`              | Jump backward on the jumplist                      | `jump_backward`             |
-| `Ctrl-s`              | Save the current selection to the jumplist         | `save_selection`            |
+| `Ctrl-s` / `Ctrl-Shift-s` | Send the pending review comment at the cursor, else save the selection to the jumplist | `review_send_or_save_selection` |
 
 ### Changes
 
@@ -86,7 +86,7 @@ Normal mode is the default mode when you launch helix. You can return to it from
 | `U`         | Redo change                                                          | `redo`                    |
 | `Alt-u`     | Move backward in history                                             | `earlier`                 |
 | `Alt-U`     | Move forward in history                                              | `later`                   |
-| `y`         | Yank selection                                                       | `yank`                    |
+| `y`         | Copy from the focused review box to the clipboard, else yank selection | `review_copy_or_yank`   |
 | `p`         | Paste after selection                                                | `paste_after`             |
 | `P`         | Paste before selection                                               | `paste_before`            |
 | `"` `<reg>` | Select a register to yank to or paste from                           | `select_register`         |
@@ -95,7 +95,11 @@ Normal mode is the default mode when you launch helix. You can return to it from
 | `=`         | Format selection (**LSP**)                                           | `format_selections`       |
 | `d`         | Delete selection                                                     | `delete_selection`        |
 | `Alt-d`     | Delete selection, without yanking                                    | `delete_selection_noyank` |
-| `c`         | Change selection (delete and enter insert mode)                      | `change_selection`        |
+| `c`         | Continue the unsent review draft at the cursor, else reply, else change selection | `review_comment_or_change` |
+| `d`         | Delete the focused review entry, else delete selection               | `review_delete_or_change` |
+| `C-left` / `C-right` | Show the previous / next entry in the thread at the cursor   | `review_prev_message` / `review_next_message` |
+| `C-up` / `C-down` | Move the cursor up / down inside the focused review box         | `review_scroll_up` / `review_scroll_down` |
+| `Ctrl-Shift-c` | Copy from the focused review box, else yank to the clipboard    | `review_copy_or_yank_to_clipboard` |
 | `Alt-c`     | Change selection (delete and enter insert mode, without yanking)     | `change_selection_noyank` |
 | `Ctrl-a`    | Increment object (number) under cursor                               | `increment`               |
 | `Ctrl-x`    | Decrement object (number) under cursor                               | `decrement`               |
@@ -220,7 +224,7 @@ Jumps to various locations.
 | <code>&lt;n&gt;&#124;</code>  | Go to column number `<n>`      | `goto_column`              |
 | <code>&#124;</code>     | Go to the start of line        | `goto_column`              |
 | `e`   | Go to the end of the file                        | `goto_last_line`           |
-| `f`   | Go to files in the selections                    | `goto_file`                |
+| `f`   | Go to the path under a focused review box's cursor, else to files in the selections | `review_goto_file_or_goto_file` |
 | `h`   | Go to the start of the line                      | `goto_line_start`          |
 | `l`   | Go to the end of the line                        | `goto_line_end`            |
 | `s`   | Go to first non-whitespace character of the line | `goto_first_nonwhitespace` |
@@ -335,7 +339,7 @@ resolution. The commands that open diff or merge views are documented in
 
 | Key | Description | Command |
 | --- | --- | --- |
-| `c` | Set the changed-file picker range from selected git log lines | `diff_commit_from_selection` |
+| `c` | Set the changed-file picker range from selected git log lines, with the bottom line as the excluded base (`OLDER..NEWER`, or `COMMIT` vs working tree) | `diff_commit_from_selection` |
 | `C` | Set the changed-file picker range to show the selected commit only (`COMMIT^..COMMIT`) | `diff_show_commit_from_selection` |
 | `r` | Reset diff state back to `HEAD` vs working tree | `diff_reset` |
 | `v` | Toggle side-by-side split diff view | `diff_toggle_split_view` |
@@ -347,6 +351,152 @@ resolution. The commands that open diff or merge views are documented in
 | `n` | Jump to the next unresolved conflict | `merge_next_conflict` |
 | `p` | Jump to the previous unresolved conflict | `merge_prev_conflict` |
 | `f` | Save and stage the resolved file (`git add`) | `merge_finish` |
+| `R` | Review submenu, see below | |
+
+###### Review
+
+Accessed by typing `Space-m-R`. [Review comments](./review-comments.md) explains
+how they work and walks through a typical review. Review comments are anchored to a file and a
+line, so they work in any buffer — a diff view is simply where they are most
+useful, not a requirement.
+
+Pressing `c` — in the submenu, or on its own on a line that carries a thread — adds a reply rather than
+starting a second thread, so a thread grows into a conversation. `c` only does
+this when the cursor is on a thread; elsewhere it changes the selection as
+usual, at the cost of not being able to change text on a commented line. If the
+thread still has an unsent draft, `c` opens that draft again with the text in
+place and the cursor at the end. `Esc` closes the box and leaves the saved
+draft as it was.
+
+Moving down onto a line that carries a thread stops on its box first: the
+cursor stays put, the box is drawn as focused, and the next press carries on.
+Going up lands on the line with its box focused, and the press after that
+continues. A box cannot hold the cursor itself — it is drawn into virtual rows
+rather than document text — so it is given a stop of its own in the motion. A
+count (`10j`) travels straight through without stopping.
+
+`C-left` / `C-right` step through that thread's history, and only once its box
+is focused: walking a conversation is an action on the box, not on being near
+it.
+
+A box never takes more than half the window, so the code it is about stays on
+screen. A reply too tall to fit shows the visible range in its header
+(`12-40 of 201`). `C-up` / `C-down` walk a cursor down the reply and the box
+follows it, scrolling only when the cursor would otherwise leave. Scrolling the
+editor *through* a box is not possible — the cursor cannot be inside virtual
+rows, so the view would be pulled straight back to the cursor's line — which is
+why a box has a cursor of its own instead.
+
+**Drag across a reply with the mouse** to select part of it, then `y` (or
+`Ctrl-Shift-C`) to copy it to the **system clipboard**, ready to paste back into
+a comment. Clicking a box only points at it; it takes a drag to select, and the
+click never moves the text cursor into the code underneath. `C-up` / `C-down`
+adjust a selection once there is one. With nothing selected `y` copies the whole
+entry — and then it copies the text as it was written rather than as it was
+wrapped to fit the pane. Away from a box, `y` is an ordinary yank.
+
+Selecting in a box is by line rather than by character, since the box draws its
+own cursor and selection where the editor's cannot go. Trim after pasting, in
+the comment you are writing. `Ctrl-Shift-C` reaches Helix only in terminals that
+forward it; most keep it for their own copy, which is why `y` is the one to
+reach for.
+
+`d` removes the entry being looked at, leaving the rest of the conversation.
+Unlike `c` it requires the box to have been stopped on rather than just having
+the cursor on its line, since it throws something away. Deleting the last entry
+removes the thread with it.
+
+Replying while looking at an older entry continues the conversation from that
+point and **discards the entries after it** — the point of going back is to take
+it a different way. The status line says how many were dropped. That comment's
+conversation still remembers them, so the next message tells it they no
+longer stand. Inside the box, Enter inserts a newline, `Ctrl-S`
+saves a draft and closes the box, and `Ctrl-Shift-S` saves and sends it straight away.
+`c` on that line opens the saved draft again. A thread shows one
+entry at a time, with a `3/5` counter in its header, so its height stays bounded
+by a single message however long the conversation grows.
+
+`S` sends every unsent comment. The agent is started on the first send. Each
+comment has its own conversation, so a reply cannot land on another comment and
+one comment does not see the others. A follow-up in the same window resumes
+that conversation.
+
+The agent runs with **full access to the worktree**: it can edit files and run
+commands without asking, because a comment on a line usually implies a change to
+it. A process the editor spawned has no terminal to prompt in, so there is no
+approval step. Its edits land in the diff you are reviewing, where they are
+visible, and the conversation is kept — but treat it as you would any agent with
+write access to your checkout.
+
+The child is **Claude Code** (`claude`) until you pick otherwise with
+`:review-session grok`. `:review-session claude` switches back. Either way one
+turn is one process, and the UUID stored on that comment decides which
+conversation it is. The first turn passes `--session-id`. Every later turn in
+the same window passes `--resume` with that same UUID. Claude is `claude -p`
+with the prompt on stdin. Grok is `grok --prompt-file`. Turns on different
+comments run at the same time. A follow-up sent while its comment's reply is
+still arriving stays a draft and goes out once that reply lands, so two
+processes never resume one conversation together. Saving or deleting that
+draft before then cancels the send. The
+UUID is shown at the right of the box's header and of the reply input, so
+running `claude --resume <uuid>` (or `/resume <uuid>`) from the worktree opens
+that one comment's conversation interactively. Helix does not know about that
+session, so do not reply from Helix while it is open there. A
+conversation name and an agent can be given together, in either order:
+`:review-session spike grok`.
+
+`:q` refuses while a reply is still being written, the same way it refuses
+with unsaved buffers. `:q!` stops the agent, together with any command it is
+running, and keeps what had arrived of the reply, marked as stopped.
+
+Conversations are saved as they change and come back when you reopen Helix in
+the same worktree, including comments you drafted but never sent. They are
+shown as soon as the first file in that worktree opens, and track your edits
+from then on; nothing is written back until you comment. If another running
+Helix owns the worktree's conversation, this one shows its own `worktree#2`
+conversation instead. Ones nothing has touched for a year are deleted
+automatically.
+
+Each worktree has one conversation, whatever is checked out. A comment is about
+the revision it was left on: a file opened from disk, or a diff's working-tree
+pane, is the working tree, and a snapshot such as `foo.rs @ abc1234` is that
+commit, kept by its full hash. It is shown wherever that revision is shown, in
+either pane of any diff. Comments on the working tree stay on the file through
+a commit, a stash or a checkout, and follow its text on `:reload`; nothing is
+copied onto a new commit.
+`:review-session` shows the current conversation and agent.
+`:review-session [name]` switches to a conversation of that name, kept apart
+from the worktree's; `:review-session worktree` goes back to it.
+`:review-session grok` or `:review-session claude` picks the agent without
+renaming.
+
+| Key | Description | Command |
+| --- | --- | --- |
+| `c` | Comment, reply, or continue editing the unsent draft on this line | `review_add` |
+| `S` | Send any comments saved but not yet sent | `review_send_all` |
+| `t` | Collapse or expand the thread at the cursor | `review_toggle_collapse` |
+| `h` | Hide or show every review box | `review_toggle_visible` |
+
+An agent's reply is drawn with the markdown preview renderer: headings, lists,
+tables and code are laid out instead of shown as source. That text is not
+editable. `d` still deletes the reply on screen, and `c` starts a new reply
+rather than opening what the agent wrote.
+
+Everything else happens on the box itself: `c` and `d` act on it, `C-left` /
+`C-right` walk its history, `C-up` / `C-down` read a long reply, the mouse
+selects from it and `y` copies that. `]c` / `[c` move between review
+comments in the current diff, and are code comments in any other buffer.
+`]C` / `[C` move between every review comment in the session, in path order,
+and open or switch to the buffer that holds the next one.
+`Ctrl-Shift-S` in the box sends straight away. After saving with `Ctrl-S`, `c`
+on the line opens that draft for editing again. `Ctrl-S` or `Ctrl-Shift-S` in
+normal mode send the draft on this line; `S` in the review submenu still sends
+every unsent comment.
+
+`h` hides the boxes for the keys as well as for the eye: `c`, `d` and the motion
+stops fall back to what they normally do, so a box you cannot see cannot be
+replied to or deleted by mistake. Asking to comment shows them again, since that
+is what asking implies. The conversations themselves are untouched either way.
 
 ##### Popup
 
@@ -428,8 +578,10 @@ These mappings are in the style of [vim-unimpaired](https://github.com/tpope/vim
 | `[t`     | Go to previous type definition (**TS**)      | `goto_prev_class`       |
 | `]a`     | Go to next argument/parameter (**TS**)       | `goto_next_parameter`   |
 | `[a`     | Go to previous argument/parameter (**TS**)   | `goto_prev_parameter`   |
-| `]c`     | Go to next comment (**TS**)                  | `goto_next_comment`     |
-| `[c`     | Go to previous comment (**TS**)              | `goto_prev_comment`     |
+| `]c`     | Go to next review comment in the current diff, else next code comment (**TS**) | `goto_next_comment_or_review` |
+| `[c`     | Go to previous review comment in the current diff, else previous code comment (**TS**) | `goto_prev_comment_or_review` |
+| `]C`     | Go to the next review comment in any buffer | `goto_next_review_comment` |
+| `[C`     | Go to the previous review comment in any buffer | `goto_prev_review_comment` |
 | `]T`     | Go to next test (**TS**)                     | `goto_next_test`        |
 | `[T`     | Go to previous test (**TS**)                 | `goto_prev_test`        |
 | `]p`     | Go to next paragraph                         | `goto_next_paragraph`   |

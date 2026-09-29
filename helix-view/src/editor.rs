@@ -737,6 +737,8 @@ impl Default for ModeConfig {
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum StatusLineElement {
+    /// The name of the active review conversation
+    ReviewSession,
     /// The editor mode (Normal, Insert, Visual/Selection)
     Mode,
 
@@ -2019,7 +2021,7 @@ impl Editor {
         let workspace_path = doc
             .git_revision
             .as_ref()
-            .map(|(path, _)| path.clone())
+            .map(|revision| revision.path.clone())
             .or_else(|| doc.path().cloned());
         let (lang, path) = (doc.language.clone(), workspace_path);
         let config = doc.config.load();
@@ -2357,16 +2359,26 @@ impl Editor {
         if !self.tree.contains(id) {
             return;
         }
+        let views_before = self.tree.views().count();
+        let mut closed_session = false;
         // Clean up any diff/merge session that owns this view.
         if self.diff.views.contains_key(&id) {
-            self.close_diff_view(id);
+            closed_session |= self.close_diff_view(id);
         }
         if self.diff.merge_views.contains_key(&id) {
-            self.close_merge_view(id);
+            closed_session |= self.close_merge_view(id);
         }
         // Session teardown may already have removed this view (e.g. closing the
         // virtual base/OURS/THEIRS pane closes the document, which closes the view).
         if !self.tree.contains(id) {
+            self._refresh();
+            return;
+        }
+        // Closing one pane of a split diff or merge closes its partner panes
+        // too. When that leaves only this view, keep it rather than empty the
+        // tree: that would quit, and `:q` or `C-w q` only check for unsaved
+        // buffers when a single view is open to begin with.
+        if closed_session && views_before > 1 && self.tree.views().count() == 1 {
             self._refresh();
             return;
         }
@@ -2421,12 +2433,26 @@ impl Editor {
                     self.close(view_id);
                 }
                 Action::ReplaceDoc(view_id, doc_id) => {
-                    self.replace_document_in_view(view_id, doc_id);
+                    if self.tree.contains(view_id) {
+                        self.replace_document_in_view(view_id, doc_id);
+                    }
                 }
             }
         }
 
-        let doc = self.documents.remove(&doc_id).unwrap();
+        // Anchors die with the document; write remapped/orphaned lines back
+        // first so a later save or reopen does not reseed at the old place.
+        // An inner close may already have removed this document; that close
+        // synced before removing it, and a second sync is a no-op.
+        self.sync_reviews_from_doc(doc_id);
+
+        // Closing a view can tear down the diff/merge session it belonged to,
+        // and that teardown closes this same document (`:bc` in a merge
+        // OURS/THEIRS pane or a range-diff pane). The inner close already did
+        // the rest of the work below.
+        let Some(doc) = self.documents.remove(&doc_id) else {
+            return Ok(());
+        };
         if doc.is_virtual_base {
             if let Some(path) = doc.path() {
                 let _ = std::fs::remove_file(path);
@@ -3056,9 +3082,9 @@ impl Editor {
 
     fn virtual_document_id_by_revision(&self, path: &Path, git_ref: &str) -> Option<DocumentId> {
         self.documents.iter().find_map(|(id, doc)| {
-            doc.git_revision
-                .as_ref()
-                .and_then(|(p, r)| (p.as_path() == path && r == git_ref).then_some(*id))
+            doc.git_revision.as_ref().and_then(|revision| {
+                (revision.path == path && revision.git_ref == git_ref).then_some(*id)
+            })
         })
     }
 
@@ -3072,10 +3098,14 @@ impl Editor {
         }
         let content = Self::get_diff_content_or_empty(path, git_ref)
             .map_err(|e| anyhow::anyhow!("Failed to fetch '{}': {}", git_ref, e))?;
+        // Resolved now, with the content, so the snapshot keeps the commit it
+        // was read from however far the ref moves on while it is open.
+        let commit = self.diff_providers.resolve_commit_id(path, git_ref);
         let doc = Document::from_git_revision(
             content,
             path,
             git_ref,
+            commit,
             self.config.clone(),
             self.syn_loader.clone(),
         )?;
@@ -3149,8 +3179,26 @@ impl Editor {
             self.detach_diff_view(focused_view);
         }
 
+        // A file deleted from the working tree has nothing to open: `open`
+        // would make a new, writable buffer at the path, and `:w` would bring
+        // the file back. Show it as an empty read-only pane instead.
+        let mut working_is_virtual = false;
         let working_doc_id = if let Some(id) = self.non_virtual_document_id_by_path(&working_path) {
             id
+        } else if !working_path.exists() {
+            working_is_virtual = true;
+            let mut working_doc = Document::from_git_revision(
+                Vec::new(),
+                &working_path,
+                "deleted",
+                None,
+                self.config.clone(),
+                self.syn_loader.clone(),
+            )?;
+            // Git-revision documents get a cache path so LSP can open them.
+            // A deleted working file has to stay pathless, or `:w` recreates it.
+            working_doc.set_path(None);
+            self.new_document(working_doc)
         } else {
             self.open(&working_path, Action::Load)?
         };
@@ -3174,7 +3222,7 @@ impl Editor {
             let base_view_id = self.tree.focus;
             self.switch(working_doc_id, Action::VerticalSplit);
             let working_view_id = self.tree.focus;
-            let diff_state = DiffViewState::new(
+            let mut diff_state = DiffViewState::new(
                 base_doc_id,
                 working_doc_id,
                 base_view_id,
@@ -3188,12 +3236,13 @@ impl Editor {
                 None,
             )
             .close_base_doc_on_close();
+            diff_state.close_working_doc_on_close = working_is_virtual;
             self.diff.views.insert(base_view_id, diff_state.clone());
             self.diff.views.insert(working_view_id, diff_state);
         } else {
             self.switch(working_doc_id, Action::Replace);
             let working_view_id = self.tree.focus;
-            let diff_state = DiffViewState::new(
+            let mut diff_state = DiffViewState::new(
                 base_doc_id,
                 working_doc_id,
                 working_view_id,
@@ -3207,10 +3256,364 @@ impl Editor {
                 None,
             )
             .close_base_doc_on_close();
+            diff_state.close_working_doc_on_close = working_is_virtual;
             self.diff.views.insert(working_view_id, diff_state);
         }
 
         Ok(())
+    }
+
+    /// The review conversation for the current file, claiming one if this is the
+    /// first comment.
+    ///
+    /// The worktree's own conversation, [`crate::review::session::WORKTREE_STORE`],
+    /// which holds the threads on every revision of every file in it. Claims
+    /// the conversation already on screen when it is this worktree's, so a
+    /// comment joins the threads it is shown beside.
+    pub fn review_session(&mut self) -> Option<&crate::review::session::ReviewSession> {
+        if self.diff.session.is_none() {
+            let path = self.review_session_path()?;
+            let worktree = self.diff_providers.get_workdir(&path)?;
+            let session =
+                crate::review::session::claim(&worktree, crate::review::session::WORKTREE_STORE);
+            match self.diff.peeked.take() {
+                // Already showing this conversation, loaded when the file
+                // opened. Loading again would show every thread twice.
+                Some(peeked) if peeked.session.uuid == session.uuid => {}
+                // Showing another one: another editor claimed it meanwhile, or
+                // it belongs to another worktree. Its threads are not ours.
+                Some(peeked) => {
+                    self.remove_review_threads(&peeked.threads);
+                    self.load_reviews(&session, Some(&path));
+                }
+                None => {
+                    self.load_reviews(&session, Some(&path));
+                }
+            }
+            self.diff.session = Some(session);
+        }
+        self.diff.session.as_ref()
+    }
+
+    /// Show the saved conversation for a document's worktree as the document
+    /// opens, without claiming it.
+    ///
+    /// Waiting for the first comment to claim a session, as loading used to,
+    /// left a restarted editor showing no threads at all, and edits made in
+    /// the meantime were not tracked, so the threads landed on the wrong lines
+    /// once they did appear. Claiming here instead would take the name for an
+    /// editor that may only be browsing, and push the one that comments to a
+    /// `#2` conversation. So the threads are loaded now and saved only once a
+    /// comment claims the session.
+    ///
+    /// Only the first file of a worktree loads anything. The conversation holds
+    /// every revision's threads, and each document that opens later picks out
+    /// its own (see [`Self::seed_review_anchors`]).
+    pub fn peek_reviews(&mut self, doc_id: DocumentId) {
+        if self.diff.session.is_some() || self.diff.peeked.is_some() {
+            return;
+        }
+        let Some((path, _)) = self.review_doc_identity(doc_id) else {
+            return;
+        };
+        let Some(worktree) = self.diff_providers.get_workdir(&path) else {
+            return;
+        };
+        let predicted =
+            crate::review::session::predict(&worktree, crate::review::session::WORKTREE_STORE);
+        let threads = self.load_reviews(&predicted, Some(&path));
+        self.diff.peeked = Some(crate::diff_view::PeekedReviews {
+            session: predicted,
+            threads,
+        });
+    }
+
+    /// Take threads out of the store and their anchors out of the documents.
+    fn remove_review_threads(&mut self, ids: &[crate::review::ThreadId]) {
+        for id in ids {
+            self.diff.reviews.remove(*id);
+        }
+        let reviews = &self.diff.reviews;
+        for doc in self.documents.values_mut() {
+            doc.review_anchors
+                .retain(|anchor| reviews.get(anchor.thread).is_some());
+        }
+        if self
+            .diff
+            .reviews
+            .focused
+            .is_some_and(|id| ids.contains(&id))
+        {
+            self.diff.reviews.focused = None;
+        }
+    }
+
+    /// Switch to a differently named conversation for the same worktree, or
+    /// rename the current one. Releases the old claim so its name is reusable.
+    pub fn set_review_session(
+        &mut self,
+        name: &str,
+    ) -> Option<&crate::review::session::ReviewSession> {
+        let worktree = match &self.diff.session {
+            Some(session) if session.name == name => {
+                return self.diff.session.as_ref();
+            }
+            Some(session) => session.worktree.clone(),
+            None => {
+                let path = self.review_session_path()?;
+                self.diff_providers.get_workdir(&path)?
+            }
+        };
+
+        // The threads in memory belong to the session being left, and
+        // load_reviews adds to them. Save them, then clear, so the new session
+        // shows only its own.
+        self.save_reviews();
+        self.clear_reviews();
+
+        if let Some(previous) = &self.diff.session {
+            crate::review::session::release(previous);
+        }
+        // Turns already running belong to the previous session's threads.
+        self.drop_review_agent();
+        let session = crate::review::session::claim(&worktree, name);
+        self.load_reviews(&session, None);
+        self.diff.session = Some(session);
+        self.diff.session.as_ref()
+    }
+
+    fn clear_reviews(&mut self) {
+        self.diff.reviews = crate::review::ReviewStore::default();
+        self.diff.peeked = None;
+        for doc in self.documents.values_mut() {
+            doc.review_anchors.clear();
+        }
+    }
+
+    /// Stop the running review child, if any. The next send starts a fresh one.
+    pub fn drop_review_agent(&mut self) {
+        if let Some(mut agent) = self.diff.agent.take() {
+            agent.shutdown();
+        }
+    }
+
+    /// Which child will answer the next send.
+    pub fn set_review_agent(&mut self, kind: crate::review::agent::ReviewAgentKind) {
+        if self.diff.agent_kind != kind {
+            self.drop_review_agent();
+            self.diff.agent_kind = kind;
+        }
+    }
+
+    /// Bring back the conversations belonging to `session`.
+    ///
+    /// Threads carry the line they were anchored at; the anchors that track
+    /// edits are re-established as each document opens.
+    ///
+    /// `file` is the file in the worktree that asked, used to find the branch
+    /// whose conversation a worktree's is first made from (see
+    /// [`Self::adopt_branch_conversation`]).
+    fn load_reviews(
+        &mut self,
+        session: &crate::review::session::ReviewSession,
+        file: Option<&Path>,
+    ) -> Vec<crate::review::ThreadId> {
+        let dir = crate::review::session::review_dir();
+        // Threads saved before each named its revision were left on a diff
+        // pane. The base pane's revision was never recorded, and HEAD is the
+        // likeliest thing it was.
+        let legacy_base = self
+            .diff_providers
+            .resolve_commit_id(&session.worktree, "HEAD");
+        if let Some(file) = file {
+            self.adopt_branch_conversation(&dir, session, file, legacy_base.as_deref());
+        }
+        // Merged into what is already in memory rather than replacing it, which
+        // would discard whatever had been typed there. Skipping the load
+        // instead would be worse: the session is set regardless, and its next
+        // save would replace the saved conversation with what is in memory.
+        let loaded =
+            crate::review::ReviewStore::load_upgrading(&dir, &session.uuid, legacy_base.as_deref());
+        let ids = self.diff.reviews.absorb(loaded);
+        // A conversation that could not be read is worth saying out loud: the
+        // reviewer would otherwise see an empty file list and assume the work
+        // was never there.
+        if let Some(message) = self.diff.reviews.load_error.take() {
+            self.set_error(message);
+        }
+        let open: Vec<DocumentId> = self.documents.keys().copied().collect();
+        for id in open {
+            self.seed_review_anchors(id);
+        }
+        ids
+    }
+
+    /// Give a document anchors for the threads that belong to it, so they track
+    /// edits rather than staying frozen at the line they were saved on.
+    ///
+    /// Only threads about the revision the document shows: the same file at
+    /// another commit, or on disk, is different text.
+    pub fn seed_review_anchors(&mut self, doc_id: DocumentId) {
+        let Some((path, rev)) = self.review_doc_identity(doc_id) else {
+            return;
+        };
+        let Some(doc) = self.documents.get(&doc_id) else {
+            return;
+        };
+        let text = doc.text().clone();
+        let existing: Vec<crate::review::ThreadId> = doc
+            .review_anchors
+            .iter()
+            .map(|anchor| anchor.thread)
+            .collect();
+
+        let anchors: Vec<crate::review::ReviewAnchor> = self
+            .diff
+            .reviews
+            .for_snapshot(&path, &rev)
+            .filter(|thread| !existing.contains(&thread.id))
+            .map(|thread| {
+                crate::review::ReviewAnchor::for_line(thread.id, &text, thread.line as usize)
+            })
+            .collect();
+        if anchors.is_empty() {
+            return;
+        }
+        // A file changed on disk since it was loaded, by a checkout or a stash
+        // say, still shows text these threads were not saved against. Anchored
+        // there they would sit on the wrong lines, and reloading would then
+        // carry them along with that text. They are anchored once the document
+        // is reloaded instead. A commit's snapshot never changes, and its cache
+        // file is written after it loads, so it would always look newer.
+        if !doc.is_virtual_base && doc.has_newer_file_on_disk().unwrap_or(false) {
+            return;
+        }
+
+        if let Some(doc) = self.documents.get_mut(&doc_id) {
+            doc.review_anchors.extend(anchors);
+        }
+    }
+
+    /// File and revision a document's review threads belong to. See
+    /// [`crate::review::review_key`].
+    fn review_doc_identity(
+        &self,
+        doc_id: DocumentId,
+    ) -> Option<(PathBuf, crate::review::ReviewRev)> {
+        let doc = self.documents.get(&doc_id)?;
+        crate::review::review_key(doc, self.diff.views.values())
+    }
+
+    /// Store key for a document's review threads: its path, or a stable scratch
+    /// identity so pathless buffers do not all collide under `PathBuf::new()`.
+    fn document_review_path(doc: &Document) -> PathBuf {
+        match doc.path() {
+            Some(path) => helix_stdx::path::canonicalize(path),
+            None => PathBuf::from(format!("[scratch {}]", doc.id())),
+        }
+    }
+
+    /// Worktree file for the focused view: the file its threads are keyed to,
+    /// which for a revision snapshot is the real file rather than its cache
+    /// copy.
+    fn review_session_path(&self) -> Option<PathBuf> {
+        let view = self.tree.get(self.tree.focus);
+        let doc = self.document(view.doc)?;
+        match view.review_identity(doc, &self.diff.views) {
+            Some((path, _)) if !path.as_os_str().is_empty() => Some(path),
+            _ => doc.path().map(|p| p.to_path_buf()),
+        }
+    }
+
+    /// Make a worktree's conversation from the branch's, the first time.
+    ///
+    /// Each branch used to have its own conversation. The one for the branch
+    /// checked out now is copied into the worktree's, once: only while the
+    /// worktree's has never been saved. Other branches' are left on disk.
+    fn adopt_branch_conversation(
+        &mut self,
+        dir: &Path,
+        session: &crate::review::session::ReviewSession,
+        file: &Path,
+        legacy_base: Option<&str>,
+    ) {
+        use crate::review::{session, ReviewStore};
+
+        if session.name != session::WORKTREE_STORE || ReviewStore::exists_in(dir, &session.uuid) {
+            return;
+        }
+        let branch = self.legacy_branch_name(file);
+        let old = session::derive_uuid(&session.worktree, &branch);
+        if !ReviewStore::exists_in(dir, &old) {
+            return;
+        }
+        let mut adopted = ReviewStore::load_upgrading(dir, &old, legacy_base);
+        if let Some(message) = adopted.load_error.take() {
+            self.set_error(message);
+        }
+        if adopted.is_empty() {
+            return;
+        }
+        match adopted.save_to(dir, &session.uuid) {
+            Ok(()) => log::info!(
+                "review threads of {branch} moved to the worktree's conversation {}",
+                session.uuid
+            ),
+            Err(err) => log::warn!("could not adopt the review threads of {branch}: {err}"),
+        }
+    }
+
+    /// The name a branch's conversation was saved under, from when each branch
+    /// had its own: the branch, a short hash while detached, else `review`.
+    fn legacy_branch_name(&self, path: &Path) -> String {
+        let current = self
+            .diff_providers
+            .get_current_head_name(path)
+            .map(|head| head.load_full().to_string());
+        let loaded = || {
+            self.non_virtual_document_id_by_path(path)
+                .and_then(|doc_id| self.documents.get(&doc_id))
+                .and_then(Document::version_control_head)
+                .map(|head| head.to_string())
+        };
+        current
+            .filter(|head| !head.is_empty())
+            .or_else(|| loaded().filter(|head| !head.is_empty()))
+            .unwrap_or_else(|| "review".to_string())
+    }
+
+    /// Write the current conversations out, if a session owns them.
+    pub fn save_reviews(&mut self) {
+        // Anchors track edits in open documents; the store's line numbers are
+        // only a snapshot. Write them back so a restart reseeds at the new
+        // place rather than the line the comment was first left on.
+        self.sync_reviews_from_open_docs();
+        let Some(session) = &self.diff.session else {
+            return;
+        };
+        let dir = crate::review::session::review_dir();
+        if let Err(err) = self.diff.reviews.save_to(&dir, &session.uuid) {
+            log::warn!("could not save review threads: {err}");
+        }
+    }
+
+    fn sync_reviews_from_open_docs(&mut self) {
+        let ids: Vec<DocumentId> = self.documents.keys().copied().collect();
+        for id in ids {
+            self.sync_reviews_from_doc(id);
+        }
+    }
+
+    fn sync_reviews_from_doc(&mut self, doc_id: DocumentId) {
+        let Some(doc) = self.documents.get(&doc_id) else {
+            return;
+        };
+        if doc.review_anchors.is_empty() {
+            return;
+        }
+        let anchors = doc.review_anchors.clone();
+        let text = doc.text().clone();
+        self.diff.reviews.sync_from_anchors(&anchors, &text);
     }
 
     pub fn open_diff_view_range(
@@ -3340,6 +3743,12 @@ impl Editor {
 
         self.link_shared_diff_handles(base_doc_id, working_doc_id);
 
+        // Review threads are keyed by these paths. Leaving them empty stored
+        // every buffer-diff comment under PathBuf::new(), so unrelated pairs
+        // collided and the threads vanished once the diff closed.
+        let base_path = Self::document_review_path(self.documents.get(&base_doc_id).unwrap());
+        let working_path = Self::document_review_path(self.documents.get(&working_doc_id).unwrap());
+
         let split_view_override = split_view_override.or(self.diff.split_view_override);
         let split_view = split_view_override.unwrap_or_else(|| self.config().diff.split_view);
         let display = format!("buffer {base_doc_id}..{working_doc_id}");
@@ -3365,6 +3774,7 @@ impl Editor {
                 working_view_id,
                 display,
             )
+            .with_reopen(base_path, working_path, String::new(), None)
             .with_buffer_reopen();
             self.diff.views.insert(base_view_id, diff_state.clone());
             self.diff.views.insert(working_view_id, diff_state);
@@ -3378,6 +3788,7 @@ impl Editor {
                 working_view_id,
                 display,
             )
+            .with_reopen(base_path, working_path, String::new(), None)
             .with_buffer_reopen();
             self.diff.views.insert(working_view_id, diff_state);
         }
@@ -3524,10 +3935,13 @@ impl Editor {
                 .context("Failed to fetch merge versions from git index")?;
 
             // 4. Create virtual read-only documents.
+            // OURS is the file as HEAD has it, so it is that commit's snapshot.
+            // THEIRS is an index stage and names no commit.
             let ours_doc = Document::from_git_revision(
                 ours_bytes,
                 &path,
                 "HEAD",
+                self.diff_providers.resolve_commit_id(&path, "HEAD"),
                 self.config.clone(),
                 self.syn_loader.clone(),
             )?;
@@ -3535,6 +3949,7 @@ impl Editor {
                 theirs_bytes,
                 &path,
                 "incoming",
+                None,
                 self.config.clone(),
                 self.syn_loader.clone(),
             )?;
@@ -3583,7 +3998,9 @@ impl Editor {
             self.diff.merge_views.insert(result_view_id, state);
 
             // Focus RESULT pane so the user starts editing conflicts immediately.
-            self.tree.focus = result_view_id;
+            // `focus` rather than setting `tree.focus`, so RESULT is marked
+            // focused and THEIRS (the last pane opened) gets its focus-lost event.
+            self.focus(result_view_id);
 
             Ok(())
         }

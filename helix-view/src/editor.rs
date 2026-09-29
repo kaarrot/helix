@@ -1153,6 +1153,9 @@ pub struct DapEvalResult {
     pub expression: String,
     /// The full, untrimmed value.
     pub value: String,
+    /// Where the value was written in the debug console, if it was: the console
+    /// document at the time, and where the entry starts.
+    pub console_entry: Option<(DocumentId, usize)>,
 }
 
 use futures_util::stream::{Flatten, Once};
@@ -1203,9 +1206,9 @@ pub struct Editor {
     /// `status_msg` so a double-click can still retrieve it after the first click of
     /// the double-click clears the status line. Cleared on use or on a new/failed eval.
     pub dap_eval_result: Option<DapEvalResult>,
-    /// Scratch buffer that double-clicked evaluate results are written to. Reused for
-    /// every result so a debugging session does not leave a trail of scratch buffers.
-    pub dap_eval_buffer: Option<DocumentId>,
+    /// The debug console: the buffer evaluate results, program output and stops are
+    /// written to, and whose last line takes console input.
+    pub dap_console: crate::handlers::dap_console::DapConsole,
     pub autoinfo: Option<Info>,
 
     pub config: Arc<dyn DynAccess<Config>>,
@@ -1345,7 +1348,7 @@ impl Editor {
             ))),
             status_msg: None,
             dap_eval_result: None,
-            dap_eval_buffer: None,
+            dap_console: Default::default(),
             autoinfo: None,
             idle_timer: Box::pin(sleep(conf.idle_timeout)),
             redraw_timer: Box::pin(sleep(Duration::MAX)),
@@ -1713,7 +1716,7 @@ impl Editor {
         }
     }
 
-    fn replace_document_in_view(&mut self, current_view: ViewId, doc_id: DocumentId) {
+    pub(crate) fn replace_document_in_view(&mut self, current_view: ViewId, doc_id: DocumentId) {
         let scrolloff = self.config().scrolloff;
         let view = self.tree.get_mut(current_view);
 
@@ -1746,6 +1749,8 @@ impl Editor {
                 // Boolean value is determined before the call to `view_mut` because the operation requires a borrow
                 // of `self.tree`, which is mutably borrowed when `view_mut` is called.
                 let remove_empty_scratch = !doc.is_modified()
+                    // A transcript has no path and is never modified, but is not empty.
+                    && !doc.is_transcript
                     // If the buffer has no path and is not modified, it is an empty scratch buffer.
                     && doc.path().is_none()
                     // If the buffer we are changing to is not this buffer
@@ -1837,7 +1842,7 @@ impl Editor {
     }
 
     /// Generate an id for a new document and register it.
-    fn new_document(&mut self, mut doc: Document) -> DocumentId {
+    pub(crate) fn new_document(&mut self, mut doc: Document) -> DocumentId {
         let id = self.next_document_id;
         // Safety: adding 1 from 1 is fine, probably impossible to reach usize max
         self.next_document_id =

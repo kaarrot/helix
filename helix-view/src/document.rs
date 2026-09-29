@@ -204,6 +204,11 @@ pub struct Document {
 
     pub readonly: bool,
 
+    /// A buffer the editor writes itself, such as the debug console. Nothing in it
+    /// needs saving, so it never counts as modified, and it is kept rather than
+    /// discarded when another file replaces it in a view, although it has no path.
+    pub is_transcript: bool,
+
     pub previous_diagnostic_id: Option<String>,
 
     /// Annotations for LSP document color swatches
@@ -727,6 +732,7 @@ impl Document {
             version_control_head: None,
             focused_at: std::time::Instant::now(),
             readonly: false,
+            is_transcript: false,
             jump_labels: HashMap::new(),
             color_swatches: None,
             color_swatch_controller: TaskController::new(),
@@ -1736,6 +1742,9 @@ impl Document {
 
     /// If there are unsaved modifications.
     pub fn is_modified(&self) -> bool {
+        if self.is_transcript {
+            return false;
+        }
         let history = self.history.take();
         let current_revision = history.current_revision();
         self.history.set(history);

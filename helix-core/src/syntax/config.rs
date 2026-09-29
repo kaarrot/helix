@@ -490,6 +490,15 @@ pub struct DebuggerQuirks {
     /// is evaluated a second time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub full_value_expression: Option<String>,
+    /// How to ask for a value laid out over several lines, for `pp` in the debug
+    /// console. `{}` stands for the expression; the result should be a string.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pretty_value_expression: Option<String>,
+    /// The adapter runs statements, not only expressions, when evaluating in the
+    /// `repl` context, as debugpy does. A failed assignment is then not retried
+    /// through `setExpression`, which would run its right-hand side again.
+    #[serde(default)]
+    pub repl_statements: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -650,13 +659,21 @@ mod tests {
             r#"
             absolute-paths = true
             full-value-expression = "repr({})"
+            pretty-value-expression = "pformat({})"
+            repl-statements = true
             "#,
         )
         .unwrap();
 
         assert!(quirks.absolute_paths);
         assert_eq!(quirks.full_value_expression.as_deref(), Some("repr({})"));
+        assert_eq!(
+            quirks.pretty_value_expression.as_deref(),
+            Some("pformat({})")
+        );
+        assert!(quirks.repl_statements);
         assert_eq!(DebuggerQuirks::default().full_value_expression, None);
+        assert!(!DebuggerQuirks::default().repl_statements);
     }
 
     #[test]

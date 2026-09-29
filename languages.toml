@@ -1067,7 +1067,17 @@ args = ["-m", "debugpy.adapter"]
 # debugpy renders only the first ~60 entries of a collection and ends the value
 # with an ellipsis. Asking for `repr(...)` of the same expression returns the
 # whole thing, since that is a plain string.
-quirks = { full-value-expression = "repr({})" }
+# `pp` in the debug console lays values out with pprint, and numpy arrays with
+# array2string, lifting numpy's own "..." elision of large arrays. numpy is only
+# looked up, never imported: an array means it is loaded already.
+# debugpy runs statements in the repl, so a failed assignment is not retried.
+[language.debugger.quirks]
+full-value-expression = "repr({})"
+pretty-value-expression = "(lambda v, np=__import__('sys').modules.get('numpy'): np.array2string(v, threshold=__import__('sys').maxsize, max_line_width=120) if np is not None and isinstance(v, np.ndarray) else __import__('pprint').pformat(v, width=120, compact=True))({})"
+repl-statements = true
+
+# Both templates set `redirectOutput` so what the program prints shows in the
+# debug console.
 
 # Attach to PID: attach to a running Python process by PID or by name.
 # Helix spawns debugpy.adapter; the adapter injects debugpy into the target.
@@ -1082,7 +1092,7 @@ quirks = { full-value-expression = "repr({})" }
 name = "Attach to PID"
 request = "attach"
 completion = [{ name = "pid or process name", completion = "process" }]
-args = { processId = "{0}", justMyCode = false }
+args = { processId = "{0}", justMyCode = false, redirectOutput = true }
 
 # Attach to port: connect to a debugpy server the source already started.
 # Instrument the script with:
@@ -1095,7 +1105,7 @@ name = "Attach to port"
 request = "attach"
 connect = "127.0.0.1:{0}"
 completion = [{ name = "port", default = "5678" }]
-args = { justMyCode = false }
+args = { justMyCode = false, redirectOutput = true }
 
 [[grammar]]
 name = "python"

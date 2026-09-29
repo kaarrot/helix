@@ -676,6 +676,57 @@ pub mod requests {
 
     #[derive(Debug, PartialEq, Eq, Clone, Deserialize, Serialize)]
     #[serde(rename_all = "camelCase")]
+    pub struct CompletionsArguments {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub frame_id: Option<usize>,
+        /// The text typed so far, possibly several lines of it.
+        pub text: String,
+        /// Where in `text` completions are asked for, in UTF-16 code units.
+        pub column: usize,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub line: Option<usize>,
+    }
+
+    #[derive(Debug, PartialEq, Eq, Clone, Deserialize, Serialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct CompletionsResponse {
+        pub targets: Vec<CompletionItem>,
+    }
+
+    #[derive(Debug, PartialEq, Eq, Clone, Deserialize, Serialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct CompletionItem {
+        pub label: String,
+        /// What to insert, when it differs from the label.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub text: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub sort_text: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub detail: Option<String>,
+        #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+        pub ty: Option<String>,
+        /// Where in the request's `text` the completion replaces from, in UTF-16
+        /// code units. Adapters count it from 0 regardless of `columnsStartAt1`,
+        /// following VS Code. Missing means the request's `column`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub start: Option<usize>,
+        /// How many code units from `start` the completion replaces.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub length: Option<usize>,
+    }
+
+    #[derive(Debug)]
+    pub enum Completions {}
+
+    impl Request for Completions {
+        type Arguments = CompletionsArguments;
+        type Result = CompletionsResponse;
+        const COMMAND: &'static str = "completions";
+    }
+
+    #[derive(Debug, PartialEq, Eq, Clone, Deserialize, Serialize)]
+    #[serde(rename_all = "camelCase")]
     pub struct GotoTargetsArguments {
         pub source: Source,
         pub line: usize,

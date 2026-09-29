@@ -605,6 +605,32 @@ impl Client {
         self.eval_with_context(expression, frame_id, context).await
     }
 
+    /// What could complete `text` at `column` (1-based, UTF-16 code units) in the
+    /// context of `frame_id`.
+    pub async fn completions(
+        &self,
+        text: String,
+        column: usize,
+        frame_id: Option<usize>,
+    ) -> Result<Vec<requests::CompletionItem>> {
+        let args = requests::CompletionsArguments {
+            frame_id,
+            text,
+            column,
+            line: None,
+        };
+
+        let response = self.request::<requests::Completions>(args).await?;
+        Ok(response.targets)
+    }
+
+    pub fn supports_completions(&self) -> bool {
+        self.caps
+            .as_ref()
+            .and_then(|caps| caps.supports_completions_request)
+            .unwrap_or_default()
+    }
+
     pub fn supports_clipboard_context(&self) -> bool {
         self.caps
             .as_ref()

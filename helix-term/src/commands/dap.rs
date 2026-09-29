@@ -1207,15 +1207,14 @@ pub fn dap_evaluate(cx: &mut Context) {
                     return;
                 }
             };
-            let (frame, thread_id) = match (debugger.active_frame, debugger.thread_id) {
-                (Some(frame), Some(thread_id)) => (frame, thread_id),
-                _ => {
+            let frame_id = match debugger.current_stack_frame() {
+                Some(frame) => frame.id,
+                None => {
                     cx.editor
                         .set_error("Cannot find current stack frame to access variables");
                     return;
                 }
             };
-            let frame_id = debugger.stack_frames[&thread_id][frame].id;
             let mut result = eval_complete(debugger, input, frame_id);
 
             // An assignment evaluates to nothing, so read the target back to

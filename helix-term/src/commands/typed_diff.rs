@@ -45,7 +45,7 @@ pub(crate) fn diff_base(
 /// Show, name, or switch the review conversation, and/or pick its agent.
 ///
 /// `:review-session` with no arguments reports the current conversation and
-/// agent. A lone `claude` or `grok` selects the child without renaming.
+/// agent. A lone `claude`, `grok` or `agy` selects the child without renaming.
 /// Anything else is a conversation name. Both together, in either order:
 /// `:review-session spike grok`.
 pub(crate) fn review_session(
@@ -152,10 +152,10 @@ fn parse_review_session_args(args: &Args) -> Result<ReviewSessionArgs, &'static 
                     name: Some(second.to_string()),
                     agent: Some(agent),
                 }),
-                (None, None) => Err("review agent must be `claude` or `grok`"),
+                (None, None) => Err("review agent must be `claude`, `grok` or `agy`"),
             }
         }
-        _ => Err("usage: review-session [name] [claude|grok]"),
+        _ => Err("usage: review-session [name] [claude|grok|agy]"),
     }
 }
 

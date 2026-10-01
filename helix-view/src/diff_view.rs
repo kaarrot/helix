@@ -47,7 +47,7 @@ pub struct DiffSession {
     /// Whatever answers review comments. Spawned lazily on the first send, so
     /// merely commenting never starts a process.
     pub agent: Option<Box<dyn ReviewAgent>>,
-    /// Which child to spawn. Set by `:review-session [claude|grok]`; default
+    /// Which child to spawn. Set by `:review-session [claude|grok|agy]`; default
     /// Claude. Changing it drops a running child so the next send starts the
     /// other one.
     pub agent_kind: ReviewAgentKind,

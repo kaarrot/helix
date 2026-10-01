@@ -3647,7 +3647,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     TypableCommand {
         name: "review-session",
         aliases: &[],
-        doc: "Show the review conversation, switch it by name, and/or pick its agent (`claude` or `grok`).",
+        doc: "Show the review conversation, switch it by name, and/or pick its agent (`claude`, `grok` or `agy`).",
         fun: typed_diff::review_session,
         completer: CommandCompleter::all(completers::review_agent),
         signature: Signature {

@@ -1,4 +1,4 @@
-//! Drives a `claude` or `grok` child as the answerer for one review thread.
+//! Drives a `claude`, `grok` or `agy` child as the answerer for one review thread.
 //!
 //! Each thread has its own conversation id. A turn is one process: the first
 //! creates that id with `--session-id`, and a follow-up resumes it with
@@ -320,6 +320,7 @@ fn unmark_session_started(uuid: &str) {
 enum CliKind {
     Claude,
     Grok,
+    Agy,
 }
 
 impl CliKind {
@@ -327,6 +328,7 @@ impl CliKind {
         match self {
             Self::Claude => "claude",
             Self::Grok => "grok",
+            Self::Agy => "agy",
         }
     }
 }
@@ -486,7 +488,11 @@ impl TurnState {
 
         let args = match &prompt_file {
             Some(file) => grok_args(session, resuming, file.path()),
-            None => child_args(session, resuming),
+            None => match self.kind {
+                CliKind::Claude => child_args(session, resuming),
+                CliKind::Agy => agy_args(session, resuming, &prompt),
+                CliKind::Grok => unreachable!(),
+            },
         };
 
         let mut command = Command::new(&self.program);
@@ -502,10 +508,12 @@ impl TurnState {
             use std::os::unix::process::CommandExt;
             command.process_group(0);
         }
-        if prompt_file.is_some() {
-            command.stdin(Stdio::null());
-        } else {
+        // Only Claude reads the prompt from stdin. Grok takes `--prompt-file`
+        // and Agy takes `--print`; a piped stdin would leave them waiting.
+        if self.kind == CliKind::Claude {
             command.stdin(Stdio::piped());
+        } else {
+            command.stdin(Stdio::null());
         }
 
         let mut child = match command.spawn() {
@@ -523,7 +531,7 @@ impl TurnState {
         // Claude reads the prompt from stdin and exits on EOF. Writing it on
         // another task keeps a large prompt from filling the pipe while this
         // task is still stuck before it starts reading stdout.
-        if prompt_file.is_none() {
+        if self.kind == CliKind::Claude {
             let Some(mut stdin) = child.stdin.take() else {
                 let _ = child.kill();
                 tokio::task::spawn_blocking(move || {
@@ -626,6 +634,38 @@ impl ReviewAgent for GrokChildAgent {
     }
 }
 
+/// Drives `agy --print` once per turn. The prompt is the flag's argument.
+#[derive(Debug)]
+pub struct AgyChildAgent {
+    turns: TurnState,
+}
+
+impl AgyChildAgent {
+    pub fn new(worktree: PathBuf) -> Self {
+        Self {
+            turns: TurnState::new(CliKind::Agy, worktree),
+        }
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    fn with_program(program: String, worktree: PathBuf) -> Self {
+        Self {
+            turns: TurnState::with_program(CliKind::Agy, program, worktree),
+        }
+    }
+}
+
+impl ReviewAgent for AgyChildAgent {
+    fn send(&mut self, thread: ThreadId, session: String, prompt: String) -> anyhow::Result<()> {
+        self.turns.send(thread, session, prompt)
+    }
+
+    fn shutdown(&mut self) {
+        self.turns.shutdown();
+    }
+}
+
 /// Command line for one Claude turn.
 ///
 /// The prompt is written to stdin and the pipe is closed; `-p` prints the reply
@@ -666,7 +706,8 @@ fn child_args(uuid: &str, resuming: bool) -> Vec<String> {
     args
 }
 
-/// A parsed line from Claude Code `stream-json` or Grok `streaming-messages-json`.
+/// A parsed line from Claude Code `stream-json`, Grok `streaming-messages-json`,
+/// or Antigravity (`agy`) `stream-json`.
 #[derive(Debug)]
 enum StreamPart {
     Chunk(String),
@@ -677,38 +718,84 @@ enum StreamPart {
 ///
 /// Claude Code wraps deltas as `stream_event` / `content_block_delta`. Grok's
 /// `--include-partial-messages` may emit that wrapping or the inner event
-/// unwrapped. The finished-turn `result` line is the same on both.
+/// unwrapped. Antigravity (`agy`) emits `step_update` events with `text_delta`
+/// and a terminal `result` event with `status` and `response` or `error`.
 fn stream_part(value: &serde_json::Value) -> Option<StreamPart> {
-    match value.get("type").and_then(|t| t.as_str()) {
-        Some("stream_event") => {
-            if value.pointer("/event/type").and_then(|t| t.as_str()) != Some("content_block_delta")
-            {
-                return None;
+    if let Some(event_type) = value.get("type").and_then(|t| t.as_str()) {
+        match event_type {
+            "stream_event" => {
+                if value.pointer("/event/type").and_then(|t| t.as_str())
+                    != Some("content_block_delta")
+                {
+                    return None;
+                }
+                return value
+                    .pointer("/event/delta/text")
+                    .and_then(|t| t.as_str())
+                    .filter(|text| !text.is_empty())
+                    .map(|text| StreamPart::Chunk(text.to_string()));
             }
-            value
-                .pointer("/event/delta/text")
-                .and_then(|t| t.as_str())
-                .filter(|text| !text.is_empty())
-                .map(|text| StreamPart::Chunk(text.to_string()))
+            "content_block_delta" => {
+                return value
+                    .pointer("/delta/text")
+                    .and_then(|t| t.as_str())
+                    .filter(|text| !text.is_empty())
+                    .map(|text| StreamPart::Chunk(text.to_string()));
+            }
+            "result" => {
+                return Some(StreamPart::Result {
+                    is_error: value
+                        .get("is_error")
+                        .and_then(|e| e.as_bool())
+                        .unwrap_or(false),
+                    text: value
+                        .get("result")
+                        .and_then(|r| r.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                });
+            }
+            _ => {}
         }
-        Some("content_block_delta") => value
-            .pointer("/delta/text")
-            .and_then(|t| t.as_str())
-            .filter(|text| !text.is_empty())
-            .map(|text| StreamPart::Chunk(text.to_string())),
-        Some("result") => Some(StreamPart::Result {
-            is_error: value
-                .get("is_error")
-                .and_then(|e| e.as_bool())
-                .unwrap_or(false),
-            text: value
-                .get("result")
-                .and_then(|r| r.as_str())
-                .unwrap_or_default()
-                .to_string(),
-        }),
-        _ => None,
     }
+
+    if let Some(event) = value.get("event").and_then(|e| e.as_str()) {
+        match event {
+            "step_update" => {
+                return value
+                    .pointer("/step_update/text_delta")
+                    .and_then(|t| t.as_str())
+                    .filter(|text| !text.is_empty())
+                    .map(|text| StreamPart::Chunk(text.to_string()));
+            }
+            "result" => {
+                let is_error = value
+                    .pointer("/result/status")
+                    .and_then(|s| s.as_str())
+                    .map(|s| s != "SUCCESS")
+                    .unwrap_or(false);
+                let text = if is_error {
+                    value
+                        .pointer("/result/error")
+                        .and_then(|e| e.as_str())
+                        .filter(|s| !s.is_empty())
+                        .or_else(|| value.pointer("/result/response").and_then(|r| r.as_str()))
+                        .unwrap_or_default()
+                        .to_string()
+                } else {
+                    value
+                        .pointer("/result/response")
+                        .and_then(|r| r.as_str())
+                        .unwrap_or_default()
+                        .to_string()
+                };
+                return Some(StreamPart::Result { is_error, text });
+            }
+            _ => {}
+        }
+    }
+
+    None
 }
 
 fn mark_session_started(uuid: &str) {
@@ -750,6 +837,44 @@ fn write_prompt_file(prompt: &str) -> std::io::Result<tempfile::NamedTempFile> {
     Ok(file)
 }
 
+/// Command line for one Agy turn.
+///
+/// `--print` requires the prompt as its argument; stdin is ignored. Last so a
+/// missing prompt cannot swallow another flag.
+fn agy_args(uuid: &str, resuming: bool, prompt: &str) -> Vec<String> {
+    let mut args = vec![
+        "--output-format".into(),
+        "stream-json".into(),
+        "--dangerously-skip-permissions".into(),
+    ];
+    if resuming {
+        args.extend(["--conversation".into(), uuid.to_string()]);
+    }
+    args.push("--print".into());
+    args.push(prompt.to_string());
+    args
+}
+
+fn update_session(thread: ThreadId, old_session: &str, new_session: &str) {
+    if in_memory_only(old_session) {
+        keep_in_memory(new_session);
+    }
+    #[cfg(test)]
+    if SUPPRESS_DISPATCH.load(Ordering::SeqCst) {
+        return;
+    }
+    let old = old_session.to_string();
+    let new = new_session.to_string();
+    job::dispatch_blocking(move |editor, _| {
+        if let Some(t) = editor.diff.reviews.get_mut(thread) {
+            if t.agent_session.as_deref() == Some(&old) {
+                t.agent_session = Some(new);
+            }
+        }
+    });
+    schedule_save();
+}
+
 /// One process is one turn, so the thread is known before any line arrives.
 ///
 /// Lines after the terminal `result` are drained and ignored. Stopping at the
@@ -768,6 +893,7 @@ fn read_turn(
     let reader = BufReader::new(stdout);
     let mut spoke = false;
     let mut finished = false;
+    let mut session = session.to_string();
 
     for line in reader.lines() {
         let Ok(line) = line else { break };
@@ -778,16 +904,28 @@ fn read_turn(
         let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
             continue;
         };
+        if let Some(conv_id) = value
+            .get("conversation_id")
+            .or_else(|| value.pointer("/init/conversation_id"))
+            .or_else(|| value.pointer("/step_update/conversation_id"))
+            .or_else(|| value.pointer("/result/conversation_id"))
+            .and_then(|c| c.as_str())
+        {
+            if !conv_id.is_empty() && conv_id != session {
+                update_session(thread, &session, conv_id);
+                session = conv_id.to_string();
+            }
+        }
         match stream_part(&value) {
             Some(StreamPart::Chunk(text)) => {
-                apply(session, AgentEvent::Chunk(thread, text));
+                apply(&session, AgentEvent::Chunk(thread, text));
             }
             Some(StreamPart::Result { is_error, text }) => {
                 if !is_error {
-                    mark_session_started(session);
+                    mark_session_started(&session);
                 }
                 apply(
-                    session,
+                    &session,
                     if is_error {
                         AgentEvent::Failed(thread, text)
                     } else {
@@ -808,7 +946,7 @@ fn read_turn(
 
     if !finished {
         apply(
-            session,
+            &session,
             AgentEvent::Failed(
                 thread,
                 if spoke {
@@ -828,10 +966,10 @@ fn read_turn(
             // longer has. Both are a disagreement between our marker and the
             // agent's memory, so flipping the marker is the repair. The next
             // send starts a fresh child the other way round.
-            if session_started(session) {
-                unmark_session_started(session);
+            if session_started(&session) {
+                unmark_session_started(&session);
             } else {
-                mark_session_started(session);
+                mark_session_started(&session);
             }
         }
     }
@@ -1015,6 +1153,117 @@ mod test {
             Some(StreamPart::Result { is_error, text }) => {
                 assert!(!is_error);
                 assert_eq!(text, "done");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    fn agy_sample(resuming: bool) -> Vec<String> {
+        agy_args("11111111-2222-5333-8444-555555555555", resuming, "hello")
+    }
+
+    #[test]
+    fn agy_is_one_print_then_exit_not_stdin() {
+        for resuming in [false, true] {
+            let args = agy_sample(resuming);
+            assert!(
+                args.windows(2)
+                    .any(|w| w[0] == "--print" && w[1] == "hello"),
+                "{args:?}"
+            );
+            assert_eq!(
+                args[args.len() - 2],
+                "--print",
+                "prompt last so --print cannot swallow another flag: {args:?}"
+            );
+            assert!(
+                !args.iter().any(|arg| arg == "--input-format"),
+                "stream-json stdin is a multi-turn session, not one process per turn: {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn agy_is_given_full_access_deliberately() {
+        for resuming in [false, true] {
+            let args = agy_sample(resuming);
+            assert!(
+                args.iter()
+                    .any(|arg| arg == "--dangerously-skip-permissions"),
+                "{args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn agy_session_is_created_once_and_resumed_after() {
+        let fresh = agy_sample(false);
+        assert!(!fresh.iter().any(|arg| arg == "--conversation"));
+
+        let again = agy_sample(true);
+        assert!(
+            again
+                .windows(2)
+                .any(|w| w[0] == "--conversation" && w[1] == "11111111-2222-5333-8444-555555555555"),
+            "{again:?}"
+        );
+    }
+
+    #[test]
+    fn agy_replies_are_streamed_rather_than_arriving_whole() {
+        let args = agy_sample(false);
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "--output-format" && w[1] == "stream-json"),
+            "{args:?}"
+        );
+    }
+
+    #[test]
+    fn stream_part_accepts_agy_step_updates_and_results() {
+        let update: serde_json::Value = serde_json::json!({
+            "event": "step_update",
+            "step_update": {
+                "conversation_id": "test-uuid",
+                "step_index": 1,
+                "state": "ACTIVE",
+                "step_type": "agent_response",
+                "text_delta": "hello agy"
+            }
+        });
+        match stream_part(&update) {
+            Some(StreamPart::Chunk(text)) => assert_eq!(text, "hello agy"),
+            other => panic!("{other:?}"),
+        }
+
+        let result_success: serde_json::Value = serde_json::json!({
+            "event": "result",
+            "result": {
+                "conversation_id": "test-uuid",
+                "status": "SUCCESS",
+                "response": "all done"
+            }
+        });
+        match stream_part(&result_success) {
+            Some(StreamPart::Result { is_error, text }) => {
+                assert!(!is_error);
+                assert_eq!(text, "all done");
+            }
+            other => panic!("{other:?}"),
+        }
+
+        let result_error: serde_json::Value = serde_json::json!({
+            "event": "result",
+            "result": {
+                "conversation_id": "test-uuid",
+                "status": "ERROR",
+                "error": "something went wrong"
+            }
+        });
+        match stream_part(&result_error) {
+            Some(StreamPart::Result { is_error, text }) => {
+                assert!(is_error);
+                assert_eq!(text, "something went wrong");
             }
             other => panic!("{other:?}"),
         }

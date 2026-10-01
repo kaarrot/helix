@@ -94,12 +94,14 @@ nothing is locked until you leave a comment that is kept.
                         save the thread to disk      ◀────── exits
 ```
 
-- **One turn is one process.** Every send starts the agent, gives it the
-  prompt, and lets it exit when the reply is done. Nothing stays running
-  between turns.
+- **One turn is one process.** Every send starts the agent (`claude -p`,
+  `grok --prompt-file`, or `agy --print`), gives it the prompt, and lets it
+  exit when the reply is done. Nothing stays running between turns.
 - **The first turn creates the thread's agent conversation** (`--session-id
-  <uuid>`), and every later turn continues it (`--resume <uuid>`). A follow-up
-  only carries the new text, because the agent already holds the context.
+  <uuid>` for Claude and Grok; `agy` assigns one), and every later turn
+  continues it (`--resume <uuid>`, or `--conversation <uuid>` for `agy`). A
+  follow-up only carries the new text, because the agent already holds the
+  context.
 - **Several threads can be waiting at once.** Each has its own process, and a
   reply can only land on the thread that asked for it.
 - **One thread waits for one reply at a time.** A follow-up sent while its reply
@@ -206,10 +208,10 @@ Helix that crashed is ignored.
 - **Open a path from a reply.** `gf` or Ctrl+click on a `path:line` or a link in
   a reply opens that file at that line.
 - **Continue in a terminal.** The thread's conversation id is at the right of its
-  header; click it to copy it, then run `claude --resume <uuid>` in the project.
+  header; click it to copy it, then run `claude --resume <uuid>`, `grok --resume <uuid>`, or `agy --conversation <uuid>` in the project.
   Do not reply from Helix while that session is open elsewhere.
-- **Choice of agent.** Claude Code (`claude`) by default, or Grok with
-  `:review-session grok`.
+- **Choice of agent.** Claude Code (`claude`) by default, Grok with
+  `:review-session grok`, or Antigravity with `:review-session agy`.
 - **Hide everything** with one key when you want to read the code alone.
 
 ## Shortcuts
@@ -268,7 +270,7 @@ goes straight through. These keys work once a box is focused:
 | --- | --- |
 | `:review-session` | Show the current conversation and agent |
 | `:review-session <name>` | Switch to a conversation of that name, which stays put across checkouts; `:review-session <branch checked out>` goes back to following the branch |
-| `:review-session grok` / `claude` | Choose the agent for this Helix, without renaming the conversation |
+| `:review-session grok` / `claude` / `agy` | Choose the agent for this Helix, without renaming the conversation |
 | `:review-session <name> grok` | Both at once, in either order |
 
 `:q` refuses while a reply is still arriving, as it does with unsaved buffers.

@@ -1154,6 +1154,22 @@ async fn review_session_picks_the_agent_without_renaming() -> anyhow::Result<()>
     assert_eq!(app.editor.diff.session.as_ref().unwrap().name, "spike");
     assert_eq!(app.editor.diff.agent_kind, ReviewAgentKind::Claude);
 
+    assert!(
+        harness
+            .send_keys(&mut app, ":review-session agy<ret>")
+            .await?
+    );
+    assert_eq!(app.editor.diff.session.as_ref().unwrap().name, "spike");
+    assert_eq!(app.editor.diff.agent_kind, ReviewAgentKind::Agy);
+
+    assert!(
+        harness
+            .send_keys(&mut app, ":review-session work agy<ret>")
+            .await?
+    );
+    assert_eq!(app.editor.diff.session.as_ref().unwrap().name, "work");
+    assert_eq!(app.editor.diff.agent_kind, ReviewAgentKind::Agy);
+
     harness.close(&mut app).await?;
     Ok(())
 }

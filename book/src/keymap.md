@@ -429,19 +429,20 @@ visible, and the conversation is kept — but treat it as you would any agent wi
 write access to your checkout.
 
 The child is **Claude Code** (`claude`) until you pick otherwise with
-`:review-session grok`. `:review-session claude` switches back. Either way one
+`:review-session grok` or `:review-session agy`. `:review-session claude` switches back. Either way one
 turn is one process, and the UUID stored on that comment decides which
-conversation it is. The first turn passes `--session-id`. Every later turn in
-the same window passes `--resume` with that same UUID. Claude is `claude -p`
-with the prompt on stdin. Grok is `grok --prompt-file`. Turns on different
-comments run at the same time. A follow-up sent while its comment's reply is
-still arriving stays a draft and goes out once that reply lands, so two
-processes never resume one conversation together. Saving or deleting that
-draft before then cancels the send. The
-UUID is shown at the right of the box's header and of the reply input, so
-running `claude --resume <uuid>` (or `/resume <uuid>`) from the project opens
-that one comment's conversation interactively. Helix does not know about that
-session, so do not reply from Helix while it is open there. A
+conversation it is. The first turn passes `--session-id` (or lets `agy`
+assign its conversation ID). Every later turn in the same window passes
+`--resume` (or `--conversation` for `agy`) with that same UUID. Claude is `claude -p`
+with the prompt on stdin. Grok is `grok --prompt-file`. Agy is `agy --print`
+with the prompt as the flag argument. Turns on different comments run at the same time. A follow-up
+sent while its comment's reply is still arriving stays a draft and goes out once
+that reply lands, so two processes never resume one conversation together.
+Saving or deleting that draft before then cancels the send. The UUID is shown at
+the right of the box's header and of the reply input, so running
+`claude --resume <uuid>`, `grok --resume <uuid>`, or `agy --conversation <uuid>`
+from the project opens that one comment's conversation interactively. Helix does
+not know about that session, so do not reply from Helix while it is open there. A
 conversation name and an agent can be given together, in either order:
 `:review-session spike grok`.
 
@@ -471,7 +472,7 @@ stopped. Comments that last for the session stay where they are.
 `:review-session` shows the current conversation and agent.
 `:review-session [name]` switches to a conversation of that name, which stays
 put across checkouts; naming the branch checked out goes back to following it.
-`:review-session grok` or `:review-session claude` picks the agent without
+`:review-session grok`, `:review-session claude` or `:review-session agy` picks the agent without
 renaming.
 
 | Key | Description | Command |

@@ -898,6 +898,9 @@ fn ensure_agent(editor: &mut Editor) -> Result<(), String> {
         helix_view::review::agent::ReviewAgentKind::Grok => {
             Box::new(crate::review_agent::GrokChildAgent::new(worktree))
         }
+        helix_view::review::agent::ReviewAgentKind::Agy => {
+            Box::new(crate::review_agent::AgyChildAgent::new(worktree))
+        }
     };
     editor.diff.agent = Some(agent);
     Ok(())

@@ -10,7 +10,7 @@ use std::fmt;
 
 /// Which child answers review comments.
 ///
-/// Chosen with `:review-session [claude|grok]`, not config. The two CLIs take
+/// Chosen with `:review-session [claude|grok|agy]`, not config. The CLIs take
 /// the prompt differently, so the editor picks the spawn path from this. Each
 /// comment is its own conversation either way.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -18,6 +18,7 @@ pub enum ReviewAgentKind {
     #[default]
     Claude,
     Grok,
+    Agy,
 }
 
 impl ReviewAgentKind {
@@ -25,6 +26,7 @@ impl ReviewAgentKind {
         match name {
             "claude" => Some(Self::Claude),
             "grok" => Some(Self::Grok),
+            "agy" => Some(Self::Agy),
             _ => None,
         }
     }
@@ -35,6 +37,7 @@ impl fmt::Display for ReviewAgentKind {
         f.write_str(match self {
             Self::Claude => "claude",
             Self::Grok => "grok",
+            Self::Agy => "agy",
         })
     }
 }

@@ -52,7 +52,10 @@ pub enum Align {
 
 pub fn align_view(doc: &mut Document, view: &View, align: Align) {
     let doc_text = doc.text().slice(..);
-    let cursor = doc.selection(view.id).primary().cursor(doc_text);
+    let cursor = match doc.selections().get(&view.id) {
+        Some(s) => s.primary().cursor(doc_text),
+        None => return,
+    };
     let viewport = view.inner_area(doc);
     let last_line_height = viewport.height.saturating_sub(1);
     let mut view_offset = doc.view_offset(view.id);

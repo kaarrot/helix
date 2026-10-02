@@ -1873,7 +1873,7 @@ impl Editor {
     fn replace_document_in_view(&mut self, current_view: ViewId, doc_id: DocumentId) {
         let scrolloff = self.config().scrolloff;
         let view = self.tree.get_mut(current_view);
-
+        view.virtual_rows.borrow_mut().take();
         view.doc = doc_id;
         let doc = doc_mut!(self, &doc_id);
 
@@ -2743,7 +2743,7 @@ impl Editor {
         let Some(diff_state) = self.diff.views.get(&source_view_id).cloned() else {
             return;
         };
-        if !diff_state.sync_scroll {
+        if !diff_state.sync_scroll || !diff_state.is_split() {
             return;
         }
 
@@ -3660,13 +3660,8 @@ impl Editor {
             self.diff.views.remove(&diff_state.base_view_id);
             self.diff.views.remove(&diff_state.working_view_id);
             if diff_state.base_view_id != diff_state.working_view_id {
-                let other = if view_id == diff_state.base_view_id {
-                    diff_state.working_view_id
-                } else {
-                    diff_state.base_view_id
-                };
-                if other != view_id && self.tree.contains(other) {
-                    self.close(other);
+                if view_id == diff_state.working_view_id && self.tree.contains(diff_state.base_view_id) {
+                    self.close(diff_state.base_view_id);
                 }
             }
         }

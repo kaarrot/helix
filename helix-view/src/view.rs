@@ -161,8 +161,14 @@ pub struct View {
     /// every click, scroll and cursor placement below a box out by its height.
     /// Filled in while drawing, since drawing is what decides it, and read back
     /// by [`View::text_annotations`].
-    pub virtual_rows:
-        std::cell::RefCell<Option<std::rc::Rc<crate::annotations::rows::VirtualRowPlan>>>,
+    pub virtual_rows: std::cell::RefCell<Option<CachedVirtualRows>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct CachedVirtualRows {
+    pub doc_id: DocumentId,
+    pub width: u16,
+    pub plan: std::rc::Rc<crate::annotations::rows::VirtualRowPlan>,
 }
 
 impl fmt::Debug for View {
@@ -269,7 +275,7 @@ impl View {
             )
         };
 
-        let cursor = doc.selection(self.id).primary().cursor(doc_text);
+        let cursor = doc.selections().get(&self.id)?.primary().cursor(doc_text);
         let mut offset = view_offset;
         let off = visual_offset_from_anchor(
             doc_text,
@@ -457,10 +463,12 @@ impl View {
         // Rows held for comment boxes and diff spacers count as part of the
         // layout, so they belong here rather than only in the renderer: this is
         // what a click, a scroll and a cursor placement all measure against.
-        if let Some(plan) = self.virtual_rows.borrow().clone() {
-            text_annotations.add_line_annotation(Box::new(
-                crate::annotations::rows::VirtualRowLines::new(plan),
-            ));
+        if let Some(cached) = self.virtual_rows.borrow().as_ref() {
+            if cached.doc_id == doc.id() && cached.width == self.inner_width(doc) {
+                text_annotations.add_line_annotation(Box::new(
+                    crate::annotations::rows::VirtualRowLines::new(cached.plan.clone()),
+                ));
+            }
         }
 
         if let Some(labels) = doc.jump_labels.get(&self.id) {
@@ -742,7 +750,7 @@ impl View {
         let mut builder = VirtualRowPlanBuilder::new();
 
         // Spacers: only a real two-pane diff needs its sides aligned.
-        if let Some(diff_state) = diff_views.get(&self.id) {
+        if let Some(diff_state) = diff_views.get(&self.id).filter(|s| s.is_split()) {
             let other_doc_id = if diff_state.is_base_view(self.id) {
                 diff_state.working_doc_id
             } else {
@@ -778,7 +786,11 @@ impl View {
                 let text = doc.text();
                 // Which box the reader is on, so it can be drawn as the one
                 // they are acting on rather than one of several alike.
-                let cursor_line = doc.selection(self.id).primary().cursor_line(text.slice(..));
+                let cursor_line = doc
+                    .selections()
+                    .get(&self.id)
+                    .map(|s| s.primary().cursor_line(text.slice(..)))
+                    .unwrap_or(0);
                 for thread in reviews.for_snapshot(&file, &rev) {
                     // An open document's anchor leads; the stored line is the
                     // fallback for a thread whose document was reopened.

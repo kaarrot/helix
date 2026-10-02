@@ -452,8 +452,15 @@ impl<'a> TextRenderer<'a> {
         let top = self.offset.row as u16;
         area = area.clip_top(top.saturating_sub(area.y));
         area.y = area.y.saturating_sub(top) + self.viewport.y;
-        self.surface
-            .set_style(area.intersection(self.surface.area), style);
+        // A row below the viewport is the next split's or the statusline's, or
+        // off the surface altogether. Columns are not clipped to it: the gutter
+        // sits left of the viewport and is painted through here too.
+        let rows = Rect {
+            x: self.surface.area.x,
+            width: self.surface.area.width,
+            ..self.viewport
+        };
+        self.surface.set_style(area.intersection(rows), style);
     }
 
     #[allow(clippy::too_many_arguments)]

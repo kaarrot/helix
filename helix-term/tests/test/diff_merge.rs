@@ -1627,3 +1627,82 @@ async fn buffer_close_in_range_diff_pane_does_not_panic() -> anyhow::Result<()> 
     harness.close(&mut app).await?;
     Ok(())
 }
+
+/// A single-pane diff shows only the working document, so there is no other
+/// pane to keep in step. Syncing it anyway read the base document's scroll for
+/// that view, as left by the last time the view showed it, and every key put
+/// the working document back there.
+#[tokio::test(flavor = "multi_thread")]
+async fn single_pane_diff_keeps_its_own_scroll() -> anyhow::Result<()> {
+    let repo = GitRepoFixture::new()?;
+    let text: String = (0..2000).map(|n| format!("line {n}\n")).collect();
+    repo.write_file("tracked.txt", &text)?;
+    repo.commit_all("initial")?;
+    repo.write_file("tracked.txt", &text.replace("line 1000\n", "changed\n"))?;
+
+    let _cwd = CwdGuard::enter(repo.path()).await?;
+    let tracked_path = repo.file("tracked.txt");
+    let mut app = AppBuilder::new().with_file(&tracked_path, None).build()?;
+    let mut harness = AppTestHarness::new();
+
+    assert!(harness.send_keys(&mut app, "<space>g").await?);
+    assert!(harness.wait_for_idle(&mut app).await?);
+    assert!(harness.send_keys(&mut app, "<ret>").await?);
+    let diff_state = main_diff_state(&app);
+    assert!(!diff_state.is_split());
+    let view_id = diff_state.working_view_id;
+    {
+        let base = app.editor.document_mut(diff_state.base_doc_id).unwrap();
+        base.ensure_view_init(view_id);
+        base.set_view_offset(view_id, helix_view::view::ViewPosition::default());
+    }
+
+    assert!(harness.send_keys(&mut app, "1500gg").await?);
+    let anchor = view_anchor_line(&app, diff_state.working_doc_id, view_id);
+    assert!(
+        (1000..1500).contains(&anchor),
+        "the view should follow the cursor to line 1500, not start at line {anchor}"
+    );
+
+    harness.close(&mut app).await?;
+    Ok(())
+}
+
+/// Showing another buffer in a split's base pane takes that pane out of the
+/// diff and leaves the file under review open beside it, as a plain view
+/// without the diff's colouring.
+#[tokio::test(flavor = "multi_thread")]
+async fn leaving_a_split_from_its_base_pane_keeps_the_working_file() -> anyhow::Result<()> {
+    let repo = GitRepoFixture::new()?;
+    repo.write_file("tracked.txt", "before\n")?;
+    repo.commit_all("initial")?;
+    repo.write_file("tracked.txt", "after\n")?;
+
+    let _cwd = CwdGuard::enter(repo.path()).await?;
+    let tracked_path = repo.file("tracked.txt");
+    let mut app = AppBuilder::new().with_file(&tracked_path, None).build()?;
+    let mut harness = AppTestHarness::new();
+
+    assert!(harness.send_keys(&mut app, "<space>g").await?);
+    assert!(harness.wait_for_idle(&mut app).await?);
+    assert!(harness.send_keys(&mut app, "<ret>").await?);
+    assert!(harness.send_keys(&mut app, "<space>mv").await?);
+    let diff_state = main_diff_state(&app);
+    app.editor.focus(diff_state.base_view_id);
+
+    assert!(harness.send_keys(&mut app, ":new<ret>").await?);
+    assert!(app.editor.diff.views.is_empty());
+    assert_eq!(app.editor.tree.views().count(), 2);
+    let working = app.editor.tree.get(diff_state.working_view_id);
+    assert_eq!(working.doc, diff_state.working_doc_id);
+    let working_doc = app.editor.document(diff_state.working_doc_id).unwrap();
+    assert!(
+        !working_doc.char_diff_enabled,
+        "the working file kept the diff's colouring"
+    );
+
+    // `close` quits one view, so leave only one.
+    assert!(harness.send_keys(&mut app, "<C-w>o").await?);
+    harness.close(&mut app).await?;
+    Ok(())
+}

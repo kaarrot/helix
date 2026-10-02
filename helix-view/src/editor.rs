@@ -1873,7 +1873,7 @@ impl Editor {
     fn replace_document_in_view(&mut self, current_view: ViewId, doc_id: DocumentId) {
         let scrolloff = self.config().scrolloff;
         let view = self.tree.get_mut(current_view);
-        view.virtual_rows.borrow_mut().take();
+
         view.doc = doc_id;
         let doc = doc_mut!(self, &doc_id);
 
@@ -3655,14 +3655,43 @@ impl Editor {
     }
 
     /// Drop the diff session from this view without closing revision buffers.
+    ///
+    /// The base pane of a split shows a revision that means nothing on its own,
+    /// so it goes when the working pane leaves the diff. The working pane shows
+    /// the file under review, so it stays when the base pane leaves, as a plain
+    /// view of that file.
     fn detach_diff_view(&mut self, view_id: ViewId) {
         if let Some(diff_state) = self.diff.views.remove(&view_id) {
             self.diff.views.remove(&diff_state.base_view_id);
             self.diff.views.remove(&diff_state.working_view_id);
-            if diff_state.base_view_id != diff_state.working_view_id {
-                if view_id == diff_state.working_view_id && self.tree.contains(diff_state.base_view_id) {
-                    self.close(diff_state.base_view_id);
-                }
+            self.unlink_diff_documents(&diff_state);
+            if diff_state.is_split()
+                && view_id == diff_state.working_view_id
+                && self.tree.contains(diff_state.base_view_id)
+            {
+                self.close(diff_state.base_view_id);
+            }
+        }
+    }
+
+    /// Undo what opening the diff did to its two documents, so that neither
+    /// keeps its diff colouring once it is no longer part of the diff.
+    fn unlink_diff_documents(&mut self, diff_state: &crate::diff_view::DiffViewState) {
+        let buffers = matches!(diff_state.source, crate::diff_view::DiffViewSource::Buffers);
+        if let Some(doc) = self.documents.get_mut(&diff_state.base_doc_id) {
+            doc.linked_diff_doc = None;
+            if buffers {
+                doc.char_diff_enabled = false;
+                doc.char_diff_minus_side = false;
+                doc.clear_diff_handle();
+            }
+        }
+        if let Some(doc) = self.documents.get_mut(&diff_state.working_doc_id) {
+            doc.linked_diff_doc = None;
+            doc.char_diff_enabled = false;
+            doc.char_diff_minus_side = false;
+            if buffers {
+                doc.clear_diff_handle();
             }
         }
     }
@@ -3692,24 +3721,7 @@ impl Editor {
         if let Some(diff_state) = self.diff.views.remove(&view_id) {
             self.diff.views.remove(&diff_state.base_view_id);
             self.diff.views.remove(&diff_state.working_view_id);
-            let source = diff_state.source;
-
-            if let Some(doc) = self.documents.get_mut(&diff_state.base_doc_id) {
-                doc.linked_diff_doc = None;
-                if matches!(source, crate::diff_view::DiffViewSource::Buffers) {
-                    doc.char_diff_enabled = false;
-                    doc.char_diff_minus_side = false;
-                    doc.clear_diff_handle();
-                }
-            }
-            if let Some(doc) = self.documents.get_mut(&diff_state.working_doc_id) {
-                doc.linked_diff_doc = None;
-                doc.char_diff_enabled = false;
-                doc.char_diff_minus_side = false;
-                if matches!(source, crate::diff_view::DiffViewSource::Buffers) {
-                    doc.clear_diff_handle();
-                }
-            }
+            self.unlink_diff_documents(&diff_state);
 
             if diff_state.close_base_doc_on_close {
                 let _ = self.close_document(diff_state.base_doc_id, true);

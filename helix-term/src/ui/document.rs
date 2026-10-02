@@ -508,7 +508,8 @@ impl<'a> TextRenderer<'a> {
         let top = self.offset.row as u16;
         area = area.clip_top(top.saturating_sub(area.y));
         area.y = area.y.saturating_sub(top) + self.viewport.y;
-        self.surface.set_style(area, style);
+        self.surface
+            .set_style(area.intersection(self.surface.area), style);
     }
 
     #[allow(clippy::too_many_arguments)]

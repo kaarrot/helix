@@ -147,13 +147,13 @@ impl EditorView {
             crate::review_agent::spinner_frame(),
             Some(&mut layout_agent),
         );
-        *view.virtual_rows.borrow_mut() = virtual_row_plan.clone().map(|plan| {
-            helix_view::view::CachedVirtualRows {
-                doc_id: doc.id(),
-                width: view.inner_width(doc),
-                plan,
-            }
-        });
+        *view.virtual_rows.borrow_mut() =
+            virtual_row_plan
+                .clone()
+                .map(|plan| helix_view::view::CachedVirtualRows {
+                    doc_id: doc.id(),
+                    plan,
+                });
 
         let loader = editor.syn_loader.load();
         let text_annotations = view.text_annotations(doc, Some(theme));

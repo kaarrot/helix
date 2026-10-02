@@ -4147,138 +4147,85 @@ async fn a_click_on_a_box_in_a_lower_split_lands_on_its_row() -> anyhow::Result<
     Ok(())
 }
 
+/// A view that starts inside a box stays there when a split narrows it and
+/// when closing the split widens it again. The rows drawn at the old width
+/// used to be dropped as soon as the width changed, so the cursor check the
+/// split runs laid the view out as if the box were not there, and scrolled it
+/// up out of the box.
 #[tokio::test(flavor = "multi_thread")]
-async fn test_switching_split_to_single_pane_with_comments() -> anyhow::Result<()> {
-    use helix_view::editor::GutterType;
-    use helix_view::review::agent::AgentEvent;
-
-    let mut config = Config::default();
-    config.editor.soft_wrap.enable = Some(true);
-    config.editor.soft_wrap.wrap_indicator = Some("\t".to_string());
-    config.editor.gutters = vec![
-        GutterType::Diagnostics,
-        GutterType::Spacer,
-        GutterType::Diff,
-    ]
-    .into();
+#[cfg(not(windows))]
+async fn a_view_inside_a_box_stays_there_through_a_split() -> anyhow::Result<()> {
+    use termina::event::MouseEventKind;
 
     let file = tempfile::NamedTempFile::new()?;
-    let text = "first line\nsecond line with some long text that wraps across multiple visual rows when softwrap is enabled\nthird line\nfourth line\nfifth line with more long text that wraps\nsixth line\n";
-    std::fs::write(file.path(), text)?;
+    let text: String = (0..400).map(|n| format!("code {n}\n")).collect();
+    std::fs::write(file.path(), &text)?;
+    let (mut app, mut harness, _) = app_with_reply(file.path(), &numbered_reply(10)).await?;
+    harness
+        .mouse(&mut app, MouseEventKind::ScrollDown, 10, 20)
+        .await?;
 
-    let mut app = AppBuilder::new()
-        .with_config(config)
-        .with_file(file.path(), None)
-        .build()?;
-    let mut harness = AppTestHarness::new();
-    let fake = FakeAgent::default();
-    let sent = fake.sent.clone();
-    app.editor.diff.agent = Some(Box::new(fake));
+    let offset = |app: &Application, view: helix_view::ViewId| {
+        let doc = app.editor.document(app.editor.tree.get(view).doc).unwrap();
+        let offset = doc.view_offset(view);
+        (offset.anchor, offset.vertical_offset)
+    };
+    let first = app.editor.tree.focus;
+    let inside = offset(&app, first);
+    assert_eq!(inside.1, 3, "the view should start inside the box");
 
-    assert!(harness.send_keys(&mut app, "<space>mRc").await?);
-    assert!(harness.send_keys(&mut app, "why?<C-S-s>").await?);
-    let id = sent.lock().unwrap()[0].0;
-    app.editor
-        .diff
-        .reviews
-        .apply_agent_event(AgentEvent::Completed(id, numbered_reply(5).into()));
-    assert!(harness.send_keys(&mut app, "<esc>").await?);
-
-    // Test 1: vsplit then close split (<C-w>q)
     assert!(harness.send_keys(&mut app, ":vsplit<ret>").await?);
-    assert_eq!(app.editor.tree.views().count(), 2);
-    assert!(harness.send_keys(&mut app, "<C-w>q").await?);
-    assert_eq!(app.editor.tree.views().count(), 1);
+    assert_eq!(offset(&app, first), inside, "narrowing the view moved it");
+    assert_eq!(offset(&app, app.editor.tree.focus), inside);
 
-    // Test 2: vsplit then :only (<C-w>o)
-    assert!(harness.send_keys(&mut app, ":vsplit<ret>").await?);
-    assert_eq!(app.editor.tree.views().count(), 2);
     assert!(harness.send_keys(&mut app, "<C-w>o").await?);
-    assert_eq!(app.editor.tree.views().count(), 1);
-
-    // Test 3: vsplit then switch buffer (:b or :new)
-    assert!(harness.send_keys(&mut app, ":vsplit<ret>").await?);
-    assert_eq!(app.editor.tree.views().count(), 2);
-    assert!(harness.send_keys(&mut app, ":new<ret>").await?);
-    assert!(harness.send_keys(&mut app, "<C-w>q").await?);
+    assert_eq!(
+        offset(&app, app.editor.tree.focus),
+        inside,
+        "widening the view moved it"
+    );
 
     harness.close(&mut app).await?;
     Ok(())
 }
 
+/// Spacers line a split's panes up with each other. A single-pane diff has
+/// nothing to line up with, and used to show a blank row for every deleted
+/// line anyway.
 #[tokio::test(flavor = "multi_thread")]
-async fn test_switching_git_diff_split_to_single_pane_with_comments() -> anyhow::Result<()> {
-    use helix_view::editor::GutterType;
-
+async fn only_a_split_diff_holds_spacer_rows() -> anyhow::Result<()> {
     let repo = GitRepoFixture::new()?;
-    let text1 = "line 1\nline 2 with a long sentence that wraps in soft wrap mode\nline 3\nline 4\nline 5\n";
-    repo.write_file("tracked.rs", text1)?;
+    repo.write_file("tracked.rs", "one\ntwo\nthree\nfour\n")?;
     repo.commit_all("initial")?;
-    let text2 = "line 1\nline 2 modified with another long sentence that wraps in soft wrap mode\nline 3\nline 4 with extra content added\nline 5\n";
-    repo.write_file("tracked.rs", text2)?;
+    repo.write_file("tracked.rs", "one\nfour\n")?;
 
     let _cwd = CwdGuard::enter(repo.path()).await?;
     let path = repo.file("tracked.rs");
-
-    let mut config = Config::default();
-    config.editor.soft_wrap.enable = Some(true);
-    config.editor.soft_wrap.wrap_indicator = Some("\t".to_string());
-    config.editor.gutters = vec![
-        GutterType::Diagnostics,
-        GutterType::Spacer,
-        GutterType::Diff,
-    ]
-    .into();
-
-    let mut app = AppBuilder::new()
-        .with_config(config)
-        .with_file(&path, None)
-        .build()?;
+    let mut app = AppBuilder::new().with_file(&path, None).build()?;
     let mut harness = AppTestHarness::new();
 
-    // Add a review comment
-    assert!(harness.send_keys(&mut app, "<space>mRc").await?);
-    assert!(harness.send_keys(&mut app, "why this change?<C-s>").await?);
-
-    // Open diff
     assert!(harness.send_keys(&mut app, "<space>g").await?);
     assert!(harness.wait_for_idle(&mut app).await?);
     assert!(harness.send_keys(&mut app, "<ret>").await?);
+    assert_eq!(
+        app.editor.diff.views.len(),
+        1,
+        "default diff is single-pane"
+    );
+    assert_eq!(focused_plan_row_count(&app), 0);
 
-    // Turn on split diff view
     assert!(harness.send_keys(&mut app, "<space>mv").await?);
-    assert_eq!(app.editor.diff.views.len(), 2);
-    assert_eq!(app.editor.tree.views().count(), 2);
+    let diff_state = app.editor.diff.views[&app.editor.tree.focus].clone();
+    assert!(diff_state.is_working_view(app.editor.tree.focus));
+    assert_eq!(
+        focused_plan_row_count(&app),
+        2,
+        "the working pane should hold a row for each of the two deleted lines"
+    );
 
-    // Focus base pane
-    let diff_state = app
-        .editor
-        .diff
-        .views
-        .values()
-        .next()
-        .unwrap()
-        .clone();
-    app.editor.focus(diff_state.base_view_id);
-
-    // Add another review comment on base pane
-    assert!(harness.send_keys(&mut app, "<space>mRc").await?);
-    assert!(harness.send_keys(&mut app, "base pane comment<C-s>").await?);
-
-    // Toggle split view off -> back to single buffer view!
     assert!(harness.send_keys(&mut app, "<space>mv").await?);
-    assert_eq!(app.editor.diff.views.len(), 1);
-    assert_eq!(app.editor.tree.views().count(), 1);
-
-    // Switch buffer while in diff view
-    assert!(harness.send_keys(&mut app, "<space>mv").await?); // turn split on
-    assert_eq!(app.editor.tree.views().count(), 2);
-    assert!(harness.send_keys(&mut app, ":new<ret>").await?); // switch buffer!
+    assert_eq!(focused_plan_row_count(&app), 0);
 
     harness.close(&mut app).await?;
     Ok(())
 }
-
-
-
-

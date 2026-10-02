@@ -168,10 +168,17 @@ pub struct View {
     pub virtual_rows: std::cell::RefCell<Option<CachedVirtualRows>>,
 }
 
+/// A view's last drawn plan, with the document it was drawn for.
+///
+/// A view can show another document before the next frame (a buffer switch, a
+/// jump), and one document's rows mean nothing in another, so those are not
+/// used. A plan drawn at another width is: its rows sit on the right lines and
+/// only their count can be off until the next frame. Dropping it instead lays
+/// the view out as if it had no boxes or spacers, and a split or resize then
+/// scrolls a view that starts inside a box away from it.
 #[derive(Clone, Debug)]
 pub struct CachedVirtualRows {
     pub doc_id: DocumentId,
-    pub width: u16,
     pub plan: std::rc::Rc<crate::annotations::rows::VirtualRowPlan>,
 }
 
@@ -473,12 +480,15 @@ impl View {
         // Rows held for comment boxes and diff spacers count as part of the
         // layout, so they belong here rather than only in the renderer: this is
         // what a click, a scroll and a cursor placement all measure against.
-        if let Some(cached) = self.virtual_rows.borrow().as_ref() {
-            if cached.doc_id == doc.id() && cached.width == self.inner_width(doc) {
-                text_annotations.add_line_annotation(Box::new(
-                    crate::annotations::rows::VirtualRowLines::new(cached.plan.clone()),
-                ));
-            }
+        if let Some(cached) = self
+            .virtual_rows
+            .borrow()
+            .as_ref()
+            .filter(|cached| cached.doc_id == doc.id())
+        {
+            text_annotations.add_line_annotation(Box::new(
+                crate::annotations::rows::VirtualRowLines::new(cached.plan.clone()),
+            ));
         }
 
         if let Some(labels) = doc.jump_labels.get(&self.id) {
@@ -735,9 +745,9 @@ impl View {
     /// Build this view's virtual-row plan.
     ///
     /// Rows come from independent sources: diff alignment spacers only when the
-    /// view is a diff pane, and review comments wherever the document has
-    /// threads. Returns `None` when both are empty, so an ordinary buffer with
-    /// no comments keeps a zero-cost path.
+    /// view is a pane of a split diff, and review comments wherever the
+    /// document has threads. Returns `None` when both are empty, so an ordinary
+    /// buffer with no comments keeps a zero-cost path.
     ///
     /// Both consumers -- the reserving annotation and the painting decoration --
     /// must be driven from the same plan, or they will disagree about row counts.

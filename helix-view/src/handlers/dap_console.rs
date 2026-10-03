@@ -175,14 +175,17 @@ impl Editor {
         self.dap_source_view(path.as_deref())
     }
 
-    /// The view to show `path` in without touching the console: one already showing
-    /// it, else the split above the focused view, else any view but the console's.
+    /// The view to show `path` in without touching the focused view or the
+    /// console: one already showing it, else the split above the focused view, else
+    /// any other.
     pub fn dap_source_view(&self, path: Option<&Path>) -> Option<ViewId> {
         let console = self.dap_console_doc();
         let is_source = |view_id: ViewId| {
-            self.tree
-                .try_get(view_id)
-                .is_some_and(|view| Some(view.doc) != console)
+            view_id != self.tree.focus
+                && self
+                    .tree
+                    .try_get(view_id)
+                    .is_some_and(|view| Some(view.doc) != console)
         };
         let path = path.map(helix_stdx::path::canonicalize);
 

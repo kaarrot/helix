@@ -32,6 +32,14 @@ The same thing from the command line:
 
 Template names containing spaces need quoting, e.g. `:debug-start "Attach to PID" 12345`.
 
+While a session runs, the status line says so beside the mode, in red: what is
+being debugged and whether it is stopped, e.g. `DEBUG hython-bin pid 1234 ·
+stopped`, `DEBUG port 5678 · running`. That is the `debug-session` element of
+[`[editor.statusline]`](./editor.md#editorstatusline-section), there by default; a
+configured `left` list needs it added. When execution stops, the line it stopped
+on gets `▶` in the gutter and a tint of the theme's `ui.highlight.frameline`, in
+every view of its file, and the view showing it scrolls there.
+
 ### Breakpoints
 
 | Key      | Description                                        | Command                 |
@@ -140,6 +148,7 @@ Press `i` or `a` to type; the cursor moves to the end of the `(hx)` line first.
 | `Esc`                                       | Normal mode inside the console, to move around the output     |
 | `Esc` in normal mode                        | Back to the source, in the debug menu; the console stays open |
 | `Ctrl-d`                                    | Close the console, back to the source in the debug menu. It takes the place of half-page down and delete-forward here |
+| `gF` in normal mode                         | Show the `file:line` under the cursor in the source view, staying in the console |
 
 Typing always happens on the input line: entering insert mode anywhere in the
 transcript, or typing after scrolling up, moves the cursor to the end of the
@@ -151,6 +160,13 @@ what you were typing alone.
 
 An empty line only repeats what the console itself last ran, never an entry of
 the history, which is shared with the eval prompt and kept between sessions.
+
+`gF` previews a place the transcript names — a frame of `w`, a line of a
+traceback, a breakpoint of `b` — in the source view above the console, with the
+line marked, without moving focus or opening another split. It reads
+`file:line`, pdb's `file(line)` and a traceback's `File "file", line N`. The next
+step, jump or frame change takes the source view back to the current frame.
+`gF` works the same in any buffer, showing the place in the view beside it.
 
 The console is never counted as unsaved, so it does not hold up `:q`, and it
 survives having another file opened in its window; `Ctrl-d` brings it back with

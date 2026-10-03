@@ -576,6 +576,7 @@ impl MappableCommand {
         goto_file, "Goto files/URLs in selections",
         goto_file_hsplit, "Goto files in selections (hsplit)",
         goto_file_vsplit, "Goto files in selections (vsplit)",
+        peek_file_line, "Show file:line under cursor in the split beside",
         goto_reference, "Goto references",
         goto_window_top, "Goto window top",
         goto_window_center, "Goto window center",
@@ -1560,6 +1561,125 @@ fn select_line_in_opened_file(
     if action.align_view(view, doc.id()) {
         align_view(doc, view, Align::Center);
     }
+}
+
+/// Shows the `file:line` under the cursor -- a traceback's, `w`'s or a
+/// compiler's -- in the view beside this one, reusing it rather than splitting
+/// again, and stays here. The line is marked there until that view's cursor
+/// leaves it. From the debug console this is the source view, which the next
+/// stop takes back to the current frame.
+fn peek_file_line(cx: &mut Context) {
+    let (view, doc) = current_ref!(cx.editor);
+    let text = doc.text().slice(..);
+    let cursor = doc.selection(view.id).primary().cursor(text);
+    let line_idx = text.char_to_line(cursor);
+    let line_start = text.line_to_char(line_idx);
+    let line = String::from(text.line(line_idx));
+    let column = text.slice(line_start..cursor).len_bytes();
+
+    let Some((path, line)) = file_line_at(&line, column) else {
+        cx.editor.set_error("No file:line under the cursor");
+        return;
+    };
+    let view_id = match helix_view::handlers::dap::show_beside(cx.editor, &path) {
+        Ok(view_id) => view_id,
+        Err(err) => {
+            cx.editor
+                .set_error(format!("Unable to open {}: {err}", path.display()));
+            return;
+        }
+    };
+
+    let view = view!(cx.editor, view_id);
+    let doc_id = view.doc;
+    let doc = doc_mut!(cx.editor, &doc_id);
+    let text = doc.text().slice(..);
+    let line = line.min(text.len_lines().saturating_sub(1));
+    let start = text.line_to_char(line);
+    let pos = start + text.line(line).first_non_whitespace_char().unwrap_or(0);
+    doc.set_selection(view_id, Selection::point(pos));
+    align_view(doc, view, Align::Center);
+    cx.editor.peek = Some((view_id, doc_id, line));
+}
+
+/// The existing file and line (0-based) referred to on `text`, a line: the
+/// reference under byte `column`, else the first one.
+fn file_line_at(text: &str, column: usize) -> Option<(PathBuf, usize)> {
+    let references: Vec<_> = file_line_references(text)
+        .into_iter()
+        .map(|(range, path, line)| (range, path::canonicalize(path), line))
+        .filter(|(_, path, _)| path.is_file())
+        .collect();
+    let (_, path, line) = references
+        .iter()
+        .find(|(range, ..)| range.contains(&column))
+        .or(references.first())?;
+    Some((path.clone(), line.saturating_sub(1)))
+}
+
+/// The places in files `text` names the way debuggers and compilers print them,
+/// with their byte ranges, in order: `file:line`, with or without a column after;
+/// pdb's `file(line)`; and a Python traceback's `File "file", line N`. Lines are
+/// 1-based, as printed. Whether the files exist is not checked.
+fn file_line_references(text: &str) -> Vec<(std::ops::Range<usize>, &str, usize)> {
+    let digits = |s: &str| -> Option<(usize, usize)> {
+        let len = s.bytes().take_while(u8::is_ascii_digit).count();
+        Some((s[..len].parse().ok()?, len))
+    };
+    let mut references = Vec::new();
+
+    // The traceback's path is quoted and may hold spaces, so it is found whole.
+    const FILE: &str = "File \"";
+    const LINE: &str = "\", line ";
+    let mut from = 0;
+    while let Some(found) = text[from..].find(FILE) {
+        let start = from + found;
+        let path_start = start + FILE.len();
+        from = path_start;
+        let Some(path_len) = text[path_start..].find('"') else {
+            break;
+        };
+        let path_end = path_start + path_len;
+        let reference = text[path_end..]
+            .strip_prefix(LINE)
+            .and_then(digits)
+            .filter(|_| path_len > 0);
+        if let Some((line, len)) = reference {
+            let end = path_end + LINE.len() + len;
+            references.push((start..end, &text[path_start..path_end], line));
+        }
+    }
+
+    // The others sit in one word, which may be wrapped in quotes or brackets.
+    let mut word_start = None;
+    for (i, c) in text.char_indices().chain([(text.len(), ' ')]) {
+        match (word_start, c.is_whitespace()) {
+            (None, false) => word_start = Some(i),
+            (Some(start), true) => {
+                word_start = None;
+                let word = &text[start..i];
+                let trimmed = word.trim_start_matches(['"', '\'', '(', '[', '<']);
+                let pdb = trimmed.find('(').and_then(|open| {
+                    let (line, len) = digits(&trimmed[open + 1..])?;
+                    let close = open + 1 + len;
+                    trimmed[close..].starts_with(')').then_some((open, line))
+                });
+                let colon = || {
+                    trimmed.match_indices(':').find_map(|(colon, _)| {
+                        let (line, _) = digits(&trimmed[colon + 1..])?;
+                        Some((colon, line))
+                    })
+                };
+                if let Some((path_len, line)) = pdb.or_else(colon).filter(|(len, _)| *len > 0) {
+                    references.push((start..i, &trimmed[..path_len], line));
+                }
+            }
+            _ => (),
+        }
+    }
+
+    references.sort_by_key(|(range, ..)| range.start);
+    references
 }
 
 /// Goto files in selection.
@@ -7874,6 +7994,47 @@ mod tests {
         );
     }
 
+    use super::*;
+
+    fn references(text: &str) -> Vec<(&str, &str, usize)> {
+        file_line_references(text)
+            .into_iter()
+            .map(|(range, path, line)| (&text[range], path, line))
+            .collect()
+    }
+
+    #[test]
+    fn finds_file_lines_as_debuggers_print_them() {
+        // The debug console's `w`, its stop location, and `b`.
+        assert_eq!(
+            references("> #0  run  /src/app.py:42"),
+            [("/src/app.py:42", "/src/app.py", 42)]
+        );
+        assert_eq!(
+            references("> /src/app.py(42)run()"),
+            [("/src/app.py(42)run()", "/src/app.py", 42)]
+        );
+        assert_eq!(
+            references("src/app.py:7 (unverified)"),
+            [("src/app.py:7", "src/app.py", 7)]
+        );
+        // A traceback's path is quoted and may hold spaces.
+        assert_eq!(
+            references(r#"  File "/my src/app.py", line 12, in run"#),
+            [(r#"File "/my src/app.py", line 12"#, "/my src/app.py", 12)]
+        );
+        // A compiler's, with a column, wrapped in brackets.
+        assert_eq!(
+            references("error at (src/main.rs:10:5):"),
+            [("(src/main.rs:10:5):", "src/main.rs", 10)]
+        );
+        // Several on a line come in order.
+        assert_eq!(
+            references("a.py:1 calls b.py:2"),
+            [("a.py:1", "a.py", 1), ("b.py:2", "b.py", 2)]
+        );
+    }
+
     #[test]
     fn global_search_phases_prune_current_directory_from_the_root_walk() {
         // When the current file sits directly in the workspace root, the second
@@ -7913,5 +8074,39 @@ mod tests {
                 skip: None,
             }]
         );
+    }
+
+    #[test]
+    fn needs_a_path_and_a_line_number() {
+        assert_eq!(references("-> x = run()"), []);
+        assert_eq!(references("(hx) p xs[0]"), []);
+        assert_eq!(references("app.py:"), []);
+        assert_eq!(references(":12"), []);
+        assert_eq!(references(r#"File "", line 3"#), []);
+        // Only the first colon followed by a number ends the path.
+        assert_eq!(references("C:\\a.py:3"), [("C:\\a.py:3", "C:\\a.py", 3)]);
+    }
+
+    #[test]
+    fn picks_the_existing_file_under_the_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.py");
+        let b = dir.path().join("b.py");
+        std::fs::write(&a, "").unwrap();
+        std::fs::write(&b, "").unwrap();
+        let text = format!("{}:3 calls {}:8", a.display(), b.display());
+        let on_b = text.rfind("b.py").unwrap();
+
+        assert_eq!(file_line_at(&text, on_b), Some((b.clone(), 7)));
+        assert_eq!(file_line_at(&text, 0), Some((a.clone(), 2)));
+        // Off any reference, the first one.
+        assert_eq!(
+            file_line_at(&text, text.find("calls").unwrap()),
+            Some((a, 2))
+        );
+        // Files that are not there are passed over.
+        let missing = format!("/no/such/file.py:4 then {}:8", b.display());
+        assert_eq!(file_line_at(&missing, 0), Some((b, 7)));
+        assert_eq!(file_line_at("/no/such/file.py:4", 0), None);
     }
 }

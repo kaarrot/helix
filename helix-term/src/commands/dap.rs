@@ -199,6 +199,33 @@ fn process_name_by_pid(pid: u32) -> Option<String> {
     read_process(pid, 0).map(|(_, comm, process)| process_name(&comm, &process.argv))
 }
 
+/// What the status line calls a session's program: the process attached to by
+/// PID, with its name while it can be found; the program launched; or the debug
+/// server dialled, by port when it is local.
+fn session_target(args: &Value, socket: Option<std::net::SocketAddr>) -> Option<String> {
+    let pid = args.get("processId").and_then(|pid| match pid {
+        Value::Number(pid) => pid.as_u64(),
+        Value::String(pid) => pid.parse().ok(),
+        _ => None,
+    });
+    if let Some(pid) = pid {
+        let name = u32::try_from(pid).ok().and_then(process_name_by_pid);
+        return Some(match name {
+            Some(name) => format!("{name} pid {pid}"),
+            None => format!("pid {pid}"),
+        });
+    }
+    if let Some(program) = args.get("program").and_then(Value::as_str) {
+        let name = std::path::Path::new(program).file_name();
+        return Some(name.map_or(program.into(), |name| name.to_string_lossy().into()));
+    }
+    let socket = socket?;
+    Some(match socket.ip().is_loopback() {
+        true => format!("port {}", socket.port()),
+        false => socket.to_string(),
+    })
+}
+
 /// The first non-flag argument, which for an interpreter is the script it runs
 /// (or, after `-m`, the module).
 fn script_argument(argv: &[String]) -> Option<&str> {
@@ -565,6 +592,7 @@ pub fn dap_start_impl(
             bail!("Failed to get child debugger.");
         }
     };
+    debugger.target = session_target(&args, socket);
 
     match &template.request[..] {
         "launch" => {
@@ -854,16 +882,32 @@ pub(crate) fn step(editor: &mut Editor, jobs: &mut Jobs, step: Step) -> anyhow::
         .thread_id
         .ok_or_else(|| anyhow!("Currently active thread is not stopped. Switch the thread."))?;
 
-    let request: std::pin::Pin<Box<dyn Future<Output = helix_dap::Result<Value>> + Send>> =
-        match step {
-            Step::Over => Box::pin(debugger.next(thread_id)),
-            Step::In => Box::pin(debugger.step_in(thread_id)),
-            Step::Out => Box::pin(debugger.step_out(thread_id)),
-            Step::Continue => Box::pin(debugger.continue_thread(thread_id)),
-        };
-    dap_callback(jobs, request, |editor, _compositor, _response: Value| {
-        debugger!(editor).resume_application();
-    });
+    let (request, verb): (
+        std::pin::Pin<Box<dyn Future<Output = helix_dap::Result<Value>> + Send>>,
+        _,
+    ) = match step {
+        Step::Over => (Box::pin(debugger.next(thread_id)), "step over"),
+        Step::In => (Box::pin(debugger.step_in(thread_id)), "step in"),
+        Step::Out => (Box::pin(debugger.step_out(thread_id)), "step out"),
+        Step::Continue => (Box::pin(debugger.continue_thread(thread_id)), "continue"),
+    };
+    // The thread is running from here on. Waiting for the adapter's answer to say
+    // so is too late: a short step stops again at once, and the "stopped" event
+    // can be handled first -- the answer would then throw away the frame it
+    // selected, leaving no current line and the view where it was.
+    debugger.resume_application();
+    let callback = async move {
+        let result = request.await;
+        let call: Callback = Callback::Editor(Box::new(move |editor: &mut Editor| {
+            if let Err(err) = result {
+                // Refused, so the thread is still where it stopped.
+                report_error(editor, &format!("Failed to {verb}: {err}"));
+                block_on(select_thread_id(editor, thread_id, false));
+            }
+        }));
+        Ok(call)
+    };
+    jobs.callback(callback);
     Ok(())
 }
 
@@ -1881,6 +1925,35 @@ mod tests {
         // Unreferenced placeholders and plain text are left alone.
         assert_eq!(substitute_params("{2}", &params), "{2}");
         assert_eq!(substitute_params("python3", &[]), "python3");
+    }
+
+    #[test]
+    fn names_what_the_session_debugs() {
+        use serde_json::json;
+
+        let own = std::process::id();
+        let target = session_target(&json!({ "processId": own }), None).unwrap();
+        assert!(target.ends_with(&format!(" pid {own}")), "{target}");
+        // Above Linux's largest PID, so there is no process to name.
+        assert_eq!(
+            session_target(&json!({ "processId": "4194305" }), None).as_deref(),
+            Some("pid 4194305")
+        );
+        assert_eq!(
+            session_target(&json!({ "program": "/src/app.py" }), None).as_deref(),
+            Some("app.py")
+        );
+        let local = "127.0.0.1:5678".parse().ok();
+        assert_eq!(
+            session_target(&json!({ "justMyCode": false }), local).as_deref(),
+            Some("port 5678")
+        );
+        let remote = "10.0.0.2:5678".parse().ok();
+        assert_eq!(
+            session_target(&json!({}), remote).as_deref(),
+            Some("10.0.0.2:5678")
+        );
+        assert_eq!(session_target(&json!({}), None), None);
     }
 
     #[test]

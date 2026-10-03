@@ -2,11 +2,12 @@ use std::borrow::Cow;
 
 use helix_core::indent::IndentStyle;
 use helix_core::{coords_at_pos, encoding, unicode::width::UnicodeWidthStr, Position};
+use helix_dap::ConnectionType;
 use helix_lsp::lsp::DiagnosticSeverity;
 use helix_view::document::DEFAULT_LANGUAGE_NAME;
 use helix_view::{
     document::{Mode, SCRATCH_BUFFER_NAME},
-    graphics::Rect,
+    graphics::{Color, Modifier, Rect},
     theme::Style,
     Document, Editor, View,
 };
@@ -331,6 +332,7 @@ where
 {
     match element_id {
         helix_view::editor::StatusLineElement::Mode => render_mode,
+        helix_view::editor::StatusLineElement::DebugSession => render_debug_session,
         helix_view::editor::StatusLineElement::Spinner => render_spinner,
         helix_view::editor::StatusLineElement::FileBaseName => render_file_base_name,
         helix_view::editor::StatusLineElement::FileName => render_file_name,
@@ -394,6 +396,46 @@ where
     } else {
         Style::default()
     };
+    write(context, Span::styled(content, style));
+}
+
+/// While a debug session runs: ` DEBUG hython-bin pid 1234 · stopped `, in the
+/// theme's `ui.statusline.debug`, or else in its error colour.
+fn render_debug_session<'a, F>(context: &mut RenderContext<'a>, write: F)
+where
+    F: Fn(&mut RenderContext<'a>, Span<'a>) + Copy,
+{
+    let Some(debugger) = context.editor.debug_adapters.get_active_client() else {
+        return;
+    };
+    let target = debugger
+        .target
+        .as_deref()
+        .unwrap_or(match debugger.connection_type() {
+            Some(ConnectionType::Launch) => "launched",
+            _ => "attached",
+        });
+    // A thread is selected only while it is stopped.
+    let state = match debugger.thread_id {
+        Some(_) => "stopped",
+        None => "running",
+    };
+    let content = format!(" DEBUG {target} · {state} ");
+
+    if !context.focused {
+        // Like the mode, keep the room so the rest lines up across views.
+        write(context, " ".repeat(content.width()).into());
+        return;
+    }
+    let theme = &context.editor.theme;
+    let style = theme
+        .try_get_exact("ui.statusline.debug")
+        .unwrap_or_else(|| {
+            Style::default()
+                .bg(theme.get("error").fg.unwrap_or(Color::Red))
+                .fg(theme.get("ui.background").bg.unwrap_or(Color::Black))
+                .add_modifier(Modifier::BOLD)
+        });
     write(context, Span::styled(content, style));
 }
 

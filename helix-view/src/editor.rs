@@ -644,6 +644,7 @@ impl Default for StatusLineConfig {
         Self {
             left: vec![
                 E::Mode,
+                E::DebugSession,
                 E::Spinner,
                 E::FileName,
                 E::ReadOnlyIndicator,
@@ -741,6 +742,9 @@ pub enum StatusLineElement {
     ReviewSession,
     /// The editor mode (Normal, Insert, Visual/Selection)
     Mode,
+
+    /// While a debug session runs: what it debugs, and whether it is stopped
+    DebugSession,
 
     /// The LSP activity spinner
     Spinner,
@@ -1598,6 +1602,9 @@ pub struct Editor {
     /// The debug console: the buffer evaluate results, program output and stops are
     /// written to, and whose last line takes console input.
     pub dap_console: crate::handlers::dap_console::DapConsole,
+    /// The line (0-based) `peek_file_line` last showed in another view, marked
+    /// there until that view's cursor leaves it.
+    pub peek: Option<(ViewId, DocumentId, usize)>,
     pub autoinfo: Option<Info>,
 
     pub config: Arc<dyn DynAccess<Config>>,
@@ -1739,6 +1746,7 @@ impl Editor {
             status_msg: None,
             dap_eval_result: None,
             dap_console: Default::default(),
+            peek: None,
             autoinfo: None,
             idle_timer: Box::pin(sleep(conf.idle_timeout)),
             redraw_timer: Box::pin(sleep(Duration::MAX)),
@@ -2815,6 +2823,29 @@ impl Editor {
 
     pub fn current_stack_frame(&self) -> Option<&dap::StackFrame> {
         self.debug_adapters.current_stack_frame()
+    }
+
+    /// The line (0-based) execution is stopped on in the current frame, when `doc`
+    /// is that frame's file.
+    pub fn dap_frame_line(&self, doc: &Document) -> Option<usize> {
+        let frame = self.current_stack_frame()?;
+        let path = frame.source.as_ref()?.path.as_ref()?;
+        // Documents are kept by canonical path; the adapter's may not be one.
+        let in_doc = doc
+            .path()
+            .is_some_and(|doc_path| helix_stdx::path::canonicalize(path) == *doc_path);
+        in_doc.then(|| frame.line.saturating_sub(1))
+    }
+
+    /// The line `peek_file_line` showed in `view`, while its cursor is still on it.
+    pub fn peeked_line(&self, view: &View, doc: &Document) -> Option<usize> {
+        let (view_id, doc_id, line) = self.peek?;
+        if view_id != view.id || doc_id != doc.id() {
+            return None;
+        }
+        let text = doc.text().slice(..);
+        let cursor_line = doc.selection(view.id).primary().cursor_line(text);
+        (cursor_line == line).then_some(line)
     }
 
     /// Returns the id of a view that this doc contains a selection for,

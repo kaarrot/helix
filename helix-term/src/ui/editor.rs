@@ -176,18 +176,17 @@ impl EditorView {
             Self::highlight_cursorcolumn(doc, view, surface, theme, inner, &text_annotations);
         }
 
-        // Set DAP highlights, if needed.
-        if let Some(frame) = editor.current_stack_frame() {
-            let dap_line = frame.line.saturating_sub(1);
-            let style = theme.get("ui.highlight.frameline");
-            let line_decoration = move |renderer: &mut TextRenderer, pos: LinePos| {
-                if pos.doc_line != dap_line {
-                    return;
-                }
-                renderer.set_style(Rect::new(inner.x, pos.visual_line, inner.width, 1), style);
-            };
+        // A line `peek_file_line` showed here from another view; once this view
+        // has focus its cursor marks it.
+        if let Some(line) = editor.peeked_line(view, doc).filter(|_| !is_focused) {
+            let style = Self::line_highlight(theme, "ui.highlight");
+            decorations.add_decoration(Self::line_decoration(inner, line, style));
+        }
 
-            decorations.add_decoration(line_decoration);
+        // The line execution is stopped on, in its own file only.
+        if let Some(line) = editor.dap_frame_line(doc) {
+            let style = Self::line_highlight(theme, "ui.highlight.frameline");
+            decorations.add_decoration(Self::line_decoration(inner, line, style));
         }
 
         let syntax_highlighter = Self::doc_syntax_highlighter(
@@ -928,6 +927,35 @@ impl EditorView {
     }
 
     /// Apply the highlighting on the lines where a cursor is active
+    /// Highlights document line `line` across the width of the view.
+    fn line_decoration(inner: Rect, line: usize, style: Style) -> impl Decoration {
+        move |renderer: &mut TextRenderer, pos: LinePos| {
+            if pos.doc_line == line {
+                renderer.set_style(Rect::new(inner.x, pos.visual_line, inner.width, 1), style);
+            }
+        }
+    }
+
+    /// A whole-line highlight in the theme's `scope` that leaves the code on it
+    /// readable. A background far from the editor's own, like the dark red many
+    /// themes mark the debugger's line with, even on light themes, is toned down to
+    /// a tint of it. The theme's foreground is then dropped, since it was chosen
+    /// for the original background, and the text keeps its syntax colours.
+    /// Backgrounds already near the editor's, and terminal palette colours, are
+    /// used as the theme has them.
+    fn line_highlight(theme: &Theme, scope: &str) -> Style {
+        let style = theme.get(scope);
+        match (style.bg, theme.get("ui.background").bg) {
+            (Some(Color::Rgb(r, g, b)), Some(Color::Rgb(br, bg, bb))) => {
+                match tint([r, g, b], [br, bg, bb]) {
+                    Some([r, g, b]) => Style::default().bg(Color::Rgb(r, g, b)),
+                    None => style,
+                }
+            }
+            _ => style,
+        }
+    }
+
     pub fn cursorline(doc: &Document, view: &View, theme: &Theme) -> impl Decoration {
         let text = doc.text().slice(..);
         // TODO only highlight the visual line that contains the cursor instead of the full visual line
@@ -2369,5 +2397,57 @@ fn canonicalize_key(key: &mut KeyEvent) {
     } = key
     {
         key.modifiers.remove(KeyModifiers::SHIFT)
+    }
+}
+
+/// How far a line highlight's background may stray from the editor's before it
+/// is toned down, as a distance between RGB colours: about a quarter of one
+/// channel's range. That is plain to see without drowning the text out.
+const MAX_LINE_TINT: f32 = 64.0;
+
+/// `color` moved towards `base`, the editor's background, until it is no further
+/// than [`MAX_LINE_TINT`] from it, or `None` when it is that close already.
+fn tint(color: [u8; 3], base: [u8; 3]) -> Option<[u8; 3]> {
+    let offset: [f32; 3] = std::array::from_fn(|i| f32::from(color[i]) - f32::from(base[i]));
+    let distance = offset.iter().map(|c| c * c).sum::<f32>().sqrt();
+    if distance <= MAX_LINE_TINT {
+        return None;
+    }
+    let scale = MAX_LINE_TINT / distance;
+    Some(std::array::from_fn(|i| {
+        (f32::from(base[i]) + offset[i] * scale).round() as u8
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn distance(a: [u8; 3], b: [u8; 3]) -> f32 {
+        (0..3)
+            .map(|i| (f32::from(a[i]) - f32::from(b[i])).powi(2))
+            .sum::<f32>()
+            .sqrt()
+    }
+
+    #[test]
+    fn a_loud_line_highlight_becomes_a_tint() {
+        // zed_onelight's frame line: zed_onedark's dark red on a near-white page.
+        let page = [0xfa, 0xfa, 0xfa];
+        let toned = tint([0x97, 0x20, 0x2a], page).unwrap();
+        assert_eq!(toned, [230, 206, 208]);
+        assert!((distance(toned, page) - MAX_LINE_TINT).abs() < 1.0);
+
+        // The same red on onedark's background stays a red, only darker.
+        let toned = tint([0x97, 0x20, 0x2a], [0x28, 0x2c, 0x34]).unwrap();
+        assert!(toned[0] > toned[1] && toned[0] > toned[2]);
+        assert!(toned[0] < 0x97);
+    }
+
+    #[test]
+    fn a_quiet_line_highlight_is_left_alone() {
+        // zed_onelight's `ui.highlight`, and ayu_light's frame line.
+        assert_eq!(tint([0xea, 0xea, 0xed], [0xfa, 0xfa, 0xfa]), None);
+        assert_eq!(tint([0xcf, 0xe0, 0xf2], [0xfa, 0xfa, 0xfa]), None);
     }
 }

@@ -271,31 +271,19 @@ pub fn breakpoints<'doc>(
     )
 }
 
+/// Marks the line execution is stopped on, in every view of its file: the one
+/// beside the debug console shows it while the console keeps focus.
 fn execution_pause_indicator<'doc>(
     editor: &'doc Editor,
     doc: &'doc Document,
     theme: &Theme,
-    is_focused: bool,
 ) -> GutterFn<'doc> {
     let style = theme.get("ui.debug.active");
-    let current_stack_frame = editor.current_stack_frame();
-    let frame_line = current_stack_frame.map(|frame| frame.line - 1);
-    let frame_source_path = current_stack_frame.map(|frame| {
-        frame
-            .source
-            .as_ref()
-            .and_then(|source| source.path.as_ref())
-    });
-    let should_display_for_current_doc =
-        doc.path().is_some() && frame_source_path.unwrap_or(None) == doc.path();
+    let frame_line = editor.dap_frame_line(doc);
 
     Box::new(
         move |line: usize, _selected: bool, first_visual_line: bool, out: &mut String| {
-            if !first_visual_line
-                || !is_focused
-                || line != frame_line?
-                || !should_display_for_current_doc
-            {
+            if !first_visual_line || line != frame_line? {
                 return None;
             }
 
@@ -315,7 +303,7 @@ pub fn diagnostics_or_breakpoints<'doc>(
 ) -> GutterFn<'doc> {
     let mut diagnostics = diagnostic(editor, doc, view, theme, is_focused);
     let mut breakpoints = breakpoints(editor, doc, view, theme, is_focused);
-    let mut execution_pause_indicator = execution_pause_indicator(editor, doc, theme, is_focused);
+    let mut execution_pause_indicator = execution_pause_indicator(editor, doc, theme);
 
     Box::new(move |line, selected, first_visual_line: bool, out| {
         execution_pause_indicator(line, selected, first_visual_line, out)

@@ -32,10 +32,18 @@ pub fn dap_pos_to_pos(doc: &helix_core::Rope, line: usize, column: usize) -> Opt
     Some(pos)
 }
 
+/// Makes `thread_id` the selected thread and shows its innermost frame. Unless
+/// `force`d, a thread stopping while another one is selected leaves the selection
+/// alone. The selected thread stopping again -- after a `goto`, which never
+/// resumes it -- shows where it is now.
 pub async fn select_thread_id(editor: &mut Editor, thread_id: ThreadId, force: bool) {
     let debugger = debugger!(editor);
 
-    if !force && debugger.thread_id.is_some() {
+    if !force
+        && debugger
+            .thread_id
+            .is_some_and(|selected| selected != thread_id)
+    {
         return;
     }
 
@@ -77,7 +85,7 @@ pub fn jump_to_stack_frame(editor: &mut Editor, frame: &helix_dap::StackFrame) {
     // Stepping from the debug console shows the source beside it rather than in
     // its place, and leaves the console focused for the next command.
     let shown = if editor.is_dap_console_focused() {
-        show_beside_console(editor, &path)
+        show_beside(editor, &path)
     } else {
         editor
             .open(&path, Action::Replace)
@@ -106,14 +114,15 @@ pub fn jump_to_stack_frame(editor: &mut Editor, frame: &helix_dap::StackFrame) {
     align_view(doc, view, Align::Center);
 }
 
-/// Opens `path` in the view the console reserves for source (see
-/// `Editor::dap_source_view`) without taking focus from the console, splitting one
-/// off when the console is alone on screen. Returns that view.
-fn show_beside_console(
+/// Opens `path` in the view beside the focused one -- for the console, the one it
+/// reserves for source, see `Editor::dap_source_view` -- without taking focus or
+/// leaving the mode, splitting one off above when there is no other. Returns that
+/// view.
+pub fn show_beside(
     editor: &mut Editor,
     path: &std::path::Path,
 ) -> Result<ViewId, DocumentOpenError> {
-    let console_view = editor.tree.focus;
+    let focused_view = editor.tree.focus;
     let mode = editor.mode;
     // Loading neither moves focus nor leaves insert mode.
     let doc_id = editor.open(path, Action::Load)?;
@@ -126,11 +135,11 @@ fn show_beside_console(
     }
 
     // Splitting and refocusing both drop back to normal mode on the way; the
-    // console was focused throughout as far as the user is concerned.
+    // focused view kept focus throughout as far as the user is concerned.
     editor.switch(doc_id, Action::HorizontalSplit);
     editor.swap_split_in_direction(Direction::Up);
     let view_id = editor.tree.focus;
-    editor.focus(console_view);
+    editor.focus(focused_view);
     editor.mode = mode;
     Ok(view_id)
 }
@@ -225,6 +234,9 @@ impl Editor {
                         all_threads_stopped,
                         ..
                     }) => {
+                        // Before selecting the thread, which is done in the active
+                        // session -- on the first stop this one may not be it yet.
+                        self.debug_adapters.set_active_client(id);
                         let debugger = match self.debug_adapters.get_client_mut(id) {
                             Some(debugger) => debugger,
                             None => return false,
@@ -266,7 +278,6 @@ impl Editor {
                         }
 
                         self.set_status(status);
-                        self.debug_adapters.set_active_client(id);
 
                         self.dap_console_flush_output();
                         self.dap_console_print_location();
@@ -291,8 +302,19 @@ impl Editor {
                             None => return false,
                         };
 
-                        debugger.thread_id = Some(thread.thread_id);
-                        // set the stack frame for the thread
+                        // The selected thread is the stopped one being looked at. A
+                        // thread the program starts meanwhile is running, so it has
+                        // no frame to show nor any to step, and taking it over the
+                        // selection would make the next stop of the selected thread
+                        // look like someone else's.
+                        if thread.reason == "exited" {
+                            debugger.thread_states.remove(&thread.thread_id);
+                            debugger.stack_frames.remove(&thread.thread_id);
+                            if debugger.thread_id == Some(thread.thread_id) {
+                                debugger.thread_id = None;
+                                debugger.active_frame = None;
+                            }
+                        }
                     }
                     Event::Breakpoint(events::BreakpointBody { reason, breakpoint }) => {
                         match &reason[..] {
@@ -378,6 +400,9 @@ impl Editor {
                     }
                     Event::Initialized(_) => {
                         self.set_status("Debugger initialized...");
+                        // The session is live from here, not only once it first
+                        // stops: it shows on the status line, and can be paused.
+                        self.debug_adapters.set_active_client(id);
                         let debugger = match self.debug_adapters.get_client_mut(id) {
                             Some(debugger) => debugger,
                             None => return false,

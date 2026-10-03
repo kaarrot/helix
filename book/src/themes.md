@@ -315,6 +315,7 @@ These scopes are used for theming the editor interface:
 | `ui.statusline.insert`            | Statusline mode during insert mode ([only if `editor.color-modes` is enabled][editor-section]) |
 | `ui.statusline.select`            | Statusline mode during select mode ([only if `editor.color-modes` is enabled][editor-section]) |
 | `ui.statusline.separator`         | Separator character in statusline                                                              |
+| `ui.statusline.debug`             | Statusline `debug-session` element; the theme's `error` colour as background if unset         |
 | `ui.bufferline`                   | Style for the buffer line                                                                      |
 | `ui.bufferline.active`            | Style for the active buffer in buffer line                                                     |
 | `ui.bufferline.background`        | Style for bufferline background                                                                |
@@ -343,7 +344,7 @@ These scopes are used for theming the editor interface:
 | `ui.menu.scroll`                  | `fg` sets thumb color, `bg` sets track color of scrollbar                                      |
 | `ui.selection`                    | For selections in the editing area                                                             |
 | `ui.selection.primary`            |                                                                                                |
-| `ui.highlight`                    | Highlighted lines in the picker preview                                                        |
+| `ui.highlight`                    | Highlighted lines in the picker preview, and the line `gF` showed in another split             |
 | `ui.highlight.frameline`          | Line at which debugging execution is paused at                                                 |
 | `ui.cursorline.primary`           | The line of the primary cursor ([if cursorline is enabled][editor-section])                    |
 | `ui.cursorline.secondary`         | The lines of any other cursors ([if cursorline is enabled][editor-section])                    |
@@ -361,5 +362,12 @@ These scopes are used for theming the editor interface:
 | `diagnostic.unnecessary`          | Diagnostics with unnecessary tag (editing area)                                                |
 | `diagnostic.deprecated`           | Diagnostics with deprecated tag (editing area)                                                 |
 | `tabstop`                         | Snippet placeholder                                                                            |
+
+The debugger's line, `ui.highlight.frameline`, and the line `gF` marks with
+`ui.highlight` are toned down when their background is far from that of
+`ui.background`, so the code on them stays readable: the background becomes a
+tint of the theme's colour, and the scope's foreground is dropped so the text
+keeps its syntax colours. This takes RGB colours for both backgrounds; terminal
+palette colours are used as the theme has them.
 
 [editor-section]: ./configuration.md#editor-section

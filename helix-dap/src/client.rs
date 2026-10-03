@@ -46,6 +46,9 @@ pub struct Client {
     pub quirks: DebuggerQuirks,
     /// The config which was used to start this debugger.
     pub config: Option<DebugAdapterConfig>,
+    /// What the session debugs, as the status line names it: the process attached
+    /// to, the address of a debug server, or the program launched.
+    pub target: Option<String>,
 }
 
 impl Client {
@@ -101,6 +104,7 @@ impl Client {
             active_frame: None,
             quirks: DebuggerQuirks::default(),
             config: None,
+            target: None,
         };
 
         tokio::spawn(Self::recv(id, server_rx, client_tx));

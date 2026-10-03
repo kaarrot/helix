@@ -220,6 +220,7 @@ Jumps to various locations.
 | <code>&#124;</code>     | Go to the start of line        | `goto_column`              |
 | `e`   | Go to the end of the file                        | `goto_last_line`           |
 | `f`   | Go to files in the selections                    | `goto_file`                |
+| `F`   | Show the `file:line` under the cursor in the split beside, staying here | `peek_file_line` |
 | `h`   | Go to the start of the line                      | `goto_line_start`          |
 | `l`   | Go to the end of the line                        | `goto_line_end`            |
 | `s`   | Go to first non-whitespace character of the line | `goto_first_nonwhitespace` |

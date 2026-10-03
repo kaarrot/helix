@@ -441,3 +441,61 @@ async fn breakpoints_can_be_set_from_the_console_before_a_session() -> anyhow::R
 
     session.quit().await
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn gf_shows_a_file_line_from_the_transcript_beside_the_console() -> anyhow::Result<()> {
+    let (mut session, _file) = Session::new()?;
+    let other = tempfile::NamedTempFile::new()?;
+    let text: String = (1..=400).map(|i| format!("    line {i}\n")).collect();
+    std::fs::write(other.path(), text)?;
+    let other_path = helix_stdx::path::canonicalize(other.path());
+
+    session.keys("<space>G<C-d>").await?;
+    let console_view = session.editor().tree.focus;
+    let source_view = session
+        .editor()
+        .tree
+        .views()
+        .map(|(view, _)| view.id)
+        .find(|&id| id != console_view)
+        .unwrap();
+    // A traceback line and a `w` line, as the console prints them.
+    let traceback = format!("  File \"{}\", line 300, in run", other.path().display());
+    let frame = format!("  #1  main  {}:20", other.path().display());
+    session
+        .editor()
+        .dap_console_print(&format!("{traceback}\n{frame}"));
+
+    // `gF` on the traceback, two lines up from the input line.
+    let editor = session.keys("<esc>kkgF").await?;
+    assert_eq!(console_view, editor.tree.focus);
+    assert_eq!(Mode::Normal, editor.mode());
+    assert_eq!(2, editor.tree.views().count());
+    let shows_line = |editor: &Editor, line: usize| {
+        let view = editor.tree.get(source_view);
+        let doc = editor.document(view.doc).unwrap();
+        let text = doc.text().slice(..);
+        assert_eq!(Some(&other_path), doc.path());
+        let cursor = doc.selection(source_view).primary().cursor(text);
+        // On the line's first non-blank, in the middle of the view.
+        assert_eq!(text.line_to_char(line) + 4, cursor);
+        let top = text.char_to_line(doc.view_offset(source_view).anchor);
+        assert!(top < line && line < top + view.inner_height(), "{top}");
+        assert_eq!(Some((source_view, view.doc, line)), editor.peek);
+        assert_eq!(Some(line), editor.peeked_line(view, doc));
+    };
+    shows_line(editor, 299);
+
+    // The next one reuses the same split.
+    let editor = session.keys("jgF").await?;
+    assert_eq!(console_view, editor.tree.focus);
+    assert_eq!(2, editor.tree.views().count());
+    shows_line(editor, 19);
+
+    // Nothing to show on the input line.
+    let editor = session.keys("jgF").await?;
+    assert_eq!(2, editor.tree.views().count());
+    assert_eq!(console_view, editor.tree.focus);
+
+    session.quit().await
+}

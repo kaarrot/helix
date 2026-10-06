@@ -316,8 +316,8 @@ merge/diff submode.
 | `Alt-c` | Line comment/uncomment selections                                       | `toggle_line_comments`                     |
 | `p`     | Paste system clipboard after selections                                 | `paste_clipboard_after`                    |
 | `P`     | Paste system clipboard before selections                                | `paste_clipboard_before`                   |
-| `y`     | Yank selections to clipboard                                            | `yank_to_clipboard`                        |
-| `Y`     | Yank main selection to clipboard                                        | `yank_main_selection_to_clipboard`         |
+| `y`     | Copy from the focused review box, else yank selections to clipboard     | `review_copy_or_yank_to_clipboard`         |
+| `Y`     | Copy from the focused review box, else yank main selection to clipboard | `review_copy_or_yank_main_to_clipboard`    |
 | `R`     | Replace selections by clipboard contents                                | `replace_selections_with_clipboard`        |
 | `/`     | Global search in workspace folder                                       | `global_search`                            |
 | `?`     | Open command palette                                                    | `command_palette`                          |
@@ -383,18 +383,21 @@ it.
 A box never takes more than half the window, so the code it is about stays on
 screen. A reply too tall to fit shows the visible range in its header
 (`12-40 of 201`). `C-up` / `C-down` walk a cursor down the reply and the box
-follows it, scrolling only when the cursor would otherwise leave. Scrolling the
-editor *through* a box is not possible — the cursor cannot be inside virtual
-rows, so the view would be pulled straight back to the cursor's line — which is
-why a box has a cursor of its own instead.
+follows it, scrolling only when the cursor would otherwise leave. The mouse
+wheel over a box scrolls the box itself, and the buffer again once the box has
+reached its top or bottom. Scrolling the editor *through* a box is not
+possible — the cursor cannot be inside virtual rows, so the view would be
+pulled straight back to the cursor's line — which is why a box has a cursor of
+its own instead.
 
-**Drag across a reply with the mouse** to select part of it, then `y` (or
-`Ctrl-Shift-C`) to copy it to the **system clipboard**, ready to paste back into
-a comment. Clicking a box only points at it; it takes a drag to select, and the
-click never moves the text cursor into the code underneath. `C-up` / `C-down`
-adjust a selection once there is one. With nothing selected `y` copies the whole
-entry — and then it copies the text as it was written rather than as it was
-wrapped to fit the pane. Away from a box, `y` is an ordinary yank.
+**Drag across a reply with the mouse** to select part of it: letting go copies
+it to the **system clipboard**, the way selecting in a terminal does, ready to
+paste back into a comment or anywhere else. `y`, `Space-y` (or
+`Ctrl-Shift-C`) copy it again. Clicking a box only points at it; it takes a
+drag to select, and the click never moves the text cursor into the code
+underneath. `C-up` / `C-down` adjust a selection once there is one. With
+nothing selected `y` copies the whole entry — and then it copies the text as
+it was written rather than as it was wrapped to fit the pane. Away from a box, `y` is an ordinary yank.
 
 Selecting in a box is by line rather than by character, since the box draws its
 own cursor and selection where the editor's cannot go. Trim after pasting, in
@@ -493,7 +496,8 @@ Everything else happens on the box itself: `c` and `d` act on it, `C-left` /
 selects from it and `y` copies that. `]c` / `[c` move between review
 comments in the current diff, and are code comments in any other buffer.
 `]C` / `[C` move between every review comment in the session, in path order,
-and open or switch to the buffer that holds the next one.
+and open or switch to the buffer that holds the next one. Both land with the
+box focused, so the keys that act on a box work straight away.
 `Ctrl-Shift-S` in the box sends straight away. After saving with `Ctrl-S`, `c`
 on the line opens that draft for editing again. `Ctrl-S` or `Ctrl-Shift-S` in
 normal mode send the draft on this line; `S` in the review submenu still sends

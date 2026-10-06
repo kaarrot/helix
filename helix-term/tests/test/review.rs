@@ -1714,11 +1714,17 @@ async fn ctrl_left_walks_the_thread_while_the_comment_box_is_open() -> anyhow::R
     // Open a reply. Ctrl-left must walk the thread, not move the caret in the box.
     assert!(harness.send_keys(&mut app, "c").await?);
     assert!(app.editor.diff.reviews.composing.is_some());
+    // Only the input at first: a one-line reply should not sit on a tall answer.
+    let input_only = focused_plan_row_count(&app);
     assert!(harness.send_keys(&mut app, "<C-left>").await?);
     assert_eq!(
         app.editor.diff.reviews.get(id).unwrap().view_index(),
         0,
         "Ctrl-left while composing should show the previous entry"
+    );
+    assert!(
+        focused_plan_row_count(&app) > input_only,
+        "the entry stepped to should be drawn under the input"
     );
 
     assert!(harness.send_keys(&mut app, "<esc>").await?);
@@ -3321,14 +3327,6 @@ async fn part_of_a_reply_is_selected_with_the_mouse_and_copied() -> anyhow::Resu
         )
         .await?;
 
-    let before = app
-        .editor
-        .document(app.editor.tree.get(app.editor.tree.focus).doc)
-        .unwrap()
-        .text()
-        .to_string();
-    assert!(harness.send_keys(&mut app, "y").await?);
-
     let clipboard = |app: &Application| -> Vec<String> {
         app.editor
             .registers
@@ -3336,6 +3334,26 @@ async fn part_of_a_reply_is_selected_with_the_mouse_and_copied() -> anyhow::Resu
             .map(|values| values.map(|value| value.to_string()).collect())
             .unwrap_or_default()
     };
+    // Letting go is enough to copy, as selecting in a terminal is, and the
+    // selection stays drawn so it is plain what was taken.
+    assert_eq!(clipboard(&app), vec!["alpha\nbeta".to_string()]);
+    assert_eq!(
+        app.editor
+            .diff
+            .reviews
+            .get(id)
+            .unwrap()
+            .selected_rows(width),
+        Some((0, 1))
+    );
+
+    let before = app
+        .editor
+        .document(app.editor.tree.get(app.editor.tree.focus).doc)
+        .unwrap()
+        .text()
+        .to_string();
+    assert!(harness.send_keys(&mut app, "y").await?);
     assert_eq!(clipboard(&app), vec!["alpha\nbeta".to_string()]);
     assert!(
         app.editor.registers.read('"', &app.editor).is_none(),
@@ -4034,6 +4052,100 @@ fn assert_hits_on_their_rows(app: &Application, view: helix_view::ViewId, id: Th
 #[cfg(not(windows))]
 fn numbered_reply(rows: usize) -> String {
     (0..rows).map(|n| format!("- reply row {n}\n")).collect()
+}
+
+/// The wheel over a box too tall to show at once scrolls the box, not the
+/// code, and hands back to the code once the box has reached its end.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg(not(windows))]
+async fn the_wheel_over_a_tall_box_scrolls_the_box() -> anyhow::Result<()> {
+    use termina::event::MouseEventKind;
+
+    let file = tempfile::NamedTempFile::new()?;
+    let text: String = (0..400).map(|n| format!("code {n}\n")).collect();
+    std::fs::write(file.path(), &text)?;
+    let (mut app, mut harness, id) = app_with_reply(file.path(), &numbered_reply(200)).await?;
+    harness
+        .pump(&mut app, std::time::Duration::from_millis(200))
+        .await;
+
+    let view_offset = |app: &Application| {
+        let view = app.editor.tree.get(app.editor.tree.focus);
+        let doc = app.editor.document(view.doc).unwrap();
+        let offset = doc.view_offset(view.id);
+        (offset.anchor, offset.vertical_offset)
+    };
+    let box_rows = app.editor.tree.get(app.editor.tree.focus).review_box_rows();
+    let box_scroll = |app: &Application| app.editor.diff.reviews.get(id).unwrap().scroll.get();
+    let before = view_offset(&app);
+
+    let (row, x) = painted(&app, id, Some(0));
+    harness
+        .mouse(&mut app, MouseEventKind::ScrollDown, row, x + 3)
+        .await?;
+    assert_eq!(box_scroll(&app), 3, "one wheel step is three rows");
+    assert_eq!(view_offset(&app), before, "the code should not have moved");
+
+    harness
+        .mouse(&mut app, MouseEventKind::ScrollUp, row, x + 3)
+        .await?;
+    assert_eq!(box_scroll(&app), 0);
+    assert_eq!(view_offset(&app), before);
+
+    // Wheeling on stops the box at its last rows, and the step after that
+    // moves the code instead.
+    for _ in 0..100 {
+        let scrolled = box_scroll(&app);
+        harness
+            .mouse(&mut app, MouseEventKind::ScrollDown, row, x + 3)
+            .await?;
+        if box_scroll(&app) == scrolled {
+            break;
+        }
+        assert_eq!(view_offset(&app), before, "the code moved mid-box");
+    }
+    assert_eq!(box_scroll(&app), 200 - box_rows);
+    assert_ne!(
+        view_offset(&app),
+        before,
+        "the code should scroll at the end"
+    );
+
+    harness.close(&mut app).await?;
+    Ok(())
+}
+
+/// `]C` lands on the box itself, so the keys that act on a box -- here
+/// `Space-y` -- work without stopping on it with `j` first.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg(not(windows))]
+async fn bracket_c_focuses_the_box_it_lands_on() -> anyhow::Result<()> {
+    let file = tempfile::NamedTempFile::new()?;
+    std::fs::write(file.path(), "one\ntwo\nthree\n")?;
+    let (mut app, mut harness, id) = app_with_reply(file.path(), "alpha\nbeta").await?;
+
+    assert!(harness.send_keys(&mut app, "ge").await?);
+    assert_eq!(app.editor.diff.reviews.focused, None);
+    assert!(harness.send_keys(&mut app, "]C").await?);
+    assert_eq!(focused_cursor_line(&app), 0);
+    assert_eq!(app.editor.diff.reviews.focused, Some(id));
+
+    assert!(harness.send_keys(&mut app, "<space>y").await?);
+    let clipboard: Vec<String> = app
+        .editor
+        .registers
+        .read('+', &app.editor)
+        .map(|values| values.map(|value| value.to_string()).collect())
+        .unwrap_or_default();
+    assert_eq!(clipboard, vec!["alpha\nbeta".to_string()]);
+
+    // Moving on from the box is one press, as after stopping on it with `j`.
+    assert!(harness.send_keys(&mut app, "j").await?);
+    assert_eq!(focused_cursor_line(&app), 1);
+    assert_eq!(app.editor.diff.reviews.focused, None);
+
+    harness.close(&mut app).await?;
+    Ok(())
 }
 
 /// Scrolled until the view starts partway into a box, the box moves up with

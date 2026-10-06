@@ -661,6 +661,7 @@ fn prompt_at_cursor(
         rev,
         line,
         rows: body_lines + 1,
+        peek: false,
     });
 
     let input = CommentInput::new(
@@ -1126,6 +1127,11 @@ fn review_step_message(cx: &mut Context, forward: bool) {
         thread.reset_reading();
     }
     let (index, total) = (thread.view_index() + 1, thread.entry_count());
+    // Stepping while a reply is being typed is looking back at what it answers,
+    // so the box the input stands in for comes back, under the input.
+    if let Some(composing) = cx.editor.diff.reviews.composing.as_mut() {
+        composing.peek = true;
+    }
     if moved {
         cx.editor
             .set_status(format!("Comment entry {index}/{total}"));
@@ -1186,33 +1192,40 @@ fn review_copy(cx: &mut Context) -> bool {
         return false;
     };
     let width = box_width(cx);
-    let Some(thread) = cx.editor.diff.reviews.get(id) else {
-        return false;
+    // The selection has served its purpose; leaving it standing would make the
+    // next copy take something the reader has stopped pointing at.
+    copy_from_box(cx.editor, id, width, true);
+    true
+}
+
+/// Put the selected rows of `id`, or its whole entry, on the system clipboard
+/// and say what was taken.
+fn copy_from_box(editor: &mut Editor, id: ThreadId, width: usize, clear_selection: bool) {
+    let Some(thread) = editor.diff.reviews.get(id) else {
+        return;
     };
     let Some(text) = thread.copy_text(width) else {
-        cx.editor.set_error("Nothing to copy");
-        return true;
+        editor.set_error("Nothing to copy");
+        return;
     };
     let lines = text.lines().count().max(1);
     let partial = thread.selected_rows(width).is_some();
 
-    match cx.editor.registers.write('+', vec![text]) {
+    match editor.registers.write('+', vec![text]) {
         Ok(()) => {
-            // The selection has served its purpose; leaving it standing would
-            // make the next copy take something the reader has stopped
-            // pointing at.
-            if let Some(thread) = cx.editor.diff.reviews.get_mut(id) {
-                thread.select = None;
+            if clear_selection {
+                if let Some(thread) = editor.diff.reviews.get_mut(id) {
+                    thread.select = None;
+                }
             }
-            cx.editor.set_status(if partial {
+            editor.set_status(if partial {
                 format!("Copied {lines} lines to the clipboard")
             } else {
                 format!("Copied the whole entry ({lines} lines) to the clipboard")
             });
         }
-        Err(err) => cx.editor.set_error(err.to_string()),
+        Err(err) => editor.set_error(err.to_string()),
     }
-    true
 }
 
 pub fn review_copy_or_yank(cx: &mut Context) {
@@ -1224,6 +1237,12 @@ pub fn review_copy_or_yank(cx: &mut Context) {
 pub fn review_copy_or_yank_to_clipboard(cx: &mut Context) {
     if !review_copy(cx) {
         super::yank_to_clipboard(cx);
+    }
+}
+
+pub fn review_copy_or_yank_main_to_clipboard(cx: &mut Context) {
+    if !review_copy(cx) {
+        super::yank_main_selection_to_clipboard(cx);
     }
 }
 
@@ -1642,8 +1661,70 @@ pub fn review_mouse_drag(editor: &mut Editor, row: u16) -> bool {
 
 /// The button coming back up. `true` when it ends a press that was in a box,
 /// so the release is not also read as a selection made in the document.
+///
+/// A drag that selected rows copies them to the system clipboard as the button
+/// comes up, the way selecting in a terminal does: the text in a box is mostly
+/// wanted somewhere else, and a key after the drag would be one more step. The
+/// selection stays drawn, so it is plain what was taken.
 pub fn review_mouse_up(editor: &mut Editor) -> bool {
-    editor.diff.reviews.press.take().is_some()
+    let Some(press) = editor.diff.reviews.press.take() else {
+        return false;
+    };
+    if press.dragged && press.body.is_some() {
+        // The press focused the pane the box is in.
+        let (view, doc) = current_ref!(editor);
+        let width = view.inner_width(doc) as usize;
+        copy_from_box(editor, press.thread, width, false);
+    }
+    true
+}
+
+/// The wheel over a box scrolls the box, so a reply taller than the box can be
+/// read without first walking the in-box cursor down to its bottom edge.
+///
+/// `false` when the box fits, or is already at the end the wheel is turning
+/// towards, so the wheel carries on scrolling the buffer rather than going dead
+/// over a box that has nothing more to show.
+pub fn review_mouse_scroll(
+    editor: &mut Editor,
+    row: u16,
+    column: u16,
+    down: bool,
+    lines: usize,
+) -> bool {
+    if editor.diff.reviews.hidden {
+        return false;
+    }
+    let Some(hit) = editor.diff.reviews.hit_at(row, column) else {
+        return false;
+    };
+    let Some(view) = editor.tree.try_get(hit.view) else {
+        return false;
+    };
+    let Some(doc) = editor.documents.get(&view.doc) else {
+        return false;
+    };
+    let width = view.inner_width(doc) as usize;
+    let max_rows = view.review_box_rows();
+    let Some(thread) = editor.diff.reviews.get_mut(hit.thread) else {
+        return false;
+    };
+    let total = thread.body_rows(width).len();
+    let last_scroll = total.saturating_sub(max_rows);
+    let scroll = thread.scroll.get().min(last_scroll);
+    let next = if down {
+        scroll.saturating_add(lines).min(last_scroll)
+    } else {
+        scroll.saturating_sub(lines)
+    };
+    if next == scroll {
+        return false;
+    }
+    thread.scroll.set(next);
+    // Drawing scrolls the box to wherever the in-box cursor is, so the cursor
+    // comes along, or the next frame would put the box straight back.
+    thread.cursor = thread.cursor.clamp(next, next + max_rows - 1);
+    true
 }
 
 pub fn review_scroll_down(cx: &mut Context) {
@@ -1993,7 +2074,7 @@ fn goto_review_comment_impl(cx: &mut Context, forward: bool) {
             .find(|(thread_line, _)| *thread_line < line)
             .or_else(|| threads.last())
     };
-    let Some(&(target_line, _)) = target else {
+    let Some(&(target_line, target_id)) = target else {
         return;
     };
 
@@ -2005,6 +2086,8 @@ fn goto_review_comment_impl(cx: &mut Context, forward: bool) {
     let scrolloff = cx.editor.config().scrolloff;
     let (view, doc) = current!(cx.editor);
     view.ensure_cursor_in_view_center(doc, scrolloff);
+    // Landed on the box, as `]C` does.
+    cx.editor.diff.reviews.focused = Some(target_id);
 
     let index = threads
         .iter()
@@ -2041,9 +2124,11 @@ fn goto_review_comment_across_buffers(cx: &mut Context, forward: bool) {
     if !show_stop(cx.editor, &stop) {
         return;
     }
-    // Landing is not the same as stopping on the box with `j`. A stale focus
-    // would make `d` act on whatever thread still matched.
-    cx.editor.diff.reviews.focused = None;
+    // Land on the box, not just its line: the jump is asking to read that
+    // thread, and making `j` stop on it first would cost a key every time.
+    // Naming the thread landed on, rather than keeping an old focus, is what
+    // keeps `d` from acting on some other thread that still matched.
+    cx.editor.diff.reviews.focused = Some(stop.id);
     let status = comment_status(&stops, index);
     cx.editor.set_status(status);
 }

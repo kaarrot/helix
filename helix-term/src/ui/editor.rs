@@ -1900,13 +1900,25 @@ impl EditorView {
                     MouseEventKind::ScrollDown => Direction::Forward,
                     _ => unreachable!(),
                 };
+                let offset = config.scroll_lines.unsigned_abs();
+
+                // A box under the pointer scrolls before the buffer does, the
+                // way a scrollable panel on a page does.
+                if commands::review::review_mouse_scroll(
+                    cxt.editor,
+                    row,
+                    column,
+                    direction == Direction::Forward,
+                    offset,
+                ) {
+                    return EventResult::Consumed(None);
+                }
 
                 match pos_and_view(cxt.editor, row, column, false) {
                     Some((_, view_id)) => cxt.editor.tree.focus = view_id,
                     None => return EventResult::Ignored(None),
                 }
 
-                let offset = config.scroll_lines.unsigned_abs();
                 commands::scroll(cxt, offset, direction, false);
 
                 cxt.editor.tree.focus = current_view;

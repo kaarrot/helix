@@ -234,6 +234,15 @@ impl View {
         self.area.clip_left(self.gutter_offset(doc)).width
     }
 
+    /// Most body rows a review box shows at once in this view.
+    ///
+    /// Never more than half the window: the code it is about has to stay
+    /// visible, and a box taller than the window could not be scrolled through
+    /// anyway.
+    pub fn review_box_rows(&self) -> usize {
+        (self.inner_height() / 2).max(3)
+    }
+
     pub fn gutters(&self) -> &[GutterType] {
         &self.gutters.layout
     }
@@ -799,10 +808,7 @@ impl View {
         if !reviews.is_empty() && !reviews.hidden {
             if let Some((file, rev)) = self.review_identity(doc, diff_views) {
                 let width = self.inner_width(doc) as usize;
-                // Never let a box take more than half the window: the code it
-                // is about has to stay visible, and a box taller than the window
-                // could not be scrolled through anyway.
-                let max_body_rows = (self.inner_height() / 2).max(3);
+                let max_body_rows = self.review_box_rows();
                 let text = doc.text();
                 // Which box the reader is on, so it can be drawn as the one
                 // they are acting on rather than one of several alike.
@@ -815,11 +821,14 @@ impl View {
                     // An open document's anchor leads; the stored line is the
                     // fallback for a thread whose document was reopened.
                     let line = thread.line_in(&doc.review_anchors, text);
-                    // Its space is already held by the input being typed into.
+                    // Its space is already held by the input being typed into,
+                    // unless the reader stepped through its entries while
+                    // typing: then it is drawn under the input, which was
+                    // added to this line first.
                     if reviews
                         .composing
                         .as_ref()
-                        .is_some_and(|composing| composing.line as usize == line)
+                        .is_some_and(|composing| composing.line as usize == line && !composing.peek)
                     {
                         continue;
                     }

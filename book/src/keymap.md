@@ -482,6 +482,9 @@ renaming.
 | Key | Description | Command |
 | --- | --- | --- |
 | `c` | Comment, reply, or continue editing the unsent draft on this line | `review_add` |
+| `D` | Delete the whole thread at the cursor, every entry at once | `review_delete` |
+| `j` | Pick from the review comments in this file | `review_comment_picker_file` |
+| `J` | Pick from every review comment in the conversation (this branch) | `review_comment_picker_all` |
 | `S` | Send any comments saved but not yet sent | `review_send_all` |
 | `t` | Collapse or expand the thread at the cursor | `review_toggle_collapse` |
 | `h` | Hide or show every review box | `review_toggle_visible` |

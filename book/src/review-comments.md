@@ -263,6 +263,11 @@ goes straight through. These keys work once a box is focused:
 | --- | --- |
 | `]c` / `[c` | Next / previous comment in this diff; outside a diff, the usual code-comment motion |
 | `]C` / `[C` | Next / previous comment anywhere in the conversation, opening its file if needed. A comment on a commit is reached while that commit's snapshot is open |
+| `Space m R j` | Pick a comment in this file. The thread the cursor is on starts selected |
+| `Space m R J` | Pick a comment anywhere in the conversation, with the same reach as `]C` |
+
+Picking a comment lands on its box, focused, as `]C` does. `Space m R D` deletes
+the whole thread at the cursor, where `d` on a focused box deletes one entry.
 
 ### Commands
 

@@ -1404,6 +1404,111 @@ async fn bracket_c_jumps_between_review_comments_across_buffers() -> anyhow::Res
     Ok(())
 }
 
+/// `Space-m-R D` removes the whole thread at once, where `d` on a focused box
+/// takes one entry at a time.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg(not(windows))]
+async fn space_m_r_d_deletes_the_whole_thread() -> anyhow::Result<()> {
+    let file = tempfile::NamedTempFile::new()?;
+    std::fs::write(file.path(), "one\ntwo\n")?;
+    let (mut app, mut harness, id) = app_with_reply(file.path(), "because").await?;
+    assert_eq!(app.editor.diff.reviews.get(id).unwrap().entry_count(), 2);
+
+    assert!(harness.send_keys(&mut app, "]C<space>mRD").await?);
+    assert!(app.editor.diff.reviews.get(id).is_none());
+    assert_eq!(app.editor.diff.reviews.focused, None);
+    let view = app.editor.tree.get(app.editor.tree.focus);
+    assert!(app
+        .editor
+        .document(view.doc)
+        .unwrap()
+        .review_anchors
+        .is_empty());
+
+    harness.close(&mut app).await?;
+    Ok(())
+}
+
+/// `Space-m-R j` lists this file's threads and opens on the one the cursor is
+/// on, so `Enter` straight away stays put and moving in the list starts from
+/// there.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_comment_picker_starts_on_the_current_thread() -> anyhow::Result<()> {
+    let file = tempfile::NamedTempFile::new()?;
+    std::fs::write(file.path(), "one\ntwo\nthree\n")?;
+    let mut app = AppBuilder::new().with_file(file.path(), None).build()?;
+    let mut harness = AppTestHarness::new();
+
+    assert!(harness.send_keys(&mut app, "<space>mRc").await?);
+    assert!(harness.send_keys(&mut app, "about one<C-s>").await?);
+    place_cursor(&mut app, 2);
+    assert!(harness.send_keys(&mut app, "<space>mRc").await?);
+    assert!(harness.send_keys(&mut app, "about three<C-s>").await?);
+    let three = app.editor.diff.reviews.focused;
+
+    // Stop on the second box, then open the picker and take what it offers.
+    place_cursor(&mut app, 0);
+    assert!(harness.send_keys(&mut app, "]C").await?);
+    assert_eq!(focused_cursor_line(&app), 2);
+    // Separate sends: the picker settles its starting row when it is drawn,
+    // as it always is before a person can press anything.
+    assert!(harness.send_keys(&mut app, "<space>mRj").await?);
+    assert!(harness.send_keys(&mut app, "<ret>").await?);
+    assert_eq!(
+        focused_cursor_line(&app),
+        2,
+        "the current thread was not picked out"
+    );
+
+    // One down from there wraps to the first thread, and lands on its box.
+    assert!(harness.send_keys(&mut app, "<space>mRj").await?);
+    assert!(harness.send_keys(&mut app, "<down><ret>").await?);
+    assert_eq!(focused_cursor_line(&app), 0);
+    let one = app.editor.diff.reviews.focused;
+    assert!(one.is_some());
+    assert_ne!(one, three);
+
+    harness.close(&mut app).await?;
+    Ok(())
+}
+
+/// `Space-m-R J` lists every comment in the conversation and opens the file a
+/// picked one is in.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_all_comments_picker_opens_another_file() -> anyhow::Result<()> {
+    let repo = GitRepoFixture::new()?;
+    repo.write_file("alpha.rs", "fn alpha() {}\n")?;
+    repo.write_file("beta.rs", "fn beta() {}\nfn beta_two() {}\n")?;
+    repo.commit_all("initial")?;
+
+    let _cwd = CwdGuard::enter(repo.path()).await?;
+    let alpha = repo.file("alpha.rs");
+    let beta = repo.file("beta.rs");
+
+    let mut app = AppBuilder::new().with_file(&beta, None).build()?;
+    let mut harness = AppTestHarness::new();
+    place_cursor(&mut app, 1);
+    assert!(harness.send_keys(&mut app, "<space>mRc").await?);
+    assert!(harness.send_keys(&mut app, "zebra question<C-s>").await?);
+
+    let open_alpha = format!(":open {}<ret>", alpha.display());
+    assert!(harness.send_keys(&mut app, &open_alpha).await?);
+    assert!(harness.send_keys(&mut app, "<space>mRc").await?);
+    assert!(harness.send_keys(&mut app, "about alpha<C-s>").await?);
+
+    // This file's picker only knows about this file.
+    assert!(harness.send_keys(&mut app, "<space>mRjzebra<ret>").await?);
+    assert_eq!(focused_file_name(&app), "alpha.rs");
+
+    assert!(harness.send_keys(&mut app, "<space>mRJzebra<ret>").await?);
+    assert_eq!(focused_file_name(&app), "beta.rs");
+    assert_eq!(focused_cursor_line(&app), 1);
+    assert!(app.editor.diff.reviews.focused.is_some());
+
+    harness.close(&mut app).await?;
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn bracket_c_leaves_a_diff_to_reach_a_comment_in_another_file() -> anyhow::Result<()> {
     // A single-pane diff reuses the view. Switching its document in place would

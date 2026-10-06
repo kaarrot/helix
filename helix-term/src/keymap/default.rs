@@ -263,6 +263,9 @@ pub fn default() -> HashMap<Mode, KeyTrie> {
                 "q" => close_diff_or_merge_view,
                 "R" => { "Review"
                     "c" => review_add,
+                    "D" => review_delete,
+                    "j" => review_comment_picker_file,
+                    "J" => review_comment_picker_all,
                     "S" => review_send_all,
                     "t" => review_toggle_collapse,
                     "h" => review_toggle_visible,

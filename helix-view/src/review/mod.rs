@@ -484,13 +484,17 @@ struct StoreSnapshot {
 ///
 /// While this is set the thread there renders as the input rather than as
 /// itself, so composing a one-line reply does not leave a tall answer sitting
-/// underneath the box being typed into.
+/// underneath the box being typed into -- until the reader steps through the
+/// thread's entries, which is asking to see them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Composing {
     pub file: PathBuf,
     pub rev: ReviewRev,
     pub line: u32,
     pub rows: usize,
+    /// The thread's entries were stepped through while typing, so its box is
+    /// drawn under the input, showing the entry stepped to.
+    pub peek: bool,
 }
 
 /// One painted box row, as the mouse would find it.

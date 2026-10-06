@@ -1743,16 +1743,30 @@ pub fn review_next_message(cx: &mut Context) {
     review_step_message(cx, true);
 }
 
+/// `Space-m-R D`: delete the whole thread at the cursor, every entry at once,
+/// where `d` on a focused box takes one entry at a time.
 pub fn review_delete(cx: &mut Context) {
     let Some(id) = thread_at_cursor(cx) else {
         cx.editor.set_error("No review comment on this line");
         return;
     };
+    let entries = cx
+        .editor
+        .diff
+        .reviews
+        .get(id)
+        .map_or(0, |thread| thread.entry_count());
     cx.editor.diff.reviews.remove(id);
     let doc = doc_mut!(cx.editor);
     doc.review_anchors.retain(|anchor| anchor.thread != id);
+    if cx.editor.diff.reviews.focused == Some(id) {
+        cx.editor.diff.reviews.focused = None;
+    }
     crate::review_agent::schedule_save();
-    cx.editor.set_status("Comment deleted");
+    cx.editor.set_status(match entries {
+        1 => "Thread deleted".to_string(),
+        n => format!("Thread deleted ({n} entries)"),
+    });
 }
 
 /// One review comment `]C` / `[C` can land on.
@@ -2054,6 +2068,30 @@ fn show_stop(editor: &mut Editor, stop: &ReviewStop) -> bool {
     }
 }
 
+/// [`show_stop`] for a picker's split actions: open the comment's file in a new
+/// split rather than reusing a pane that already shows it.
+fn show_stop_in_split(editor: &mut Editor, stop: &ReviewStop, action: Action) -> bool {
+    let doc_id = document_for_snapshot(editor, &stop.file, &stop.rev).map(|doc| doc.id());
+    if let Some(doc_id) = doc_id {
+        editor.switch(doc_id, action);
+    } else if stop.rev != ReviewRev::Worktree {
+        editor.set_error(format!(
+            "That review comment is on {} @ {}, which is not open",
+            stop.file.display(),
+            stop.rev.short()
+        ));
+        return false;
+    } else if let Err(err) = editor.open(&stop.file, action) {
+        editor.set_error(format!(
+            "Cannot open {} for its review comment: {err}",
+            stop.file.display()
+        ));
+        return false;
+    }
+    move_to_review_line(editor, stop.line, false);
+    true
+}
+
 fn goto_review_comment_impl(cx: &mut Context, forward: bool) {
     let threads = threads_in_view(cx);
     if threads.is_empty() {
@@ -2139,6 +2177,152 @@ pub fn goto_next_review_comment(cx: &mut Context) {
 
 pub fn goto_prev_review_comment(cx: &mut Context) {
     goto_review_comment_across_buffers(cx, false);
+}
+
+/// One row of the review comment picker.
+struct CommentPick {
+    stop: ReviewStop,
+    /// Where it is, as the picker shows it: the line alone for this file,
+    /// the path too when listing every file.
+    location: String,
+    state: String,
+    /// First line of the comment that started the thread, which is what names
+    /// it to the reader.
+    text: String,
+}
+
+fn comment_pick(editor: &Editor, stop: ReviewStop, with_path: bool) -> Option<CommentPick> {
+    let thread = editor.diff.reviews.get(stop.id)?;
+    let text = thread
+        .messages
+        .first()
+        .map(|message| message.text.as_str())
+        .or(thread.draft.as_deref())
+        .unwrap_or("")
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("")
+        .to_string();
+
+    let mut state = vec![match thread.entry_count() {
+        1 => "1 entry".to_string(),
+        n => format!("{n} entries"),
+    }];
+    if thread.is_pending() {
+        state.push("draft".into());
+    }
+    if thread.awaiting {
+        state.push("awaiting reply".into());
+    }
+    if thread.orphaned {
+        state.push("orphaned".into());
+    }
+    if thread.temporary {
+        state.push("this session".into());
+    }
+
+    let rev = match &stop.rev {
+        ReviewRev::Commit(_) => format!(" @ {}", stop.rev.short()),
+        ReviewRev::Worktree => String::new(),
+    };
+    let location = if with_path {
+        let path = helix_stdx::path::get_relative_path(&stop.file);
+        format!("{}:{}{rev}", path.display(), stop.line + 1)
+    } else {
+        format!("{}{rev}", stop.line + 1)
+    };
+    Some(CommentPick {
+        location,
+        state: state.join(" · "),
+        text,
+        stop,
+    })
+}
+
+/// `Space-m-R j` / `J`: pick a review comment from this file, or from every
+/// file in the conversation, and land on its box as `]C` does.
+///
+/// The thread the cursor is on is picked out when the list opens -- the box
+/// stopped on if there is one -- so the picker starts from where the reader
+/// already is rather than from the top.
+fn review_comment_picker(cx: &mut Context, all: bool) {
+    use crate::ui::{overlay::overlaid, picker::PathOrId, Picker, PickerColumn};
+
+    // The conversation on screen should be this branch's before it is listed.
+    cx.editor.follow_review_branch();
+    if cx.editor.diff.reviews.hidden {
+        cx.editor.set_error("Review comments are hidden");
+        return;
+    }
+    let here = identity(cx);
+    if !all && here.is_none() {
+        cx.editor
+            .set_error("This buffer has no file path to list comments for");
+        return;
+    }
+    let current = thread_at_cursor(cx);
+
+    let stops = review_stops(cx.editor).into_iter().filter(|stop| {
+        all || here
+            .as_ref()
+            .is_some_and(|(file, rev)| &stop.file == file && &stop.rev == rev)
+    });
+    let items: Vec<CommentPick> = stops
+        .filter_map(|stop| comment_pick(cx.editor, stop, all))
+        .collect();
+    if items.is_empty() {
+        cx.editor.set_error(if all {
+            "No review comments"
+        } else {
+            "No review comments in this file"
+        });
+        return;
+    }
+
+    let columns = [
+        PickerColumn::new(
+            if all { "location" } else { "line" },
+            |item: &CommentPick, _| item.location.as_str().into(),
+        ),
+        PickerColumn::new("comment", |item: &CommentPick, _| item.text.as_str().into()),
+        PickerColumn::new("state", |item: &CommentPick, _| item.state.as_str().into()),
+    ];
+
+    let picker = Picker::new(columns, 1, items, (), |cx, item: &CommentPick, action| {
+        let stop = &item.stop;
+        let shown = match action {
+            Action::Replace => show_stop(cx.editor, stop),
+            _ => show_stop_in_split(cx.editor, stop, action),
+        };
+        if shown {
+            cx.editor.diff.reviews.focused = Some(stop.id);
+        }
+    })
+    .with_preview(|editor, item: &CommentPick| {
+        let stop = &item.stop;
+        let target = match document_for_snapshot(editor, &stop.file, &stop.rev) {
+            Some(doc) => PathOrId::Id(doc.id()),
+            None if stop.rev == ReviewRev::Worktree && !is_scratch_key(&stop.file) => {
+                PathOrId::Path(&stop.file)
+            }
+            None => return None,
+        };
+        Some((target, Some((stop.line, stop.line))))
+    });
+    let picker = match current {
+        Some(id) => picker.with_pre_select(move |item: &CommentPick| item.stop.id == id),
+        None => picker,
+    };
+    cx.push_layer(Box::new(overlaid(picker)));
+}
+
+pub fn review_comment_picker_file(cx: &mut Context) {
+    review_comment_picker(cx, false);
+}
+
+pub fn review_comment_picker_all(cx: &mut Context) {
+    review_comment_picker(cx, true);
 }
 
 /// Whether the cursor has stopped on the box below it.

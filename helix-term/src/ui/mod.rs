@@ -5,6 +5,7 @@ pub(crate) mod editor;
 mod info;
 pub mod lsp;
 mod markdown;
+mod markdown_preview;
 pub mod menu;
 pub mod overlay;
 pub mod picker;
@@ -22,7 +23,8 @@ pub use completion::Completion;
 pub use editor::EditorView;
 use helix_stdx::rope;
 use helix_view::theme::Style;
-pub use markdown::{layout_agent_markdown, Markdown};
+pub use markdown::{layout_agent_markdown, Markdown, MarkdownLink};
+pub use markdown_preview::MarkdownPreview;
 pub use menu::Menu;
 pub use picker::{Column as PickerColumn, FileLocation, Picker};
 pub use popup::Popup;
@@ -443,6 +445,13 @@ pub mod completers {
 
     pub fn none(_editor: &Editor, _input: &str) -> Vec<Completion> {
         Vec::new()
+    }
+
+    pub fn markdown_preview(_editor: &Editor, input: &str) -> Vec<Completion> {
+        fuzzy_match(input, ["split"], false)
+            .into_iter()
+            .map(|(name, _)| ((0..), Span::raw(name)))
+            .collect()
     }
 
     pub fn buffer(editor: &Editor, input: &str) -> Vec<Completion> {

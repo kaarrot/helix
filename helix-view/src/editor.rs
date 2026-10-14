@@ -1869,6 +1869,13 @@ impl Editor {
     }
 
     fn replace_document_in_view(&mut self, current_view: ViewId, doc_id: DocumentId) {
+        // Every way of putting another buffer in a view comes through here, so
+        // none can leave the view registered as a diff pane it no longer
+        // shows. `switch` suspends the diff first, so a jump back restores it;
+        // the rest (closing a buffer, the debugger showing a frame) end it.
+        if self.leaves_diff(current_view, doc_id) {
+            self.detach_diff_view(current_view);
+        }
         let scrolloff = self.config().scrolloff;
         let view = self.tree.get_mut(current_view);
 
@@ -1951,14 +1958,16 @@ impl Editor {
                     }
                 }
 
-                self.replace_document_in_view(view_id, id);
-
                 // Drop the session from this view but keep revision buffers so
                 // the same file can stay open at other commits. The diff is
                 // remembered, so jumping back to this buffer restores it.
+                // Before the buffer changes, or the view would only detach.
                 if leaving_diff {
                     self.suspend_diff_view(view_id);
                 }
+
+                self.replace_document_in_view(view_id, id);
+
                 if leaving_merge {
                     self.close_merge_session_leaving_view(view_id);
                 }
@@ -2153,6 +2162,21 @@ impl Editor {
 
         // This will also disallow any follow-up writes
         self.saves.remove(&doc_id);
+
+        // A diff whose buffer goes is over, whether a view shows that buffer
+        // or not (the base of a single-pane diff never is). Otherwise the view
+        // the buffer falls back to below stays registered as a diff pane. The
+        // teardown may close this same buffer; see below.
+        let diff_views: Vec<ViewId> = self
+            .diff
+            .views
+            .iter()
+            .filter(|(_, state)| state.base_doc_id == doc_id || state.working_doc_id == doc_id)
+            .map(|(&view_id, _)| view_id)
+            .collect();
+        for view_id in diff_views {
+            self.close_diff_view(view_id);
+        }
 
         enum Action {
             Close(ViewId),
@@ -3128,8 +3152,24 @@ impl Editor {
 
         let focused_view = self.tree.focus;
         self.forget_suspended_diffs(focused_view);
-        if self.diff.views.contains_key(&focused_view) {
+        if let Some(state) = self.diff.views.get_mut(&focused_view) {
+            // The diff being replaced closes its revision buffers with it, and
+            // the new one may be made of one of them: the base pane's revision
+            // is the buffer `:diff-buffer` there compares. Keep that one open.
+            for doc_id in [base_doc_id, working_doc_id] {
+                if state.base_doc_id == doc_id {
+                    state.close_base_doc_on_close = false;
+                }
+                if state.working_doc_id == doc_id {
+                    state.close_working_doc_on_close = false;
+                }
+            }
             self.close_diff_view(focused_view);
+        }
+        if !self.documents.contains_key(&base_doc_id)
+            || !self.documents.contains_key(&working_doc_id)
+        {
+            anyhow::bail!("A buffer to diff was closed with the previous diff");
         }
 
         self.link_shared_diff_handles(base_doc_id, working_doc_id);
@@ -3180,12 +3220,14 @@ impl Editor {
     }
 
     /// Whether showing `doc_id` in `view_id` takes the view out of the diff it
-    /// is part of. The two buffers of the diff do not.
+    /// is part of. Only the buffer of the view's own side keeps it there: a
+    /// base pane that jumps to the working buffer would show the same file as
+    /// its partner while still drawn as the base.
     pub fn leaves_diff(&self, view_id: ViewId, doc_id: DocumentId) -> bool {
         self.diff
             .views
             .get(&view_id)
-            .is_some_and(|state| doc_id != state.base_doc_id && doc_id != state.working_doc_id)
+            .is_some_and(|state| doc_id != state.doc_in_view(view_id))
     }
 
     /// Take `view_id` out of its diff because another buffer is about to be

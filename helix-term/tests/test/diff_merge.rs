@@ -2145,3 +2145,91 @@ async fn closing_the_working_file_ends_a_single_pane_diff() -> anyhow::Result<()
     harness.close(&mut app).await?;
     Ok(())
 }
+
+fn diff_base_text(app: &Application, doc_id: helix_view::DocumentId) -> Option<String> {
+    let doc = app.editor.document(doc_id).unwrap();
+    doc.diff_handle()
+        .map(|handle| handle.load().diff_base().to_string())
+}
+
+/// A buffer diff takes over the file's own diff against HEAD. Ending it
+/// dropped the diff altogether, so the gutter stayed blank until `:reload`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_file_gets_its_own_diff_back_after_a_buffer_diff() -> anyhow::Result<()> {
+    let repo = repo_with_a_file_to_jump_to()?;
+    let _cwd = CwdGuard::enter(repo.path()).await?;
+    let tracked = repo.file("tracked.txt");
+    let other = repo.file("other.txt");
+    let mut app = AppBuilder::new().with_file(&tracked, None).build()?;
+    let mut harness = AppTestHarness::new();
+    let tracked_doc_id = app.editor.tree.get(app.editor.tree.focus).doc;
+    let head: String = (0..60).map(|n| format!("line {n}\n")).collect();
+    app.editor.open(&other, Action::Load)?;
+
+    let command = format!(":diff-buffer {}<ret>", other.display());
+    assert!(harness.send_keys(&mut app, &command).await?);
+    assert_eq!(app.editor.diff.views.len(), 2);
+    assert_eq!(
+        diff_base_text(&app, tracked_doc_id).as_deref(),
+        Some("other\n")
+    );
+
+    let diff_state = main_diff_state(&app);
+    app.editor.focus(diff_state.working_view_id);
+    assert!(harness.send_keys(&mut app, "<space>mq").await?);
+    assert!(app.editor.diff.views.is_empty());
+    assert_eq!(diff_base_text(&app, tracked_doc_id), Some(head));
+
+    harness.close(&mut app).await?;
+    Ok(())
+}
+
+/// Leaving a diff against an older commit left the file diffed against that
+/// commit, with nothing on screen to say so, and the revision kept its
+/// character-diff colouring.
+#[tokio::test(flavor = "multi_thread")]
+async fn leaving_a_diff_against_an_older_commit_goes_back_to_head() -> anyhow::Result<()> {
+    let repo = GitRepoFixture::new()?;
+    repo.write_file("tracked.txt", "one\n")?;
+    repo.write_file("other.txt", "other\n")?;
+    repo.commit_all("initial")?;
+    let older = repo.rev_parse("HEAD")?;
+    repo.write_file("tracked.txt", "two\n")?;
+    repo.commit_all("second")?;
+    repo.write_file("tracked.txt", "three\n")?;
+
+    let _cwd = CwdGuard::enter(repo.path()).await?;
+    let tracked = repo.file("tracked.txt");
+    let mut app = AppBuilder::new().with_file(&tracked, None).build()?;
+    let mut harness = AppTestHarness::new();
+
+    app.editor.open_diff_view(&tracked, &older, Some(true))?;
+    let diff_state = main_diff_state(&app);
+    assert_eq!(
+        diff_base_text(&app, diff_state.working_doc_id).as_deref(),
+        Some("one\n")
+    );
+
+    open_other(&mut app, &mut harness, &repo.file("other.txt")).await?;
+    assert!(app.editor.diff.views.is_empty());
+    assert_eq!(
+        diff_base_text(&app, diff_state.working_doc_id).as_deref(),
+        Some("two\n")
+    );
+    let revision = app.editor.document(diff_state.base_doc_id).unwrap();
+    assert!(!revision.char_diff_enabled);
+    assert!(!revision.char_diff_minus_side);
+    assert!(revision.diff_handle().is_none());
+
+    // Jumping back still finds the diff, against the same commit.
+    assert!(harness.send_keys(&mut app, "<C-o>").await?);
+    assert_eq!(app.editor.diff.views.len(), 2);
+    assert_eq!(
+        diff_base_text(&app, diff_state.working_doc_id).as_deref(),
+        Some("one\n")
+    );
+
+    assert!(harness.send_keys(&mut app, "<C-w>o").await?);
+    harness.close(&mut app).await?;
+    Ok(())
+}

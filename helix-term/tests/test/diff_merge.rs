@@ -1624,3 +1624,203 @@ async fn buffer_close_in_range_diff_pane_does_not_panic() -> anyhow::Result<()> 
     harness.close(&mut app).await?;
     Ok(())
 }
+
+/// A repository with a tracked file of numbered lines, one of them changed in
+/// the working tree, and a second file to jump to.
+fn repo_with_a_file_to_jump_to() -> anyhow::Result<GitRepoFixture> {
+    let repo = GitRepoFixture::new()?;
+    let text: String = (0..60).map(|n| format!("line {n}\n")).collect();
+    repo.write_file("tracked.txt", &text)?;
+    repo.write_file("other.txt", "other\n")?;
+    repo.commit_all("initial")?;
+    repo.write_file("tracked.txt", &text.replace("line 30\n", "changed\n"))?;
+    Ok(repo)
+}
+
+async fn open_changed_file_diff(
+    app: &mut Application,
+    harness: &mut AppTestHarness,
+    split: bool,
+) -> anyhow::Result<()> {
+    assert!(harness.send_keys(app, "<space>g").await?);
+    assert!(harness.wait_for_idle(app).await?);
+    assert!(harness.send_keys(app, "<ret>").await?);
+    if split {
+        assert!(harness.send_keys(app, "<space>mv").await?);
+    }
+    Ok(())
+}
+
+async fn open_other(
+    app: &mut Application,
+    harness: &mut AppTestHarness,
+    other: &Path,
+) -> anyhow::Result<()> {
+    assert!(
+        harness
+            .send_keys(app, &format!(":o {}<ret>", other.display()))
+            .await?
+    );
+    Ok(())
+}
+
+/// Going to another file with the working pane of a split diff takes the diff
+/// apart. Jumping back to the file used to leave it a plain buffer, to be
+/// diffed again from the top with `<space>g`. It brings the diff back instead,
+/// around the same view, so the place in the file is not lost.
+#[tokio::test(flavor = "multi_thread")]
+async fn jumping_back_to_a_split_diff_restores_it() -> anyhow::Result<()> {
+    let repo = repo_with_a_file_to_jump_to()?;
+    let _cwd = CwdGuard::enter(repo.path()).await?;
+    let mut app = AppBuilder::new()
+        .with_file(repo.file("tracked.txt"), None)
+        .build()?;
+    let mut harness = AppTestHarness::new();
+
+    open_changed_file_diff(&mut app, &mut harness, true).await?;
+    assert!(harness.send_keys(&mut app, "40gg").await?);
+    let before = main_diff_state(&app);
+    let working_view = before.working_view_id;
+    assert_eq!(app.editor.tree.focus, working_view);
+
+    open_other(&mut app, &mut harness, &repo.file("other.txt")).await?;
+    assert!(app.editor.diff.views.is_empty());
+    assert_eq!(app.editor.tree.views().count(), 1);
+
+    assert!(harness.send_keys(&mut app, "<C-o>").await?);
+    assert_eq!(app.editor.diff.views.len(), 2, "the diff should be back");
+    assert_eq!(app.editor.tree.views().count(), 2);
+    assert_eq!(
+        app.editor.tree.focus, working_view,
+        "the view the user was in keeps the focus"
+    );
+    let diff_state = main_diff_state(&app);
+    assert!(diff_state.base_view_id != diff_state.working_view_id);
+    assert_eq!(diff_state.working_view_id, working_view);
+    assert_eq!(diff_state.working_doc_id, before.working_doc_id);
+    assert_eq!(
+        app.editor.tree.get(working_view).doc,
+        before.working_doc_id,
+        "the working pane shows the file again"
+    );
+    assert_eq!(
+        app.editor.tree.get(diff_state.base_view_id).doc,
+        diff_state.base_doc_id
+    );
+    assert!(
+        app.editor.tree.get(diff_state.base_view_id).area.x
+            < app.editor.tree.get(working_view).area.x,
+        "the base pane sits on the left"
+    );
+    assert!(
+        app.editor
+            .document(diff_state.working_doc_id)
+            .unwrap()
+            .char_diff_enabled
+    );
+    assert_eq!(
+        current_cursor_line(&app),
+        39,
+        "the cursor stayed on its line"
+    );
+    assert_split_diff_cursor_line(&app, 39);
+
+    assert!(harness.send_keys(&mut app, "<C-w>o").await?);
+    harness.close(&mut app).await?;
+    Ok(())
+}
+
+/// The jump out of a restored diff takes it apart again, as the first one did,
+/// and the next jump back finds it once more.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_diff_can_be_left_and_restored_by_jumping_back_and_forth() -> anyhow::Result<()> {
+    let repo = repo_with_a_file_to_jump_to()?;
+    let _cwd = CwdGuard::enter(repo.path()).await?;
+    let other = repo.file("other.txt");
+    let mut app = AppBuilder::new()
+        .with_file(repo.file("tracked.txt"), None)
+        .build()?;
+    let mut harness = AppTestHarness::new();
+
+    open_changed_file_diff(&mut app, &mut harness, true).await?;
+    open_other(&mut app, &mut harness, &other).await?;
+    assert!(harness.send_keys(&mut app, "<C-o>").await?);
+    assert_eq!(app.editor.diff.views.len(), 2);
+
+    assert!(harness.send_keys(&mut app, "<C-i>").await?);
+    assert_current_doc_path(&app, &other);
+    assert!(
+        app.editor.diff.views.is_empty(),
+        "a jump to another file ended the diff only in the view it was left from"
+    );
+    assert_eq!(app.editor.tree.views().count(), 1);
+
+    assert!(harness.send_keys(&mut app, "<C-o>").await?);
+    assert_eq!(app.editor.diff.views.len(), 2);
+    assert_eq!(app.editor.tree.views().count(), 2);
+    assert_current_doc_path(&app, &repo.file("tracked.txt"));
+
+    assert!(harness.send_keys(&mut app, "<C-w>o").await?);
+    harness.close(&mut app).await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn jumping_back_to_a_single_pane_diff_restores_it() -> anyhow::Result<()> {
+    let repo = repo_with_a_file_to_jump_to()?;
+    let _cwd = CwdGuard::enter(repo.path()).await?;
+    let mut app = AppBuilder::new()
+        .with_file(repo.file("tracked.txt"), None)
+        .build()?;
+    let mut harness = AppTestHarness::new();
+
+    open_changed_file_diff(&mut app, &mut harness, false).await?;
+    let view = app.editor.tree.focus;
+    assert!(harness.send_keys(&mut app, "40gg").await?);
+    open_other(&mut app, &mut harness, &repo.file("other.txt")).await?;
+    assert!(app.editor.diff.views.is_empty());
+
+    assert!(harness.send_keys(&mut app, "<C-o>").await?);
+    assert_eq!(app.editor.tree.views().count(), 1);
+    assert_eq!(app.editor.tree.focus, view);
+    let diff_state = main_diff_state(&app);
+    assert!(diff_state.base_view_id == diff_state.working_view_id);
+    assert_eq!(current_cursor_line(&app), 39);
+
+    harness.close(&mut app).await?;
+    Ok(())
+}
+
+/// Only the diff a view was last taken out of is worth jumping back to. One
+/// opened or closed since is the user's newer choice, which a jump back must
+/// not undo.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_diff_opened_or_closed_since_is_not_brought_back() -> anyhow::Result<()> {
+    let repo = repo_with_a_file_to_jump_to()?;
+    let _cwd = CwdGuard::enter(repo.path()).await?;
+    let tracked = repo.file("tracked.txt");
+    let mut app = AppBuilder::new().with_file(&tracked, None).build()?;
+    let mut harness = AppTestHarness::new();
+
+    open_changed_file_diff(&mut app, &mut harness, true).await?;
+    open_other(&mut app, &mut harness, &repo.file("other.txt")).await?;
+    assert_eq!(app.editor.diff.suspended.len(), 1);
+
+    // Diffing the file again from where the view is, ...
+    app.editor.open_diff_view(&tracked, "HEAD", Some(false))?;
+    assert!(app.editor.diff.suspended.is_empty());
+    // ... and leaving that, is a diff of its own to jump back to.
+    open_other(&mut app, &mut harness, &repo.file("other.txt")).await?;
+    assert_eq!(app.editor.diff.suspended.len(), 1);
+
+    // Closing the view ends it. The split takes the focus, so go back to
+    // the view that was left before closing it.
+    assert!(harness.send_keys(&mut app, ":vsplit<ret>").await?);
+    assert_eq!(app.editor.diff.suspended.len(), 1);
+    assert!(harness.send_keys(&mut app, "<C-w>h<C-w>q").await?);
+    assert!(app.editor.diff.suspended.is_empty());
+
+    assert!(harness.send_keys(&mut app, "<C-w>o").await?);
+    harness.close(&mut app).await?;
+    Ok(())
+}

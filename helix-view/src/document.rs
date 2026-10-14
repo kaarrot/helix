@@ -1251,6 +1251,13 @@ impl Document {
         view: &mut View,
         provider_registry: &DiffProviderRegistry,
     ) -> Result<(), Error> {
+        // Nothing to read back: the cache file only holds what the snapshot
+        // already shows. Reading it would also replace the diff the snapshot
+        // is one side of with one against the cache file's repository, which
+        // is none, and its gutter would go blank.
+        if self.is_virtual_base {
+            return Ok(());
+        }
         let encoding = self.encoding;
         let path = match self.path() {
             None => return Ok(()),

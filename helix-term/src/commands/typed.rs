@@ -590,11 +590,11 @@ fn focused_file_revision(editor: &Editor) -> (Option<PathBuf>, Option<String>) {
         }
     }
 
-    if let Some((path, rev)) = editor
+    if let Some(revision) = editor
         .document(view.doc)
         .and_then(|doc| doc.git_revision.clone())
     {
-        return (Some(path), Some(rev));
+        return (Some(revision.path), Some(revision.git_ref));
     }
 
     // Merge panes are index stages rather than commits, so only the path of the

@@ -1340,9 +1340,22 @@ impl Document {
         self.pickup_last_saved_time();
         self.detect_indent_and_line_ending();
 
-        match provider_registry.get_diff_base(&path) {
-            Some(diff_base) => self.set_diff_base(diff_base),
-            None => self.diff_handle = None,
+        // A diff this document is one side of owns its handle, a worker shared
+        // with the other side, whose base is that side's text. The new text
+        // already reached it through `apply` above. Giving it HEAD as its
+        // base would redraw both gutters and the spacers against HEAD while
+        // the other pane still shows the other side, or, for a file outside
+        // a repository, drop the diff.
+        if self.linked_diff_doc.is_none() {
+            // Stay on the ref `:diff-base` set, if it still names something.
+            let base_ref = self.diff_base_ref.clone();
+            if !base_ref.is_some_and(|base_ref| self.set_diff_base_from_ref(base_ref).is_ok()) {
+                self.diff_base_ref = None;
+                match provider_registry.get_diff_base(&path) {
+                    Some(diff_base) => self.set_diff_base(diff_base),
+                    None => self.diff_handle = None,
+                }
+            }
         }
 
         self.version_control_head = provider_registry.get_current_head_name(&path);

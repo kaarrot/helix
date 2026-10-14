@@ -3404,6 +3404,7 @@ impl Editor {
         if let Some(diff_state) = self.diff.views.remove(&view_id) {
             self.diff.views.remove(&diff_state.base_view_id);
             self.diff.views.remove(&diff_state.working_view_id);
+            self.unlink_diff_documents(&diff_state);
             if diff_state.base_view_id != diff_state.working_view_id {
                 let other = if view_id == diff_state.base_view_id {
                     diff_state.working_view_id
@@ -3414,6 +3415,56 @@ impl Editor {
                     self.close(other);
                 }
             }
+        }
+    }
+
+    /// Undo what opening the diff did to its two documents, so that neither
+    /// keeps its diff colouring once it is no longer part of the diff.
+    fn unlink_diff_documents(&mut self, diff_state: &crate::diff_view::DiffViewState) {
+        for doc_id in [diff_state.base_doc_id, diff_state.working_doc_id] {
+            // The same file diffed against the same ref in another view shares
+            // these buffers. That diff still needs them as they are.
+            let in_another_diff = self
+                .diff
+                .views
+                .values()
+                .any(|other| other.base_doc_id == doc_id || other.working_doc_id == doc_id);
+            if !in_another_diff {
+                self.restore_own_diff(doc_id);
+            }
+        }
+    }
+
+    /// Put a document back on the diff it has on its own: a file against HEAD,
+    /// or the ref `:diff-base` set, and nothing for a revision or a scratch
+    /// buffer.
+    ///
+    /// Its handle is the worker the diff shares between both sides. Giving that
+    /// one a new base would change the other side's diff too, and leaving it
+    /// kept the file diffed against the other buffer, or a commit no longer on
+    /// screen, with nothing to show for it.
+    fn restore_own_diff(&mut self, doc_id: DocumentId) {
+        let Some(doc) = self.documents.get_mut(&doc_id) else {
+            return;
+        };
+        doc.linked_diff_doc = None;
+        doc.char_diff_enabled = false;
+        doc.char_diff_minus_side = false;
+        let base_ref = doc.diff_base_ref().map(str::to_owned);
+        doc.clear_diff_handle();
+        if doc.is_virtual_base {
+            return;
+        }
+        let Some(path) = doc.path().cloned() else {
+            return;
+        };
+        if let Some(base_ref) = base_ref {
+            if doc.set_diff_base_from_ref(base_ref).is_ok() {
+                return;
+            }
+        }
+        if let Some(diff_base) = self.diff_providers.get_diff_base(&path) {
+            doc.set_diff_base(diff_base);
         }
     }
 
@@ -3445,24 +3496,7 @@ impl Editor {
             // Closing a diff is the end of it: nothing is left to jump back to.
             self.forget_suspended_diffs(diff_state.base_view_id);
             self.forget_suspended_diffs(diff_state.working_view_id);
-            let source = diff_state.source;
-
-            if let Some(doc) = self.documents.get_mut(&diff_state.base_doc_id) {
-                doc.linked_diff_doc = None;
-                if matches!(source, crate::diff_view::DiffViewSource::Buffers) {
-                    doc.char_diff_enabled = false;
-                    doc.char_diff_minus_side = false;
-                    doc.clear_diff_handle();
-                }
-            }
-            if let Some(doc) = self.documents.get_mut(&diff_state.working_doc_id) {
-                doc.linked_diff_doc = None;
-                doc.char_diff_enabled = false;
-                doc.char_diff_minus_side = false;
-                if matches!(source, crate::diff_view::DiffViewSource::Buffers) {
-                    doc.clear_diff_handle();
-                }
-            }
+            self.unlink_diff_documents(&diff_state);
 
             if diff_state.close_base_doc_on_close {
                 let _ = self.close_document(diff_state.base_doc_id, true);

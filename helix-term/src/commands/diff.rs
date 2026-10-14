@@ -712,29 +712,6 @@ struct DiffTogglePosition {
     view_offset: helix_view::view::ViewPosition,
 }
 
-fn map_position_between_documents(
-    editor: &Editor,
-    source_doc_id: DocumentId,
-    target_doc_id: DocumentId,
-    source_pos: usize,
-) -> Option<usize> {
-    let source_doc = editor.document(source_doc_id)?;
-    let target_doc = editor.document(target_doc_id)?;
-    let source_text = source_doc.text();
-    let target_text = target_doc.text();
-
-    let source_pos = source_pos.min(source_text.len_chars());
-    let source_line = source_text.char_to_line(source_pos);
-    let source_line_start = source_text.line_to_char(source_line);
-    let source_col = source_pos.saturating_sub(source_line_start);
-
-    let target_line = editor.map_line_between_documents(source_doc_id, target_doc_id, source_line);
-    let target_line_start = target_text.line_to_char(target_line);
-    let target_line_end = target_text.line_to_char((target_line + 1).min(target_text.len_lines()));
-
-    Some((target_line_start + source_col).min(target_line_end))
-}
-
 fn capture_diff_toggle_position(
     editor: &Editor,
     view_id: ViewId,
@@ -761,14 +738,12 @@ fn capture_diff_toggle_position(
     }
 
     let cursor = selection.primary().cursor(doc.text().slice(..));
-    let target_cursor = map_position_between_documents(
-        editor,
+    let target_cursor = editor.map_position_between_documents(
         diff_state.base_doc_id,
         diff_state.working_doc_id,
         cursor,
     )?;
-    let target_anchor = map_position_between_documents(
-        editor,
+    let target_anchor = editor.map_position_between_documents(
         diff_state.base_doc_id,
         diff_state.working_doc_id,
         view_offset.anchor,
@@ -808,9 +783,8 @@ fn restore_diff_toggle_position(editor: &mut Editor, position: DiffTogglePositio
     let paired_position = paired.and_then(|(paired_doc_id, paired_view_id)| {
         let doc = editor.document(doc_id)?;
         let cursor = position.selection.primary().cursor(doc.text().slice(..));
-        let mapped_cursor = map_position_between_documents(editor, doc_id, paired_doc_id, cursor)?;
-        let mapped_anchor = map_position_between_documents(
-            editor,
+        let mapped_cursor = editor.map_position_between_documents(doc_id, paired_doc_id, cursor)?;
+        let mapped_anchor = editor.map_position_between_documents(
             doc_id,
             paired_doc_id,
             position.view_offset.anchor,

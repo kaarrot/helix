@@ -5643,47 +5643,51 @@ fn match_brackets(cx: &mut Context) {
 
 //
 
+/// Show a jumplist entry in the current view.
+///
+/// Another buffer takes the view out of its diff, as switching buffers does,
+/// and coming back to the buffer it left puts the diff back around the view.
+fn show_jump(cx: &mut Context, from_doc: DocumentId, doc_id: DocumentId, selection: Selection) {
+    let scrolloff = cx.editor.config().scrolloff;
+    let view_id = view!(cx.editor).id;
+    if cx.editor.leaves_diff(view_id, doc_id) {
+        cx.editor.suspend_diff_view(view_id);
+    }
+
+    view_mut!(cx.editor).doc = doc_id;
+    let (view, doc) = current!(cx.editor); // refetch doc
+
+    if doc.id() != from_doc {
+        view.add_to_history(from_doc);
+    }
+
+    doc.set_selection(view.id, selection);
+    // Document we switch to might not have been opened in the view before
+    doc.ensure_view_init(view.id);
+    view.ensure_cursor_in_view_center(doc, scrolloff);
+
+    cx.editor.resume_diff_view(view_id);
+}
+
 fn jump_forward(cx: &mut Context) {
     let count = cx.count();
-    let config = cx.editor.config();
     let view = view_mut!(cx.editor);
     let doc_id = view.doc;
 
     if let Some((id, selection)) = view.jumps.forward(count) {
-        view.doc = *id;
-        let selection = selection.clone();
-        let (view, doc) = current!(cx.editor); // refetch doc
-
-        if doc.id() != doc_id {
-            view.add_to_history(doc_id);
-        }
-
-        doc.set_selection(view.id, selection);
-        // Document we switch to might not have been opened in the view before
-        doc.ensure_view_init(view.id);
-        view.ensure_cursor_in_view_center(doc, config.scrolloff);
+        let (id, selection) = (*id, selection.clone());
+        show_jump(cx, doc_id, id, selection);
     };
 }
 
 fn jump_backward(cx: &mut Context) {
     let count = cx.count();
-    let config = cx.editor.config();
     let (view, doc) = current!(cx.editor);
     let doc_id = doc.id();
 
     if let Some((id, selection)) = view.jumps.backward(view.id, doc, count) {
-        view.doc = *id;
-        let selection = selection.clone();
-        let (view, doc) = current!(cx.editor); // refetch doc
-
-        if doc.id() != doc_id {
-            view.add_to_history(doc_id);
-        }
-
-        doc.set_selection(view.id, selection);
-        // Document we switch to might not have been opened in the view before
-        doc.ensure_view_init(view.id);
-        view.ensure_cursor_in_view_center(doc, config.scrolloff);
+        let (id, selection) = (*id, selection.clone());
+        show_jump(cx, doc_id, id, selection);
     };
 }
 

@@ -1916,10 +1916,7 @@ impl Editor {
                             .tree
                             .traverse()
                             .any(|(_, v)| v.doc == current_doc_id && v.id != view_id);
-                    let leaving_diff =
-                        self.diff.views.get(&view_id).is_some_and(|state| {
-                            id != state.base_doc_id && id != state.working_doc_id
-                        });
+                    let leaving_diff = self.leaves_diff(view_id, id);
                     let leaving_merge = self.diff.merge_views.get(&view_id).is_some_and(|state| {
                         id != state.ours_doc_id
                             && id != state.theirs_doc_id
@@ -1962,9 +1959,10 @@ impl Editor {
                 self.replace_document_in_view(view_id, id);
 
                 // Drop the session from this view but keep revision buffers so
-                // the same file can stay open at other commits.
+                // the same file can stay open at other commits. The diff is
+                // remembered, so jumping back to this buffer restores it.
                 if leaving_diff {
-                    self.detach_diff_view(view_id);
+                    self.suspend_diff_view(view_id);
                 }
                 if leaving_merge {
                     self.close_merge_session_leaving_view(view_id);
@@ -2119,6 +2117,7 @@ impl Editor {
         }
         let views_before = self.tree.views().count();
         let mut closed_session = false;
+        self.forget_suspended_diffs(id);
         // Clean up any diff/merge session that owns this view.
         if self.diff.views.contains_key(&id) {
             closed_session |= self.close_diff_view(id);
@@ -2933,6 +2932,7 @@ impl Editor {
         let working_path = helix_stdx::path::canonicalize(working_path);
 
         let focused_view = self.tree.focus;
+        self.forget_suspended_diffs(focused_view);
         if self.diff.views.contains_key(&focused_view) {
             self.detach_diff_view(focused_view);
         }
@@ -3501,6 +3501,7 @@ impl Editor {
         let target_path = helix_stdx::path::canonicalize(target_path);
 
         let focused_view = self.tree.focus;
+        self.forget_suspended_diffs(focused_view);
         if self.diff.views.contains_key(&focused_view) {
             self.detach_diff_view(focused_view);
         }
@@ -3598,6 +3599,7 @@ impl Editor {
         }
 
         let focused_view = self.tree.focus;
+        self.forget_suspended_diffs(focused_view);
         if self.diff.views.contains_key(&focused_view) {
             self.close_diff_view(focused_view);
         }
@@ -3655,6 +3657,184 @@ impl Editor {
         }
 
         Ok(())
+    }
+
+    /// Whether showing `doc_id` in `view_id` takes the view out of the diff it
+    /// is part of. The two buffers of the diff do not.
+    pub fn leaves_diff(&self, view_id: ViewId, doc_id: DocumentId) -> bool {
+        self.diff
+            .views
+            .get(&view_id)
+            .is_some_and(|state| doc_id != state.base_doc_id && doc_id != state.working_doc_id)
+    }
+
+    /// Take `view_id` out of its diff because another buffer is about to be
+    /// shown in it, and remember the diff.
+    ///
+    /// The view's jumplist still points back at the buffer it showed. Jumping
+    /// there again finds the diff here and [`Self::resume_diff_view`] puts it
+    /// back, rather than leaving a plain buffer to be diffed all over again,
+    /// from the top.
+    pub fn suspend_diff_view(&mut self, view_id: ViewId) {
+        use crate::diff_view::SuspendedDiff;
+
+        let Some(state) = self.diff.views.get(&view_id).cloned() else {
+            return;
+        };
+        let suspended = SuspendedDiff { view_id, state };
+        let shown = suspended.shown_doc();
+        self.diff
+            .suspended
+            .retain(|other| other.view_id != view_id || other.shown_doc() != shown);
+        self.diff.suspended.push(suspended);
+        if self.diff.suspended.len() > SuspendedDiff::LIMIT {
+            self.diff.suspended.remove(0);
+        }
+        self.detach_diff_view(view_id);
+    }
+
+    /// Forget the diffs `view_id` was taken out of. The view starts or ends a
+    /// diff of its own, or is gone, so they are not the ones to come back to.
+    fn forget_suspended_diffs(&mut self, view_id: ViewId) {
+        self.diff
+            .suspended
+            .retain(|suspended| suspended.view_id != view_id);
+    }
+
+    /// The position in `target_doc_id` that matches `source_pos` in
+    /// `source_doc_id`: the same column on the line the diff pairs with the
+    /// source line.
+    pub fn map_position_between_documents(
+        &self,
+        source_doc_id: DocumentId,
+        target_doc_id: DocumentId,
+        source_pos: usize,
+    ) -> Option<usize> {
+        let source_doc = self.document(source_doc_id)?;
+        let target_doc = self.document(target_doc_id)?;
+        let source_text = source_doc.text();
+        let target_text = target_doc.text();
+
+        let source_pos = source_pos.min(source_text.len_chars());
+        let source_line = source_text.char_to_line(source_pos);
+        let source_line_start = source_text.line_to_char(source_line);
+        let source_col = source_pos.saturating_sub(source_line_start);
+
+        let target_line =
+            self.map_line_between_documents(source_doc_id, target_doc_id, source_line);
+        let target_line_start = target_text.line_to_char(target_line);
+        let target_line_end =
+            target_text.line_to_char((target_line + 1).min(target_text.len_lines()));
+
+        Some((target_line_start + source_col).min(target_line_end))
+    }
+
+    /// Put back the diff `view_id` was taken out of by
+    /// [`Self::suspend_diff_view`], now that it shows the buffer it left.
+    /// Returns whether a diff was restored.
+    ///
+    /// The view keeps everything it has: its cursor, scroll and jumplist. A
+    /// working pane gets its base pane back beside it; a base pane finds the
+    /// working pane where it was left. Neither is rebuilt from the top the way
+    /// opening the diff again would.
+    pub fn resume_diff_view(&mut self, view_id: ViewId) -> bool {
+        use crate::diff_view::DiffViewSource;
+
+        if self.tree.focus != view_id || self.diff.views.contains_key(&view_id) {
+            return false;
+        }
+        let Some(doc_id) = self.tree.try_get(view_id).map(|view| view.doc) else {
+            return false;
+        };
+        let Some(index) =
+            self.diff.suspended.iter().position(|suspended| {
+                suspended.view_id == view_id && suspended.shown_doc() == doc_id
+            })
+        else {
+            return false;
+        };
+        let mut state = self.diff.suspended.remove(index).state;
+
+        if view_id != state.working_view_id {
+            // The base pane came back. The working pane never left the tree,
+            // unless it has since been closed or been given another diff.
+            let partner = state.working_view_id;
+            let partner_is_intact = !self.diff.views.contains_key(&partner)
+                && self
+                    .tree
+                    .try_get(partner)
+                    .is_some_and(|view| view.doc == state.working_doc_id)
+                && self.documents.contains_key(&state.working_doc_id);
+            if !partner_is_intact {
+                return false;
+            }
+            self.link_shared_diff_handles(state.base_doc_id, state.working_doc_id);
+            self.diff.views.insert(view_id, state.clone());
+            self.diff.views.insert(partner, state);
+            self.ensure_cursor_in_view(view_id);
+            return true;
+        }
+
+        // The working pane came back. Its base revision stays open when the
+        // diff is left, unless it was closed since, and a git revision can be
+        // read again. Buffers cannot.
+        let base_doc_id = match state.source {
+            DiffViewSource::Git => {
+                match self.get_or_create_git_revision_doc(&state.base_path, &state.base_ref) {
+                    Ok(id) => id,
+                    Err(err) => {
+                        self.set_error(format!("Failed to restore the diff: {err}"));
+                        return false;
+                    }
+                }
+            }
+            DiffViewSource::Buffers if self.documents.contains_key(&state.base_doc_id) => {
+                state.base_doc_id
+            }
+            DiffViewSource::Buffers => return false,
+        };
+        if base_doc_id == doc_id {
+            return false;
+        }
+        self.link_shared_diff_handles(base_doc_id, doc_id);
+
+        let was_split = state.is_split();
+        state.base_doc_id = base_doc_id;
+        state.working_doc_id = doc_id;
+        state.working_view_id = view_id;
+        state.base_view_id = view_id;
+
+        if was_split {
+            // The base pane sits to the left, as it did when the diff opened,
+            // and the working pane keeps the focus.
+            self.switch(base_doc_id, Action::VerticalSplit);
+            let base_view_id = self.tree.focus;
+            self.tree.swap_split_in_direction(tree::Direction::Left);
+            self.focus(view_id);
+            state.base_view_id = base_view_id;
+
+            // The new pane starts at the top of its buffer. Put its cursor
+            // level with the working pane's: with its scroll following the
+            // working pane's below, a cursor left at the top would pull the
+            // view back there as soon as the pane is focused.
+            let cursor = self.document(doc_id).map(|doc| {
+                doc.selection(view_id)
+                    .primary()
+                    .cursor(doc.text().slice(..))
+            });
+            let mapped = cursor.and_then(|cursor| {
+                self.map_position_between_documents(doc_id, base_doc_id, cursor)
+            });
+            if let (Some(mapped), Some(base_doc)) = (mapped, self.document_mut(base_doc_id)) {
+                base_doc.set_selection(base_view_id, Selection::point(mapped));
+            }
+        }
+
+        self.diff.views.insert(state.base_view_id, state.clone());
+        self.diff.views.insert(view_id, state);
+        // Narrower than it was, and the base pane's scroll is not set yet.
+        self.ensure_cursor_in_view(view_id);
+        true
     }
 
     /// Drop the diff session from this view without closing revision buffers.
@@ -3724,6 +3904,9 @@ impl Editor {
         if let Some(diff_state) = self.diff.views.remove(&view_id) {
             self.diff.views.remove(&diff_state.base_view_id);
             self.diff.views.remove(&diff_state.working_view_id);
+            // Closing a diff is the end of it: nothing is left to jump back to.
+            self.forget_suspended_diffs(diff_state.base_view_id);
+            self.forget_suspended_diffs(diff_state.working_view_id);
             self.unlink_diff_documents(&diff_state);
 
             if diff_state.close_base_doc_on_close {

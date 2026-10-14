@@ -14,6 +14,9 @@ use std::{collections::HashMap, path::PathBuf, sync::Arc};
 #[derive(Debug, Default)]
 pub struct DiffSession {
     pub views: HashMap<ViewId, DiffViewState>,
+    /// Diffs whose pane was taken to another buffer, oldest first. See
+    /// [`SuspendedDiff`].
+    pub suspended: Vec<SuspendedDiff>,
     pub merge_views: HashMap<ViewId, MergeViewState>,
     pub range: Option<DiffRange>,
     pub split_view_override: Option<bool>,
@@ -74,6 +77,33 @@ pub struct PeekedReviews {
     /// The conversation a claim is expected to land on. Not claimed.
     pub session: ReviewSession,
     pub threads: Vec<crate::review::ThreadId>,
+}
+
+/// A diff that one of its panes walked out of by showing another buffer, kept
+/// so that jumping back to the buffer that pane showed puts the diff back.
+///
+/// The pane is the view that survives the walk, so it is also the view that
+/// comes back: a working pane leaves its base pane closed behind it, and a
+/// base pane leaves the working pane in place as a plain view.
+#[derive(Debug, Clone)]
+pub struct SuspendedDiff {
+    pub view_id: ViewId,
+    pub state: DiffViewState,
+}
+
+impl SuspendedDiff {
+    /// How many are kept. Each is a few paths and ids, but nothing else ever
+    /// drops one that is never jumped back to.
+    pub const LIMIT: usize = 32;
+
+    /// The buffer the pane has to come back to for the diff to return.
+    pub fn shown_doc(&self) -> DocumentId {
+        if self.view_id == self.state.working_view_id {
+            self.state.working_doc_id
+        } else {
+            self.state.base_doc_id
+        }
+    }
 }
 
 /// A changed-file listing cached together with the diff range it was computed

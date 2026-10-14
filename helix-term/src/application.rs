@@ -104,6 +104,12 @@ fn setup_integration_logging() {
 }
 
 impl Application {
+    /// The last frame the test backend was sent, cell by cell.
+    #[cfg(feature = "integration")]
+    pub fn screen(&self) -> &tui::buffer::Buffer {
+        self.terminal.backend().buffer()
+    }
+
     /// The last frame the test backend was sent, one string per terminal row,
     /// so a test can check where something was actually drawn.
     #[cfg(feature = "integration")]

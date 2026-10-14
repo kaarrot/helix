@@ -2233,3 +2233,49 @@ async fn leaving_a_diff_against_an_older_commit_goes_back_to_head() -> anyhow::R
     harness.close(&mut app).await?;
     Ok(())
 }
+
+/// A snapshot of `HEAD` stays open when its diff is left, to be jumped back to.
+/// Once `HEAD` moved on, the jump back, or diffing the file again, reused it
+/// and compared the file with the commit before.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_diff_against_head_follows_a_new_commit() -> anyhow::Result<()> {
+    let repo = repo_with_a_file_to_jump_to()?;
+    let _cwd = CwdGuard::enter(repo.path()).await?;
+    let tracked = repo.file("tracked.txt");
+    let mut app = AppBuilder::new().with_file(&tracked, None).build()?;
+    let mut harness = AppTestHarness::new();
+
+    open_changed_file_diff(&mut app, &mut harness, true).await?;
+    let before = main_diff_state(&app);
+    let old_head = repo.rev_parse("HEAD")?;
+    open_other(&mut app, &mut harness, &repo.file("other.txt")).await?;
+    assert!(app.editor.document(before.base_doc_id).is_some());
+
+    repo.commit_all("second")?;
+    let new_head = repo.rev_parse("HEAD")?;
+    assert_ne!(old_head, new_head);
+
+    assert!(harness.send_keys(&mut app, "<C-o>").await?);
+    assert_eq!(app.editor.diff.views.len(), 2, "the diff should be back");
+    let diff_state = main_diff_state(&app);
+    assert_ne!(diff_state.base_doc_id, before.base_doc_id);
+    let base = app.editor.document(diff_state.base_doc_id).unwrap();
+    assert_eq!(
+        base.git_revision.as_ref().unwrap().commit.as_deref(),
+        Some(new_head.as_str())
+    );
+    assert!(base.text().to_string().contains("changed\n"));
+    assert!(
+        app.editor.document(before.base_doc_id).is_none(),
+        "the snapshot of the old HEAD is gone"
+    );
+    assert_ne!(
+        base.path(),
+        None,
+        "the new snapshot has a cache file of its own"
+    );
+
+    assert!(harness.send_keys(&mut app, "<C-w>o").await?);
+    harness.close(&mut app).await?;
+    Ok(())
+}

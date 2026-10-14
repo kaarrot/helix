@@ -1964,12 +1964,16 @@ impl Document {
     fn materialize_git_revision(
         real_path: &Path,
         git_ref: &str,
+        commit: Option<&str>,
         content: &[u8],
     ) -> Option<PathBuf> {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         real_path.hash(&mut hasher);
         git_ref.hash(&mut hasher);
+        // `HEAD` before and after a commit are two snapshots, which can be
+        // open together. Each needs a file, and a URI, of its own.
+        commit.hash(&mut hasher);
         let filename = real_path
             .file_name()
             .unwrap_or_else(|| std::ffi::OsStr::new("unknown"));
@@ -1999,6 +2003,10 @@ impl Document {
         let mut doc = Self::from(text, Some((encoding, has_bom)), config, syn_loader.clone());
         doc.is_virtual_base = true;
         doc.readonly = true;
+        // Materialize to a unique cache file so LSP can didOpen this snapshot
+        // without colliding with the working-tree URI.
+        let cache_path =
+            Self::materialize_git_revision(real_path, git_ref, commit.as_deref(), &content);
         doc.git_revision = Some(GitRevision {
             path: real_path.to_path_buf(),
             git_ref: git_ref.to_string(),
@@ -2012,9 +2020,7 @@ impl Document {
         // Detect language from the real filename without claiming the working-tree path.
         doc.path = Some(real_path.to_path_buf());
         doc.detect_language(&syn_loader.load());
-        // Materialize to a unique cache file so LSP can didOpen this snapshot
-        // without colliding with the working-tree URI.
-        doc.path = Self::materialize_git_revision(real_path, git_ref, &content);
+        doc.path = cache_path;
         doc.relative_path = OnceCell::new();
         Ok(doc)
     }

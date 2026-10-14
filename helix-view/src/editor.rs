@@ -2861,12 +2861,22 @@ impl Editor {
         })
     }
 
-    fn virtual_document_id_by_revision(&self, path: &Path, git_ref: &str) -> Option<DocumentId> {
-        self.documents.iter().find_map(|(id, doc)| {
-            doc.git_revision.as_ref().and_then(|revision| {
-                (revision.path == path && revision.git_ref == git_ref).then_some(*id)
+    /// The snapshots of `path` taken at `git_ref`, and whether each was read
+    /// from `commit`, the commit `git_ref` names now.
+    fn virtual_documents_by_revision(
+        &self,
+        path: &Path,
+        git_ref: &str,
+        commit: Option<&str>,
+    ) -> Vec<(DocumentId, bool)> {
+        self.documents
+            .iter()
+            .filter_map(|(id, doc)| {
+                let revision = doc.git_revision.as_ref()?;
+                (revision.path == path && revision.git_ref == git_ref)
+                    .then(|| (*id, revision.commit.as_deref() == commit))
             })
-        })
+            .collect()
     }
 
     fn get_or_create_git_revision_doc(
@@ -2874,14 +2884,31 @@ impl Editor {
         path: &Path,
         git_ref: &str,
     ) -> Result<DocumentId, Error> {
-        if let Some(id) = self.virtual_document_id_by_revision(path, git_ref) {
+        // `HEAD` or a branch may have moved on since a snapshot of it was read.
+        // Only one of the commit it names now will do. The snapshot keeps the
+        // commit it was read from, so one already open is never wrong as such.
+        let commit = self.diff_providers.resolve_commit_id(path, git_ref);
+        let snapshots = self.virtual_documents_by_revision(path, git_ref, commit.as_deref());
+        if let Some(&(id, _)) = snapshots.iter().find(|(_, current)| *current) {
             return Ok(id);
         }
-        let content = Self::get_diff_content_or_empty(path, git_ref)
+        // The old ones go when nothing shows them, or there would be two
+        // buffers of the same name in the buffer list, one of them out of date.
+        for (id, _) in snapshots {
+            let in_use = self.tree.views().any(|(view, _)| view.doc == id)
+                || self
+                    .diff
+                    .views
+                    .values()
+                    .any(|state| state.base_doc_id == id || state.working_doc_id == id);
+            if !in_use {
+                let _ = self.close_document(id, true);
+            }
+        }
+        // Read from the commit just resolved, so the text is that commit's even
+        // if the ref moves again in between.
+        let content = Self::get_diff_content_or_empty(path, commit.as_deref().unwrap_or(git_ref))
             .map_err(|e| anyhow::anyhow!("Failed to fetch '{}': {}", git_ref, e))?;
-        // Resolved now, with the content, so the snapshot keeps the commit it
-        // was read from however far the ref moves on while it is open.
-        let commit = self.diff_providers.resolve_commit_id(path, git_ref);
         let doc = Document::from_git_revision(
             content,
             path,

@@ -2011,3 +2011,137 @@ async fn auto_reload_leaves_the_base_pane_gutter_alone() -> anyhow::Result<()> {
     harness.close(&mut app).await?;
     Ok(())
 }
+
+/// `:diff-buffer` in a split's base pane compares that pane's revision. The
+/// old diff closed the revision on its way out, and the new one then read a
+/// buffer that was gone and panicked.
+#[tokio::test(flavor = "multi_thread")]
+async fn diff_buffer_from_the_base_pane_keeps_its_revision() -> anyhow::Result<()> {
+    let repo = repo_with_a_file_to_jump_to()?;
+    let _cwd = CwdGuard::enter(repo.path()).await?;
+    let other = repo.file("other.txt");
+    let mut app = AppBuilder::new()
+        .with_file(repo.file("tracked.txt"), None)
+        .build()?;
+    let mut harness = AppTestHarness::new();
+
+    open_changed_file_diff(&mut app, &mut harness, true).await?;
+    let other_doc_id = app.editor.open(&other, Action::Load)?;
+    let before = main_diff_state(&app);
+    app.editor.focus(before.base_view_id);
+
+    let command = format!(":diff-buffer {}<ret>", other.display());
+    assert!(harness.send_keys(&mut app, &command).await?);
+    let diff_state = main_diff_state(&app);
+    assert_eq!(diff_state.base_doc_id, other_doc_id);
+    assert_eq!(diff_state.working_doc_id, before.base_doc_id);
+    assert!(app.editor.document(before.base_doc_id).is_some());
+    assert_eq!(app.editor.diff.views.len(), 2);
+
+    assert!(harness.send_keys(&mut app, "<C-w>o").await?);
+    harness.close(&mut app).await?;
+    Ok(())
+}
+
+/// The base pane's jumplist holds the working file it showed before the diff
+/// opened. Jumping there showed the working file in both panes, with the left
+/// one still drawn as the base. It leaves the diff instead, and jumping
+/// forward again brings it back.
+#[tokio::test(flavor = "multi_thread")]
+async fn jumping_the_base_pane_to_the_working_file_leaves_the_diff() -> anyhow::Result<()> {
+    let repo = repo_with_a_file_to_jump_to()?;
+    let _cwd = CwdGuard::enter(repo.path()).await?;
+    let mut app = AppBuilder::new()
+        .with_file(repo.file("tracked.txt"), None)
+        .build()?;
+    let mut harness = AppTestHarness::new();
+
+    open_changed_file_diff(&mut app, &mut harness, true).await?;
+    let before = main_diff_state(&app);
+    app.editor.focus(before.base_view_id);
+
+    assert!(harness.send_keys(&mut app, "<C-o>").await?);
+    assert_eq!(
+        app.editor.tree.get(before.base_view_id).doc,
+        before.working_doc_id
+    );
+    assert!(
+        app.editor.diff.views.is_empty(),
+        "a pane showing the working file is not the base pane"
+    );
+    assert_eq!(app.editor.tree.views().count(), 2);
+
+    assert!(harness.send_keys(&mut app, "<C-i>").await?);
+    assert_eq!(app.editor.diff.views.len(), 2, "the diff should be back");
+    let diff_state = main_diff_state(&app);
+    assert_eq!(diff_state.base_view_id, before.base_view_id);
+    assert_eq!(
+        app.editor.tree.get(before.base_view_id).doc,
+        before.base_doc_id
+    );
+
+    assert!(harness.send_keys(&mut app, "<C-w>o").await?);
+    harness.close(&mut app).await?;
+    Ok(())
+}
+
+/// `:bc` on the revision in a split's base pane used to put the working file in
+/// that pane while it stayed registered as the base. Closing the revision ends
+/// the diff and leaves the working file in one plain pane.
+#[tokio::test(flavor = "multi_thread")]
+async fn closing_the_base_revision_ends_the_split_diff() -> anyhow::Result<()> {
+    let repo = repo_with_a_file_to_jump_to()?;
+    let _cwd = CwdGuard::enter(repo.path()).await?;
+    let mut app = AppBuilder::new()
+        .with_file(repo.file("tracked.txt"), None)
+        .build()?;
+    let mut harness = AppTestHarness::new();
+
+    open_changed_file_diff(&mut app, &mut harness, true).await?;
+    let before = main_diff_state(&app);
+    app.editor.focus(before.base_view_id);
+
+    assert!(harness.send_keys(&mut app, ":bc<ret>").await?);
+    assert!(app.editor.diff.views.is_empty());
+    assert!(app.editor.document(before.base_doc_id).is_none());
+    assert!(app
+        .editor
+        .tree
+        .views()
+        .all(|(view, _)| view.doc == before.working_doc_id));
+    let working_doc = app.editor.document(before.working_doc_id).unwrap();
+    assert!(!working_doc.char_diff_enabled);
+    assert!(working_doc.linked_diff_doc.is_none());
+
+    harness.close(&mut app).await?;
+    Ok(())
+}
+
+/// `:bc` on the file of a single-pane diff falls back to the buffer shown
+/// before it. That buffer used to inherit the diff: its spacers, gutter and
+/// `]c`, and `<space>mv` reopened the closed file's diff.
+#[tokio::test(flavor = "multi_thread")]
+async fn closing_the_working_file_ends_a_single_pane_diff() -> anyhow::Result<()> {
+    let repo = repo_with_a_file_to_jump_to()?;
+    let _cwd = CwdGuard::enter(repo.path()).await?;
+    let other = repo.file("other.txt");
+    let tracked = repo.file("tracked.txt");
+    let mut app = AppBuilder::new().with_file(&other, None).build()?;
+    let mut harness = AppTestHarness::new();
+
+    open_other(&mut app, &mut harness, &tracked).await?;
+    open_changed_file_diff(&mut app, &mut harness, false).await?;
+    let before = main_diff_state(&app);
+    assert!(!before.is_split());
+
+    assert!(harness.send_keys(&mut app, ":bc<ret>").await?);
+    assert_current_doc_path(&app, &other);
+    assert!(app.editor.diff.views.is_empty());
+    assert!(
+        app.editor.document(before.base_doc_id).is_none(),
+        "the revision goes with the diff"
+    );
+
+    harness.close(&mut app).await?;
+    Ok(())
+}

@@ -98,11 +98,7 @@ impl SuspendedDiff {
 
     /// The buffer the pane has to come back to for the diff to return.
     pub fn shown_doc(&self) -> DocumentId {
-        if self.view_id == self.state.working_view_id {
-            self.state.working_doc_id
-        } else {
-            self.state.base_doc_id
-        }
+        self.state.doc_in_view(self.view_id)
     }
 }
 
@@ -216,6 +212,17 @@ impl DiffViewState {
 
     pub fn is_working_view(&self, view_id: ViewId) -> bool {
         view_id == self.working_view_id
+    }
+
+    /// The buffer `view_id` shows as its side of the diff: the base pane of a
+    /// split shows the base, and the working pane, or the single pane, the
+    /// working buffer.
+    pub fn doc_in_view(&self, view_id: ViewId) -> DocumentId {
+        if view_id == self.working_view_id {
+            self.working_doc_id
+        } else {
+            self.base_doc_id
+        }
     }
 
     /// True when this is a two-pane split. The default single-pane diff

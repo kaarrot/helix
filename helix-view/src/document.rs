@@ -1263,6 +1263,11 @@ impl Document {
     /// Returns whether the document's path points to a regular file that was modified after
     /// the document was last opened or saved.
     pub fn has_newer_file_on_disk(&self) -> io::Result<bool> {
+        // A revision's snapshot never changes, and its cache file is written
+        // after it loads, so it would always look newer.
+        if self.is_virtual_base {
+            return Ok(false);
+        }
         let Some(path) = self.path() else {
             return Ok(false);
         };
@@ -1303,6 +1308,13 @@ impl Document {
         view: &mut View,
         provider_registry: &DiffProviderRegistry,
     ) -> Result<(), Error> {
+        // Nothing to read back: the cache file only holds what the snapshot
+        // already shows. Reading it would also replace the diff the snapshot
+        // is one side of with one against the cache file's repository, which
+        // is none, and its gutter would go blank.
+        if self.is_virtual_base {
+            return Ok(());
+        }
         let encoding = self.encoding;
         let path = match self.path() {
             None => return Ok(()),

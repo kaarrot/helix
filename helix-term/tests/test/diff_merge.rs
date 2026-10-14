@@ -2087,3 +2087,107 @@ async fn a_diff_against_head_follows_a_new_commit() -> anyhow::Result<()> {
     harness.close(&mut app).await?;
     Ok(())
 }
+
+/// Reloading the file of a diff against an older commit, as `:reload` or
+/// auto-reload do after an outside edit, rebased the worker both panes share
+/// on HEAD. The base pane still showed the older commit, while both gutters
+/// and the spacers were worked out against HEAD.
+#[tokio::test(flavor = "multi_thread")]
+async fn reloading_a_diffed_file_keeps_the_diff_s_base() -> anyhow::Result<()> {
+    let repo = GitRepoFixture::new()?;
+    repo.write_file("tracked.txt", "one\n")?;
+    repo.commit_all("initial")?;
+    let older = repo.rev_parse("HEAD")?;
+    repo.write_file("tracked.txt", "two\n")?;
+    repo.commit_all("second")?;
+    repo.write_file("tracked.txt", "three\n")?;
+
+    let _cwd = CwdGuard::enter(repo.path()).await?;
+    let tracked = repo.file("tracked.txt");
+    let mut app = AppBuilder::new().with_file(&tracked, None).build()?;
+    let mut harness = AppTestHarness::new();
+
+    app.editor.open_diff_view(&tracked, &older, Some(true))?;
+    let diff_state = main_diff_state(&app);
+    app.editor.focus(diff_state.working_view_id);
+
+    repo.write_file("tracked.txt", "four\n")?;
+    assert!(harness.send_keys(&mut app, ":reload<ret>").await?);
+    assert_eq!(current_doc_text(&app), "four\n");
+    assert_eq!(app.editor.diff.views.len(), 2);
+    assert_eq!(
+        diff_base_text(&app, diff_state.working_doc_id).as_deref(),
+        Some("one\n"),
+        "the diff is still against the older commit"
+    );
+
+    assert!(harness.send_keys(&mut app, "<C-w>o").await?);
+    harness.close(&mut app).await?;
+    Ok(())
+}
+
+/// A file outside any repository has no base of its own, so reloading it in
+/// a buffer diff dropped the diff altogether.
+#[tokio::test(flavor = "multi_thread")]
+async fn reloading_a_file_outside_a_repository_keeps_its_buffer_diff() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let working = dir.path().join("working.txt");
+    let base = dir.path().join("base.txt");
+    std::fs::write(&working, "working\n")?;
+    std::fs::write(&base, "base\n")?;
+
+    let mut app = AppBuilder::new().with_file(&working, None).build()?;
+    let mut harness = AppTestHarness::new();
+    let working_doc_id = app.editor.tree.get(app.editor.tree.focus).doc;
+    app.editor.open(&base, Action::Load)?;
+
+    let command = format!(":diff-buffer {}<ret>", base.display());
+    assert!(harness.send_keys(&mut app, &command).await?);
+    let diff_state = main_diff_state(&app);
+    assert_eq!(diff_state.working_doc_id, working_doc_id);
+    app.editor.focus(diff_state.working_view_id);
+
+    std::fs::write(&working, "changed\n")?;
+    assert!(harness.send_keys(&mut app, ":reload<ret>").await?);
+    assert_eq!(current_doc_text(&app), "changed\n");
+    assert_eq!(
+        diff_base_text(&app, working_doc_id).as_deref(),
+        Some("base\n"),
+        "the buffer diff is still there"
+    );
+
+    assert!(harness.send_keys(&mut app, "<C-w>o").await?);
+    harness.close(&mut app).await?;
+    Ok(())
+}
+
+/// A `:diff-base` ref outlasts a reload, as it outlasts a diff, rather than
+/// going back to HEAD while the status still names the ref.
+#[tokio::test(flavor = "multi_thread")]
+async fn reloading_keeps_the_diff_base_ref() -> anyhow::Result<()> {
+    let repo = GitRepoFixture::new()?;
+    repo.write_file("tracked.txt", "one\n")?;
+    repo.commit_all("initial")?;
+    let older = repo.rev_parse("HEAD")?;
+    repo.write_file("tracked.txt", "two\n")?;
+    repo.commit_all("second")?;
+
+    let _cwd = CwdGuard::enter(repo.path()).await?;
+    let tracked = repo.file("tracked.txt");
+    let mut app = AppBuilder::new().with_file(&tracked, None).build()?;
+    let mut harness = AppTestHarness::new();
+    let doc_id = app.editor.tree.get(app.editor.tree.focus).doc;
+
+    let command = format!(":diff-base {older}<ret>");
+    assert!(harness.send_keys(&mut app, &command).await?);
+    assert_eq!(diff_base_text(&app, doc_id).as_deref(), Some("one\n"));
+
+    repo.write_file("tracked.txt", "three\n")?;
+    assert!(harness.send_keys(&mut app, ":reload<ret>").await?);
+    assert_eq!(diff_base_text(&app, doc_id).as_deref(), Some("one\n"));
+    let doc = app.editor.document(doc_id).unwrap();
+    assert_eq!(doc.diff_base_ref(), Some(older.as_str()));
+
+    harness.close(&mut app).await?;
+    Ok(())
+}

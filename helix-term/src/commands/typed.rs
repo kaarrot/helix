@@ -2684,12 +2684,16 @@ fn primary_selection_stream_arg(cx: &mut compositor::Context) -> Option<String> 
     let (view, doc) = current!(cx.editor);
     let selection = doc.selection(view.id);
     let range = selection.primary();
+    let doc_text = doc.text().slice(..);
 
-    if range.is_empty() {
+    // In normal mode the cursor is a one-grapheme range, which is
+    // indistinguishable from a deliberate one-grapheme selection. Treat it as
+    // no selection so a bare cursor never adds an argument to the command.
+    if range.to() <= graphemes::next_grapheme_boundary(doc_text, range.from()) {
         return None;
     }
 
-    let mut text = range.slice(doc.text().slice(..)).to_string();
+    let mut text = range.slice(doc_text).to_string();
     if text.ends_with("\r\n") {
         text.truncate(text.len() - 2);
     } else if text.ends_with('\n') {

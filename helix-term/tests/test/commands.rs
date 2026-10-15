@@ -527,6 +527,23 @@ async fn test_insert_stream_output_empty_selection_does_not_append_arg() -> anyh
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
+async fn test_insert_stream_output_cursor_does_not_append_arg() -> anyhow::Result<()> {
+    let _lock = Arc::clone(&STREAM_TEST_LOCK).lock_owned().await;
+
+    // A normal-mode cursor covers one grapheme; it must not be passed as an
+    // argument the way a real selection is.
+    let text =
+        assert_stream_output_contains("#[a|]#bc\n", ":: printf '[%%s]'<ret>", "[]").await?;
+    assert!(
+        !text.contains("[a]"),
+        "the character under the cursor should not be appended as a shell argument: {text:?}"
+    );
+
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_insert_stream_output_spinner_runs_then_clears() -> anyhow::Result<()> {
     let _lock = Arc::clone(&STREAM_TEST_LOCK).lock_owned().await;
     let mut app = AppBuilder::new().build()?;

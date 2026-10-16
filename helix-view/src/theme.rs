@@ -643,6 +643,14 @@ impl ThemePalette {
                         for modifier in modifiers {
                             if modifier.as_str() == Some("underlined") {
                                 *style = style.underline_style(UnderlineStyle::Line);
+                            } else if let Some(name) =
+                                modifier.as_str().and_then(|s| s.strip_prefix('-'))
+                            {
+                                // `-bold` takes bold off text this style is drawn over
+                                let removed = name
+                                    .parse()
+                                    .map_err(|_| format!("Invalid modifier: {}", modifier))?;
+                                *style = style.remove_modifier(removed);
                             } else {
                                 *style = style.add_modifier(Self::parse_modifier(modifier)?);
                             }
@@ -744,6 +752,39 @@ mod tests {
                 .bg(Color::Rgb(0, 0, 0))
                 .add_modifier(Modifier::BOLD)
         );
+    }
+
+    #[test]
+    fn test_parse_style_remove_modifier() {
+        let table = toml::toml! {
+            "markup.raw" = {
+                modifiers = ["-bold", "italic"],
+            }
+        };
+
+        let mut style = Style::default();
+        let palette = ThemePalette::default();
+        for (_name, value) in table {
+            palette.parse_style(&mut style, value).unwrap();
+        }
+
+        assert_eq!(
+            style,
+            Style::default()
+                .remove_modifier(Modifier::BOLD)
+                .add_modifier(Modifier::ITALIC)
+        );
+        // drawn over bold text, it takes the bold off
+        let over_bold = Style::default().add_modifier(Modifier::BOLD).patch(style);
+        assert_eq!(over_bold.add_modifier, Modifier::ITALIC);
+
+        let table = toml::toml! { "markup.raw" = { modifiers = ["-loud"] } };
+        for (_name, value) in table {
+            assert_eq!(
+                palette.parse_style(&mut Style::default(), value),
+                Err("Invalid modifier: \"-loud\"".to_string())
+            );
+        }
     }
 
     // tests for parsing an RGB `Highlight`

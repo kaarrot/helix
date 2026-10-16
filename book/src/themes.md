@@ -112,6 +112,10 @@ your terminal emulator.
 > 💡 The `underlined` modifier is deprecated and only available for backwards compatibility.
 > Its behavior is equivalent to setting `underline.style="line"`.
 
+A modifier with a leading `-` is taken off instead. A highlight nested inside
+another keeps the outer one's modifiers, so `modifiers = ["-bold"]` stops a
+scope from turning bold inside bold text.
+
 ### Underline style
 
 One of the following values may be used as a value for `underline.style`, providing it is

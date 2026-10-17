@@ -197,6 +197,13 @@ the selection. The "sticky" variant of this mode (accessed by typing `Z` in
 normal mode) is persistent and can be exited using the escape key. This is
 useful when you're simply looking over text and not actively editing it.
 
+Folds hide the lines of a block behind its first line, which stays on screen
+followed by the number of hidden lines. Blocks are found by the nodes that the
+language's `folds.scm` tree-sitter query captures as `@fold`; patterns marked
+`(#set! fold.closed)` start out folded whenever a file is opened. Folds belong to
+the view, and a fold opens again as soon as a cursor moves onto one of its hidden
+lines, for example after a search.
+
 
 | Key                  | Description                                               | Command                 |
 | -----                | -----------                                               | -------                 |
@@ -210,6 +217,10 @@ useful when you're simply looking over text and not actively editing it.
 | `Ctrl-b`, `PageUp`   | Move page up                                              | `page_up`               |
 | `Ctrl-u`             | Move cursor and page half page up                         | `page_cursor_half_up`   |
 | `Ctrl-d`             | Move cursor and page half page down                       | `page_cursor_half_down` |
+| `a`                  | Fold or unfold the block at the cursor (**TS**)           | `toggle_fold`           |
+| `f`                  | Fold the selected lines                                   | `fold_selection`        |
+| `M`                  | Fold all blocks (**TS**)                                  | `fold_all`              |
+| `R`                  | Unfold all blocks                                         | `unfold_all`            |
 
 #### Goto mode
 

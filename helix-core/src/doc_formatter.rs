@@ -364,6 +364,8 @@ impl<'t> DocumentFormatter<'t> {
     /// This is usually just a normal line break.
     /// However very long lines are always wrapped at constant intervals that can be cheaply
     /// calculated to avoid pathological behaviour -- see [`BLOCK_CHARS`].
+    ///
+    /// A `char_idx` hidden by a fold starts the formatter at the fold's header.
     pub fn new_at_prev_checkpoint(
         text: RopeSlice<'t>,
         text_fmt: &'t TextFormat,
@@ -371,6 +373,9 @@ impl<'t> DocumentFormatter<'t> {
         char_idx: usize,
     ) -> Self {
         let char_idx = char_idx.min(text.len_chars());
+        let char_idx = annotations
+            .fold_at(char_idx)
+            .map_or(char_idx, |fold| fold.start - 1);
         let block_line_idx = text.char_to_line(char_idx);
         let line_start = text.line_to_char(block_line_idx);
         let line_end = Self::block_line_end(text, text_fmt, line_start, block_line_idx);
@@ -835,13 +840,32 @@ impl<'t> DocumentFormatter<'t> {
         // keeps the cached line state in step with `Iterator::next`. A no-op in practice
         // -- this path only runs with soft wrap off, where there are no blocks -- but the
         // two line transitions must not be allowed to drift apart.
-        self.enter_line(line_idx + 1);
+        let next_line = self.skip_folded_lines().unwrap_or(line_idx + 1);
+        self.enter_line(next_line);
 
         Some(SkippedLine {
             row,
             line_end_char_idx,
             line_idx,
         })
+    }
+
+    /// Jumps over the lines of a fold that starts at the current position and returns
+    /// the line it lands on, which the caller still has to enter.
+    ///
+    /// Folds start at line starts, so this only runs right after a line break, when no
+    /// graphemes are buffered that would have to be thrown away.
+    fn skip_folded_lines(&mut self) -> Option<usize> {
+        let mut line = None;
+        while let Some(fold) = self.annotations.fold_at(self.char_pos) {
+            debug_assert!(self.peeked_grapheme.is_none() && self.word_i >= self.word_buf.len());
+            let end = fold.end.min(self.text.len_chars());
+            self.char_pos = end;
+            self.graphemes = self.text.slice(end..).graphemes();
+            self.annotations.skip_to(end);
+            line = Some(self.text.char_to_line(end));
+        }
+        line
     }
 
     /// returns the char index at the end of the last yielded grapheme
@@ -895,8 +919,10 @@ impl<'t> Iterator for DocumentFormatter<'t> {
             self.visual_pos.col = 0;
             if !grapheme.is_virtual() {
                 // `char_pos` was advanced past the line break above, so it is the first
-                // char of the new line -- exactly what `enter_line` expects.
-                self.enter_line(self.line_pos + 1);
+                // char of the new line -- exactly what `enter_line` expects. The same
+                // holds after jumping over a fold.
+                let next_line = self.skip_folded_lines().unwrap_or(self.line_pos + 1);
+                self.enter_line(next_line);
             }
         } else {
             self.visual_pos.col += grapheme.width();

@@ -273,7 +273,12 @@ pub fn visual_offset_from_anchor(
                 // character would be an O(log N) rope search added to ordinary editing,
                 // taxing every keystroke to speed up the long-line case.
                 current_line_end = if grapheme.line_idx + 1 < text.len_lines() {
-                    text.line_to_char(grapheme.line_idx + 1)
+                    let next_line_start = text.line_to_char(grapheme.line_idx + 1);
+                    // A folded block belongs to the line above it, so a position the
+                    // fold hides is found on that line, as without the skip.
+                    annotations
+                        .fold_at(next_line_start)
+                        .map_or(next_line_start, |fold| fold.end)
                 } else {
                     usize::MAX
                 };

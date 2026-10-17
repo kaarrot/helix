@@ -9,6 +9,7 @@ use helix_core::command_line::Token;
 use helix_core::diagnostic::DiagnosticProvider;
 use helix_core::doc_formatter::TextFormat;
 use helix_core::encoding::Encoding;
+use helix_core::fold::{self, Fold};
 use helix_core::snippets::{ActiveSnippet, SnippetRenderCtx};
 use helix_core::syntax::config::LanguageServerFeature;
 use helix_core::text_annotations::{InlineAnnotation, Overlay};
@@ -38,10 +39,11 @@ use helix_core::{
     encoding,
     history::{History, State, UndoKind},
     indent::{auto_detect_indent_style, IndentStyle},
-    line_ending::auto_detect_line_ending,
+    line_ending::{auto_detect_line_ending, line_end_char_index},
     syntax::{self, config::LanguageConfiguration},
     unicode::segmentation::UnicodeSegmentation,
-    ChangeSet, Diagnostic, LineEnding, Range, Rope, RopeBuilder, Selection, Syntax, Transaction,
+    ChangeSet, Diagnostic, LineEnding, Range, Rope, RopeBuilder, RopeSlice, Selection, Syntax,
+    Transaction,
 };
 
 use crate::{
@@ -166,6 +168,8 @@ pub struct Document {
     /// To know if they're up-to-date, check the `id` field in `DocumentInlayHints`.
     pub(crate) inlay_hints: HashMap<ViewId, DocumentInlayHints>,
     pub(crate) jump_labels: HashMap<ViewId, Vec<Overlay>>,
+    /// Folded lines, by view.
+    folds: HashMap<ViewId, DocumentFolds>,
     /// Set to `true` when the document is updated, reset to `false` on the next inlay hints
     /// update from the LSP
     pub inlay_hints_oudated: bool,
@@ -258,6 +262,44 @@ pub struct Document {
     // of storing a copy on every doc. Then we can remove the surrounding `Arc` and use the
     // `ArcSwap` directly.
     syn_loader: Arc<ArcSwap<syntax::Loader>>,
+}
+
+/// A block of lines that the `folds.scm` query of a document's language lets fold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FoldableBlock {
+    pub first_line: usize,
+    pub last_line: usize,
+    /// The query marks the block `(#set! fold.closed)`: it starts out folded.
+    pub closed: bool,
+}
+
+impl FoldableBlock {
+    /// The fold that hides the block below its first line.
+    pub fn fold(&self, text: RopeSlice) -> Option<Fold> {
+        Fold::new(text, self.first_line, self.last_line)
+    }
+}
+
+/// The folds of one view, and the placeholder drawn after each fold's header.
+#[derive(Debug, Default, Clone)]
+struct DocumentFolds {
+    folds: Vec<Fold>,
+    placeholders: Vec<InlineAnnotation>,
+}
+
+impl DocumentFolds {
+    fn update_placeholders(&mut self, text: RopeSlice) {
+        self.placeholders = self
+            .folds
+            .iter()
+            .map(|fold| {
+                let header_end = line_end_char_index(&text, fold.header_line(text));
+                let lines = fold.lines(text).len();
+                let noun = if lines == 1 { "line" } else { "lines" };
+                InlineAnnotation::new(header_end, format!(" ⋯ {lines} {noun}"))
+            })
+            .collect();
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -779,6 +821,7 @@ impl Document {
             linked_diff_doc: None,
             is_transcript: false,
             jump_labels: HashMap::new(),
+            folds: HashMap::new(),
             color_swatches: None,
             color_swatch_controller: TaskController::new(),
             syn_loader,
@@ -1508,11 +1551,16 @@ impl Document {
     /// Initializes a new selection and view_data for the given view
     /// if it does not already have them.
     pub fn ensure_view_init(&mut self, view_id: ViewId) {
-        if !self.selections.contains_key(&view_id) {
+        let new_view = !self.selections.contains_key(&view_id);
+        if new_view {
             self.reset_selection(view_id);
         }
 
         self.view_data_mut(view_id);
+
+        if new_view {
+            self.fold_closed_blocks(view_id);
+        }
     }
 
     /// Mark document as recent used for MRU sorting
@@ -1525,6 +1573,7 @@ impl Document {
         self.selections.remove(&view_id);
         self.inlay_hints.remove(&view_id);
         self.jump_labels.remove(&view_id);
+        self.folds.remove(&view_id);
     }
 
     /// Apply a [`Transaction`] to the [`Document`] to change its text.
@@ -1675,6 +1724,12 @@ impl Document {
             apply_inlay_hint_changes(other_inlay_hints);
             apply_inlay_hint_changes(padding_after_inlay_hints);
         }
+
+        for view_folds in self.folds.values_mut() {
+            fold::map(&mut view_folds.folds, changes, self.text.slice(..));
+            view_folds.update_placeholders(self.text.slice(..));
+        }
+        self.folds.retain(|_, view_folds| !view_folds.folds.is_empty());
 
         helix_event::dispatch(DocumentDidChange {
             doc: self,
@@ -2603,6 +2658,113 @@ impl Document {
 
     pub fn remove_jump_labels(&mut self, view_id: ViewId) {
         self.jump_labels.remove(&view_id);
+    }
+
+    /// The folds in `view_id`, sorted and disjoint.
+    pub fn folds(&self, view_id: ViewId) -> &[Fold] {
+        self.folds
+            .get(&view_id)
+            .map_or(&[], |view_folds| &view_folds.folds)
+    }
+
+    /// The text drawn after the header of each fold in `view_id`.
+    pub fn fold_placeholders(&self, view_id: ViewId) -> &[InlineAnnotation] {
+        self.folds
+            .get(&view_id)
+            .map_or(&[], |view_folds| &view_folds.placeholders)
+    }
+
+    /// Replaces the folds in `view_id`. `folds` must be sorted and disjoint, which
+    /// [`fold::insert`] maintains.
+    ///
+    /// A view scrolled to a line that is now hidden is scrolled to the fold's header
+    /// instead. Moving the selection out of the new folds is up to the caller.
+    pub fn set_folds(&mut self, view_id: ViewId, folds: Vec<Fold>) {
+        if folds.is_empty() {
+            self.folds.remove(&view_id);
+            return;
+        }
+        let text = self.text.slice(..);
+        let mut view_folds = DocumentFolds {
+            folds,
+            placeholders: Vec::new(),
+        };
+        view_folds.update_placeholders(text);
+        if let Some(view_data) = self.view_data.get_mut(&view_id) {
+            let position = &mut view_data.view_position;
+            if let Some(fold) = fold::fold_at(&view_folds.folds, position.anchor) {
+                position.anchor = text.line_to_char(fold.header_line(text));
+                position.vertical_offset = 0;
+            }
+        }
+        self.folds.insert(view_id, view_folds);
+    }
+
+    /// The blocks that the `folds.scm` query of the document's language finds,
+    /// leaving out the ones that fit on one line.
+    pub fn foldable_blocks(&self) -> Vec<FoldableBlock> {
+        let Some(syntax) = self.syntax() else {
+            return Vec::new();
+        };
+        let text = self.text.slice(..);
+        let loader = self.syn_loader.load();
+        syntax
+            .fold_captures(text, &loader)
+            .into_iter()
+            .filter_map(|capture| {
+                let first_line = text.byte_to_line(capture.byte_range.start as usize);
+                let end = text.byte_to_char(capture.byte_range.end as usize);
+                let mut last_line = text.char_to_line(end);
+                // a node that takes its line break along ends on the line before
+                if last_line > first_line && text.line_to_char(last_line) == end {
+                    last_line -= 1;
+                }
+                (last_line > first_line).then_some(FoldableBlock {
+                    first_line,
+                    last_line,
+                    closed: capture.closed,
+                })
+            })
+            .collect()
+    }
+
+    /// Folds the blocks that the `folds.scm` query marks `fold.closed`, so that a
+    /// view showing the document for the first time starts with them folded.
+    fn fold_closed_blocks(&mut self, view_id: ViewId) {
+        let text = self.text.slice(..);
+        let mut folds = self.folds(view_id).to_vec();
+        let mut folded = false;
+        for block in self.foldable_blocks().iter().filter(|block| block.closed) {
+            if let Some(new_fold) = block.fold(text) {
+                fold::insert(&mut folds, new_fold);
+                folded = true;
+            }
+        }
+        if folded {
+            self.set_folds(view_id, folds);
+        }
+    }
+
+    /// Opens the folds in `view_id` that hide a cursor of the view's selection, so
+    /// that a jump into a folded block shows it. Returns whether any fold opened.
+    pub fn open_folds_at_cursors(&mut self, view_id: ViewId) -> bool {
+        let (Some(view_folds), Some(selection)) =
+            (self.folds.get(&view_id), self.selections.get(&view_id))
+        else {
+            return false;
+        };
+        let text = self.text.slice(..);
+        let cursors: Vec<usize> = selection
+            .iter()
+            .map(|range| range.cursor(text))
+            .collect();
+        let mut folds = view_folds.folds.clone();
+        folds.retain(|fold| !cursors.iter().any(|&cursor| fold.contains(cursor)));
+        if folds.len() == view_folds.folds.len() {
+            return false;
+        }
+        self.set_folds(view_id, folds);
+        true
     }
 
     /// Get the inlay hints for this document and `view_id`.

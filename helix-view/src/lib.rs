@@ -51,6 +51,7 @@ pub enum Align {
 }
 
 pub fn align_view(doc: &mut Document, view: &View, align: Align) {
+    doc.open_folds_at_cursors(view.id);
     let doc_text = doc.text().slice(..);
     let cursor = match doc.selections().get(&view.id) {
         Some(s) => s.primary().cursor(doc_text),

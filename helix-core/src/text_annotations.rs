@@ -5,6 +5,7 @@ use std::ops::Range;
 use std::ptr::NonNull;
 
 use crate::doc_formatter::FormattedGrapheme;
+use crate::fold::{self, Fold};
 use crate::syntax::{Highlight, OverlayHighlights};
 use crate::{Position, Tendril};
 
@@ -285,6 +286,7 @@ pub struct TextAnnotations<'a> {
     inline_annotations: Vec<Layer<'a, InlineAnnotation, Option<Highlight>>>,
     overlays: Vec<Layer<'a, Overlay, Option<Highlight>>>,
     line_annotations: Vec<(Cell<usize>, RawBox<dyn LineAnnotation + 'a>)>,
+    folds: &'a [Fold],
 }
 
 impl Debug for TextAnnotations<'_> {
@@ -292,6 +294,7 @@ impl Debug for TextAnnotations<'_> {
         f.debug_struct("TextAnnotations")
             .field("inline_annotations", &self.inline_annotations)
             .field("overlays", &self.overlays)
+            .field("folds", &self.folds)
             .finish_non_exhaustive()
     }
 }
@@ -376,6 +379,20 @@ impl<'a> TextAnnotations<'a> {
         self.line_annotations
             .push((Cell::new(usize::MAX), layer.into()));
         self
+    }
+
+    /// Hides the lines covered by `folds`, which **must be sorted** and disjoint.
+    pub fn set_folds(&mut self, folds: &'a [Fold]) -> &mut Self {
+        self.folds = folds;
+        self
+    }
+
+    pub fn folds(&self) -> &'a [Fold] {
+        self.folds
+    }
+
+    pub(crate) fn fold_at(&self, char_idx: usize) -> Option<&'a Fold> {
+        fold::fold_at(self.folds, char_idx)
     }
 
     /// Removes all line annotations, useful for vertical motions

@@ -116,14 +116,18 @@ impl EditorView {
             decorations.add_decoration(line_decoration);
         }
 
+        // Folds put more document lines on screen than there are rows, and all of
+        // them need highlights.
+        let text_lines = view.estimate_doc_lines_in_view(doc);
+        let text_height = u16::try_from(text_lines).unwrap_or(u16::MAX);
         let syntax_highlighter =
-            Self::doc_syntax_highlighter(doc, view_offset.anchor, inner.height, &loader);
+            Self::doc_syntax_highlighter(doc, view_offset.anchor, text_height, &loader);
         let mut overlays = Vec::new();
 
         overlays.push(Self::overlay_syntax_highlights(
             doc,
             view_offset.anchor,
-            inner.height,
+            text_height,
             &text_annotations,
         ));
 
@@ -133,7 +137,7 @@ impl EditorView {
             .unwrap_or(config.rainbow_brackets)
         {
             if let Some(overlay) =
-                Self::doc_rainbow_highlights(doc, view_offset.anchor, inner.height, theme, &loader)
+                Self::doc_rainbow_highlights(doc, view_offset.anchor, text_height, theme, &loader)
             {
                 overlays.push(overlay);
             }

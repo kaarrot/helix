@@ -211,3 +211,98 @@ fn annotation_and_overlay() {
         "fooo  bar "
     );
 }
+
+fn fold_text(
+    text: &str,
+    softwrap: bool,
+    folds: &[(usize, usize)],
+    annotations: &[InlineAnnotation],
+    char_idx: usize,
+) -> String {
+    use crate::fold::Fold;
+    let folds: Vec<_> = folds
+        .iter()
+        .map(|&(header, last)| Fold::new(text.into(), header, last).unwrap())
+        .collect();
+    let text_fmt = TextFormat::new_test(softwrap);
+    let mut text_annotations = TextAnnotations::default();
+    text_annotations
+        .add_inline_annotations(annotations, None)
+        .set_folds(&folds);
+    let mut formatter =
+        DocumentFormatter::new_at_prev_checkpoint(text.into(), &text_fmt, &text_annotations, char_idx);
+    formatter.collect_to_str()
+}
+
+#[test]
+fn fold_hides_lines() {
+    let text = "0\n1\n2\n3\n4\n";
+    for softwrap in [false, true] {
+        assert_eq!(fold_text(text, softwrap, &[(0, 2)], &[], 0), "0 \n3 \n4 \n ");
+        assert_eq!(
+            fold_text(text, softwrap, &[(0, 1), (2, 3)], &[], 0),
+            "0 \n2 \n4 \n "
+        );
+        // folded up to the end of the text
+        assert_eq!(fold_text(text, softwrap, &[(1, 4)], &[], 0), "0 \n1 \n ");
+    }
+}
+
+#[test]
+fn fold_starts_at_header_when_asked_for_a_hidden_char() {
+    let text = "0\n1\n2\n3\n4\n";
+    // char 4 is on the hidden line 2
+    assert_eq!(fold_text(text, false, &[(0, 2)], &[], 4), "0 \n3 \n4 \n ");
+}
+
+#[test]
+fn fold_drops_annotations_on_hidden_lines() {
+    let text = "0\n1\n2\n3\n4\n";
+    let annotations = [
+        // after the header, before its line break
+        InlineAnnotation::new(1, "~"),
+        // on hidden lines
+        InlineAnnotation::new(2, "X"),
+        InlineAnnotation::new(5, "X"),
+        // on the first line after the fold
+        InlineAnnotation::new(6, "Y"),
+    ];
+    for softwrap in [false, true] {
+        assert_eq!(
+            fold_text(text, softwrap, &[(0, 2)], &annotations, 0),
+            "0~ \nY3 \n4 \n "
+        );
+    }
+}
+
+#[test]
+fn fold_reports_document_lines_and_positions() {
+    use crate::fold::Fold;
+    use crate::{char_idx_at_visual_offset, visual_offset_from_block, Position};
+
+    let text: crate::RopeSlice = "0\n1\n2\n3\n4\n".into();
+    let folds = [Fold::new(text, 0, 2).unwrap()];
+    let text_fmt = TextFormat::new_test(false);
+    let mut annotations = TextAnnotations::default();
+    annotations.set_folds(&folds);
+
+    let rows: Vec<_> = DocumentFormatter::new_at_prev_checkpoint(text, &text_fmt, &annotations, 0)
+        .filter(|grapheme| grapheme.visual_pos.col == 0)
+        .map(|grapheme| (grapheme.visual_pos.row, grapheme.line_idx, grapheme.char_idx))
+        .collect();
+    assert_eq!(rows, [(0, 0, 0), (1, 3, 6), (2, 4, 8), (3, 5, 10)]);
+
+    // a hidden char shows up at the end of the header
+    let (pos, _) = visual_offset_from_block(text, 0, 4, &text_fmt, &annotations);
+    assert_eq!(pos, Position::new(0, 1));
+    // the row below the header is the first line after the fold
+    assert_eq!(
+        char_idx_at_visual_offset(text, 0, 1, 0, &text_fmt, &annotations),
+        (6, 0)
+    );
+    // and going back up from there skips the fold too
+    assert_eq!(
+        char_idx_at_visual_offset(text, 6, -1, 0, &text_fmt, &annotations),
+        (0, 0)
+    );
+}

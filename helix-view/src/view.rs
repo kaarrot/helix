@@ -11,6 +11,7 @@ use crate::{
 use helix_core::{
     char_idx_at_visual_offset,
     doc_formatter::TextFormat,
+    fold,
     text_annotations::TextAnnotations,
     visual_offset_from_anchor, visual_offset_from_block, Position, RopeSlice, Selection,
     Transaction,
@@ -332,13 +333,16 @@ impl View {
         Some(offset)
     }
 
+    /// Scrolls the cursor into view, first opening any fold that hides it.
     pub fn ensure_cursor_in_view(&self, doc: &mut Document, scrolloff: usize) {
+        doc.open_folds_at_cursors(self.id);
         if let Some(offset) = self.offset_coords_to_in_view_center::<false>(doc, scrolloff) {
             doc.set_view_offset(self.id, offset);
         }
     }
 
     pub fn ensure_cursor_in_view_center(&self, doc: &mut Document, scrolloff: usize) {
+        doc.open_folds_at_cursors(self.id);
         if let Some(offset) = self.offset_coords_to_in_view_center::<true>(doc, scrolloff) {
             doc.set_view_offset(self.id, offset);
         } else {
@@ -352,7 +356,7 @@ impl View {
 
     /// Estimates the last visible document line on screen.
     /// This estimate is an upper bound obtained by calculating the first
-    /// visible line and adding the viewport height.
+    /// visible line and adding the viewport height and the lines folded away.
     /// The actual last visible line may be smaller if softwrapping occurs
     /// or virtual text lines are visible
     #[inline]
@@ -360,9 +364,17 @@ impl View {
         let doc_text = doc.text().slice(..);
         let line = doc_text.char_to_line(doc.view_offset(self.id).anchor.min(doc_text.len_chars()));
         // Saturating subs to make it inclusive zero indexing.
-        (line + self.inner_height())
+        (line + self.estimate_doc_lines_in_view(doc))
             .min(doc_text.len_lines())
             .saturating_sub(1)
+    }
+
+    /// Estimates how many document lines the view spans: an upper bound made of
+    /// the viewport height plus the lines that folds hide between them.
+    pub fn estimate_doc_lines_in_view(&self, doc: &Document) -> usize {
+        let doc_text = doc.text().slice(..);
+        let line = doc_text.char_to_line(doc.view_offset(self.id).anchor.min(doc_text.len_chars()));
+        fold::lines_for_rows(doc.folds(self.id), doc_text, line, self.inner_height())
     }
 
     /// Calculates the last non-empty visual line on screen
@@ -489,6 +501,17 @@ impl View {
 
                 text_annotations.add_inline_annotations(color_swatches_padding, None);
             }
+        }
+
+        let folds = doc.folds(self.id);
+        if !folds.is_empty() {
+            let style = theme.and_then(|t| {
+                t.find_highlight_exact("ui.virtual.fold")
+                    .or_else(|| t.find_highlight("ui.virtual.inlay-hint"))
+            });
+            text_annotations
+                .add_inline_annotations(doc.fold_placeholders(self.id), style)
+                .set_folds(folds);
         }
 
         let width = self.inner_width(doc);

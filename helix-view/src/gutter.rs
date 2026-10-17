@@ -32,6 +32,7 @@ impl GutterType {
             GutterType::LineNumbers => line_numbers(editor, doc, view, theme, is_focused),
             GutterType::Spacer => padding(editor, doc, view, theme, is_focused),
             GutterType::Diff => diff(editor, doc, view, theme, is_focused),
+            GutterType::Folds => folds(editor, doc, view, theme, is_focused),
         }
     }
 
@@ -41,6 +42,7 @@ impl GutterType {
             GutterType::LineNumbers => line_numbers_width(view, doc),
             GutterType::Spacer => 1,
             GutterType::Diff => 1,
+            GutterType::Folds => 1,
         }
     }
 }
@@ -161,6 +163,7 @@ pub fn line_numbers<'doc>(
     let current_line = doc
         .text()
         .char_to_line(doc.selection(view.id).primary().cursor(text));
+    let folds = doc.folds(view.id);
 
     let line_number = editor.config().line_number;
     let mode = editor.mode;
@@ -179,7 +182,8 @@ pub fn line_numbers<'doc>(
                     && current_line != line;
 
                 let display_num = if relative {
-                    current_line.abs_diff(line)
+                    // a fold counts as one line, the way vertical motions count it
+                    helix_core::fold::line_distance(folds, text, current_line, line)
                 } else {
                     line + 1
                 };
@@ -198,6 +202,39 @@ pub fn line_numbers<'doc>(
 
                 first_visual_line.then_some(style)
             }
+        },
+    )
+}
+
+/// Marks each line whose block below is folded with a triangle.
+pub fn folds<'doc>(
+    _editor: &'doc Editor,
+    doc: &'doc Document,
+    view: &View,
+    theme: &Theme,
+    _is_focused: bool,
+) -> GutterFn<'doc> {
+    fold_markers(doc, view, theme)
+}
+
+fn fold_markers<'doc>(doc: &'doc Document, view: &View, theme: &Theme) -> GutterFn<'doc> {
+    let text = doc.text().slice(..);
+    let folds = doc.folds(view.id);
+    let style = theme
+        .try_get("ui.virtual.fold")
+        .unwrap_or_else(|| theme.get("ui.linenr"));
+
+    Box::new(
+        move |line: usize, _selected: bool, first_visual_line: bool, out: &mut String| {
+            if !first_visual_line || folds.is_empty() {
+                return None;
+            }
+            // a fold starts right after its header line
+            let next_line_start = text.line_to_char((line + 1).min(text.len_lines()));
+            helix_core::fold::fold_at(folds, next_line_start)
+                .filter(|fold| fold.start == next_line_start)?;
+            write!(out, "▸").unwrap();
+            Some(style)
         },
     )
 }
@@ -334,7 +371,30 @@ mod tests {
     use crate::graphics::Rect;
     use crate::DocumentId;
     use arc_swap::ArcSwap;
-    use helix_core::{syntax, Rope};
+    use helix_core::{fold::Fold, syntax, Rope};
+
+    #[test]
+    fn folds_gutter_marks_fold_headers() {
+        let view = View::new(DocumentId::default(), GutterConfig::default());
+        let mut doc = Document::from(
+            Rope::from_str("a\nb\nc\nd\ne\nf\n"),
+            None,
+            Arc::new(ArcSwap::new(Arc::new(Config::default()))),
+            Arc::new(ArcSwap::from_pointee(syntax::Loader::default())),
+        );
+        doc.ensure_view_init(view.id);
+        let fold = Fold::new(doc.text().slice(..), 1, 3).unwrap();
+        doc.set_folds(view.id, vec![fold]);
+
+        let mut marker = fold_markers(&doc, &view, &crate::theme::DEFAULT_THEME);
+        let marked: Vec<usize> = (0..doc.text().len_lines())
+            .filter(|&line| {
+                let mut out = String::new();
+                marker(line, false, true, &mut out).is_some() && out == "▸"
+            })
+            .collect();
+        assert_eq!(marked, [1]);
+    }
 
     #[test]
     fn test_default_gutter_widths() {

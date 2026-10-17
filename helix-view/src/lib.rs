@@ -48,6 +48,7 @@ pub enum Align {
 }
 
 pub fn align_view(doc: &mut Document, view: &View, align: Align) {
+    doc.open_folds_at_cursors(view.id);
     let doc_text = doc.text().slice(..);
     let cursor = doc.selection(view.id).primary().cursor(doc_text);
     let viewport = view.inner_area(doc);

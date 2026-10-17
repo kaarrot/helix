@@ -44,6 +44,7 @@ pub struct LanguageData {
     textobject_query: OnceCell<Option<TextObjectQuery>>,
     tag_query: OnceCell<Option<TagQuery>>,
     rainbow_query: OnceCell<Option<RainbowQuery>>,
+    fold_query: OnceCell<Option<FoldQuery>>,
 }
 
 impl LanguageData {
@@ -55,6 +56,7 @@ impl LanguageData {
             textobject_query: OnceCell::new(),
             tag_query: OnceCell::new(),
             rainbow_query: OnceCell::new(),
+            fold_query: OnceCell::new(),
         }
     }
 
@@ -222,6 +224,36 @@ impl LanguageData {
             .get_or_init(|| {
                 let grammar = self.syntax_config(loader)?.grammar;
                 Self::compile_rainbow_query(grammar, &self.config)
+                    .map_err(|err| {
+                        log::error!("{err}");
+                    })
+                    .ok()
+                    .flatten()
+            })
+            .as_ref()
+    }
+
+    /// Compiles the folds.scm query for a language.
+    /// This function should only be used by this module or the xtask crate.
+    pub fn compile_fold_query(
+        grammar: Grammar,
+        config: &LanguageConfiguration,
+    ) -> Result<Option<FoldQuery>> {
+        let name = &config.language_id;
+        let text = read_query(name, "folds.scm");
+        if text.is_empty() {
+            return Ok(None);
+        }
+        let fold_query = FoldQuery::new(grammar, &text)
+            .with_context(|| format!("Failed to compile folds.scm query for '{name}'"))?;
+        Ok(Some(fold_query))
+    }
+
+    fn fold_query(&self, loader: &Loader) -> Option<&FoldQuery> {
+        self.fold_query
+            .get_or_init(|| {
+                let grammar = self.syntax_config(loader)?.grammar;
+                Self::compile_fold_query(grammar, &self.config)
                     .map_err(|err| {
                         log::error!("{err}");
                     })
@@ -424,6 +456,10 @@ impl Loader {
         self.language(lang).rainbow_query(self)
     }
 
+    fn fold_query(&self, lang: Language) -> Option<&FoldQuery> {
+        self.language(lang).fold_query(self)
+    }
+
     pub fn language_server_configs(&self) -> &HashMap<String, LanguageServerConfiguration> {
         &self.language_server_configs
     }
@@ -624,6 +660,31 @@ impl Syntax {
             |lang| loader.tag_query(lang).map(|q| &q.query),
             range,
         )
+    }
+
+    /// The nodes that the `folds.scm` queries capture as `@fold`, in every injection layer.
+    pub fn fold_captures(&self, source: RopeSlice, loader: &Loader) -> Vec<FoldCapture> {
+        let mut captures = Vec::new();
+        let mut query_iter = self.query_iter::<_, (), _>(
+            source,
+            |lang| loader.fold_query(lang).map(|q| &q.query),
+            ..,
+        );
+        while let Some(event) = query_iter.next() {
+            let QueryIterEvent::Match(mat) = event else {
+                continue;
+            };
+            let fold_query = loader
+                .fold_query(query_iter.current_language())
+                .expect("language must have a fold query to emit matches");
+            if Some(mat.capture) == fold_query.fold_capture {
+                captures.push(FoldCapture {
+                    byte_range: mat.node.byte_range(),
+                    closed: fold_query.closed_patterns.contains(&mat.pattern),
+                });
+            }
+        }
+        captures
     }
 
     pub fn rainbow_highlights(
@@ -1156,6 +1217,48 @@ pub fn child_for_byte_range<'a>(node: &Node<'a>, range: ops::Range<u32>) -> Opti
     }
 
     None
+}
+
+#[derive(Debug)]
+pub struct FoldQuery {
+    query: Query,
+    fold_capture: Option<Capture>,
+    /// Patterns marked `(#set! fold.closed)`, whose blocks start out folded.
+    closed_patterns: HashSet<Pattern>,
+}
+
+impl FoldQuery {
+    fn new(grammar: Grammar, source: &str) -> Result<Self, tree_sitter::query::ParseError> {
+        let mut closed_patterns = HashSet::default();
+
+        let query = Query::new(grammar, source, |pattern, predicate| match predicate {
+            UserPredicate::SetProperty {
+                key: "fold.closed",
+                val,
+            } => {
+                if val.is_some() {
+                    return Err("property 'fold.closed' does not take an argument".into());
+                }
+                closed_patterns.insert(pattern);
+                Ok(())
+            }
+            _ => Err(InvalidPredicateError::unknown(predicate)),
+        })?;
+
+        Ok(Self {
+            fold_capture: query.get_capture("fold"),
+            closed_patterns,
+            query,
+        })
+    }
+}
+
+/// A node that a `folds.scm` query captures as `@fold`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FoldCapture {
+    pub byte_range: ops::Range<u32>,
+    /// The pattern is marked `(#set! fold.closed)`: the block starts out folded.
+    pub closed: bool,
 }
 
 #[derive(Debug)]

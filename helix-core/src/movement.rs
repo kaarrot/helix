@@ -125,11 +125,8 @@ pub fn move_vertically(
     new_row = new_row.max(visual_pos.row as u32);
     let line_idx = slice.char_to_line(pos);
 
-    // Compute the new position.
-    let mut new_line_idx = match dir {
-        Direction::Forward => line_idx.saturating_add(count),
-        Direction::Backward => line_idx.saturating_sub(count),
-    };
+    // Compute the new position. A folded block moves along with its header line.
+    let mut new_line_idx = crate::fold::step_lines(annotations.folds(), slice, line_idx, dir, count);
 
     let line = if new_line_idx >= slice.len_lines() - 1 {
         // there is no line terminator for the last line
@@ -738,6 +735,39 @@ mod test {
             ),
             (1, 3).into()
         );
+    }
+
+    #[test]
+    fn vertical_moves_step_over_folds() {
+        let text = Rope::from("abcd\nefg\nhij\nklm\nnop\n");
+        let slice = text.slice(..);
+        let folds = [crate::fold::Fold::new(slice, 1, 3).unwrap()];
+
+        for soft_wrap in [false, true] {
+            let text_fmt = TextFormat {
+                soft_wrap,
+                ..TextFormat::default()
+            };
+            let mut annotations = TextAnnotations::default();
+            annotations.set_folds(&folds);
+            let mut move_by = |line: usize, dir: Direction| {
+                let pos = pos_at_coords(slice, (line, 1).into(), true);
+                let range = move_vertically_visual(
+                    slice,
+                    Range::point(pos),
+                    dir,
+                    1,
+                    Movement::Move,
+                    &text_fmt,
+                    &mut annotations,
+                );
+                coords_at_pos(slice, range.head)
+            };
+
+            assert_eq!(move_by(0, Direction::Forward), (1, 1).into());
+            assert_eq!(move_by(1, Direction::Forward), (4, 1).into());
+            assert_eq!(move_by(4, Direction::Backward), (1, 1).into());
+        }
     }
 
     #[test]

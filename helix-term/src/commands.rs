@@ -1,9 +1,11 @@
 pub(crate) mod dap;
+pub(crate) mod fold;
 pub(crate) mod lsp;
 pub(crate) mod syntax;
 pub(crate) mod typed;
 
 pub use dap::*;
+pub use fold::*;
 use futures_util::FutureExt;
 use helix_event::status;
 use helix_stdx::{
@@ -560,6 +562,10 @@ impl MappableCommand {
         align_view_bottom, "Align view bottom",
         scroll_up, "Scroll view up",
         scroll_down, "Scroll view down",
+        toggle_fold, "Fold or unfold the block at the cursor",
+        fold_selection, "Fold the selected lines",
+        fold_all, "Fold all blocks",
+        unfold_all, "Unfold all blocks",
         match_brackets, "Goto matching bracket",
         surround_add, "Surround add",
         surround_replace, "Surround replace",
@@ -2707,6 +2713,7 @@ fn extend_line_impl(cx: &mut Context, extend: Extend) {
     let (view, doc) = current!(cx.editor);
 
     let text = doc.text();
+    let folds = doc.folds(view.id);
     let selection = doc.selection(view.id).clone().transform(|range| {
         let (start_line, end_line) = range.line_range(text.slice(..));
 
@@ -2715,6 +2722,10 @@ fn extend_line_impl(cx: &mut Context, extend: Extend) {
             (end_line + 1) // newline of end_line
                 .min(text.len_lines()),
         );
+        // a folded block counts as part of its header line
+        let lines = helix_core::fold::grow_over_folds(folds, text.slice(..), Range::new(start, end));
+        let (start, end) = (lines.from(), lines.to());
+        let (start_line, end_line) = lines.line_range(text.slice(..));
 
         // extend to previous/next line if current line is selected
         let (anchor, head) = if range.from() == start && range.to() == end {
@@ -2735,7 +2746,7 @@ fn extend_line_impl(cx: &mut Context, extend: Extend) {
             }
         };
 
-        Range::new(anchor, head)
+        helix_core::fold::grow_over_folds(folds, text.slice(..), Range::new(anchor, head))
     });
 
     doc.set_selection(view.id, selection);
@@ -2806,7 +2817,8 @@ fn extend_to_line_bounds(cx: &mut Context) {
             let start = text.line_to_char(start_line);
             let end = text.line_to_char((end_line + 1).min(text.len_lines()));
 
-            Range::new(start, end).with_direction(range.direction())
+            let range = Range::new(start, end).with_direction(range.direction());
+            helix_core::fold::grow_over_folds(doc.folds(view.id), text.slice(..), range)
         }),
     );
 }
@@ -3656,6 +3668,7 @@ fn open(cx: &mut Context, open: Open, comment_continuation: CommentContinuation)
     let text = doc.text().slice(..);
     let contents = doc.text();
     let selection = doc.selection(view.id);
+    let folds = doc.folds(view.id);
     let mut offs = 0;
 
     let mut ranges = SmallVec::with_capacity(selection.len());
@@ -3670,10 +3683,19 @@ fn open(cx: &mut Context, open: Open, comment_continuation: CommentContinuation)
 
     let mut transaction = Transaction::change_by_selection(contents, selection, |range| {
         // the line number, where the cursor is currently
-        let curr_line_num = text.char_to_line(match open {
+        let mut curr_line_num = text.char_to_line(match open {
             Open::Below => graphemes::prev_grapheme_boundary(text, range.to()),
             Open::Above => range.from(),
         });
+        // a folded block is part of its header line, so open below the block
+        if open == Open::Below {
+            if let Some(fold) = folds
+                .iter()
+                .find(|fold| fold.header_line(text) == curr_line_num)
+            {
+                curr_line_num = fold.lines(text).end - 1;
+            }
+        }
 
         // the next line number, where the cursor will be, after finishing the transaction
         let next_new_line_num = match open {
@@ -3697,6 +3719,17 @@ fn open(cx: &mut Context, open: Open, comment_continuation: CommentContinuation)
             )
         };
 
+        // The new line usually goes in at the end of the line above it. When a fold
+        // hides that line it goes in at the start of the line below instead, so that
+        // it lands after the fold rather than inside it.
+        let folded_above = next_new_line_num > 0
+            && helix_core::fold::fold_at(folds, above_next_line_end_index).is_some();
+        let (insert_index, insert_width) = if folded_above {
+            (text.line_to_char(next_new_line_num), 0)
+        } else {
+            (above_next_line_end_index, above_next_line_end_width)
+        };
+
         let line = text.line(curr_line_num);
         let indent = match line.first_non_whitespace_char() {
             Some(pos) if continue_comment_token.is_some() => line.slice(..pos).to_string(),
@@ -3716,7 +3749,7 @@ fn open(cx: &mut Context, open: Open, comment_continuation: CommentContinuation)
         let indent_len = indent.len();
         let mut text = String::with_capacity(1 + indent_len);
 
-        if open == Open::Above && next_new_line_num == 0 {
+        if open == Open::Above && next_new_line_num == 0 || folded_above {
             text.push_str(&indent);
             if let Some(token) = continue_comment_token {
                 text.push_str(token);
@@ -3736,7 +3769,7 @@ fn open(cx: &mut Context, open: Open, comment_continuation: CommentContinuation)
         let text = text.repeat(count);
 
         // calculate new selection ranges
-        let pos = offs + above_next_line_end_index + above_next_line_end_width;
+        let pos = offs + insert_index + insert_width;
         let comment_len = continue_comment_token
             .map(|token| token.len() + 1) // `+ 1` for the extra space added
             .unwrap_or_default();
@@ -3754,11 +3787,7 @@ fn open(cx: &mut Context, open: Open, comment_continuation: CommentContinuation)
         // update the offset for the next range
         offs += text.chars().count();
 
-        (
-            above_next_line_end_index,
-            above_next_line_end_index,
-            Some(text.into()),
-        )
+        (insert_index, insert_index, Some(text.into()))
     });
 
     transaction = transaction.with_selection(Selection::new(ranges, selection.primary_index()));
@@ -6844,6 +6873,9 @@ fn jump_to_word(cx: &mut Context, behaviour: Movement) {
     // It's ok though because the extra jump labels will not be rendered.
     let start = text.line_to_char(text.char_to_line(doc.view_offset(view.id).anchor));
     let end = text.line_to_char(view.estimate_last_doc_line(doc) + 1);
+    // folded words are not on screen to be labeled
+    let folds = doc.folds(view.id);
+    let is_folded = |pos| helix_core::fold::fold_at(folds, pos).is_some();
 
     let primary_selection = doc.selection(view.id).primary();
     let cursor = primary_selection.cursor(text);
@@ -6875,7 +6907,7 @@ fn jump_to_word(cx: &mut Context, behaviour: Movement) {
                 .take_while(|g| g.chars().all(char_is_word))
                 .count()
                 == 2;
-            if !add_label {
+            if !add_label || is_folded(cursor_fwd.head) {
                 continue;
             }
             changed = true;
@@ -6903,7 +6935,7 @@ fn jump_to_word(cx: &mut Context, behaviour: Movement) {
                 .take_while(|g| g.chars().all(char_is_word))
                 .count()
                 == 2;
-            if !add_label {
+            if !add_label || is_folded(cursor_rev.head) {
                 continue;
             }
             changed = true;

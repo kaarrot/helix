@@ -791,6 +791,8 @@ pub enum GutterType {
     Spacer,
     /// Highlight local changes
     Diff,
+    /// Mark the lines whose block below is folded
+    Folds,
 }
 
 impl std::str::FromStr for GutterType {
@@ -802,8 +804,9 @@ impl std::str::FromStr for GutterType {
             "spacer" => Ok(Self::Spacer),
             "line-numbers" => Ok(Self::LineNumbers),
             "diff" => Ok(Self::Diff),
+            "folds" => Ok(Self::Folds),
             _ => anyhow::bail!(
-                "Gutter type can only be `diagnostics`, `spacer`, `line-numbers` or `diff`."
+                "Gutter type can only be `diagnostics`, `spacer`, `line-numbers`, `diff` or `folds`."
             ),
         }
     }

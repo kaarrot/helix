@@ -257,6 +257,10 @@
 | `align_view_bottom` | Align view bottom | normal: `` Zb ``, `` zb ``, select: `` Zb ``, `` zb `` |
 | `scroll_up` | Scroll view up | normal: `` Zk ``, `` zk ``, `` Z<up> ``, `` z<up> ``, select: `` Zk ``, `` zk ``, `` Z<up> ``, `` z<up> `` |
 | `scroll_down` | Scroll view down | normal: `` Zj ``, `` zj ``, `` Z<down> ``, `` z<down> ``, select: `` Zj ``, `` zj ``, `` Z<down> ``, `` z<down> `` |
+| `toggle_fold` | Fold or unfold the block at the cursor | normal: `` Za ``, `` za ``, select: `` Za ``, `` za `` |
+| `fold_selection` | Fold the selected lines | normal: `` Zf ``, `` zf ``, select: `` Zf ``, `` zf `` |
+| `fold_all` | Fold all blocks | normal: `` ZM ``, `` zM ``, select: `` ZM ``, `` zM `` |
+| `unfold_all` | Unfold all blocks | normal: `` ZR ``, `` zR ``, select: `` ZR ``, `` zR `` |
 | `match_brackets` | Goto matching bracket | normal: `` mm ``, select: `` mm `` |
 | `surround_add` | Surround add | normal: `` ms ``, select: `` ms `` |
 | `surround_replace` | Surround replace | normal: `` mr ``, select: `` mr `` |

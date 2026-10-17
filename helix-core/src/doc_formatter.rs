@@ -172,6 +172,7 @@ impl Default for TextFormat {
 
 #[derive(Debug)]
 pub struct DocumentFormatter<'t> {
+    text: RopeSlice<'t>,
     text_fmt: &'t TextFormat,
     annotations: &'t TextAnnotations<'t>,
 
@@ -206,6 +207,8 @@ impl<'t> DocumentFormatter<'t> {
     /// This is usually just a normal line break.
     /// However very long lines are always wrapped at constant intervals that can be cheaply calculated
     /// to avoid pathological behaviour.
+    ///
+    /// A `char_idx` hidden by a fold starts the formatter at the fold's header.
     pub fn new_at_prev_checkpoint(
         text: RopeSlice<'t>,
         text_fmt: &'t TextFormat,
@@ -213,11 +216,16 @@ impl<'t> DocumentFormatter<'t> {
         char_idx: usize,
     ) -> Self {
         // TODO divide long lines into blocks to avoid bad performance for long lines
-        let block_line_idx = text.char_to_line(char_idx.min(text.len_chars()));
+        let char_idx = char_idx.min(text.len_chars());
+        let char_idx = annotations
+            .fold_at(char_idx)
+            .map_or(char_idx, |fold| fold.start - 1);
+        let block_line_idx = text.char_to_line(char_idx);
         let block_char_idx = text.line_to_char(block_line_idx);
         annotations.reset_pos(block_char_idx);
 
         DocumentFormatter {
+            text,
             text_fmt,
             annotations,
             visual_pos: Position { row: 0, col: 0 },
@@ -420,6 +428,21 @@ impl<'t> DocumentFormatter<'t> {
         }
     }
 
+    /// Jumps over the lines of a fold that starts at the current position.
+    ///
+    /// Folds start at line starts, so this only runs right after a line break has
+    /// been yielded, when no graphemes are buffered that would have to be thrown away.
+    fn skip_folded_lines(&mut self) {
+        while let Some(fold) = self.annotations.fold_at(self.char_pos) {
+            debug_assert!(self.peeked_grapheme.is_none() && self.word_i >= self.word_buf.len());
+            let end = fold.end.min(self.text.len_chars());
+            self.char_pos = end;
+            self.line_pos = self.text.char_to_line(end);
+            self.graphemes = self.text.slice(end..).graphemes();
+            self.annotations.skip_to(end);
+        }
+    }
+
     /// returns the char index at the end of the last yielded grapheme
     pub fn next_char_pos(&self) -> usize {
         self.char_pos
@@ -471,6 +494,7 @@ impl<'t> Iterator for DocumentFormatter<'t> {
             self.visual_pos.col = 0;
             if !grapheme.is_virtual() {
                 self.line_pos += 1;
+                self.skip_folded_lines();
             }
         } else {
             self.visual_pos.col += grapheme.width();

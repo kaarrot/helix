@@ -240,7 +240,7 @@ impl LanguageData {
         config: &LanguageConfiguration,
     ) -> Result<Option<FoldQuery>> {
         let name = &config.language_id;
-        let text = read_query(name, "folds.scm");
+        let text = read_fold_query(config);
         if text.is_empty() {
             return Ok(None);
         }
@@ -299,8 +299,32 @@ fn reconfigure_highlights(config: &SyntaxConfig, recognized_names: &[String]) {
 
 pub fn read_query(lang: &str, query_filename: &str) -> String {
     tree_house::read_query(lang, |language| {
-        helix_loader::grammar::load_runtime_file(language, query_filename).unwrap_or_default()
+        helix_loader::grammar::load_runtime_file(language, query_filename)
+            .ok()
+            .or_else(|| builtin_query(language, query_filename).map(str::to_owned))
+            .unwrap_or_default()
     })
+}
+
+/// Queries compiled into hx, for a runtime directory that lacks them: the binary
+/// alone is then enough to fold markdown's code blocks. A file in the runtime
+/// directory takes precedence.
+fn builtin_query(lang: &str, query_filename: &str) -> Option<&'static str> {
+    match (lang, query_filename) {
+        ("markdown", "folds.scm") => Some(include_str!("../../runtime/queries/markdown/folds.scm")),
+        _ => None,
+    }
+}
+
+/// Reads the folds.scm query of a language. A language without a folds.scm of
+/// its own uses the one of its grammar, so a language built on markdown's
+/// grammar folds like markdown.
+pub fn read_fold_query(config: &LanguageConfiguration) -> String {
+    let text = read_query(&config.language_id, "folds.scm");
+    match &config.grammar {
+        Some(grammar) if text.is_empty() => read_query(grammar, "folds.scm"),
+        _ => text,
+    }
 }
 
 #[derive(Debug, Default)]
@@ -1242,6 +1266,9 @@ impl FoldQuery {
                 closed_patterns.insert(pattern);
                 Ok(())
             }
+            // used by bundled folds.scm files that come from other editors
+            UserPredicate::SetProperty { key: "role", .. } => Ok(()),
+            UserPredicate::Other(pred) if pred.name() == "trim!" => Ok(()),
             _ => Err(InvalidPredicateError::unknown(predicate)),
         })?;
 
@@ -1352,6 +1379,26 @@ mod test {
         // The query used in this test case only captures the first line_comment node.
         // Determine if this behavior is intentional in tree-sitter.
         // test("multiple_nodes_grouped", 1..37);
+    }
+
+    #[test]
+    fn fold_query_falls_back_to_grammar() {
+        let rmarkdown = LOADER.language_for_name("rmarkdown").unwrap();
+        let config = LOADER.language(rmarkdown).config();
+        assert!(!read_fold_query(config).is_empty());
+        assert_eq!(read_fold_query(config), read_query("markdown", "folds.scm"));
+    }
+
+    #[test]
+    fn fold_query_ignores_predicates_of_other_editors() {
+        for name in ["just", "blade"] {
+            let language = LOADER.language_for_name(name).unwrap();
+            let config = LOADER.language(language).config();
+            let grammar = LOADER.get_config(language).unwrap().grammar;
+            assert!(LanguageData::compile_fold_query(grammar, config)
+                .unwrap()
+                .is_some());
+        }
     }
 
     #[test]

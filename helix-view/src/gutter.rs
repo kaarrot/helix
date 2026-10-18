@@ -293,7 +293,7 @@ fn fold_markers<'doc>(doc: &'doc Document, view: &View, theme: &Theme) -> Gutter
     let text = doc.text().slice(..);
     let folds = doc.folds(view.id);
     let style = theme
-        .try_get("ui.virtual.fold")
+        .try_get_exact("ui.virtual.fold")
         .unwrap_or_else(|| theme.get("ui.linenr"));
 
     Box::new(
@@ -413,11 +413,15 @@ pub fn diagnostics_or_breakpoints<'doc>(
     let mut diagnostics = diagnostic(editor, doc, view, theme, is_focused);
     let mut breakpoints = breakpoints(editor, doc, view, theme, is_focused);
     let mut execution_pause_indicator = execution_pause_indicator(editor, doc, theme);
+    // without a "folds" gutter of its own, a layout shows the fold markers here
+    let mut folds =
+        (!view.gutters.layout.contains(&GutterType::Folds)).then(|| fold_markers(doc, view, theme));
 
     Box::new(move |line, selected, first_visual_line: bool, out| {
         execution_pause_indicator(line, selected, first_visual_line, out)
             .or_else(|| breakpoints(line, selected, first_visual_line, out))
             .or_else(|| diagnostics(line, selected, first_visual_line, out))
+            .or_else(|| folds.as_mut()?(line, selected, first_visual_line, out))
     })
 }
 

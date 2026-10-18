@@ -1338,6 +1338,13 @@ impl Document {
         language_config: Option<Arc<syntax::config::LanguageConfiguration>>,
         loader: &syntax::Loader,
     ) {
+        // Saving detects the language again. Only a new language or a first
+        // syntax tree folds blocks, so a save keeps the blocks the user unfolded.
+        let language_id = |config: &Option<Arc<syntax::config::LanguageConfiguration>>| {
+            config.as_ref().map(|config| config.language_id.clone())
+        };
+        let new_syntax =
+            self.syntax.is_none() || language_id(&self.language) != language_id(&language_config);
         self.language = language_config;
         self.syntax = self.language.as_ref().and_then(|config| {
             Syntax::new(self.text.slice(..), config.language(), loader)
@@ -1351,6 +1358,19 @@ impl Document {
                 })
                 .ok()
         });
+
+        // the views already showing the document get the folds of a newly opened file
+        if new_syntax && self.syntax.is_some() {
+            let views: Vec<ViewId> = self
+                .selections
+                .keys()
+                .filter(|&&view_id| self.folds(view_id).is_empty())
+                .copied()
+                .collect();
+            for view_id in views {
+                self.fold_closed_blocks(view_id);
+            }
+        }
     }
 
     /// Set the programming language for the file if you know the language but don't have the
@@ -2510,6 +2530,33 @@ mod test {
     use arc_swap::ArcSwap;
 
     use super::*;
+
+    #[test]
+    fn new_language_folds_closed_blocks_of_open_views() {
+        let text = Rope::from("# title\n\n```rust\nfn a() {}\nfn b() {}\n```\n");
+        let mut doc = Document::from(
+            text,
+            None,
+            Arc::new(ArcSwap::new(Arc::new(Config::default()))),
+            Arc::new(ArcSwap::from_pointee(
+                helix_core::config::default_lang_loader(),
+            )),
+        );
+        let view = ViewId::default();
+        doc.ensure_view_init(view);
+        assert!(doc.folds(view).is_empty());
+
+        let loader = doc.syn_loader.load_full();
+        doc.set_language_by_language_id("markdown", &loader)
+            .unwrap();
+        assert_eq!(doc.folds(view).len(), 1);
+
+        // saving detects the language again, which leaves unfolded blocks open
+        doc.set_folds(view, Vec::new());
+        doc.set_language_by_language_id("markdown", &loader)
+            .unwrap();
+        assert!(doc.folds(view).is_empty());
+    }
 
     #[test]
     fn changeset_to_changes_ignore_line_endings() {

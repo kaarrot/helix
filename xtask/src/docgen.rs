@@ -153,9 +153,15 @@ pub fn lang_features() -> Result<String, DynError> {
             .unwrap(); // lang comes from config
         row.push(lc.language_id.clone());
 
-        for (_feat, support_list) in &ts_features_to_langs {
+        for (feat, support_list) in &ts_features_to_langs {
+            // a language without folds.scm of its own folds with its grammar's
+            let grammar_folds = matches!(feat, TsFeature::Fold)
+                && lc
+                    .grammar
+                    .as_ref()
+                    .is_some_and(|grammar| support_list.contains(grammar));
             row.push(
-                if support_list.contains(&lang) {
+                if support_list.contains(&lang) || grammar_folds {
                     "✓"
                 } else {
                     ""

@@ -1,5 +1,6 @@
 use crate::config::{Config, ConfigLoadError};
 use helix_core::config::{default_lang_config, user_lang_config};
+use helix_core::syntax::config::LanguageConfiguration;
 use helix_loader::grammar::load_runtime_file;
 use std::{
     collections::HashSet,
@@ -17,6 +18,7 @@ pub enum TsFeature {
     AutoIndent,
     Tags,
     RainbowBracket,
+    Fold,
 }
 
 impl TsFeature {
@@ -27,6 +29,7 @@ impl TsFeature {
             Self::AutoIndent,
             Self::Tags,
             Self::RainbowBracket,
+            Self::Fold,
         ]
     }
 
@@ -37,6 +40,7 @@ impl TsFeature {
             Self::AutoIndent => "indents.scm",
             Self::Tags => "tags.scm",
             Self::RainbowBracket => "rainbows.scm",
+            Self::Fold => "folds.scm",
         }
     }
 
@@ -47,6 +51,7 @@ impl TsFeature {
             Self::AutoIndent => "Auto Indent",
             Self::Tags => "Code Navigation Tags",
             Self::RainbowBracket => "Rainbow Brackets",
+            Self::Fold => "Code Folding",
         }
     }
 
@@ -57,6 +62,16 @@ impl TsFeature {
             Self::AutoIndent => "Indent",
             Self::Tags => "Tags",
             Self::RainbowBracket => "Rainbow",
+            Self::Fold => "Fold",
+        }
+    }
+
+    /// Whether the runtime directory has the queries of this feature for `lang`.
+    /// A language without folds.scm of its own folds with its grammar's.
+    pub fn has_queries(&self, lang: &LanguageConfiguration) -> bool {
+        match self {
+            Self::Fold => !helix_core::syntax::read_fold_query(lang).is_empty(),
+            _ => load_runtime_file(&lang.language_id, self.runtime_filename()).is_ok(),
         }
     }
 }
@@ -252,7 +267,7 @@ fn languages(selection: Option<HashSet<String>>) -> std::io::Result<()> {
         write!(stdout, "{}", check_binary(formatter))?;
 
         for ts_feat in TsFeature::all() {
-            match load_runtime_file(&lang.language_id, ts_feat.runtime_filename()).is_ok() {
+            match ts_feat.has_queries(lang) {
                 true => write!(stdout, "{}", color(fit("✓"), ColorSpec::BRIGHT_GREEN))?,
                 false => write!(stdout, "{}", color(fit("✘"), ColorSpec::BRIGHT_RED))?,
             }
@@ -352,7 +367,7 @@ pub fn language(lang_str: String) -> std::io::Result<()> {
     probe_parser(lang.grammar.as_ref().unwrap_or(&lang.language_id))?;
 
     for ts_feat in TsFeature::all() {
-        probe_treesitter_feature(&lang_str, *ts_feat)?
+        probe_treesitter_feature(lang, *ts_feat)?
     }
 
     Ok(())
@@ -420,11 +435,14 @@ fn probe_protocol(protocol_name: &str, server_cmd: Option<String>) -> std::io::R
 
 /// Display diagnostics about a feature that requires tree-sitter
 /// query files (highlights, textobjects, etc).
-fn probe_treesitter_feature(lang: &str, feature: TsFeature) -> std::io::Result<()> {
+fn probe_treesitter_feature(
+    lang: &LanguageConfiguration,
+    feature: TsFeature,
+) -> std::io::Result<()> {
     let stdout = std::io::stdout();
     let mut stdout = stdout.lock();
 
-    let found = match load_runtime_file(lang, feature.runtime_filename()).is_ok() {
+    let found = match feature.has_queries(lang) {
         true => "✓".green(),
         false => "✘".red(),
     };

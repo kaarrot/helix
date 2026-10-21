@@ -50,6 +50,7 @@ use crate::{
     editor::Config,
     events::{DocumentDidChange, SelectionDidChange},
     expansion,
+    pgp::{self, PgpState},
     view::ViewPosition,
     DocumentId, Editor, Theme, View, ViewId,
 };
@@ -139,6 +140,8 @@ pub enum DocumentOpenError {
     IrregularFile,
     #[error(transparent)]
     IoError(#[from] io::Error),
+    #[error("can't open encrypted file: {0}")]
+    PgpUnsupported(&'static str),
 }
 
 /// The file and revision a virtual revision document shows.
@@ -243,6 +246,9 @@ pub struct Document {
     /// needs saving, so it never counts as modified, and it is kept rather than
     /// discarded when another file replaces it in a view, although it has no path.
     pub is_transcript: bool,
+    /// Set for a passphrase-encrypted (`gpg -c`) file, which is decrypted when
+    /// opened and encrypted again on every save.
+    pub pgp: Option<PgpState>,
     /// Live positions of the review threads anchored in this document, kept in
     /// step with edits by the `DocumentDidChange` hook. The threads themselves
     /// live on `Editor`; only their positions can be maintained here, because
@@ -820,6 +826,7 @@ impl Document {
             char_diff_minus_side: false,
             linked_diff_doc: None,
             is_transcript: false,
+            pgp: None,
             jump_labels: HashMap::new(),
             folds: HashMap::new(),
             color_swatches: None,
@@ -862,10 +869,28 @@ impl Document {
         encoding = encoding.or(editor_config.encoding);
 
         // Open the file if it exists, otherwise assume it is a new file (and thus empty).
-        let (rope, encoding, has_bom) = if path.exists() {
+        let mut pgp_state = None;
+        let (rope, encoding, has_bom) = if path.exists() && pgp::is_pgp_path(path) {
+            let bytes = std::fs::read(path)?;
+            match pgp::inspect(&bytes) {
+                pgp::Contents::Plain => from_reader(&mut &bytes[..], encoding)?,
+                pgp::Contents::Unsupported(reason) => {
+                    return Err(DocumentOpenError::PgpUnsupported(reason))
+                }
+                pgp::Contents::Encrypted { armored } => {
+                    // Opened empty and read-only until `pgp_unlock` gets the
+                    // passphrase.
+                    pgp_state = Some(PgpState::locked(armored, bytes));
+                    (Rope::new(), encoding.unwrap_or(encoding::UTF_8), false)
+                }
+            }
+        } else if path.exists() {
             let mut file = std::fs::File::open(path)?;
             from_reader(&mut file, encoding)?
         } else {
+            if pgp::is_new_file_path(path) {
+                pgp_state = Some(PgpState::new_file());
+            }
             let line_ending = editor_config
                 .line_ending
                 .unwrap_or_else(|| config.load().default_line_ending.into());
@@ -875,6 +900,7 @@ impl Document {
 
         let loader = syn_loader.load();
         let mut doc = Self::from(rope, Some((encoding, has_bom)), config, syn_loader);
+        doc.pgp = pgp_state;
 
         // set the path and try detecting the language
         doc.set_path(Some(path));
@@ -909,6 +935,10 @@ impl Document {
         &self,
         editor: &Editor,
     ) -> Option<BoxFuture<'static, Result<Transaction, FormatterError>>> {
+        // A formatter would get the decrypted text.
+        if self.pgp.is_some() {
+            return None;
+        }
         if let Some((fmt_cmd, fmt_args)) = self
             .language_config()
             .and_then(|c| c.formatter.as_ref())
@@ -1063,6 +1093,16 @@ impl Document {
             bail!("Cannot save a git revision document");
         }
 
+        // An encrypted document is saved encrypted with its own passphrase,
+        // whatever the path.
+        let pgp_save = match &self.pgp {
+            Some(state) => match &state.passphrase {
+                Some(passphrase) => Some((passphrase.clone(), state.armored)),
+                None => bail!("{} is encrypted and still locked", self.display_name()),
+            },
+            None => None,
+        };
+
         // we clone and move text + path into the future so that we asynchronously save the current
         // state without blocking any further edits.
         let text = self.text().clone();
@@ -1076,6 +1116,17 @@ impl Document {
                 self.path.as_ref().unwrap().clone()
             }
         };
+
+        if pgp_save.is_none() && pgp::is_new_file_path(&path) && !path.exists() {
+            bail!(
+                "won't write plain text to a new encrypted file; open {} to set its passphrase",
+                path.display()
+            );
+        }
+        let pgp_file_name = pgp::inner_path(&path)
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
 
         let identifier = self.path().map(|_| self.identifier());
         let language_servers: Vec<_> = self.language_servers.values().cloned().collect();
@@ -1112,6 +1163,20 @@ impl Document {
                     }
                 }
             }
+            // Encrypt before touching the file, so a failure leaves it as it was.
+            let ciphertext = match pgp_save {
+                Some((passphrase, armored)) => {
+                    let mut plaintext = Vec::new();
+                    to_writer(&mut plaintext, encoding_with_bom_info, &text).await?;
+                    let ciphertext = tokio::task::spawn_blocking(move || {
+                        pgp::encrypt(&plaintext, &passphrase, armored, &pgp_file_name)
+                    })
+                    .await??;
+                    Some(ciphertext)
+                }
+                None => None,
+            };
+
             let write_path = tokio::fs::read_link(&path)
                 .await
                 .ok()
@@ -1166,8 +1231,15 @@ impl Document {
             };
 
             let write_result: anyhow::Result<_> = async {
+                use tokio::io::AsyncWriteExt;
                 let mut dst = tokio::fs::File::create(&write_path).await?;
-                to_writer(&mut dst, encoding_with_bom_info, &text).await?;
+                match &ciphertext {
+                    Some(ciphertext) => {
+                        dst.write_all(ciphertext).await?;
+                        dst.flush().await?;
+                    }
+                    None => to_writer(&mut dst, encoding_with_bom_info, &text).await?,
+                }
                 dst.sync_all().await?;
                 Ok(())
             }
@@ -1247,8 +1319,14 @@ impl Document {
         &self,
         loader: &syntax::Loader,
     ) -> Option<Arc<syntax::config::LanguageConfiguration>> {
+        let path = self.path.as_ref()?;
+        // `notes.md.gpg` is Markdown.
+        let path = match self.pgp {
+            Some(_) => Cow::Owned(pgp::inner_path(path)),
+            None => Cow::Borrowed(path),
+        };
         let language = loader
-            .language_for_filename(self.path.as_ref()?)
+            .language_for_filename(&path)
             .or_else(|| loader.language_for_shebang(self.text().slice(..)))?;
 
         Some(loader.language(language).config().clone())
@@ -1334,7 +1412,7 @@ impl Document {
     pub fn detect_readonly(&mut self) {
         // Virtual git revisions stay read-only even when they have no path
         // (or if a caller later attaches a path for language detection).
-        if self.is_virtual_base {
+        if self.is_virtual_base || self.is_pgp_locked() {
             self.readonly = true;
             return;
         }
@@ -1370,8 +1448,28 @@ impl Document {
         // Once we have a valid path we check if its readonly status has changed
         self.detect_readonly();
 
-        let mut file = std::fs::File::open(&path)?;
-        let (rope, ..) = from_reader(&mut file, Some(encoding))?;
+        let rope = match &self.pgp {
+            Some(state) => {
+                let Some(passphrase) = &state.passphrase else {
+                    bail!("{} is encrypted and still locked", self.display_name());
+                };
+                let bytes = std::fs::read(&path)?;
+                let pgp::Contents::Encrypted { armored } = pgp::inspect(&bytes) else {
+                    bail!("can't reload: the file is no longer passphrase-encrypted");
+                };
+                let plaintext = pgp::decrypt(&bytes, passphrase)
+                    .map_err(|err| anyhow!("can't reload: {err}"))?;
+                let (rope, ..) = from_reader(&mut &plaintext[..], Some(encoding))?;
+                if let Some(state) = &mut self.pgp {
+                    state.armored = armored;
+                }
+                rope
+            }
+            None => {
+                let mut file = std::fs::File::open(&path)?;
+                from_reader(&mut file, Some(encoding))?.0
+            }
+        };
 
         // Calculate the difference between the buffer and source text, and apply it.
         // This is not considered a modification of the contents of the file regardless
@@ -1973,6 +2071,66 @@ impl Document {
         self.id
     }
 
+    /// Whether this is a passphrase-encrypted file.
+    pub fn is_encrypted(&self) -> bool {
+        self.pgp.is_some()
+    }
+
+    /// Whether this encrypted file still waits for its passphrase.
+    pub fn is_pgp_locked(&self) -> bool {
+        self.pgp.as_ref().is_some_and(PgpState::is_locked)
+    }
+
+    /// Decrypts a locked encrypted file with `passphrase` and shows its text
+    /// as if it had just been opened: nothing to undo and nothing modified,
+    /// so the empty buffer it replaces can't be brought back and saved over
+    /// the file. A new file only takes the passphrase.
+    pub fn pgp_unlock(&mut self, passphrase: pgp::Passphrase) -> Result<(), pgp::BadPassphrase> {
+        let Some(state) = self.pgp.as_ref().filter(|state| state.is_locked()) else {
+            return Ok(());
+        };
+        let decoded = match &state.ciphertext {
+            Some(ciphertext) => {
+                let plaintext = pgp::decrypt(ciphertext, &passphrase)?;
+                let decoded = from_reader(&mut &plaintext[..], self.editor_config.encoding)
+                    .map_err(|_| pgp::BadPassphrase)?;
+                Some(decoded)
+            }
+            None => None,
+        };
+        if let Some(state) = &mut self.pgp {
+            state.passphrase = Some(passphrase);
+            state.ciphertext = None;
+        }
+
+        if let Some((rope, encoding, has_bom)) = decoded {
+            self.encoding = encoding;
+            self.has_bom = has_bom;
+            let view_ids: Vec<ViewId> = self.selections.keys().copied().collect();
+            match view_ids.first() {
+                Some(&view_id) => {
+                    let transaction = helix_core::diff::compare_ropes(self.text(), &rope);
+                    self.apply(&transaction, view_id);
+                    for view_id in view_ids {
+                        self.set_selection(view_id, Selection::point(0));
+                    }
+                }
+                None => {
+                    self.text = rope;
+                    let loader = self.syn_loader.load();
+                    self.set_language(self.language.clone(), &loader);
+                }
+            }
+            self.changes = ChangeSet::new(self.text.slice(..));
+            self.old_state = None;
+            self.history.set(History::default());
+            self.reset_modified();
+            self.detect_indent_and_line_ending();
+        }
+        self.detect_readonly();
+        Ok(())
+    }
+
     /// If there are unsaved modifications.
     pub fn is_modified(&self) -> bool {
         if self.is_transcript {
@@ -2058,6 +2216,11 @@ impl Document {
     }
 
     pub fn word_completion_enabled(&self) -> bool {
+        // The word index is shared, so it would offer this file's words as
+        // completions in every other buffer.
+        if self.pgp.is_some() {
+            return false;
+        }
         self.language_config()
             .and_then(|lang_config| lang_config.word_completion.and_then(|c| c.enable))
             .unwrap_or_else(|| self.config.load().word_completion.enable)
@@ -2211,6 +2374,10 @@ impl Document {
 
     /// Intialize/updates the differ for this document with a new base.
     pub fn set_diff_base(&mut self, diff_base: Vec<u8>) {
+        // Git only has the ciphertext, and a diff worker would hold the text.
+        if self.pgp.is_some() {
+            return;
+        }
         if let Ok((diff_base, ..)) = from_reader(&mut diff_base.as_slice(), Some(self.encoding)) {
             if let Some(differ) = &self.diff_handle {
                 differ.update_diff_base(diff_base);
@@ -2844,6 +3011,94 @@ mod test {
     use arc_swap::ArcSwap;
 
     use super::*;
+
+    #[cfg(feature = "pgp")]
+    fn open(path: &Path) -> Result<Document, DocumentOpenError> {
+        Document::open(
+            path,
+            None,
+            false,
+            Arc::new(ArcSwap::new(Arc::new(Config::default()))),
+            Arc::new(ArcSwap::from_pointee(syntax::Loader::default())),
+        )
+    }
+
+    #[cfg(feature = "pgp")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn encrypted_file_opens_locked_unlocks_and_saves_encrypted() {
+        use crate::pgp::{decrypt, encrypt, inspect, Contents, Passphrase};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notes.md.gpg");
+        let passphrase = Passphrase::new("correct horse");
+        std::fs::write(
+            &path,
+            encrypt(b"secret\n", &passphrase, false, "notes.md").unwrap(),
+        )
+        .unwrap();
+
+        let mut doc = open(&path).unwrap();
+        assert!(doc.is_pgp_locked());
+        assert!(doc.readonly);
+        assert_eq!(doc.text().to_string(), "");
+        assert!(doc.save::<PathBuf>(None, false).is_err());
+
+        let view = ViewId::default();
+        doc.ensure_view_init(view);
+        assert!(doc.pgp_unlock(Passphrase::new("wrong")).is_err());
+        assert!(doc.is_pgp_locked());
+        doc.pgp_unlock(passphrase.clone()).unwrap();
+        assert_eq!(doc.text().to_string(), "secret\n");
+        assert!(!doc.readonly);
+        assert!(!doc.is_modified());
+        assert_eq!(doc.get_current_revision(), 0, "nothing to undo");
+        assert_eq!(
+            doc.selection(view).primary().from(),
+            0,
+            "cursor at the start"
+        );
+
+        let transaction = Transaction::insert(doc.text(), &Selection::point(0), "more ".into());
+        doc.apply(&transaction, view);
+        doc.save::<PathBuf>(None, false).unwrap().await.unwrap();
+
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(inspect(&bytes), Contents::Encrypted { armored: false });
+        assert_eq!(&decrypt(&bytes, &passphrase).unwrap()[..], b"more secret\n");
+    }
+
+    #[cfg(feature = "pgp")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn new_encrypted_file_needs_a_passphrase_before_saving() {
+        use crate::pgp::{decrypt, Passphrase};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("new.txt.gpg");
+        let mut doc = open(&path).unwrap();
+        assert!(doc.is_pgp_locked());
+        assert!(doc.save::<PathBuf>(None, false).is_err());
+
+        let passphrase = Passphrase::new("new one");
+        doc.ensure_view_init(ViewId::default());
+        doc.pgp_unlock(passphrase.clone()).unwrap();
+        doc.save::<PathBuf>(None, false).unwrap().await.unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(&decrypt(&bytes, &passphrase).unwrap()[..], b"\n");
+    }
+
+    #[cfg(feature = "pgp")]
+    #[test]
+    fn plain_text_is_not_written_to_a_new_encrypted_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut doc = Document::from(
+            Rope::from("secret\n"),
+            None,
+            Arc::new(ArcSwap::new(Arc::new(Config::default()))),
+            Arc::new(ArcSwap::from_pointee(syntax::Loader::default())),
+        );
+        assert!(doc.save(Some(dir.path().join("fresh.gpg")), false).is_err());
+        assert!(!dir.path().join("fresh.gpg").exists());
+    }
 
     #[test]
     fn new_language_folds_closed_blocks_of_open_views() {

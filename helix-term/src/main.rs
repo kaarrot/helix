@@ -4,6 +4,12 @@ use helix_term::application::Application;
 use helix_term::args::Args;
 use helix_term::config::{Config, ConfigLoadError};
 
+// Zeroes freed memory once an encrypted file has been opened, so its
+// plaintext doesn't linger after the buffer closes.
+#[cfg(feature = "pgp")]
+#[global_allocator]
+static GLOBAL: helix_stdx::alloc::WipeOnFree = helix_stdx::alloc::WipeOnFree;
+
 fn setup_logging(verbosity: u64) -> Result<()> {
     let mut base_config = fern::Dispatch::new();
 

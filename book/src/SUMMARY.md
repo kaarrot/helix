@@ -14,6 +14,7 @@
   - [Diff and merge](./diff-and-merge.md)
   - [Debugger](./debugger.md)
   - [Review comments](./review-comments.md)
+  - [Encrypted files](./encrypted-files.md)
   - [Jumplist](./jumplist.md)
   - [Keymap](./keymap.md)
   - [Command line](./command-line.md)

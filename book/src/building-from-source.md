@@ -52,6 +52,9 @@ RUSTFLAGS="-C target-feature=-crt-static"
 
 > 💡 If you do not want to fetch or build grammars, set an environment variable `HELIX_DISABLE_AUTO_GRAMMAR_BUILD`
 
+> 💡 Editing [encrypted files](./encrypted-files.md) needs the `pgp` feature,
+> which is off by default: add `--features pgp` to either command.
+
 > 💡 Tree-sitter grammars can be fetched and compiled if not pre-packaged. Fetch
 > grammars with `hx --grammar fetch` and compile them with
 > `hx --grammar build`. This will install them in

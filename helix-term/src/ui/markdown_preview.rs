@@ -88,6 +88,11 @@ pub struct MarkdownPreview {
 impl MarkdownPreview {
     pub const ID: &'static str = "markdown-preview";
 
+    /// The document this previews.
+    pub fn source_doc(&self) -> DocumentId {
+        self.source_doc
+    }
+
     pub fn new(
         source_view: ViewId,
         source_doc: DocumentId,

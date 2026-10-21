@@ -8,7 +8,13 @@ use crate::ui;
 pub(super) fn register_hooks(_handlers: &Handlers) {
     register_hook!(move |_event: &mut DocumentFocusLost<'_>| {
         job::dispatch_blocking(move |_, compositor| {
-            if compositor.find::<ui::Prompt>().is_some() {
+            // A passphrase prompt belongs to the encrypted file it opens, not
+            // to the focused one, and opening that file moves the focus.
+            if compositor.find::<ui::Prompt>().is_some()
+                && compositor
+                    .find_id::<ui::Prompt>(ui::Prompt::SECRET_ID)
+                    .is_none()
+            {
                 compositor.remove_type::<ui::Prompt>();
             }
         });

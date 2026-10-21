@@ -1061,6 +1061,8 @@ impl EditorView {
         cxt.editor.autoinfo = self.keymaps.sticky().map(|node| node.infobox());
 
         let mut execute_command = |command: &commands::MappableCommand| {
+            // A macro can switch buffers between commands.
+            cxt.editor.sync_register_source();
             command.execute(cxt);
             helix_event::dispatch(PostCommand { command, cx: cxt });
 

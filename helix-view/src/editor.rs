@@ -1572,6 +1572,8 @@ pub struct Editor {
     pub count: Option<std::num::NonZeroUsize>,
     pub selected_register: Option<char>,
     pub registers: Registers,
+    /// Passphrases that opened an encrypted file this session.
+    pub pgp_passphrases: crate::pgp::Passphrases,
     pub macro_recording: Option<(char, Vec<KeyEvent>)>,
     pub macro_replaying: Vec<char>,
     pub language_servers: helix_lsp::Registry,
@@ -1742,6 +1744,7 @@ impl Editor {
             theme_loader,
             last_theme: None,
             last_selection: None,
+            pgp_passphrases: crate::pgp::Passphrases::default(),
             registers: Registers::new(Box::new(arc_swap::access::Map::new(
                 Arc::clone(&config),
                 |config: &Config| &config.clipboard_provider,
@@ -2027,6 +2030,10 @@ impl Editor {
         let Some(doc_url) = doc.url() else {
             return;
         };
+        // A language server would get the decrypted text.
+        if doc.is_encrypted() {
+            return;
+        }
         // Git revision snapshots use a cache-file URI so they don't collide
         // with the working-tree file; workspace discovery still uses the real path.
         let workspace_path = doc
@@ -2328,6 +2335,34 @@ impl Editor {
         Ok(doc_id)
     }
 
+    /// Points `registers.source` at the focused document when it is encrypted,
+    /// so that whatever is copied out of it is cleared when it closes. Called
+    /// before every event and command.
+    pub fn sync_register_source(&mut self) {
+        self.registers.source = self
+            .tree
+            .try_get(self.tree.focus)
+            .and_then(|view| self.documents.get(&view.doc))
+            .filter(|doc| doc.is_encrypted())
+            .map(|doc| doc.id());
+    }
+
+    /// Clears what open encrypted files left in the clipboard, and the
+    /// remembered passphrases. Called when the editor exits; the clipboard
+    /// outlives it.
+    pub fn wipe_pgp_on_exit(&mut self) {
+        let encrypted: Vec<DocumentId> = self
+            .documents
+            .values()
+            .filter(|doc| doc.is_encrypted())
+            .map(|doc| doc.id())
+            .collect();
+        for doc_id in encrypted {
+            self.registers.wipe_from(doc_id);
+        }
+        self.pgp_passphrases.forget();
+    }
+
     pub fn document_id_by_path(&self, path: &Path) -> Option<DocumentId> {
         self.document_by_path(path).map(|doc| doc.id)
     }
@@ -2352,10 +2387,12 @@ impl Editor {
                 Editor::doc_diagnostics(&self.language_servers, &self.diagnostics, &doc);
             doc.replace_diagnostics(diagnostics, &[], None);
 
-            if let Some(diff_base) = self.diff_providers.get_diff_base(&path) {
-                doc.set_diff_base(diff_base);
+            if !doc.is_encrypted() {
+                if let Some(diff_base) = self.diff_providers.get_diff_base(&path) {
+                    doc.set_diff_base(diff_base);
+                }
+                doc.set_version_control_head(self.diff_providers.get_current_head_name(&path));
             }
-            doc.set_version_control_head(self.diff_providers.get_current_head_name(&path));
 
             let id = self.new_document(doc);
             self.launch_language_servers(id);
@@ -2487,6 +2524,12 @@ impl Editor {
         let Some(doc) = self.documents.remove(&doc_id) else {
             return Ok(());
         };
+        // Its text goes with it; the zero-on-free allocator wipes the copies.
+        // Clear what it left in registers and the clipboard too.
+        if doc.is_encrypted() {
+            self.registers.wipe_from(doc_id);
+            self.sync_register_source();
+        }
         if doc.is_virtual_base {
             if let Some(path) = doc.path() {
                 let _ = std::fs::remove_file(path);
@@ -3206,9 +3249,25 @@ impl Editor {
         id
     }
 
+    /// Whether `path` is an encrypted file, open or not. Diff and merge
+    /// views refuse those: git only has the ciphertext, and a diff against
+    /// another buffer would copy the plaintext into it.
+    fn is_encrypted_path(&self, path: &Path) -> bool {
+        if let Some(doc) = self.document_by_path(path) {
+            return doc.is_encrypted();
+        }
+        crate::pgp::is_pgp_path(path)
+            && std::fs::read(path)
+                .is_ok_and(|bytes| crate::pgp::inspect(&bytes) != crate::pgp::Contents::Plain)
+    }
+
     /// Share one differ worker between a minus-side (base) doc and a plus-side
     /// (working/target) doc. Edits to either side then update both gutters.
     fn link_shared_diff_handles(&mut self, base_doc_id: DocumentId, working_doc_id: DocumentId) {
+        let is_encrypted = |id| self.documents.get(&id).is_some_and(Document::is_encrypted);
+        if is_encrypted(base_doc_id) || is_encrypted(working_doc_id) {
+            return;
+        }
         let base_text = self
             .documents
             .get(&base_doc_id)
@@ -3257,6 +3316,9 @@ impl Editor {
 
         let base_path = helix_stdx::path::canonicalize(base_path);
         let working_path = helix_stdx::path::canonicalize(working_path);
+        if self.is_encrypted_path(&base_path) || self.is_encrypted_path(&working_path) {
+            anyhow::bail!("Diff views aren't available for encrypted files");
+        }
 
         let focused_view = self.tree.focus;
         self.forget_suspended_diffs(focused_view);
@@ -3826,6 +3888,9 @@ impl Editor {
 
         let base_path = helix_stdx::path::canonicalize(base_path);
         let target_path = helix_stdx::path::canonicalize(target_path);
+        if self.is_encrypted_path(&base_path) || self.is_encrypted_path(&target_path) {
+            anyhow::bail!("Diff views aren't available for encrypted files");
+        }
 
         let focused_view = self.tree.focus;
         self.forget_suspended_diffs(focused_view);
@@ -3923,6 +3988,12 @@ impl Editor {
         }
         if !self.documents.contains_key(&working_doc_id) {
             anyhow::bail!("Working buffer no longer exists");
+        }
+        if [base_doc_id, working_doc_id]
+            .iter()
+            .any(|id| self.documents[id].is_encrypted())
+        {
+            anyhow::bail!("Diff views aren't available for encrypted files");
         }
 
         let focused_view = self.tree.focus;
@@ -4329,6 +4400,9 @@ impl Editor {
             use anyhow::Context as _;
 
             let path = helix_stdx::path::canonicalize(path);
+            if self.is_encrypted_path(&path) {
+                anyhow::bail!("Merge views aren't available for encrypted files");
+            }
 
             let focused_view = self.tree.focus;
             if self.diff.merge_views.contains_key(&focused_view) {

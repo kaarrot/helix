@@ -1571,6 +1571,17 @@ fn get_character_info(
     Ok(())
 }
 
+#[cfg(feature = "pgp")]
+fn pgp_forget(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+    cx.editor.pgp_passphrases.forget();
+    cx.editor
+        .set_status("Forgot the passphrases of encrypted files");
+    Ok(())
+}
+
 /// Reload the [`Document`] from its source file.
 fn reload(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> anyhow::Result<()> {
     if event != PromptEvent::Validate {
@@ -3620,6 +3631,18 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         aliases: &["char"],
         doc: "Get info about the character under the primary cursor.",
         fun: get_character_info,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
+            ..Signature::DEFAULT
+        },
+    },
+    #[cfg(feature = "pgp")]
+    TypableCommand {
+        name: "pgp-forget",
+        aliases: &[],
+        doc: "Forget the passphrases remembered for encrypted (gpg -c) files this session.",
+        fun: pgp_forget,
         completer: CommandCompleter::none(),
         signature: Signature {
             positionals: (0, Some(0)),

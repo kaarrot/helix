@@ -1164,6 +1164,8 @@ pub struct Editor {
     pub count: Option<std::num::NonZeroUsize>,
     pub selected_register: Option<char>,
     pub registers: Registers,
+    /// Passphrases that opened an encrypted file this session.
+    pub pgp_passphrases: crate::pgp::Passphrases,
     pub macro_recording: Option<(char, Vec<KeyEvent>)>,
     pub macro_replaying: Vec<char>,
     pub language_servers: helix_lsp::Registry,
@@ -1321,6 +1323,7 @@ impl Editor {
             theme_loader,
             last_theme: None,
             last_selection: None,
+            pgp_passphrases: crate::pgp::Passphrases::default(),
             registers: Registers::new(Box::new(arc_swap::access::Map::new(
                 Arc::clone(&config),
                 |config: &Config| &config.clipboard_provider,
@@ -1603,6 +1606,10 @@ impl Editor {
         let Some(doc_url) = doc.url() else {
             return;
         };
+        // A language server would get the decrypted text.
+        if doc.is_encrypted() {
+            return;
+        }
         let (lang, path) = (doc.language.clone(), doc.path().cloned());
         let config = doc.config.load();
         let root_dirs = &config.workspace_lsp_roots;
@@ -1867,6 +1874,34 @@ impl Editor {
         Ok(doc_id)
     }
 
+    /// Points `registers.source` at the focused document when it is encrypted,
+    /// so that whatever is copied out of it is cleared when it closes. Called
+    /// before every event and command.
+    pub fn sync_register_source(&mut self) {
+        self.registers.source = self
+            .tree
+            .try_get(self.tree.focus)
+            .and_then(|view| self.documents.get(&view.doc))
+            .filter(|doc| doc.is_encrypted())
+            .map(|doc| doc.id());
+    }
+
+    /// Clears what open encrypted files left in the clipboard, and the
+    /// remembered passphrases. Called when the editor exits; the clipboard
+    /// outlives it.
+    pub fn wipe_pgp_on_exit(&mut self) {
+        let encrypted: Vec<DocumentId> = self
+            .documents
+            .values()
+            .filter(|doc| doc.is_encrypted())
+            .map(|doc| doc.id())
+            .collect();
+        for doc_id in encrypted {
+            self.registers.wipe_from(doc_id);
+        }
+        self.pgp_passphrases.forget();
+    }
+
     pub fn document_id_by_path(&self, path: &Path) -> Option<DocumentId> {
         self.document_by_path(path).map(|doc| doc.id)
     }
@@ -1891,10 +1926,12 @@ impl Editor {
                 Editor::doc_diagnostics(&self.language_servers, &self.diagnostics, &doc);
             doc.replace_diagnostics(diagnostics, &[], None);
 
-            if let Some(diff_base) = self.diff_providers.get_diff_base(&path) {
-                doc.set_diff_base(diff_base);
+            if !doc.is_encrypted() {
+                if let Some(diff_base) = self.diff_providers.get_diff_base(&path) {
+                    doc.set_diff_base(diff_base);
+                }
+                doc.set_version_control_head(self.diff_providers.get_current_head_name(&path));
             }
-            doc.set_version_control_head(self.diff_providers.get_current_head_name(&path));
 
             let id = self.new_document(doc);
             self.launch_language_servers(id);
@@ -1970,6 +2007,12 @@ impl Editor {
         }
 
         let doc = self.documents.remove(&doc_id).unwrap();
+        // Its text goes with it; the zero-on-free allocator wipes the copies.
+        // Clear what it left in registers and the clipboard too.
+        if doc.is_encrypted() {
+            self.registers.wipe_from(doc_id);
+            self.sync_register_source();
+        }
 
         // If the document we removed was visible in all views, we will have no more views. We don't
         // want to close the editor just for a simple buffer close, so we need to create a new view

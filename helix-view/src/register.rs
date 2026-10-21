@@ -1,4 +1,8 @@
-use std::{borrow::Cow, collections::HashMap, iter};
+use std::{
+    borrow::Cow,
+    collections::{HashMap, HashSet},
+    iter,
+};
 
 use anyhow::Result;
 use arc_swap::access::DynAccess;
@@ -6,7 +10,7 @@ use helix_core::NATIVE_LINE_ENDING;
 
 use crate::{
     clipboard::{ClipboardError, ClipboardProvider, ClipboardType},
-    Editor,
+    DocumentId, Editor,
 };
 
 /// A key-value store for saving sets of values.
@@ -29,6 +33,12 @@ pub struct Registers {
     inner: HashMap<char, Vec<String>>,
     clipboard_provider: Box<dyn DynAccess<ClipboardProvider>>,
     pub last_search_register: char,
+    /// The encrypted document focused while registers are written, kept up to
+    /// date by `Editor::sync_register_source`.
+    pub source: Option<DocumentId>,
+    /// The encrypted documents each register holds text from, cleared by
+    /// [`Registers::wipe_from`] when one of them closes.
+    taint: HashMap<char, HashSet<DocumentId>>,
 }
 
 impl Registers {
@@ -37,6 +47,63 @@ impl Registers {
             inner: Default::default(),
             clipboard_provider,
             last_search_register: '/',
+            source: None,
+            taint: HashMap::new(),
+        }
+    }
+
+    /// Records that `name` now holds text written while `source` was focused.
+    /// A write (`replace`) drops what the register held before; a push adds to it.
+    fn mark(&mut self, name: char, replace: bool) {
+        // The command history: closing a file shouldn't erase it.
+        if name == ':' {
+            return;
+        }
+        match self.source {
+            Some(doc_id) if replace => {
+                self.taint.insert(name, HashSet::from([doc_id]));
+            }
+            Some(doc_id) => {
+                self.taint.entry(name).or_default().insert(doc_id);
+            }
+            None if replace => {
+                self.taint.remove(&name);
+            }
+            None => {}
+        }
+    }
+
+    /// Clears every register holding text from the encrypted document
+    /// `doc_id`, which is closing. The system clipboard is cleared only if it
+    /// still holds that text, so something copied elsewhere since survives.
+    pub fn wipe_from(&mut self, doc_id: DocumentId) {
+        let names: Vec<char> = self
+            .taint
+            .iter()
+            .filter(|(_, docs)| docs.contains(&doc_id))
+            .map(|(&name, _)| name)
+            .collect();
+        for name in names {
+            self.taint.remove(&name);
+            let clipboard_type = match name {
+                '+' => ClipboardType::Clipboard,
+                '*' => ClipboardType::Selection,
+                _ => {
+                    self.inner.remove(&name);
+                    continue;
+                }
+            };
+            let Some(saved) = self.inner.remove(&name) else {
+                continue;
+            };
+            let still_ours = match self.clipboard_provider.load().get_contents(&clipboard_type) {
+                Ok(contents) => contents_are_saved(&saved, &contents),
+                // Can't check, so clear it to be safe.
+                Err(_) => true,
+            };
+            if still_ours {
+                self.clear_clipboard(clipboard_type);
+            }
         }
     }
 
@@ -92,11 +159,13 @@ impl Registers {
                 )?;
                 values.reverse();
                 self.inner.insert(name, values);
+                self.mark(name, true);
                 Ok(())
             }
             _ => {
                 values.reverse();
                 self.inner.insert(name, values);
+                self.mark(name, true);
                 Ok(())
             }
         }
@@ -130,11 +199,13 @@ impl Registers {
                 self.clipboard_provider
                     .load()
                     .set_contents(&value, clipboard_type)?;
+                self.mark(name, false);
 
                 Ok(())
             }
             _ => {
                 self.inner.entry(name).or_default().push(value);
+                self.mark(name, false);
                 Ok(())
             }
         }
@@ -178,10 +249,12 @@ impl Registers {
     pub fn clear(&mut self) {
         self.clear_clipboard(ClipboardType::Clipboard);
         self.clear_clipboard(ClipboardType::Selection);
-        self.inner.clear()
+        self.inner.clear();
+        self.taint.clear();
     }
 
     pub fn remove(&mut self, name: char) -> bool {
+        self.taint.remove(&name);
         match name {
             '*' | '+' => {
                 self.clear_clipboard(match name {
@@ -333,3 +406,68 @@ impl ExactSizeIterator for RegisterValues<'_> {
 trait DoubleEndedExactSizeIterator: DoubleEndedIterator + ExactSizeIterator {}
 
 impl<I: DoubleEndedIterator + ExactSizeIterator> DoubleEndedExactSizeIterator for I {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arc_swap::access::Constant;
+    use std::num::NonZeroUsize;
+
+    fn doc(id: usize) -> DocumentId {
+        DocumentId(NonZeroUsize::new(id).unwrap())
+    }
+
+    fn registers() -> Registers {
+        Registers::new(Box::new(Constant(ClipboardProvider::None)))
+    }
+
+    fn write(registers: &mut Registers, source: Option<DocumentId>, name: char, value: &str) {
+        registers.source = source;
+        registers.write(name, vec![value.to_string()]).unwrap();
+    }
+
+    #[test]
+    fn wipe_from_clears_what_the_document_wrote() {
+        let (secret, other) = (doc(1), doc(2));
+        let mut registers = registers();
+        write(&mut registers, Some(secret), '"', "hunter2");
+        write(&mut registers, Some(secret), '+', "hunter2");
+        write(&mut registers, Some(other), 'a', "other secret");
+        write(&mut registers, None, 'b', "plain");
+
+        registers.wipe_from(secret);
+        assert!(!registers.inner.contains_key(&'"'));
+        assert!(!registers.inner.contains_key(&'+'));
+        assert!(registers.inner.contains_key(&'a'));
+        assert!(registers.inner.contains_key(&'b'));
+
+        registers.wipe_from(other);
+        assert!(!registers.inner.contains_key(&'a'));
+        assert!(registers.inner.contains_key(&'b'));
+    }
+
+    #[test]
+    fn a_plain_write_replaces_the_mark_and_a_push_adds_to_it() {
+        let secret = doc(1);
+        let mut registers = registers();
+        write(&mut registers, Some(secret), 'a', "hunter2");
+        write(&mut registers, None, 'a', "plain");
+        write(&mut registers, None, 'b', "plain");
+        registers.source = Some(secret);
+        registers.push('b', "hunter2".to_string()).unwrap();
+
+        registers.wipe_from(secret);
+        assert!(registers.inner.contains_key(&'a'));
+        assert!(!registers.inner.contains_key(&'b'));
+    }
+
+    #[test]
+    fn command_history_is_kept() {
+        let secret = doc(1);
+        let mut registers = registers();
+        registers.source = Some(secret);
+        registers.push(':', "w".to_string()).unwrap();
+        registers.wipe_from(secret);
+        assert!(registers.inner.contains_key(&':'));
+    }
+}

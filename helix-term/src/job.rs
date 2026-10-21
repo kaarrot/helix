@@ -105,6 +105,7 @@ impl Jobs {
         compositor: &mut Compositor,
         call: anyhow::Result<Option<Callback>>,
     ) {
+        editor.sync_register_source();
         match call {
             Ok(None) => {}
             Ok(Some(call)) => match call {

@@ -47,6 +47,9 @@ pub struct Prompt {
     pub doc_fn: DocFn,
     next_char_handler: Option<PromptCharHandler>,
     language: Option<(&'static str, Arc<ArcSwap<syntax::Loader>>)>,
+    /// Shows `*` for each character, for passphrases. Nothing keeps the
+    /// input; the zero-on-free allocator wipes it when the prompt is dropped.
+    secret: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -103,7 +106,17 @@ impl Prompt {
             doc_fn: Box::new(|_| None),
             next_char_handler: None,
             language: None,
+            secret: false,
         }
+    }
+
+    /// The component id of a prompt [`Prompt::with_secret`] masks.
+    pub const SECRET_ID: &'static str = "secret-prompt";
+
+    /// Masks the input, for passphrases. Give it no history register.
+    pub fn with_secret(mut self) -> Self {
+        self.secret = true;
+        self
     }
 
     /// Gets the byte index in the input representing the current cursor location.
@@ -516,7 +529,14 @@ impl Prompt {
             .clip_top(line)
             .clip_right(2);
 
-        if self.line.is_empty() {
+        if self.secret {
+            self.anchor = 0;
+            self.truncate_start = false;
+            self.truncate_end = false;
+            let width = self.line_area.width as usize;
+            let mask = "*".repeat(self.line.chars().count().min(width));
+            surface.set_string(self.line_area.x, self.line_area.y, mask, prompt_color);
+        } else if self.line.is_empty() {
             // Show the most recently entered value as a suggestion.
             if let Some(suggestion) = self.first_history_completion(cx.editor) {
                 surface.set_string(
@@ -598,6 +618,10 @@ impl Prompt {
 }
 
 impl Component for Prompt {
+    fn id(&self) -> Option<&'static str> {
+        self.secret.then_some(Self::SECRET_ID)
+    }
+
     fn handle_event(&mut self, event: &Event, cx: &mut Context) -> EventResult {
         let event = match event {
             Event::Paste(data) => {
@@ -765,6 +789,19 @@ impl Component for Prompt {
         let area = area
             .clip_left(self.prompt.len() as u16)
             .clip_right(if self.prompt.is_empty() { 2 } else { 0 });
+
+        if self.secret {
+            let typed = self.line[..self.cursor].chars().count();
+            let max = (self.line_area.width as usize).saturating_sub(1);
+            let col = area.left() as usize + typed.min(max);
+            return (
+                Some(Position::new(
+                    area.y as usize + area.height as usize - 1,
+                    col,
+                )),
+                editor.config().cursor_shape.from_mode(Mode::Insert),
+            );
+        }
 
         let mut col = area.left() as usize + self.line[self.anchor..self.cursor].width();
 

@@ -705,6 +705,8 @@ impl Application {
         #[cfg(not(windows))]
         use termina::escape::csi;
 
+        self.editor.sync_register_source();
+
         let mut cx = crate::compositor::Context {
             editor: &mut self.editor,
             jobs: &mut self.jobs,
@@ -1307,6 +1309,9 @@ impl Application {
             log::error!("Error writing: {}", err);
             errs.push(err);
         }
+
+        // The clipboard outlives the editor.
+        self.editor.wipe_pgp_on_exit();
 
         if self.editor.close_language_servers(None).await.is_err() {
             log::error!("Timed out waiting for language servers to shutdown");

@@ -168,10 +168,18 @@ where
     let visible = context.focused;
     let config = context.editor.config();
     let modenames = &config.statusline.mode;
-    let mode_str = match context.editor.mode() {
-        Mode::Insert => &modenames.insert,
-        Mode::Select => &modenames.select,
-        Mode::Normal => &modenames.normal,
+    let mode_str = if visible && context.editor.focused_review_thread().is_some() {
+        if context.editor.diff.reviews.composing.is_some() {
+            "COMMENT"
+        } else {
+            "REVIEW"
+        }
+    } else {
+        match context.editor.mode() {
+            Mode::Insert => &modenames.insert,
+            Mode::Select => &modenames.select,
+            Mode::Normal => &modenames.normal,
+        }
     };
     let content = if visible {
         format!(" {mode_str} ")

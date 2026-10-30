@@ -224,13 +224,35 @@ impl View {
         self.area.clip_left(self.gutter_offset(doc)).width
     }
 
-    /// Most body rows a review box shows at once in this view.
-    ///
-    /// Never more than half the window: the code it is about has to stay
-    /// visible, and a box taller than the window could not be scrolled through
-    /// anyway.
-    pub fn review_box_rows(&self) -> usize {
-        (self.inner_height() / 2).max(3)
+    /// A review row at a visual offset from the view's document anchor.
+    pub fn review_row_at_visual_offset(
+        &self,
+        doc: &Document,
+        row: usize,
+    ) -> Option<(crate::review::ThreadId, Option<usize>)> {
+        let offset = doc.view_offset(self.id);
+        let fmt = doc.text_format(self.inner_width(doc), None);
+        let annotations = self.text_annotations(doc, None);
+        let (pos, virtual_offset) = char_idx_at_visual_offset(
+            doc.text().slice(..),
+            offset.anchor,
+            row as isize,
+            0,
+            &fmt,
+            &annotations,
+        );
+        let index = virtual_offset.checked_sub(1)?;
+        let cached = self.virtual_rows.borrow();
+        let plan = &cached
+            .as_ref()
+            .filter(|cached| cached.doc_id == doc.id())?
+            .plan;
+        match plan.rows_at(doc.text().char_to_line(pos)).get(index)? {
+            crate::annotations::rows::VirtualRow::Comment { thread, body, .. } => {
+                Some((*thread, *body))
+            }
+            _ => None,
+        }
     }
 
     pub fn gutters(&self) -> &[GutterType] {
@@ -798,7 +820,9 @@ impl View {
         if !reviews.is_empty() && !reviews.hidden {
             if let Some((file, rev)) = self.review_identity(doc, diff_views) {
                 let width = self.inner_width(doc) as usize;
-                let max_body_rows = self.review_box_rows();
+                // Complete replies are part of the visual document; the
+                // viewport may start anywhere inside their virtual rows.
+                let max_body_rows = usize::MAX;
                 let text = doc.text();
                 // Which box the reader is on, so it can be drawn as the one
                 // they are acting on rather than one of several alike.

@@ -2800,7 +2800,10 @@ async fn vertical_motion_stops_on_a_comment_box() -> anyhow::Result<()> {
         "going up should stop on the box too"
     );
 
-    // And the next press leaves.
+    // Above the box is its own code line, then the preceding line.
+    assert!(harness.send_keys(&mut app, "k").await?);
+    assert_eq!(line(&app), 1);
+    assert!(app.editor.diff.reviews.focused.is_none());
     assert!(harness.send_keys(&mut app, "k").await?);
     assert_eq!(line(&app), 0);
     assert!(app.editor.diff.reviews.focused.is_none());
@@ -2946,99 +2949,37 @@ async fn pasting_into_the_comment_box_does_not_edit_the_buffer() -> anyhow::Resu
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_tall_reply_is_capped_and_scrolled_inside_its_box() -> anyhow::Result<()> {
-    use helix_view::review::agent::AgentEvent;
-
-    // Short file: the code fits, so there is nothing for the editor to scroll.
-    let file = tempfile::NamedTempFile::new()?;
-    std::fs::write(file.path(), "one\ntwo\nthree\n")?;
-
-    let mut app = AppBuilder::new().with_file(file.path(), None).build()?;
-    let mut harness = AppTestHarness::new();
-
-    let fake = FakeAgent::default();
-    let sent = fake.sent.clone();
-    app.editor.diff.agent = Some(Box::new(fake));
-
-    assert!(harness.send_keys(&mut app, "<space>mRc").await?);
-    assert!(harness.send_keys(&mut app, "why?<C-s>").await?);
-    assert!(harness.send_keys(&mut app, "<space>mRS").await?);
-    let id = sent.lock().unwrap()[0].0;
-
-    let long: String = (0..200)
-        .map(|n| format!("line {n} of a very long explanation"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    app.editor
+#[cfg(not(windows))]
+async fn a_tall_reply_scrolls_with_its_cursor_instead_of_the_code_anchor() -> anyhow::Result<()> {
+    let file = temp_file_with_contents("one\ntwo\nthree\n")?;
+    let (mut app, mut harness, id) = app_with_reply(file.path(), &numbered_reply(200)).await?;
+    let view = app.editor.tree.get(app.editor.tree.focus);
+    assert!(focused_plan_row_count(&app) > view.inner_height());
+    harness.send_keys(&mut app, "j150j").await?;
+    let cursor = app.editor.diff.reviews.get(id).unwrap().cursor;
+    assert_eq!(cursor, 150);
+    assert!(app
+        .editor
         .diff
         .reviews
-        .apply_agent_event(AgentEvent::Completed(id, long));
-
-    let view_height = app.editor.tree.get(app.editor.tree.focus).inner_height();
-    let rows = focused_plan_row_count(&app);
-    assert!(
-        rows <= view_height,
-        "a box must never outgrow the window: {rows} rows in a window of {view_height}"
-    );
-
-    // The code it is about is still on screen.
-    assert!(rows < view_height, "the code should still have room");
-
-    // Where the box settles is decided while drawing, since only drawing knows
-    // how tall the box was allowed to be.
-    let scroll_of = |app: &Application| {
-        focused_plan_row_count(app);
-        app.editor.diff.reviews.get(id).unwrap().scroll.get()
+        .hits
+        .borrow()
+        .iter()
+        .any(|hit| hit.thread == id && hit.body == Some(cursor)));
+    let offset = {
+        let view = app.editor.tree.get(app.editor.tree.focus);
+        app.editor.document(view.doc).unwrap().view_offset(view.id)
     };
-    let cursor_of = |app: &Application| app.editor.diff.reviews.get(id).unwrap().cursor;
-
-    // Stopping on the box, C-down walks a cursor down the reply.
-    assert!(harness.send_keys(&mut app, "j").await?);
-    assert!(app.editor.diff.reviews.focused.is_some());
-    assert_eq!(cursor_of(&app), 0);
-    assert_eq!(scroll_of(&app), 0);
-
-    assert!(harness.send_keys(&mut app, "<C-down>").await?);
-    assert_eq!(cursor_of(&app), 1);
+    assert!(offset.vertical_offset > 0);
+    harness.send_keys(&mut app, "k").await?;
+    let view = app.editor.tree.get(app.editor.tree.focus);
     assert_eq!(
-        scroll_of(&app),
-        0,
-        "a cursor still inside the box must not scroll it"
+        app.editor.document(view.doc).unwrap().view_offset(view.id),
+        offset,
+        "moving inside the visible reply must not return to its code anchor"
     );
-
-    // Walked past the bottom, the box follows rather than losing the cursor.
-    let body = (view_height / 2).max(3);
-    for _ in 0..body {
-        assert!(harness.send_keys(&mut app, "<C-down>").await?);
-    }
-    assert_eq!(cursor_of(&app), body + 1);
-    assert_eq!(
-        scroll_of(&app),
-        2,
-        "the box should scroll only as far as the cursor made it"
-    );
-
-    // Coming back up, the box stays put while the cursor is still inside it ...
-    assert!(harness.send_keys(&mut app, "<C-up>").await?);
-    assert_eq!(cursor_of(&app), body);
-    assert_eq!(
-        scroll_of(&app),
-        2,
-        "a box should not move for a cursor that is still in it"
-    );
-
-    // ... and follows again once the cursor would leave the top.
-    for _ in 0..body {
-        assert!(harness.send_keys(&mut app, "<C-up>").await?);
-    }
-    assert_eq!(cursor_of(&app), 0);
-    assert_eq!(scroll_of(&app), 0);
-
-    // Moving to another entry starts it at the top rather than mid-scroll.
-    assert!(harness.send_keys(&mut app, "<C-left>").await?);
-    assert_eq!(cursor_of(&app), 0);
-    assert_eq!(scroll_of(&app), 0);
-
+    harness.send_keys(&mut app, "<C-left>").await?;
+    assert_eq!(app.editor.diff.reviews.get(id).unwrap().cursor, 0);
     harness.close(&mut app).await?;
     Ok(())
 }
@@ -4159,63 +4100,48 @@ fn numbered_reply(rows: usize) -> String {
     (0..rows).map(|n| format!("- reply row {n}\n")).collect()
 }
 
-/// The wheel over a box too tall to show at once scrolls the box, not the
-/// code, and hands back to the code once the box has reached its end.
+/// The wheel moves complete replies through the same viewport as the code.
 #[tokio::test(flavor = "multi_thread")]
 #[cfg(not(windows))]
-async fn the_wheel_over_a_tall_box_scrolls_the_box() -> anyhow::Result<()> {
+async fn the_wheel_over_a_tall_reply_scrolls_its_virtual_rows() -> anyhow::Result<()> {
     use termina::event::MouseEventKind;
-
-    let file = tempfile::NamedTempFile::new()?;
     let text: String = (0..400).map(|n| format!("code {n}\n")).collect();
-    std::fs::write(file.path(), &text)?;
+    let file = temp_file_with_contents(text)?;
     let (mut app, mut harness, id) = app_with_reply(file.path(), &numbered_reply(200)).await?;
-    harness
-        .pump(&mut app, std::time::Duration::from_millis(200))
-        .await;
-
-    let view_offset = |app: &Application| {
-        let view = app.editor.tree.get(app.editor.tree.focus);
-        let doc = app.editor.document(view.doc).unwrap();
-        let offset = doc.view_offset(view.id);
-        (offset.anchor, offset.vertical_offset)
-    };
-    let box_rows = app.editor.tree.get(app.editor.tree.focus).review_box_rows();
-    let box_scroll = |app: &Application| app.editor.diff.reviews.get(id).unwrap().scroll.get();
-    let before = view_offset(&app);
-
+    let before = app.screen_rows();
     let (row, x) = painted(&app, id, Some(0));
     harness
         .mouse(&mut app, MouseEventKind::ScrollDown, row, x + 3)
         .await?;
-    assert_eq!(box_scroll(&app), 3, "one wheel step is three rows");
-    assert_eq!(view_offset(&app), before, "the code should not have moved");
-
+    let view = app.editor.tree.get(app.editor.tree.focus);
+    assert_eq!(
+        app.editor
+            .document(view.doc)
+            .unwrap()
+            .view_offset(view.id)
+            .vertical_offset,
+        3
+    );
+    assert_eq!(app.editor.diff.reviews.get(id).unwrap().scroll.get(), 0);
+    let after = app.screen_rows();
+    for row in 0..view.inner_height() - 3 {
+        assert_eq!(
+            after[row].trim_end().replace('▌', "▏"),
+            before[row + 3].trim_end()
+        );
+    }
     harness
         .mouse(&mut app, MouseEventKind::ScrollUp, row, x + 3)
         .await?;
-    assert_eq!(box_scroll(&app), 0);
-    assert_eq!(view_offset(&app), before);
-
-    // Wheeling on stops the box at its last rows, and the step after that
-    // moves the code instead.
-    for _ in 0..100 {
-        let scrolled = box_scroll(&app);
-        harness
-            .mouse(&mut app, MouseEventKind::ScrollDown, row, x + 3)
-            .await?;
-        if box_scroll(&app) == scrolled {
-            break;
-        }
-        assert_eq!(view_offset(&app), before, "the code moved mid-box");
-    }
-    assert_eq!(box_scroll(&app), 200 - box_rows);
-    assert_ne!(
-        view_offset(&app),
-        before,
-        "the code should scroll at the end"
+    let view = app.editor.tree.get(app.editor.tree.focus);
+    assert_eq!(
+        app.editor
+            .document(view.doc)
+            .unwrap()
+            .view_offset(view.id)
+            .vertical_offset,
+        0
     );
-
     harness.close(&mut app).await?;
     Ok(())
 }
@@ -4244,7 +4170,10 @@ async fn bracket_c_focuses_the_box_it_lands_on() -> anyhow::Result<()> {
         .unwrap_or_default();
     assert_eq!(clipboard, vec!["alpha\nbeta".to_string()]);
 
-    // Moving on from the box is one press, as after stopping on it with `j`.
+    // Walk the second reply row before carrying on into code.
+    assert!(harness.send_keys(&mut app, "j").await?);
+    assert_eq!(app.editor.diff.reviews.get(id).unwrap().cursor, 1);
+    assert_eq!(app.editor.diff.reviews.focused, Some(id));
     assert!(harness.send_keys(&mut app, "j").await?);
     assert_eq!(focused_cursor_line(&app), 1);
     assert_eq!(app.editor.diff.reviews.focused, None);
@@ -4288,7 +4217,7 @@ async fn scrolling_into_a_box_moves_it_with_the_code() -> anyhow::Result<()> {
     let after = app.screen_rows();
     for row in 0..view_height - 3 {
         assert_eq!(
-            after[row].trim_end(),
+            after[row].trim_end().replace('▌', "▏"),
             before[row + 3].trim_end(),
             "row {row} should show what row {} showed before the scroll",
             row + 3
@@ -4300,7 +4229,7 @@ async fn scrolling_into_a_box_moves_it_with_the_code() -> anyhow::Result<()> {
     assert_eq!(
         assert_hits_on_their_rows(&app, view, id),
         9,
-        "body lines 1..=9 are on screen; the header and line 0 are scrolled off"
+        "the header and first body row are scrolled off; body rows 1 through 9 remain"
     );
     let row = after
         .iter()
@@ -4445,4 +4374,480 @@ async fn only_a_split_diff_holds_spacer_rows() -> anyhow::Result<()> {
 
     harness.close(&mut app).await?;
     Ok(())
+}
+
+#[cfg(not(windows))]
+mod navigation {
+    use super::*;
+    use helix_view::review::agent::AgentEvent;
+    use termina::event::{MouseButton, MouseEventKind};
+
+    async fn small_reply(
+        line: usize,
+        rows: usize,
+    ) -> anyhow::Result<(
+        tempfile::NamedTempFile,
+        Application,
+        AppTestHarness,
+        ThreadId,
+    )> {
+        let text: String = (0..400).map(|n| format!("code {n}\n")).collect();
+        small_reply_in(text, line, rows, false).await
+    }
+
+    async fn small_reply_in(
+        text: String,
+        line: usize,
+        rows: usize,
+        wrap: bool,
+    ) -> anyhow::Result<(
+        tempfile::NamedTempFile,
+        Application,
+        AppTestHarness,
+        ThreadId,
+    )> {
+        let file = temp_file_with_contents(text)?;
+        let mut config = test_config();
+        config.editor.soft_wrap.enable = Some(wrap);
+        let mut app = AppBuilder::new()
+            .with_file(file.path(), None)
+            .with_config(config)
+            .build()?;
+        app.resize_test_terminal(80, 24);
+        let mut harness = AppTestHarness::new();
+        let fake = FakeAgent::default();
+        let sent = fake.sent.clone();
+        app.editor.diff.agent = Some(Box::new(fake));
+        harness
+            .send_keys(&mut app, &format!("{}G<space>mRcwhy?<C-S-s>", line + 1))
+            .await?;
+        let id = sent.lock().unwrap()[0].0;
+        app.editor
+            .diff
+            .reviews
+            .apply_agent_event(AgentEvent::Completed(id, numbered_reply(rows)));
+        harness.send_keys(&mut app, "<esc>").await?;
+        assert_eq!(app.screen().area.height, 24);
+        Ok((file, app, harness, id))
+    }
+
+    fn offset(app: &Application) -> helix_view::view::ViewPosition {
+        let view = app.editor.tree.get(app.editor.tree.focus);
+        app.editor.document(view.doc).unwrap().view_offset(view.id)
+    }
+
+    fn visual_top(app: &Application) -> usize {
+        let view = app.editor.tree.get(app.editor.tree.focus);
+        let doc = app.editor.document(view.doc).unwrap();
+        let offset = doc.view_offset(view.id);
+        let fmt = doc.text_format(view.inner_width(doc), None);
+        let annotations = view.text_annotations(doc, None);
+        helix_core::visual_offset_from_block(
+            doc.text().slice(..),
+            0,
+            offset.anchor,
+            &fmt,
+            &annotations,
+        )
+        .0
+        .row + offset.vertical_offset
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reply_at_eof_can_be_scrolled_to_its_last_row() -> anyhow::Result<()> {
+        let (_file, mut app, mut harness, id) =
+            small_reply_in("last line".into(), 0, 80, false).await?;
+        let before = visual_top(&app);
+        for step in 1..=20 {
+            harness
+                .mouse(&mut app, MouseEventKind::ScrollDown, 10, 0)
+                .await?;
+            assert_eq!(visual_top(&app), before + step * 3);
+        }
+        harness.send_keys(&mut app, "j30j").await?;
+        let cursor = app.editor.diff.reviews.get(id).unwrap().cursor;
+        assert_eq!(cursor, 79);
+        assert!(app
+            .editor
+            .diff
+            .reviews
+            .hits
+            .borrow()
+            .iter()
+            .any(|hit| { hit.thread == id && hit.body == Some(cursor) }));
+        harness.close(&mut app).await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn wrapped_code_can_be_walked_after_leaving_a_long_reply() -> anyhow::Result<()> {
+        let text = format!("{}\nnext line\n", "wrapped code ".repeat(20));
+        let (_file, mut app, mut harness, id) = small_reply_in(text, 0, 40, true).await?;
+        harness.send_keys(&mut app, "j30j").await?;
+        assert_eq!(app.editor.diff.reviews.get(id).unwrap().cursor, 30);
+        assert!(app
+            .editor
+            .diff
+            .reviews
+            .hits
+            .borrow()
+            .iter()
+            .any(|hit| { hit.thread == id && hit.body == Some(30) }));
+        harness.send_keys(&mut app, "10j").await?;
+        assert!(app.editor.diff.reviews.focused.is_none());
+        assert_eq!(focused_cursor_line(&app), 0);
+        harness.send_keys(&mut app, "j").await?;
+        assert!(app.editor.diff.reviews.focused.is_none());
+        harness.send_keys(&mut app, "jjjj").await?;
+        assert!(focused_cursor_line(&app) > 0);
+        harness.send_keys(&mut app, "kkkkk").await?;
+        assert_eq!(app.editor.diff.reviews.focused, Some(id));
+        assert_eq!(app.editor.diff.reviews.get(id).unwrap().cursor, 39);
+        harness.close(&mut app).await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reading_a_long_reply_keeps_the_linked_diff_at_its_code_anchor() -> anyhow::Result<()> {
+        let repo = GitRepoFixture::new()?;
+        let text: String = (0..400).map(|n| format!("code {n}\n")).collect();
+        repo.write_file("tracked.txt", &text)?;
+        repo.commit_all("initial")?;
+        repo.write_file("tracked.txt", &text.replacen("code 0", "changed 0", 1))?;
+        let _cwd = CwdGuard::enter(repo.path()).await?;
+        let path = repo.file("tracked.txt");
+        let mut app = AppBuilder::new().with_file(&path, None).build()?;
+        app.resize_test_terminal(100, 24);
+        app.editor.open_diff_view(&path, "HEAD", Some(true))?;
+        let state = app.editor.diff.views[&app.editor.tree.focus].clone();
+        app.editor.focus(state.working_view_id);
+        let mut harness = AppTestHarness::new();
+        let fake = FakeAgent::default();
+        let sent = fake.sent.clone();
+        app.editor.diff.agent = Some(Box::new(fake));
+        harness
+            .send_keys(&mut app, "gg<space>mRcwhy?<C-S-s>")
+            .await?;
+        let id = sent.lock().unwrap()[0].0;
+        app.editor
+            .diff
+            .reviews
+            .apply_agent_event(AgentEvent::Completed(id, numbered_reply(80)));
+        harness.send_keys(&mut app, "<esc>j30j").await?;
+        assert_eq!(app.editor.diff.reviews.focused, Some(id));
+        assert_eq!(app.editor.diff.reviews.get(id).unwrap().cursor, 30);
+        assert!(
+            offset(&app).vertical_offset > 0,
+            "source offset {:?}, screen:\n{}",
+            offset(&app),
+            app.screen_rows().join("\n")
+        );
+        let base = app.editor.document(state.base_doc_id).unwrap();
+        let partner = base.view_offset(state.base_view_id);
+        assert_eq!(base.text().char_to_line(partner.anchor), 0);
+        assert_eq!(partner.vertical_offset, 0);
+        let _ = app.close().await;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn j_k_cross_a_long_reply_without_pulling_back_to_the_code_anchor() -> anyhow::Result<()>
+    {
+        let (_file, mut app, mut harness, _id) = small_reply(0, 80).await?;
+        harness.send_keys(&mut app, "j").await?;
+        for _ in 0..12 {
+            let before = visual_top(&app);
+            harness.send_keys(&mut app, "jjjjjjj").await?;
+            let after = visual_top(&app);
+            assert!(
+                after >= before && after - before <= 7,
+                "down moved from {before} to {after}"
+            );
+        }
+        assert!(focused_cursor_line(&app) > 0);
+        for _ in 0..12 {
+            let before = visual_top(&app);
+            harness.send_keys(&mut app, "kkkkkkk").await?;
+            let after = visual_top(&app);
+            assert!(
+                after <= before && before - after <= 7,
+                "up moved from {before} to {after}"
+            );
+        }
+        assert_eq!(visual_top(&app), 0);
+        harness.close(&mut app).await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn keyboard_continues_at_the_position_reached_with_the_mouse() -> anyhow::Result<()> {
+        let (_file, mut app, mut harness, id) = small_reply(0, 200).await?;
+        let (row, x) = painted(&app, id, Some(0));
+        harness
+            .mouse(&mut app, MouseEventKind::ScrollDown, row, x + 3)
+            .await?;
+        assert_eq!(app.editor.diff.reviews.focused, Some(id));
+        let before = offset(&app);
+        let cursor = app.editor.diff.reviews.get(id).unwrap().cursor;
+        harness.send_keys(&mut app, "j").await?;
+        assert_eq!(app.editor.diff.reviews.get(id).unwrap().cursor, cursor + 1);
+        assert_eq!(offset(&app), before);
+        harness.close(&mut app).await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn wheel_on_a_header_with_no_visible_body_scrolls_code() -> anyhow::Result<()> {
+        let (_file, mut app, mut harness, id) = small_reply(20, 40).await?;
+        {
+            let view_id = app.editor.tree.focus;
+            let doc_id = app.editor.tree.get(view_id).doc;
+            app.editor
+                .document_mut(doc_id)
+                .unwrap()
+                .set_view_offset(view_id, Default::default());
+        }
+        helix_event::request_redraw();
+        harness
+            .pump(&mut app, std::time::Duration::from_millis(200))
+            .await;
+        assert!(!app
+            .editor
+            .diff
+            .reviews
+            .hits
+            .borrow()
+            .iter()
+            .any(|hit| hit.thread == id && hit.body.is_some()));
+        let (row, x) = painted(&app, id, None);
+        let before = offset(&app);
+        harness
+            .mouse(&mut app, MouseEventKind::ScrollDown, row, x + 3)
+            .await?;
+        assert_ne!(offset(&app), before);
+        assert_eq!(app.editor.diff.reviews.get(id).unwrap().scroll.get(), 0);
+        harness.close(&mut app).await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn wheel_crosses_a_screen_filling_reply_without_jumping_in_either_direction(
+    ) -> anyhow::Result<()> {
+        let (_file, mut app, mut harness, _id) = small_reply(17, 40).await?;
+        let mut top = visual_top(&app);
+        for _ in 0..24 {
+            harness
+                .mouse(&mut app, MouseEventKind::ScrollDown, 10, 0)
+                .await?;
+            assert_eq!(
+                visual_top(&app),
+                top + 3,
+                "one wheel step must move only three visible rows"
+            );
+            top += 3;
+        }
+        assert!(
+            focused_cursor_line(&app) > 17,
+            "the wheel must reach regular code below the reply"
+        );
+        for _ in 0..24 {
+            harness
+                .mouse(&mut app, MouseEventKind::ScrollUp, 10, 0)
+                .await?;
+            assert_eq!(visual_top(&app), top - 3);
+            top -= 3;
+        }
+        harness.close(&mut app).await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn j_k_walk_reply_rows_and_cross_back_into_code() -> anyhow::Result<()> {
+        let (_file, mut app, mut harness, id) = small_reply(0, 3).await?;
+        harness.send_keys(&mut app, "j").await?;
+        assert_eq!(app.editor.diff.reviews.focused, Some(id));
+        assert!(app.screen_rows().join("\n").contains("REVIEW"));
+        assert!(app.screen_rows().join("\n").contains("▶ agent"));
+        harness.send_keys(&mut app, "j").await?;
+        assert_eq!(app.editor.diff.reviews.get(id).unwrap().cursor, 1);
+        assert_eq!(focused_cursor_line(&app), 0);
+        harness.send_keys(&mut app, "jj").await?;
+        assert!(app.editor.diff.reviews.focused.is_none());
+        assert_eq!(focused_cursor_line(&app), 1);
+        harness.send_keys(&mut app, "k").await?;
+        assert_eq!(app.editor.diff.reviews.get(id).unwrap().cursor, 2);
+        harness.send_keys(&mut app, "kkk").await?;
+        assert!(app.editor.diff.reviews.focused.is_none());
+        assert_eq!(focused_cursor_line(&app), 0);
+        harness.send_keys(&mut app, "j2j").await?;
+        assert_eq!(app.editor.diff.reviews.get(id).unwrap().cursor, 2);
+        assert_eq!(app.editor.diff.reviews.focused, Some(id));
+        harness.send_keys(&mut app, "<esc>").await?;
+        assert!(app.editor.diff.reviews.focused.is_none());
+        harness.close(&mut app).await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn keyboard_reading_keeps_the_reply_visible_near_the_bottom() -> anyhow::Result<()> {
+        let (_file, mut app, mut harness, id) = small_reply(17, 200).await?;
+        harness.send_keys(&mut app, "j8j").await?;
+        let cursor = app.editor.diff.reviews.get(id).unwrap().cursor;
+        assert_eq!(cursor, 8);
+        assert!(
+            app.editor
+                .diff
+                .reviews
+                .hits
+                .borrow()
+                .iter()
+                .any(|hit| { hit.thread == id && hit.body == Some(cursor) }),
+            "the reply cursor must remain visible in a 24-row terminal"
+        );
+        harness.close(&mut app).await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn replying_after_reading_a_tall_message_keeps_the_input_visible() -> anyhow::Result<()> {
+        let (_file, mut app, mut harness, _id) = small_reply(0, 80).await?;
+        harness.send_keys(&mut app, "j40j").await?;
+        assert!(offset(&app).vertical_offset > 0);
+        harness.send_keys(&mut app, "cnew reply").await?;
+        assert!(app.editor.diff.reviews.composing.is_some());
+        assert_eq!(visual_top(&app), 0);
+        assert!(app.screen_rows()[0].contains("code 0"));
+        assert!(app.screen_rows()[2].contains("new reply"));
+        harness.send_keys(&mut app, "<esc>").await?;
+        harness.close(&mut app).await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_long_history_entry_can_be_read_while_composing_a_reply() -> anyhow::Result<()> {
+        let (_file, mut app, mut harness, id) = small_reply(0, 80).await?;
+        harness.send_keys(&mut app, "jc<C-left><C-right>").await?;
+        harness.send_keys(&mut app, &"<C-down>".repeat(40)).await?;
+        assert_eq!(app.editor.diff.reviews.get(id).unwrap().cursor, 40);
+        assert!(app
+            .editor
+            .diff
+            .reviews
+            .hits
+            .borrow()
+            .iter()
+            .any(|hit| { hit.thread == id && hit.body == Some(40) }));
+        assert!(app.editor.diff.reviews.composing.is_some());
+        harness.send_keys(&mut app, "<esc>").await?;
+        harness.close(&mut app).await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn page_keys_traverse_reply_rows_and_continue_into_code() -> anyhow::Result<()> {
+        let (_file, mut app, mut harness, id) = small_reply(0, 200).await?;
+        harness.send_keys(&mut app, "j").await?;
+        let height = app.editor.tree.get(app.editor.tree.focus).inner_height();
+        let before = visual_top(&app);
+        harness.send_keys(&mut app, "<pagedown>").await?;
+        assert_eq!(visual_top(&app), before + height);
+        assert!(app.editor.diff.reviews.get(id).unwrap().cursor >= height);
+        harness.send_keys(&mut app, "<pageup><C-d><C-u>").await?;
+        assert_eq!(visual_top(&app), before);
+        harness.send_keys(&mut app, "190j").await?;
+        let before = visual_top(&app);
+        harness.send_keys(&mut app, "<pagedown>").await?;
+        assert_eq!(visual_top(&app), before + height);
+        assert!(app.editor.diff.reviews.focused.is_none());
+        assert!(focused_cursor_line(&app) > 0);
+        harness.close(&mut app).await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn clicking_code_and_code_commands_release_comment_focus() -> anyhow::Result<()> {
+        let (_file, mut app, mut harness, id) = small_reply(0, 3).await?;
+        harness.send_keys(&mut app, "j").await?;
+        let pos = app.editor.cursor().0.unwrap();
+        harness
+            .mouse(
+                &mut app,
+                MouseEventKind::Down(MouseButton::Left),
+                pos.row as u16,
+                pos.col as u16 + 1,
+            )
+            .await?;
+        harness
+            .mouse(
+                &mut app,
+                MouseEventKind::Up(MouseButton::Left),
+                pos.row as u16,
+                pos.col as u16 + 1,
+            )
+            .await?;
+        assert!(app.editor.diff.reviews.focused.is_none());
+        let count = app.editor.diff.reviews.get(id).unwrap().entry_count();
+        harness.send_keys(&mut app, "d").await?;
+        assert_eq!(
+            app.editor.diff.reviews.get(id).unwrap().entry_count(),
+            count
+        );
+        harness.send_keys(&mut app, "jl").await?;
+        assert!(
+            app.editor.diff.reviews.focused.is_none(),
+            "moving in code must leave review focus"
+        );
+        harness.close(&mut app).await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn full_messages_can_fill_small_panes_and_collapsed_comments_still_scroll(
+    ) -> anyhow::Result<()> {
+        let (_file, mut app, mut harness, id) = small_reply(0, 200).await?;
+        for height in [8, 24, 60] {
+            app.resize_test_terminal(80, height);
+            harness.send_keys(&mut app, "<esc>").await?;
+            let body_rows = app
+                .editor
+                .diff
+                .reviews
+                .hits
+                .borrow()
+                .iter()
+                .filter(|hit| hit.thread == id && hit.body.is_some())
+                .count();
+            assert!(body_rows >= height as usize / 2);
+            assert_eq!(
+                focused_plan_row_count(&app),
+                201,
+                "the full reply remains in the visual layout"
+            );
+        }
+        harness.send_keys(&mut app, "<space>mRt").await?;
+        let (row, x) = painted(&app, id, None);
+        let before = visual_top(&app);
+        harness
+            .mouse(&mut app, MouseEventKind::ScrollDown, row, x + 3)
+            .await?;
+        assert_eq!(visual_top(&app), before + 3);
+        harness.close(&mut app).await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unhandled_composer_shortcuts_do_not_edit_code() -> anyhow::Result<()> {
+        let file = temp_file_with_contents("123\nsecond\n")?;
+        let mut app = AppBuilder::new().with_file(file.path(), None).build()?;
+        let mut harness = AppTestHarness::new();
+        harness.send_keys(&mut app, "<space>mRcHello<C-a>").await?;
+        let view = app.editor.tree.get(app.editor.tree.focus);
+        assert_eq!(
+            app.editor.document(view.doc).unwrap().text().to_string(),
+            "123\nsecond\n"
+        );
+        harness.send_keys(&mut app, "<esc>").await?;
+        harness.close(&mut app).await?;
+        Ok(())
+    }
 }

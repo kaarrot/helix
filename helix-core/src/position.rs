@@ -446,6 +446,17 @@ pub fn char_idx_at_visual_block_offset(
         }
     }
 
+    // The final document line has no newline to advance the formatter past
+    // its line annotations. They can still occupy the rest of the viewport
+    // (for example a review reply at EOF), and are valid scroll positions.
+    if row > last_row {
+        let pos = formatter.next_char_pos();
+        let trailing_rows =
+            annotations.virtual_lines_at(pos, formatter.next_visual_pos(), text.char_to_line(pos));
+        if trailing_rows > 0 {
+            return (pos, (row - last_row).min(trailing_rows));
+        }
+    }
     (formatter.next_char_pos(), 0)
 }
 

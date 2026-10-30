@@ -76,27 +76,13 @@ impl EditorView {
         &mut self.spinners
     }
 
-    pub fn render_view(
-        &self,
-        editor: &Editor,
-        doc: &Document,
-        view: &View,
-        viewport: Rect,
-        surface: &mut Surface,
-        is_focused: bool,
-    ) {
-        let inner = view.inner_area(doc);
-        let area = view.area;
+    fn update_virtual_rows(editor: &Editor, doc: &Document, view: &View) {
         let theme = &editor.theme;
-        let config = editor.config();
-
-        let view_offset = doc.view_offset(view.id);
-
         // One plan drives everything: `text_annotations` reserves the rows from
         // it, the decoration below paints them, and the coordinate maths reads
         // the same plan back, so a click lands where the row was drawn. It is
-        // published to the view first, since building the annotations is what
-        // picks it up.
+        // published before cursor placement, including when a reply arrives or
+        // the pane is resized between input events.
         // Agent replies are laid out with the markdown preview renderer. The
         // source is not written back, so the reply stays read-only; delete
         // still removes the entry.
@@ -113,12 +99,31 @@ impl EditorView {
             Some(&mut layout_agent),
         );
         *view.virtual_rows.borrow_mut() =
-            virtual_row_plan
-                .clone()
-                .map(|plan| helix_view::view::CachedVirtualRows {
-                    doc_id: doc.id(),
-                    plan,
-                });
+            virtual_row_plan.map(|plan| helix_view::view::CachedVirtualRows {
+                doc_id: doc.id(),
+                plan,
+            });
+    }
+
+    pub fn render_view(
+        &self,
+        editor: &Editor,
+        doc: &Document,
+        view: &View,
+        viewport: Rect,
+        surface: &mut Surface,
+        is_focused: bool,
+    ) {
+        let inner = view.inner_area(doc);
+        let area = view.area;
+        let theme = &editor.theme;
+        let config = editor.config();
+        let view_offset = doc.view_offset(view.id);
+        let virtual_row_plan = view
+            .virtual_rows
+            .borrow()
+            .as_ref()
+            .map(|cached| cached.plan.clone());
 
         let loader = editor.syn_loader.load();
         let text_annotations = view.text_annotations(doc, Some(theme));
@@ -191,14 +196,16 @@ impl EditorView {
             if let Some(tabstops) = Self::tabstop_highlights(doc, theme) {
                 overlays.push(tabstops);
             }
-            overlays.push(Self::doc_selection_highlights(
-                editor.mode(),
-                doc,
-                view,
-                theme,
-                &config.cursor_shape,
-                self.terminal_focused,
-            ));
+            if editor.focused_review_thread().is_none() {
+                overlays.push(Self::doc_selection_highlights(
+                    editor.mode(),
+                    doc,
+                    view,
+                    theme,
+                    &config.cursor_shape,
+                    self.terminal_focused,
+                ));
+            }
             if let Some(overlay) = Self::highlight_focused_view_elements(view, doc, theme) {
                 overlays.push(overlay);
             }
@@ -1507,6 +1514,7 @@ impl Component for EditorView {
 
         match event {
             Event::Paste(contents) => {
+                cx.editor.diff.reviews.focused = None;
                 self.handle_non_key_input(&mut cx);
                 cx.count = cx.editor.count;
                 commands::paste_bracketed_value(&mut cx, contents.clone());
@@ -1616,10 +1624,13 @@ impl Component for EditorView {
 
                 let config = cx.editor.config();
                 let mode = cx.editor.mode();
+                let in_review = cx.editor.focused_review_thread().is_some();
                 let view_id = {
                     let (view, doc) = current!(cx.editor);
 
-                    view.ensure_cursor_in_view(doc, config.scrolloff);
+                    if !in_review {
+                        view.ensure_cursor_in_view(doc, config.scrolloff);
+                    }
 
                     // Store a history state if not in insert mode. This also takes care of
                     // committing changes when leaving insert mode.
@@ -1628,6 +1639,7 @@ impl Component for EditorView {
                     }
                     view.id
                 };
+                commands::review::ensure_box_in_view(cx.editor);
                 cx.editor.sync_scroll_to_linked_views(view_id);
                 let callback = if callbacks.is_empty() {
                     None
@@ -1697,6 +1709,15 @@ impl Component for EditorView {
 
         if use_bufferline {
             Self::render_bufferline(cx.editor, area.with_height(1), surface);
+        }
+
+        for (view, _) in cx.editor.tree.views() {
+            let doc = cx.editor.document(view.doc).unwrap();
+            Self::update_virtual_rows(cx.editor, doc, view);
+        }
+        if cx.editor.focused_review_thread().is_some() {
+            commands::review::ensure_box_in_view(cx.editor);
+            cx.editor.sync_scroll_to_linked_views(cx.editor.tree.focus);
         }
 
         for (view, is_focused) in cx.editor.tree.views() {
@@ -1776,6 +1797,22 @@ impl Component for EditorView {
     }
 
     fn cursor(&self, _area: Rect, editor: &Editor) -> (Option<Position>, CursorKind) {
+        if let Some(thread) = editor.focused_review_thread() {
+            let hits = editor.diff.reviews.hits.borrow();
+            let hit = hits
+                .iter()
+                .find(|hit| {
+                    hit.view == editor.tree.focus
+                        && hit.thread == thread.id
+                        && hit.body == Some(thread.cursor)
+                })
+                .or_else(|| {
+                    hits.iter()
+                        .find(|hit| hit.view == editor.tree.focus && hit.thread == thread.id)
+                });
+            let pos = hit.map(|hit| Position::new(hit.row as usize, hit.x as usize + 1));
+            return (pos, CursorKind::Hidden);
+        }
         match editor.cursor() {
             // all block cursors are drawn manually
             (pos, CursorKind::Block) => {

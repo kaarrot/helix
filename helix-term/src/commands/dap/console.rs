@@ -8,13 +8,13 @@
 
 use super::{
     eval_complete, evaluate, goto_line, load_eval_history, save_eval_history, select_frame,
-    selected_frame_id, step, toggle_breakpoint, unquote, Step, EVAL_HISTORY_REGISTER,
+    selected_frame_id, spawn_inspection, step, toggle_breakpoint, unquote, EvaluationContext, Step,
+    EVAL_HISTORY_REGISTER,
 };
 use crate::commands::Context;
 
 use helix_core::{self as core, Selection, Transaction};
 use helix_dap as dap;
-use helix_lsp::block_on;
 use helix_view::handlers::dap_console::{input_line, input_line_start, input_start, PROMPT};
 use helix_view::{document::Mode, Editor};
 
@@ -55,7 +55,21 @@ enum ConsoleCommand<'a> {
     /// End the session: pdb's `q`, and Python's `quit()` and `exit()`, which would
     /// otherwise raise `SystemExit` in the program and never answer.
     Quit,
+    Help,
 }
+
+pub(crate) const HELP: &str = "Debug Console\n\
+n / next             step over; s / i step in; r / o step out; c continue\n\
+j LINE               jump execution to a line\n\
+w / bt               stack; u / d move to caller / callee; f N select frame\n\
+? / ??               locals / all scopes; expr? / expr?? inspect members\n\
+p EXPR / pp EXPR     evaluate / pretty print; !EXPR bypass command names\n\
+b [FILE:]LINE        toggle breakpoint; b list breakpoints\n\
+q / quit             disconnect; h / help show this help\n\
+Enter repeats the previous console command. Up / Down recall history; Tab completes.\n\
+Ctrl-d switches source / console and resumes input. Esc browses the transcript;\n\
+Esc again returns to source. gF previews file:line beside the console.\n\
+:debug-console-hide hides the console and keeps its transcript.";
 
 /// Reads a console line. The pdb commands are only commands when they stand
 /// alone or take the argument they expect: `n` steps, but `n = 3` assigns and
@@ -78,6 +92,7 @@ fn parse_console_command(input: &str) -> ConsoleCommand<'_> {
     };
 
     match (word, rest) {
+        ("h" | "help", "") => return Help,
         ("n" | "next", "") => return Move(Step::Over),
         ("s" | "step" | "i", "") => return Move(Step::In),
         ("r" | "return" | "o", "") => return Move(Step::Out),
@@ -130,15 +145,33 @@ fn parse_console_command(input: &str) -> ConsoleCommand<'_> {
     Eval(input)
 }
 
-/// `Ctrl-d` from the debug menu: show the console, focused and ready to type on
-/// the input line. From inside the console: hide it and return to the source.
+/// An explicit visibility toggle, separate from switching focus.
 pub fn dap_console_toggle(cx: &mut Context) {
     toggle(cx.editor);
 }
 
+/// Switch source / console without closing either pane. Opening or returning to
+/// the console always puts the cursor on the input line, ready to type.
+pub fn dap_console_focus(cx: &mut Context) {
+    if cx.editor.is_dap_console_focused() {
+        leave(cx.editor);
+    } else {
+        open(cx.editor);
+    }
+}
+
+pub fn dap_console_hide(cx: &mut Context) {
+    cx.editor.dap_console_hide();
+}
+
+pub fn dap_console_help(cx: &mut Context) {
+    open(cx.editor);
+    cx.editor.dap_console_print(HELP);
+}
+
 /// `:debug-console-toggle`, and the body of `dap_console_toggle`.
 pub(crate) fn toggle(editor: &mut Editor) {
-    if editor.is_dap_console_focused() {
+    if editor.is_dap_console_visible() {
         editor.dap_console_hide();
     } else {
         open(editor);
@@ -200,7 +233,7 @@ fn set_input(editor: &mut Editor, input: &str) {
 }
 
 /// `Up`/`Down` on the input line: walk the evaluation history, shared with the
-/// eval prompt. Walking past the newest entry clears the line again.
+/// eval prompt. Returning past the newest entry restores the unfinished draft.
 pub(crate) fn history(editor: &mut Editor, older: bool) {
     let values: Vec<String> = editor
         .registers
@@ -211,6 +244,18 @@ pub(crate) fn history(editor: &mut Editor, older: bool) {
         return;
     }
 
+    if editor.dap_console.history_pos.is_none() && older {
+        let (view, doc) = current_ref!(editor);
+        let text = doc.text().slice(..);
+        let start = input_start(text);
+        let cursor = doc
+            .selection(view.id)
+            .primary()
+            .cursor(text)
+            .saturating_sub(start);
+        editor.dap_console.history_draft = Some((text.slice(start..).to_string(), cursor));
+    }
+
     let pos = match (editor.dap_console.history_pos, older) {
         (None, true) => Some(0),
         (Some(pos), true) => Some((pos + 1).min(values.len() - 1)),
@@ -219,60 +264,127 @@ pub(crate) fn history(editor: &mut Editor, older: bool) {
         (Some(pos), false) => Some(pos - 1),
     };
     editor.dap_console.history_pos = pos;
-    set_input(editor, pos.map_or("", |pos| values[pos].as_str()));
+    if let Some(pos) = pos {
+        set_input(editor, &values[pos]);
+    } else if let Some((draft, cursor)) = editor.dap_console.history_draft.take() {
+        set_input(editor, &draft);
+        let (view, doc) = current!(editor);
+        let start = input_start(doc.text().slice(..));
+        doc.set_selection(
+            view.id,
+            Selection::point(start + cursor.min(draft.chars().count())),
+        );
+    }
 }
 
 /// `Tab` on the input line: what the adapter offers to complete the input at the
 /// cursor -- `obj.` lists `obj`'s members -- as completion-menu items.
-pub(crate) fn completions(editor: &Editor) -> anyhow::Result<Vec<core::CompletionItem>> {
-    let debugger = editor
-        .debug_adapters
-        .get_active_client()
-        .ok_or_else(|| anyhow!("Debugger is not running"))?;
-    if !debugger.supports_completions() {
-        bail!("The debug adapter does not offer completions");
-    }
-    let frame_id = selected_frame_id(debugger).ok();
+pub(crate) struct CompletionRequest {
+    pub adapter: dap::registry::DebugAdapterId,
+    pub requests: dap::RequestHandle,
+    pub frame_id: Option<usize>,
+    pub input: String,
+    pub column: usize,
+    view: helix_view::ViewId,
+    doc: helix_view::DocumentId,
+    cursor: usize,
+}
 
-    let (view, doc) = current_ref!(editor);
-    let text = doc.text().slice(..);
-    let start = input_start(text);
-    let cursor = doc.selection(view.id).primary().cursor(text).max(start);
-    // The protocol counts columns in UTF-16 code units.
-    let input = text.slice(start..);
-    let typed_units = text.slice(start..cursor).len_utf16_cu();
-    let char_at = |units: usize| start + input.utf16_cu_to_char(units.min(input.len_utf16_cu()));
+impl CompletionRequest {
+    pub fn new(editor: &Editor) -> anyhow::Result<Self> {
+        let debugger = editor
+            .debug_adapters
+            .get_active_client()
+            .ok_or_else(|| anyhow!("Debugger is not running"))?;
+        if !debugger.supports_completions() {
+            bail!("The debug adapter does not offer completions");
+        }
+        let frame_id = selected_frame_id(debugger).ok();
 
-    let targets = block_on(debugger.completions(input.to_string(), typed_units + 1, frame_id))
-        .map_err(|err| anyhow!("{err}"))?;
-
-    let mut items: Vec<_> = targets
-        .into_iter()
-        .map(|target| {
-            // `start` counts from 0 whatever the client asked columns to start at:
-            // that is how VS Code reads it, and so how debugpy sends it. Without a
-            // start, `length` counts back from the cursor over what is replaced.
-            let length = target.length.unwrap_or(0);
-            let (from, to) = match target.start {
-                Some(target_start) => (char_at(target_start), char_at(target_start + length)),
-                None => (char_at(typed_units.saturating_sub(length)), cursor),
-            };
-            let insert = target.text.unwrap_or_else(|| target.label.clone());
-            let transaction =
-                Transaction::change(doc.text(), [(from, to, Some(insert.into()))].into_iter());
-            core::CompletionItem {
-                transaction,
-                label: target.label.into(),
-                kind: target.ty.unwrap_or_default().into(),
-                documentation: target.detail,
-                provider: core::completion::CompletionProvider::Debugger,
-            }
+        let (view, doc) = current_ref!(editor);
+        let text = doc.text().slice(..);
+        let start = input_start(text);
+        let cursor = doc.selection(view.id).primary().cursor(text).max(start);
+        // The protocol counts columns in UTF-16 code units.
+        let input = text.slice(start..);
+        let typed_units = text.slice(start..cursor).len_utf16_cu();
+        Ok(Self {
+            adapter: debugger.id(),
+            requests: debugger.request_handle(),
+            frame_id,
+            input: input.to_string(),
+            column: typed_units + 1,
+            view: view.id,
+            doc: doc.id(),
+            cursor: cursor - start,
         })
-        .collect();
-    // Data members before private ones, and dunders last: debugpy lists them
-    // alphabetically, which puts `__class__` and friends first.
-    items.sort_by_key(|item| (item.label.starts_with("__"), item.label.starts_with('_')));
-    Ok(items)
+    }
+
+    pub fn is_current(&self, editor: &Editor) -> bool {
+        let (view, doc) = current_ref!(editor);
+        let text = doc.text().slice(..);
+        editor.mode() == Mode::Insert
+            && view.id == self.view
+            && doc.id() == self.doc
+            && editor.is_dap_console_focused()
+            && editor
+                .debug_adapters
+                .get_active_client()
+                .is_some_and(|debugger| {
+                    debugger.id() == self.adapter
+                        && selected_frame_id(debugger).ok() == self.frame_id
+                })
+            && text.slice(input_start(text)..) == self.input
+            && doc
+                .selection(view.id)
+                .primary()
+                .cursor(text)
+                .saturating_sub(input_start(text))
+                == self.cursor
+    }
+
+    pub fn items(
+        &self,
+        editor: &Editor,
+        targets: Vec<dap::requests::CompletionItem>,
+    ) -> Vec<core::CompletionItem> {
+        let (_, doc) = current_ref!(editor);
+        let text = doc.text().slice(..);
+        let start = input_start(text);
+        let input = text.slice(start..);
+        let cursor = start + self.cursor;
+        let typed_units = self.column - 1;
+        let char_at =
+            |units: usize| start + input.utf16_cu_to_char(units.min(input.len_utf16_cu()));
+
+        let mut items: Vec<_> = targets
+            .into_iter()
+            .map(|target| {
+                // `start` counts from 0 whatever the client asked columns to start at:
+                // that is how VS Code reads it, and so how debugpy sends it. Without a
+                // start, `length` counts back from the cursor over what is replaced.
+                let length = target.length.unwrap_or(0);
+                let (from, to) = match target.start {
+                    Some(target_start) => (char_at(target_start), char_at(target_start + length)),
+                    None => (char_at(typed_units.saturating_sub(length)), cursor),
+                };
+                let insert = target.text.unwrap_or_else(|| target.label.clone());
+                let transaction =
+                    Transaction::change(doc.text(), [(from, to, Some(insert.into()))].into_iter());
+                core::CompletionItem {
+                    transaction,
+                    label: target.label.into(),
+                    kind: target.ty.unwrap_or_default().into(),
+                    documentation: target.detail,
+                    provider: core::completion::CompletionProvider::Debugger,
+                }
+            })
+            .collect();
+        // Data members before private ones, and dunders last: debugpy lists them
+        // alphabetically, which puts `__class__` and friends first.
+        items.sort_by_key(|item| (item.label.starts_with("__"), item.label.starts_with('_')));
+        items
+    }
 }
 
 /// `<ret>` on the console: run what is on the input line, as pdb would. An empty
@@ -306,6 +418,7 @@ pub(crate) fn submit(cx: &mut Context) {
         },
     };
     cx.editor.dap_console.history_pos = None;
+    cx.editor.dap_console.history_draft = None;
     cx.editor.dap_console.last_command = Some(input.clone());
 
     // The input line becomes the transcript's record of the command, and a fresh
@@ -314,7 +427,7 @@ pub(crate) fn submit(cx: &mut Context) {
         let (view, doc) = current!(cx.editor);
         let text = doc.text();
         let start = input_line_start(text.slice(..));
-        let replacement = format!("{PROMPT}{input}\n{PROMPT}");
+        let replacement = PROMPT.to_string();
         let cursor = start + replacement.chars().count();
         let transaction = Transaction::change(
             text,
@@ -366,15 +479,57 @@ fn run(cx: &mut Context, input: &str) {
 
     let command = parse_console_command(input);
     // Breakpoints can be set before a session, as in the gutter.
-    let needs_session = !matches!(command, Breakpoints | ToggleBreakpoint { .. });
+    let needs_session = !matches!(command, Help | Breakpoints | ToggleBreakpoint { .. });
     if needs_session && cx.editor.debug_adapters.get_active_client().is_none() {
+        cx.editor.dap_console_print(&format!("{PROMPT}{input}"));
         cx.editor
             .dap_console_print("*** No debug session: start one from the debug menu (<space>G l)");
         return;
     }
 
     let editor = &mut *cx.editor;
+    if matches!(
+        command,
+        Variables { .. } | Members { .. } | Eval(_) | Pretty(_)
+    ) {
+        let context = match EvaluationContext::new(editor) {
+            Ok(context) => context,
+            Err(err) => {
+                editor.dap_console_print(&format!("{PROMPT}{input}\n*** {err}"));
+                return;
+            }
+        };
+        let adapter = context.adapter;
+        let input = input.to_string();
+        let expression = input.clone();
+        let label = match command {
+            Variables { .. } | Members { .. } => "inspecting…",
+            _ => "evaluating…",
+        };
+        spawn_inspection(
+            editor,
+            cx.jobs,
+            adapter,
+            label,
+            Some(input),
+            async move {
+                match parse_console_command(&expression) {
+                    Variables { all } => frame_variables(&context, all).await.map(Some),
+                    Members { expression, all } => {
+                        members(&context, expression, all).await.map(Some)
+                    }
+                    Eval(expression) => evaluate(&context, expression).await,
+                    Pretty(expression) => pretty(&context, expression).await.map(Some),
+                    _ => unreachable!(),
+                }
+            },
+            |editor, _, result| print_result(editor, result),
+        );
+        return;
+    }
+    editor.dap_console_print(&format!("{PROMPT}{input}"));
     let result: anyhow::Result<Option<String>> = match command {
+        Help => Ok(Some(HELP.to_string())),
         Move(kind) => step(editor, cx.jobs, kind).map(|_| None),
         Jump(line) => line
             .checked_sub(1)
@@ -394,13 +549,16 @@ fn run(cx: &mut Context, input: &str) {
         Where => stack(editor).map(Some),
         Breakpoints => Ok(Some(list_breakpoints(editor))),
         ToggleBreakpoint { file, line } => set_breakpoint(editor, file, line).map(Some),
-        Variables { all } => frame_variables(editor, all).map(Some),
-        Members { expression, all } => members(editor, expression, all).map(Some),
-        Eval(expression) => evaluate(editor, expression),
-        Pretty(expression) => pretty(editor, expression).map(Some),
-        Quit => quit(editor).map(Some),
+        Variables { .. } | Members { .. } | Eval(_) | Pretty(_) => unreachable!(),
+        Quit => {
+            quit(cx);
+            return;
+        }
     };
+    print_result(editor, result);
+}
 
+fn print_result(editor: &mut Editor, result: anyhow::Result<Option<String>>) {
     let output = match result {
         Ok(Some(output)) => output,
         Ok(None) => return,
@@ -412,29 +570,42 @@ fn run(cx: &mut Context, input: &str) {
 /// `q`: disconnect, ending the session. What becomes of the program is the
 /// adapter's call, as the protocol has it: one it launched is stopped, one it
 /// attached to is left running.
-fn quit(editor: &mut Editor) -> anyhow::Result<String> {
-    let debugger = editor
-        .debug_adapters
-        .get_active_client_mut()
-        .ok_or_else(|| anyhow!("Debugger is not running"))?;
+fn quit(cx: &mut Context) {
+    let Some(debugger) = cx.editor.debug_adapters.get_active_client_mut() else {
+        return;
+    };
     let id = debugger.id();
     let request = debugger.disconnect(Some(dap::requests::DisconnectArguments {
         restart: Some(false),
         terminate_debuggee: None,
         suspend_debuggee: None,
     }));
-    match block_on(request) {
-        // An adapter that went away with the program has nothing left to say.
-        Ok(_) | Err(dap::Error::StreamClosed) => (),
-        Err(err) => bail!("{err}"),
-    }
+    cx.jobs.callback(async move {
+        let result = request.await;
+        Ok(crate::job::Callback::Editor(Box::new(move |editor| {
+            match result {
+                // An adapter that went away with the program has nothing left to say.
+                Ok(_) | Err(dap::Error::StreamClosed) => (),
+                Err(err) => {
+                    editor.dap_console_print(&format!("*** {err}"));
+                    return;
+                }
+            }
 
-    editor.debug_adapters.remove_client(id);
-    editor.debug_adapters.unset_active_client();
-    for breakpoint in editor.breakpoints.values_mut().flatten() {
-        breakpoint.verified = false;
-    }
-    Ok("Disconnected: the debug session is over".to_string())
+            if editor
+                .debug_adapters
+                .get_active_client()
+                .is_some_and(|client| client.id() == id)
+            {
+                editor.debug_adapters.unset_active_client();
+            }
+            editor.debug_adapters.remove_client(id);
+            for breakpoint in editor.breakpoints.values_mut().flatten() {
+                breakpoint.verified = false;
+            }
+            editor.dap_console_print("Disconnected: the debug session is over");
+        })))
+    });
 }
 
 /// The selected frame's source file.
@@ -622,14 +793,22 @@ fn variable_row(var: &dap::Variable, indent: &str) -> String {
 }
 
 /// One row per variable. Groups are left out, or expanded one level when `all`.
-fn variable_rows(debugger: &dap::Client, variables: Vec<dap::Variable>, all: bool) -> String {
+async fn variable_rows(
+    context: &EvaluationContext,
+    variables: Vec<dap::Variable>,
+    all: bool,
+) -> String {
     let mut out = String::new();
     for var in variables {
         if !is_group(&var) {
             out.push_str(&variable_row(&var, "  "));
         } else if all {
             let _ = writeln!(out, "  {}:", var.name);
-            for child in block_on(debugger.variables(var.variables_reference)).unwrap_or_default() {
+            for child in context
+                .variables(var.variables_reference)
+                .await
+                .unwrap_or_default()
+            {
                 out.push_str(&variable_row(&child, "    "));
             }
         }
@@ -638,64 +817,67 @@ fn variable_rows(debugger: &dap::Client, variables: Vec<dap::Variable>, all: boo
 }
 
 /// `?`/`??`: the selected frame's variables.
-fn frame_variables(editor: &Editor, all: bool) -> anyhow::Result<String> {
-    let debugger = editor
-        .debug_adapters
-        .get_active_client()
-        .ok_or_else(|| anyhow!("Debugger is not running"))?;
-    let frame_id = selected_frame_id(debugger)?;
-    let scopes = block_on(debugger.scopes(frame_id)).map_err(|err| anyhow!("{err}"))?;
+async fn frame_variables(context: &EvaluationContext, all: bool) -> anyhow::Result<String> {
+    let scopes = context
+        .requests
+        .request::<dap::requests::Scopes>(dap::requests::ScopesArguments {
+            frame_id: context.frame_id,
+        })
+        .await?
+        .scopes;
 
     let mut out = String::new();
     for scope in scopes.into_iter().take(if all { usize::MAX } else { 1 }) {
-        let variables = block_on(debugger.variables(scope.variables_reference))
+        let variables = context
+            .variables(scope.variables_reference)
+            .await
             .map_err(|err| anyhow!("{err}"))?;
         let _ = writeln!(out, "{}:", scope.name);
-        out.push_str(&variable_rows(debugger, variables, all));
+        out.push_str(&variable_rows(context, variables, all).await);
     }
     Ok(out)
 }
 
 /// `expr?`/`expr??`: one level of what `expression` evaluates to.
-fn members(editor: &Editor, expression: &str, all: bool) -> anyhow::Result<String> {
-    let debugger = editor
-        .debug_adapters
-        .get_active_client()
-        .ok_or_else(|| anyhow!("Debugger is not running"))?;
-    let frame_id = selected_frame_id(debugger)?;
-    let response = block_on(debugger.eval(expression.to_owned(), Some(frame_id)))
+async fn members(
+    context: &EvaluationContext,
+    expression: &str,
+    all: bool,
+) -> anyhow::Result<String> {
+    let response = context
+        .eval(expression.to_owned(), false)
+        .await
         .map_err(|err| anyhow!("{err}"))?;
 
     if response.variables_reference == 0 {
         return Ok(format!("{expression} has no members: {}", response.result));
     }
 
-    let variables = block_on(debugger.variables(response.variables_reference))
+    let variables = context
+        .variables(response.variables_reference)
+        .await
         .map_err(|err| anyhow!("{err}"))?;
     let header = match response.ty.as_deref().filter(|ty| !ty.is_empty()) {
         Some(ty) => format!("{expression}: {ty}\n"),
         None => format!("{expression}:\n"),
     };
-    Ok(header + variable_rows(debugger, variables, all).as_str())
+    Ok(header + variable_rows(context, variables, all).await.as_str())
 }
 
 /// `pp expr`: the value laid out over several lines, through the adapter's
 /// `pretty-value-expression` quirk. Adapters without one print it as usual.
-fn pretty(editor: &Editor, expression: &str) -> anyhow::Result<String> {
-    let debugger = editor
-        .debug_adapters
-        .get_active_client()
-        .ok_or_else(|| anyhow!("Debugger is not running"))?;
-    let frame_id = selected_frame_id(debugger)?;
-
-    let value = match debugger.quirks.pretty_value_expression.as_deref() {
+async fn pretty(context: &EvaluationContext, expression: &str) -> anyhow::Result<String> {
+    let value = match context.quirks.pretty_value_expression.as_deref() {
         Some(template) => {
-            let response =
-                block_on(debugger.eval_full(template.replace("{}", expression), Some(frame_id)))
-                    .map_err(|err| anyhow!("{err}"))?;
+            let response = context
+                .eval(template.replace("{}", expression), true)
+                .await
+                .map_err(|err| anyhow!("{err}"))?;
             unquote(&response.result).into_owned()
         }
-        None => eval_complete(debugger, expression, frame_id).map_err(|err| anyhow!("{err}"))?,
+        None => eval_complete(context, expression)
+            .await
+            .map_err(|err| anyhow!("{err}"))?,
     };
     Ok(value)
 }

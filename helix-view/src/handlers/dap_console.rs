@@ -7,10 +7,13 @@ use crate::{
     align_view, editor::Action, tree::Direction, Align, Document, DocumentId, Editor, ViewId,
 };
 use helix_core::{Rope, RopeSlice, Selection, Transaction};
-use std::path::Path;
+use helix_dap::registry::DebugAdapterId;
+use std::{collections::BTreeMap, path::Path};
+use tokio::sync::oneshot;
 
 /// Starts the input line, and every echoed command in the transcript.
 pub const PROMPT: &str = "(hx) ";
+pub const CONSOLE_NAME: &str = "[Debug Console]";
 
 #[derive(Debug, Default)]
 pub struct DapConsole {
@@ -20,10 +23,16 @@ pub struct DapConsole {
     /// Where `Up`/`Down` are in the evaluation history; `None` while typing a new
     /// line.
     pub history_pos: Option<usize>,
+    /// The unsubmitted line saved on the first move into history, including its
+    /// cursor offset so returning from history resumes the same edit.
+    pub history_draft: Option<(String, usize)>,
     /// The last line run in the console, which `<ret>` on an empty input line runs
     /// again. Kept apart from the evaluation history, which outlives the session
     /// and is shared with the eval prompt.
     pub last_command: Option<String>,
+    next_request: u64,
+    pending_requests: BTreeMap<u64, (DebugAdapterId, &'static str)>,
+    request_tail: Option<(DebugAdapterId, oneshot::Receiver<()>)>,
     /// Program output that has not reached the end of a line yet, per category.
     /// Adapters forward writes as they happen, so `print("a")` may arrive as "a"
     /// and "\n" separately.
@@ -89,6 +98,44 @@ impl Editor {
         focused.is_some() && focused == self.dap_console_doc()
     }
 
+    pub fn is_dap_console_visible(&self) -> bool {
+        self.dap_console_doc()
+            .is_some_and(|id| self.tree.views().any(|(view, _)| view.doc == id))
+    }
+
+    /// Serializes inspections for this adapter without blocking the editor.
+    pub fn dap_console_begin_request(
+        &mut self,
+        adapter: DebugAdapterId,
+        label: &'static str,
+    ) -> (u64, Option<oneshot::Receiver<()>>, oneshot::Sender<()>) {
+        let (done, tail) = oneshot::channel();
+        let previous = self
+            .dap_console
+            .request_tail
+            .replace((adapter, tail))
+            .filter(|(id, _)| *id == adapter)
+            .map(|(_, previous)| previous);
+        self.dap_console.next_request += 1;
+        let id = self.dap_console.next_request;
+        self.dap_console
+            .pending_requests
+            .insert(id, (adapter, label));
+        (id, previous, done)
+    }
+
+    pub fn dap_console_finish_request(&mut self, id: u64) {
+        self.dap_console.pending_requests.remove(&id);
+    }
+
+    pub fn dap_console_busy(&self) -> Option<&'static str> {
+        let adapter = self.debug_adapters.get_active_client()?.id();
+        self.dap_console
+            .pending_requests
+            .values()
+            .find_map(|&(id, label)| (id == adapter).then_some(label))
+    }
+
     fn dap_console_views(&self, doc_id: DocumentId) -> Vec<ViewId> {
         self.tree
             .views()
@@ -112,6 +159,7 @@ impl Editor {
             self.syn_loader.clone(),
         );
         doc.is_transcript = true;
+        doc.scratch_name = Some(CONSOLE_NAME.into());
         let language = self
             .tree
             .try_get(self.tree.focus)
@@ -148,20 +196,23 @@ impl Editor {
         view_id
     }
 
-    /// Takes the focused console off screen, keeping its document, and returns
-    /// focus to the view that shows the current frame.
+    /// Hides every console view, keeping its document. When the console had
+    /// focus, returns to the view that shows the current frame.
     pub fn dap_console_hide(&mut self) {
-        if !self.is_dap_console_focused() {
+        let Some(doc_id) = self.dap_console_doc() else {
             return;
+        };
+        let focused = self.is_dap_console_focused();
+        let target = focused.then(|| self.dap_frame_view()).flatten();
+        if focused {
+            self.enter_normal_mode();
         }
-        let console_view = self.tree.focus;
-        let target = self.dap_frame_view();
-        self.enter_normal_mode();
-        // The last view cannot go, so a lone console stays on screen.
-        if target.is_some() {
-            self.close(console_view);
+        for view in self.dap_console_views(doc_id) {
+            if self.tree.views().count() > 1 {
+                self.close(view);
+            }
         }
-        if let Some(target) = target {
+        if let Some(target) = target.filter(|&view| self.tree.contains(view)) {
             self.focus(target);
         }
     }

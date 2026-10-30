@@ -4,7 +4,7 @@ use helix_dap::ConnectionType;
 use helix_lsp::lsp::DiagnosticSeverity;
 use helix_view::document::DEFAULT_LANGUAGE_NAME;
 use helix_view::{
-    document::{Mode, SCRATCH_BUFFER_NAME},
+    document::Mode,
     graphics::{Color, Modifier, Rect},
     theme::Style,
     Document, Editor, View,
@@ -169,10 +169,18 @@ where
     let visible = context.focused;
     let config = context.editor.config();
     let modenames = &config.statusline.mode;
-    let mode_str = match context.editor.mode() {
-        Mode::Insert => &modenames.insert,
-        Mode::Select => &modenames.select,
-        Mode::Normal => &modenames.normal,
+    let mode_str: &str = if context.editor.dap_console_doc() == Some(context.doc.id()) {
+        match context.editor.mode() {
+            Mode::Insert => "INPUT",
+            Mode::Normal => "BROWSE",
+            Mode::Select => "SELECT",
+        }
+    } else {
+        match context.editor.mode() {
+            Mode::Insert => &modenames.insert,
+            Mode::Select => &modenames.select,
+            Mode::Normal => &modenames.normal,
+        }
     };
     let content = if visible {
         format!(" {mode_str} ")
@@ -213,7 +221,12 @@ where
         Some(_) => "stopped",
         None => "running",
     };
-    let content = format!(" DEBUG {target} · {state} ");
+    let busy = context
+        .editor
+        .dap_console_busy()
+        .map(|label| format!(" · {label}"))
+        .unwrap_or_default();
+    let content = format!(" DEBUG {target} · {state}{busy} ");
 
     if !context.focused {
         // Like the mode, keep the room so the rest lines up across views.
@@ -488,14 +501,8 @@ fn render_file_name<'a, F>(context: &mut RenderContext<'a>, write: F)
 where
     F: Fn(&mut RenderContext<'a>, Span<'a>) + Copy,
 {
-    let title = {
-        let rel_path = context.doc.relative_path();
-        let path = rel_path
-            .as_ref()
-            .map(|p| p.to_string_lossy())
-            .unwrap_or_else(|| SCRATCH_BUFFER_NAME.into());
-        format!(" {} ", path)
-    };
+    let title =
+        console_title(context).unwrap_or_else(|| format!(" {} ", context.doc.display_name()));
 
     write(context, title.into());
 }
@@ -504,14 +511,14 @@ fn render_file_absolute_path<'a, F>(context: &mut RenderContext<'a>, write: F)
 where
     F: Fn(&mut RenderContext<'a>, Span<'a>) + Copy,
 {
-    let title = {
+    let title = console_title(context).unwrap_or_else(|| {
         let path = context.doc.path();
         let path = path
             .as_ref()
             .map(|p| p.to_string_lossy())
-            .unwrap_or_else(|| SCRATCH_BUFFER_NAME.into());
+            .unwrap_or_else(|| context.doc.display_name());
         format!(" {} ", path)
-    };
+    });
 
     write(context, title.into());
 }
@@ -545,16 +552,43 @@ fn render_file_base_name<'a, F>(context: &mut RenderContext<'a>, write: F)
 where
     F: Fn(&mut RenderContext<'a>, Span<'a>) + Copy,
 {
-    let title = {
+    let title = console_title(context).unwrap_or_else(|| {
         let rel_path = context.doc.relative_path();
         let path = rel_path
             .as_ref()
             .and_then(|p| p.file_name().map(|s| s.to_string_lossy()))
-            .unwrap_or_else(|| SCRATCH_BUFFER_NAME.into());
+            .unwrap_or_else(|| context.doc.display_name());
         format!(" {} ", path)
-    };
+    });
 
     write(context, title.into());
+}
+
+fn console_title(context: &RenderContext<'_>) -> Option<String> {
+    if context.editor.dap_console_doc() != Some(context.doc.id()) {
+        return None;
+    }
+    let mut title = format!(" {}", context.doc.display_name());
+    if let Some(debugger) = context.editor.debug_adapters.get_active_client() {
+        if let Some(frame) = debugger.current_stack_frame() {
+            let path = frame
+                .source
+                .as_ref()
+                .and_then(|source| source.path.as_ref())
+                .and_then(|path| path.file_name())
+                .map(|name| name.to_string_lossy());
+            title.push_str(&format!(
+                " · #{} {}",
+                debugger.active_frame.unwrap_or(0),
+                frame.name
+            ));
+            if let Some(path) = path {
+                title.push_str(&format!(" {path}:{}", frame.line));
+            }
+        }
+    }
+    title.push(' ');
+    Some(title)
 }
 
 fn render_separator<'a, F>(context: &mut RenderContext<'a>, write: F)

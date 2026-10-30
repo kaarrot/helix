@@ -594,6 +594,9 @@ impl MappableCommand {
         dap_goto_line, "Jump execution to current line",
         dap_evaluate, "Evaluate expression",
         dap_console_toggle, "Open or close the debug console",
+        dap_console_focus, "Switch focus between source and debug console",
+        dap_console_hide, "Hide the debug console, keeping its transcript",
+        dap_console_help, "Show debug console help",
         dap_variables, "List and set variables",
         dap_terminate, "End debug session",
         dap_edit_condition, "Edit breakpoint condition on current line",
@@ -3277,7 +3280,7 @@ fn buffer_picker(cx: &mut Context) {
 
     struct BufferMeta {
         id: DocumentId,
-        path: Option<PathBuf>,
+        label: String,
         is_modified: bool,
         is_current: bool,
         focused_at: std::time::Instant,
@@ -3285,7 +3288,7 @@ fn buffer_picker(cx: &mut Context) {
 
     let new_meta = |doc: &Document| BufferMeta {
         id: doc.id(),
-        path: doc.path().cloned(),
+        label: doc.display_name().into_owned(),
         is_modified: doc.is_modified(),
         is_current: doc.id() == current,
         focused_at: doc.focused_at,
@@ -3313,17 +3316,7 @@ fn buffer_picker(cx: &mut Context) {
             }
             flags.into()
         }),
-        PickerColumn::new("path", |meta: &BufferMeta, _| {
-            let path = meta
-                .path
-                .as_deref()
-                .map(helix_stdx::path::get_relative_path);
-            path.as_deref()
-                .and_then(Path::to_str)
-                .unwrap_or(SCRATCH_BUFFER_NAME)
-                .to_string()
-                .into()
-        }),
+        PickerColumn::new("path", |meta: &BufferMeta, _| meta.label.as_str().into()),
     ];
     let initial_cursor = if items.len() <= 1 { 0 } else { 1 };
     let picker = Picker::new(columns, 2, items, (), |cx, meta, action| {

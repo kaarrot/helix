@@ -16,7 +16,10 @@ use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::PathBuf,
     process::Stdio,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
 };
 use tokio::{
     io::{AsyncBufRead, AsyncWrite, BufReader, BufWriter},
@@ -31,7 +34,7 @@ pub struct Client {
     id: DebugAdapterId,
     _process: Option<Child>,
     server_tx: UnboundedSender<Payload>,
-    request_counter: AtomicU64,
+    request_counter: Arc<AtomicU64>,
     connection_type: Option<ConnectionType>,
     starting_request_args: Option<Value>,
     /// The socket address of the debugger, if using TCP transport.
@@ -49,6 +52,53 @@ pub struct Client {
     /// What the session debugs, as the status line names it: the process attached
     /// to, the address of a debug server, or the program launched.
     pub target: Option<String>,
+}
+
+/// A cloneable connection for requests that outlive an editor command. It does
+/// not own the adapter process or the editor's selected thread and frame.
+#[derive(Debug, Clone)]
+pub struct RequestHandle {
+    server_tx: UnboundedSender<Payload>,
+    request_counter: Arc<AtomicU64>,
+}
+
+impl RequestHandle {
+    pub fn call<R: crate::types::Request>(
+        &self,
+        arguments: R::Arguments,
+    ) -> impl Future<Output = Result<Value>>
+    where
+        R::Arguments: serde::Serialize,
+    {
+        let server_tx = self.server_tx.clone();
+        // All handles share the connection's monotonically increasing sequence.
+        let id = self.request_counter.fetch_add(1, Ordering::Relaxed) + 1;
+        async move {
+            let arguments = Some(serde_json::to_value(arguments)?);
+            let (callback_tx, mut callback_rx) = channel(1);
+            server_tx
+                .send(Payload::Request(Request {
+                    back_ch: Some(callback_tx),
+                    seq: id,
+                    command: R::COMMAND.to_string(),
+                    arguments,
+                }))
+                .map_err(|e| Error::Other(e.into()))?;
+            time::timeout(std::time::Duration::from_secs(20), callback_rx.recv())
+                .await
+                .map_err(|_| Error::Timeout(id))?
+                .ok_or(Error::StreamClosed)?
+                .map(|response| response.body.unwrap_or_default())
+        }
+    }
+
+    pub async fn request<R: crate::types::Request>(&self, params: R::Arguments) -> Result<R::Result>
+    where
+        R::Arguments: serde::Serialize,
+        R::Result: core::fmt::Debug,
+    {
+        Ok(serde_json::from_value(self.call::<R>(params).await?)?)
+    }
 }
 
 impl Client {
@@ -93,7 +143,7 @@ impl Client {
             id,
             _process: process,
             server_tx,
-            request_counter: AtomicU64::new(0),
+            request_counter: Arc::new(AtomicU64::new(0)),
             caps: None,
             connection_type: None,
             starting_request_args: None,
@@ -242,12 +292,11 @@ impl Client {
         self.connection_type
     }
 
-    fn next_request_id(&self) -> u64 {
-        // > The `seq` for the first message sent by a client or debug adapter
-        // > is 1, and for each subsequent message is 1 greater than the
-        // > previous message sent by that actor
-        // <https://microsoft.github.io/debug-adapter-protocol/specification#Base_Protocol_ProtocolMessage>
-        self.request_counter.fetch_add(1, Ordering::Relaxed) + 1
+    pub fn request_handle(&self) -> RequestHandle {
+        RequestHandle {
+            server_tx: self.server_tx.clone(),
+            request_counter: self.request_counter.clone(),
+        }
     }
 
     // Internal, called by specific DAP commands when resuming
@@ -268,36 +317,7 @@ impl Client {
     where
         R::Arguments: serde::Serialize,
     {
-        let server_tx = self.server_tx.clone();
-        let id = self.next_request_id();
-
-        async move {
-            use std::time::Duration;
-            use tokio::time::timeout;
-
-            let arguments = Some(serde_json::to_value(arguments)?);
-
-            let (callback_tx, mut callback_rx) = channel(1);
-
-            let req = Request {
-                back_ch: Some(callback_tx),
-                seq: id,
-                command: R::COMMAND.to_string(),
-                arguments,
-            };
-
-            server_tx
-                .send(Payload::Request(req))
-                .map_err(|e| Error::Other(e.into()))?;
-
-            // TODO: specifiable timeout, delay other calls until initialize success
-            timeout(Duration::from_secs(20), callback_rx.recv())
-                .await
-                .map_err(|_| Error::Timeout(id))? // return Timeout
-                .ok_or(Error::StreamClosed)?
-                .map(|response| response.body.unwrap_or_default())
-            // TODO: check response.success
-        }
+        self.request_handle().call::<R>(arguments)
     }
 
     pub async fn request<R: crate::types::Request>(&self, params: R::Arguments) -> Result<R::Result>
@@ -305,10 +325,7 @@ impl Client {
         R::Arguments: serde::Serialize,
         R::Result: core::fmt::Debug, // TODO: temporary
     {
-        // a future that resolves into the response
-        let json = self.call::<R>(params).await?;
-        let response = serde_json::from_value(json)?;
-        Ok(response)
+        self.request_handle().request::<R>(params).await
     }
 
     pub fn reply(

@@ -8,6 +8,8 @@ use helix_view::{current_ref, document::Mode, input::parse_macro, Editor};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
+mod adapter;
+
 #[cfg(windows)]
 use crossterm::event::{Event, KeyEvent};
 #[cfg(not(windows))]
@@ -64,6 +66,42 @@ impl Session {
         self.tx.send(Ok(Event::Paste(text.to_string())))?;
         self.app.event_loop_until_idle(&mut self.rx).await;
         Ok(&self.app.editor)
+    }
+
+    fn attach_adapter(&mut self, gates: &std::path::Path) -> anyhow::Result<()> {
+        let path = helix_view::doc!(self.app.editor).path().cloned().unwrap();
+        let editor = &mut self.app.editor;
+        let id = editor
+            .debug_adapters
+            .start_client(None, &adapter::config(gates)?)?;
+        let debugger = editor.debug_adapters.get_client_mut(id).unwrap();
+        let thread = serde_json::from_value(serde_json::json!(1))?;
+        debugger.thread_id = Some(thread);
+        debugger.active_frame = Some(0);
+        debugger.stack_frames.insert(
+            thread,
+            vec![
+                serde_json::from_value(serde_json::json!({
+                    "id": 7, "name": "demo", "source": {"path": path}, "line": 1, "column": 1,
+                }))?,
+                serde_json::from_value(serde_json::json!({
+                    "id": 8, "name": "caller", "source": {"path": path}, "line": 1, "column": 1,
+                }))?,
+            ],
+        );
+        editor.debug_adapters.set_active_client(id);
+        Ok(())
+    }
+
+    async fn finish_requests(&mut self) -> anyhow::Result<()> {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while self.app.editor.dap_console_busy().is_some() {
+                self.app.editor.reset_idle_timer();
+                self.keys("").await?;
+            }
+            anyhow::Ok(())
+        })
+        .await?
     }
 
     /// Leaves the debug menu and quits.
@@ -145,7 +183,7 @@ async fn console_opens_from_the_debug_menu_and_keeps_it() -> anyhow::Result<()> 
     assert_eq!(2, editor.tree.views().count());
     assert!(editor.autoinfo.is_some());
 
-    // The same key opens and closes the console. Closing only hides it.
+    // Ctrl-d switches focus without changing the split layout.
     let editor = session.keys("<C-d>").await?;
     assert!(editor.is_dap_console_focused());
     assert_eq!(Mode::Insert, editor.mode());
@@ -153,13 +191,18 @@ async fn console_opens_from_the_debug_menu_and_keeps_it() -> anyhow::Result<()> 
     let editor = session.keys("<C-d>").await?;
     assert!(!editor.is_dap_console_focused());
     assert_eq!(Mode::Normal, editor.mode());
-    assert_eq!(1, editor.tree.views().count());
+    assert_eq!(2, editor.tree.views().count());
     assert!(editor.dap_console_doc().is_some());
     assert!(editor.autoinfo.is_some());
 
     // Shown again, the transcript is where it was left.
     let editor = session.keys("<C-d>").await?;
     assert!(console_text(editor).starts_with(&format!("{NO_SESSION}stdout line\n")));
+
+    let editor = session.keys("<esc>:debug-console-hide<ret>").await?;
+    assert!(!editor.is_dap_console_focused());
+    assert_eq!(1, editor.tree.views().count());
+    assert!(editor.dap_console_doc().is_some());
 
     session.quit().await
 }
@@ -497,5 +540,310 @@ async fn gf_shows_a_file_line_from_the_transcript_beside_the_console() -> anyhow
     assert_eq!(2, editor.tree.views().count());
     assert_eq!(console_view, editor.tree.focus);
 
+    session.quit().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn focus_and_window_navigation_keep_both_panes_open() -> anyhow::Result<()> {
+    let (mut session, _file) = Session::new()?;
+    session.keys("<space>G<C-d>draft<C-d>").await?;
+
+    // Ordinary window navigation also works while the source's debug menu is up.
+    let editor = session.keys("<C-w>j").await?;
+    assert!(editor.is_dap_console_focused());
+    assert_eq!(Mode::Normal, editor.mode());
+    assert!(console_text(editor).ends_with("(hx) draft"));
+
+    let editor = session.keys("<C-d>").await?;
+    assert!(!editor.is_dap_console_focused());
+    assert_eq!(2, editor.tree.views().count());
+    // Leave the sticky menu: the visible console still has the same focus key.
+    let editor = session.keys("<esc><C-d>").await?;
+    assert!(editor.is_dap_console_focused());
+    assert_eq!(Mode::Insert, editor.mode());
+    assert!(console_text(editor).ends_with("(hx) draft"));
+
+    // Explicitly hide from the source, retaining the transcript.
+    let editor = session.keys("<C-d>:debug-console-hide<ret>").await?;
+    assert_eq!(1, editor.tree.views().count());
+    assert!(editor.dap_console_doc().is_some());
+    session.quit().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn history_restores_the_draft_and_its_cursor() -> anyhow::Result<()> {
+    let (mut session, _file) = Session::new()?;
+    session
+        .editor()
+        .registers
+        .write('=', vec!["previous".into()])?;
+    session.keys("<space>G<C-d>tax + 🦀  <left><left>").await?;
+    let before = cursor(session.editor());
+    session.keys("<up><C-d><C-d>").await?;
+    let editor = session.keys("<down>").await?;
+    assert!(console_text(editor).ends_with("(hx) tax + 🦀  "));
+    assert_eq!(before, cursor(editor));
+    assert!(editor.dap_console.history_draft.is_none());
+    session.quit().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn console_help_works_without_a_session() -> anyhow::Result<()> {
+    let (mut session, _file) = Session::new()?;
+    let editor = session.keys(":debug-console<ret>h<ret>").await?;
+    assert_eq!("[Debug Console]", helix_view::doc!(editor).display_name());
+    assert!(console_text(editor).contains("(hx) h\nDebug Console\n"));
+    assert!(console_text(editor).contains(":debug-console-hide"));
+    assert!(!console_text(editor).contains("NameError"));
+    let editor = session.keys("help<ret>").await?;
+    assert!(console_text(editor).contains("(hx) help\nDebug Console\n"));
+    session.quit().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pending_evaluations_allow_navigation_and_keep_pasted_commands_in_order(
+) -> anyhow::Result<()> {
+    let (mut session, _file) = Session::new()?;
+    let gates = tempfile::tempdir()?;
+    session.attach_adapter(gates.path())?;
+    session.keys(":debug-console<ret>").await?;
+    session.paste("slow\nfast\ndraft").await?;
+    adapter::wait_for(gates.path().join("evaluate-started")).await?;
+    assert_eq!(Some("evaluating…"), session.editor().dap_console_busy());
+    assert!(!console_text(session.editor()).contains("(hx) fast\n"));
+
+    // The adapter is still waiting. Navigation and hiding must finish now,
+    // without waiting for the evaluation to return.
+    let editor = tokio::time::timeout(Duration::from_secs(1), session.keys("<C-d>")).await??;
+    assert!(!editor.is_dap_console_focused());
+    assert_eq!(2, editor.tree.views().count());
+    let editor = session.keys(":debug-console-hide<ret>").await?;
+    assert_eq!(1, editor.tree.views().count());
+    let source = editor.tree.focus;
+    let source_cursor = cursor(editor);
+    std::fs::write(gates.path().join("release-evaluate"), "")?;
+    session.finish_requests().await?;
+    assert_eq!(source, session.editor().tree.focus);
+    assert_eq!(source_cursor, cursor(session.editor()));
+    assert_eq!(Mode::Normal, session.editor().mode());
+    assert_eq!(1, session.editor().tree.views().count());
+    assert!(console_text(session.editor()).contains("(hx) slow\n11\n(hx) fast\n22\n(hx) draft"));
+    assert_eq!(
+        "slow:7\nfast:7\n",
+        std::fs::read_to_string(gates.path().join("evaluated"))?
+    );
+    session.keys(":debug-console<ret>").await?;
+    assert!(session.editor().is_dap_console_focused());
+    assert_eq!(Mode::Insert, session.editor().mode());
+    session.quit().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn queued_evaluations_use_the_frame_selected_when_submitted() -> anyhow::Result<()> {
+    let (mut session, _file) = Session::new()?;
+    let gates = tempfile::tempdir()?;
+    session.attach_adapter(gates.path())?;
+    session.keys(":debug-console<ret>slow<ret>").await?;
+    adapter::wait_for(gates.path().join("evaluate-started")).await?;
+
+    // Changing the selected frame must affect the next submission, while each
+    // pending evaluation retains its own frame even when it starts later.
+    session.keys("f 1<ret>fast<ret>f 0<ret>draft").await?;
+    std::fs::write(gates.path().join("release-evaluate"), "")?;
+    session.finish_requests().await?;
+    assert_eq!(
+        "slow:7\nfast:8\n",
+        std::fs::read_to_string(gates.path().join("evaluated"))?
+    );
+    assert!(console_text(session.editor()).ends_with("(hx) draft"));
+    assert_eq!(
+        Some(0),
+        session
+            .editor()
+            .debug_adapters
+            .get_active_client()
+            .unwrap()
+            .active_frame
+    );
+    session.quit().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn variable_inspection_allows_navigation_and_guards_execution() -> anyhow::Result<()> {
+    let (mut session, _file) = Session::new()?;
+    let gates = tempfile::tempdir()?;
+    session.attach_adapter(gates.path())?;
+    session.keys(":debug-console<ret>?<ret>draft").await?;
+    adapter::wait_for(gates.path().join("inspection-started")).await?;
+    assert_eq!(Some("inspecting…"), session.editor().dap_console_busy());
+
+    let editor =
+        tokio::time::timeout(Duration::from_secs(1), session.keys("<C-d><space>Gn")).await??;
+    assert!(!editor.is_dap_console_focused());
+    assert!(editor
+        .status_msg
+        .as_ref()
+        .is_some_and(|(message, _)| message.contains("pending inspection")));
+    std::fs::write(gates.path().join("release-inspection"), "")?;
+    session.finish_requests().await?;
+    assert!(!session.editor().is_dap_console_focused());
+    assert!(console_text(session.editor()).contains("Locals:\n  answer: int = 42\n(hx) draft"));
+    session.quit().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn late_completion_does_not_overwrite_newer_input() -> anyhow::Result<()> {
+    let (mut session, _file) = Session::new()?;
+    let gates = tempfile::tempdir()?;
+    session.attach_adapter(gates.path())?;
+    session.keys(":debug-console<ret>obj.<tab>").await?;
+    adapter::wait_for(gates.path().join("completion-started")).await?;
+    session.keys("new").await?;
+    std::fs::write(gates.path().join("release-completion"), "")?;
+    session.finish_requests().await?;
+    assert!(console_text(session.editor()).ends_with("(hx) obj.new"));
+    session.quit().await
+}
+
+async fn discard_completion_after(change: &str) -> anyhow::Result<()> {
+    let (mut session, _file) = Session::new()?;
+    let gates = tempfile::tempdir()?;
+    session.attach_adapter(gates.path())?;
+    session.keys(":debug-console<ret>obj.<tab>").await?;
+    adapter::wait_for(gates.path().join("completion-started")).await?;
+    match change {
+        "cursor" => {
+            session.keys("<left>").await?;
+        }
+        "focus" => {
+            session.keys("<C-d>").await?;
+        }
+        "frame" => {
+            session
+                .editor()
+                .debug_adapters
+                .get_active_client_mut()
+                .unwrap()
+                .active_frame = Some(1);
+        }
+        _ => unreachable!(),
+    }
+    let focus = session.editor().tree.focus;
+    let before = cursor(session.editor());
+    std::fs::write(gates.path().join("release-completion"), "")?;
+    session.finish_requests().await?;
+    assert!(console_text(session.editor()).ends_with("(hx) obj."));
+    assert_eq!(focus, session.editor().tree.focus);
+    assert_eq!(before, cursor(session.editor()));
+    session.quit().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn late_completion_is_discarded_after_moving_the_cursor() -> anyhow::Result<()> {
+    discard_completion_after("cursor").await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn late_completion_is_discarded_after_switching_focus() -> anyhow::Result<()> {
+    discard_completion_after("focus").await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn late_completion_is_discarded_after_switching_frames() -> anyhow::Result<()> {
+    discard_completion_after("frame").await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn closing_the_console_discards_pending_results_and_queued_evaluations() -> anyhow::Result<()>
+{
+    let (mut session, _file) = Session::new()?;
+    let gates = tempfile::tempdir()?;
+    session.attach_adapter(gates.path())?;
+    session.keys(":debug-console<ret>").await?;
+    session.paste("slow\nfast\n").await?;
+    adapter::wait_for(gates.path().join("evaluate-started")).await?;
+    let console = session.editor().dap_console_doc().unwrap();
+    session
+        .keys("<esc>:buffer-close!<ret>:debug-console<ret>fresh draft")
+        .await?;
+    assert_ne!(Some(console), session.editor().dap_console_doc());
+    std::fs::write(gates.path().join("release-evaluate"), "")?;
+    session.finish_requests().await?;
+    assert_eq!("(hx) fresh draft", console_text(session.editor()));
+    assert_eq!(
+        "slow:7\n",
+        std::fs::read_to_string(gates.path().join("evaluated"))?
+    );
+    session.quit().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ending_the_session_discards_pending_results_and_queued_evaluations() -> anyhow::Result<()>
+{
+    let (mut session, _file) = Session::new()?;
+    let gates = tempfile::tempdir()?;
+    session.attach_adapter(gates.path())?;
+    session.keys(":debug-console<ret>").await?;
+    session.paste("slow\nfast\ndraft").await?;
+    adapter::wait_for(gates.path().join("evaluate-started")).await?;
+    let before = console_text(session.editor());
+
+    let adapter = session
+        .editor()
+        .debug_adapters
+        .get_active_client()
+        .unwrap()
+        .id();
+    // Ending a session can leave its client registered until the adapter sends
+    // its termination event. Wait on the queue itself since the busy indicator
+    // correctly stops referring to this inactive adapter.
+    let (ticket, previous, done) = session
+        .editor()
+        .dap_console_begin_request(adapter, "waiting…");
+    let mut previous = previous.unwrap();
+    session.editor().debug_adapters.unset_active_client();
+    std::fs::write(gates.path().join("release-evaluate"), "")?;
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            session.editor().reset_idle_timer();
+            session.keys("").await?;
+            if previous.try_recv().is_ok() {
+                break;
+            }
+        }
+        anyhow::Ok(())
+    })
+    .await??;
+    session.editor().reset_idle_timer();
+    session.keys("").await?;
+    session.editor().dap_console_finish_request(ticket);
+    drop(done);
+
+    assert_eq!(before, console_text(session.editor()));
+    assert_eq!(
+        "slow:7\n",
+        std::fs::read_to_string(gates.path().join("evaluated"))?
+    );
+    assert!(session
+        .editor()
+        .debug_adapters
+        .get_active_client()
+        .is_none());
+    session.quit().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn completion_survives_output_arriving_before_the_response() -> anyhow::Result<()> {
+    let (mut session, _file) = Session::new()?;
+    let gates = tempfile::tempdir()?;
+    session.attach_adapter(gates.path())?;
+    session.keys(":debug-console<ret>obj.<tab>").await?;
+    adapter::wait_for(gates.path().join("completion-started")).await?;
+    session
+        .editor()
+        .dap_console_print("stdout during completion");
+    std::fs::write(gates.path().join("release-completion"), "")?;
+    session.finish_requests().await?;
+    assert!(console_text(session.editor()).ends_with("stdout during completion\n(hx) obj.member"));
     session.quit().await
 }

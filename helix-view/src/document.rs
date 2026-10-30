@@ -208,6 +208,8 @@ pub struct Document {
     /// needs saving, so it never counts as modified, and it is kept rather than
     /// discarded when another file replaces it in a view, although it has no path.
     pub is_transcript: bool,
+    /// A display label for a pathless buffer, without giving it a file to save.
+    pub scratch_name: Option<String>,
 
     pub previous_diagnostic_id: Option<String>,
 
@@ -733,6 +735,7 @@ impl Document {
             focused_at: std::time::Instant::now(),
             readonly: false,
             is_transcript: false,
+            scratch_name: None,
             jump_labels: HashMap::new(),
             color_swatches: None,
             color_swatch_controller: TaskController::new(),
@@ -2009,8 +2012,15 @@ impl Document {
     }
 
     pub fn display_name(&self) -> Cow<'_, str> {
-        self.relative_path()
-            .map_or_else(|| SCRATCH_BUFFER_NAME.into(), |path| path.to_string_lossy())
+        self.relative_path().map_or_else(
+            || {
+                self.scratch_name
+                    .as_deref()
+                    .unwrap_or(SCRATCH_BUFFER_NAME)
+                    .into()
+            },
+            |path| path.to_string_lossy(),
+        )
     }
 
     // transact(Fn) ?

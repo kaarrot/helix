@@ -3,7 +3,7 @@ pub mod registry;
 mod transport;
 mod types;
 
-pub use client::Client;
+pub use client::{Client, RequestHandle};
 pub use transport::{Payload, Response, Transport};
 pub use types::*;
 

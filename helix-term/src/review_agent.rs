@@ -1,9 +1,9 @@
-//! Drives a `claude`, `grok` or `agy` child as the answerer for one review thread.
+//! Drives a `claude`, `grok`, `agy` or `codex` child for one review thread.
 //!
 //! Each thread has its own conversation id. A turn is one process: the first
-//! creates that id with `--session-id`, and a follow-up resumes it with
-//! `--resume`. Two threads therefore cannot see each other's comments or take
-//! each other's reply, and their turns run at the same time. A follow-up sent
+//! creates a conversation, and a follow-up resumes it. Two threads therefore
+//! cannot see each other's comments or take each other's reply, and their
+//! turns run at the same time. A follow-up sent
 //! while its thread's reply is still arriving is held as a draft until that
 //! reply lands (see [`apply_event`]), so one conversation is never driven by two
 //! turns at once and two replies are never written into one entry.
@@ -301,19 +301,21 @@ fn in_memory_only(uuid: &str) -> bool {
 }
 
 /// Whether this conversation has been started, by its marker or in memory.
-fn session_started(uuid: &str) -> bool {
+fn session_started(kind: CliKind, uuid: &str) -> bool {
+    let key = kind.session_key(uuid);
     if in_memory_only(uuid) {
-        return STARTED_IN_MEMORY.lock().unwrap().contains(uuid);
+        return STARTED_IN_MEMORY.lock().unwrap().contains(&key);
     }
-    started_marker(uuid).exists()
+    started_marker(&key).exists()
 }
 
-fn unmark_session_started(uuid: &str) {
+fn unmark_session_started(kind: CliKind, uuid: &str) {
+    let key = kind.session_key(uuid);
     if in_memory_only(uuid) {
-        STARTED_IN_MEMORY.lock().unwrap().remove(uuid);
+        STARTED_IN_MEMORY.lock().unwrap().remove(&key);
         return;
     }
-    let _ = std::fs::remove_file(started_marker(uuid));
+    let _ = std::fs::remove_file(started_marker(&key));
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -321,6 +323,7 @@ enum CliKind {
     Claude,
     Grok,
     Agy,
+    Codex,
 }
 
 impl CliKind {
@@ -329,6 +332,17 @@ impl CliKind {
             Self::Claude => "claude",
             Self::Grok => "grok",
             Self::Agy => "agy",
+            Self::Codex => "codex",
+        }
+    }
+
+    fn session_key(self, uuid: &str) -> String {
+        // Codex assigns its own IDs. A marker left by a different agent must
+        // not make its first turn try to resume that agent's conversation.
+        if self == Self::Codex {
+            format!("{uuid}.codex")
+        } else {
+            uuid.to_string()
         }
     }
 }
@@ -473,7 +487,7 @@ impl TurnState {
     }
 
     fn launch(&self, session: &str, thread: ThreadId, prompt: String) {
-        let resuming = session_started(session);
+        let resuming = session_started(self.kind, session);
         let prompt_file = if self.kind == CliKind::Grok {
             match write_prompt_file(&prompt) {
                 Ok(file) => Some(file),
@@ -491,6 +505,7 @@ impl TurnState {
             None => match self.kind {
                 CliKind::Claude => child_args(session, resuming),
                 CliKind::Agy => agy_args(session, resuming, &prompt),
+                CliKind::Codex => codex_args(session, resuming),
                 CliKind::Grok => unreachable!(),
             },
         };
@@ -508,9 +523,10 @@ impl TurnState {
             use std::os::unix::process::CommandExt;
             command.process_group(0);
         }
-        // Only Claude reads the prompt from stdin. Grok takes `--prompt-file`
+        // Claude and Codex read stdin. Grok takes `--prompt-file`
         // and Agy takes `--print`; a piped stdin would leave them waiting.
-        if self.kind == CliKind::Claude {
+        let reads_stdin = matches!(self.kind, CliKind::Claude | CliKind::Codex);
+        if reads_stdin {
             command.stdin(Stdio::piped());
         } else {
             command.stdin(Stdio::null());
@@ -528,10 +544,10 @@ impl TurnState {
             }
         };
 
-        // Claude reads the prompt from stdin and exits on EOF. Writing it on
+        // These children read the prompt from stdin and exit on EOF. Writing it on
         // another task keeps a large prompt from filling the pipe while this
         // task is still stuck before it starts reading stdout.
-        if self.kind == CliKind::Claude {
+        if reads_stdin {
             let Some(mut stdin) = child.stdin.take() else {
                 let _ = child.kill();
                 tokio::task::spawn_blocking(move || {
@@ -556,8 +572,8 @@ impl TurnState {
         let session = session.to_string();
         let state = self.clone();
         tokio::task::spawn_blocking(move || {
-            if let Some(stdout) = stdout {
-                read_turn(stdout, thread, &session, &stopped);
+            let adopted_sessions = if let Some(stdout) = stdout {
+                read_turn(stdout, thread, &session, &stopped, &state)
             } else {
                 apply(
                     &session,
@@ -567,11 +583,15 @@ impl TurnState {
                     ),
                 );
                 finish_one();
-            }
+                Vec::new()
+            };
             reap(&child);
             LIVE.lock().unwrap().remove(&live);
             drop(prompt_file);
             state.release(&session);
+            for adopted in adopted_sessions {
+                state.release(&adopted);
+            }
             if !state.stopped.load(Ordering::SeqCst) {
                 state.kick();
             }
@@ -657,6 +677,30 @@ impl AgyChildAgent {
 }
 
 impl ReviewAgent for AgyChildAgent {
+    fn send(&mut self, thread: ThreadId, session: String, prompt: String) -> anyhow::Result<()> {
+        self.turns.send(thread, session, prompt)
+    }
+
+    fn shutdown(&mut self) {
+        self.turns.shutdown();
+    }
+}
+
+/// Drives `codex exec --json` once per turn, with the prompt on stdin.
+#[derive(Debug)]
+pub struct CodexChildAgent {
+    turns: TurnState,
+}
+
+impl CodexChildAgent {
+    pub fn new(worktree: PathBuf) -> Self {
+        Self {
+            turns: TurnState::new(CliKind::Codex, worktree),
+        }
+    }
+}
+
+impl ReviewAgent for CodexChildAgent {
     fn send(&mut self, thread: ThreadId, session: String, prompt: String) -> anyhow::Result<()> {
         self.turns.send(thread, session, prompt)
     }
@@ -798,12 +842,13 @@ fn stream_part(value: &serde_json::Value) -> Option<StreamPart> {
     None
 }
 
-fn mark_session_started(uuid: &str) {
+fn mark_session_started(kind: CliKind, uuid: &str) {
+    let key = kind.session_key(uuid);
     if in_memory_only(uuid) {
-        STARTED_IN_MEMORY.lock().unwrap().insert(uuid.to_string());
+        STARTED_IN_MEMORY.lock().unwrap().insert(key);
         return;
     }
-    let marker = started_marker(uuid);
+    let marker = started_marker(&key);
     let _ = std::fs::create_dir_all(marker.parent().unwrap_or(&marker));
     let _ = std::fs::write(&marker, uuid);
 }
@@ -855,6 +900,105 @@ fn agy_args(uuid: &str, resuming: bool, prompt: &str) -> Vec<String> {
     args
 }
 
+/// Codex creates its own thread ID and reports it in `thread.started`.
+/// Follow-ups target that exact ID; `-` keeps large prompts off argv.
+fn codex_args(uuid: &str, resuming: bool) -> Vec<String> {
+    let mut args = vec!["exec".into()];
+    if resuming {
+        args.push("resume".into());
+    }
+    args.extend([
+        "--json".into(),
+        // Match the other review agents' ability to edit and run commands
+        // without an interactive approval prompt.
+        "--dangerously-bypass-approvals-and-sandbox".into(),
+        // Temporary comments also work outside a repository.
+        "--skip-git-repo-check".into(),
+    ]);
+    if resuming {
+        args.push(uuid.to_string());
+    }
+    args.push("-".into());
+    args
+}
+
+/// Codex item updates contain text snapshots, not append-only deltas, and
+/// `turn.completed` has no reply text. Retain the messages to reconstruct the
+/// full reply while emitting only new text for each item.
+#[derive(Default)]
+struct CodexStream {
+    messages: Vec<(String, String)>,
+    error: Option<String>,
+}
+
+impl CodexStream {
+    fn part(&mut self, value: &serde_json::Value) -> Option<StreamPart> {
+        match value.get("type")?.as_str()? {
+            "item.started" | "item.updated" | "item.completed" => {
+                let item = value.get("item")?;
+                if item.get("type")?.as_str()? != "agent_message" {
+                    return None;
+                }
+                let id = item.get("id")?.as_str()?;
+                let text = item.get("text")?.as_str()?;
+                let index = self
+                    .messages
+                    .iter()
+                    .position(|(item_id, _)| item_id == id)
+                    .unwrap_or_else(|| {
+                        self.messages.push((id.to_string(), String::new()));
+                        self.messages.len() - 1
+                    });
+                let previous = &self.messages[index].1;
+                let first_chunk = previous.is_empty();
+                let mut delta = text.strip_prefix(previous).unwrap_or(text).to_string();
+                self.messages[index].1 = text.to_string();
+                if delta.is_empty() {
+                    return None;
+                }
+                if first_chunk
+                    && self.messages[..index]
+                        .iter()
+                        .any(|(_, text)| !text.is_empty())
+                {
+                    delta.insert_str(0, "\n\n");
+                }
+                Some(StreamPart::Chunk(delta))
+            }
+            "turn.completed" => Some(StreamPart::Result {
+                is_error: false,
+                text: self
+                    .messages
+                    .iter()
+                    .map(|(_, text)| text.as_str())
+                    .filter(|text| !text.is_empty())
+                    .collect::<Vec<_>>()
+                    .join("\n\n"),
+            }),
+            "turn.failed" => Some(StreamPart::Result {
+                is_error: true,
+                text: value
+                    .pointer("/error/message")
+                    .and_then(|message| message.as_str())
+                    .or(self.error.as_deref())
+                    .unwrap_or("Codex turn failed")
+                    .to_string(),
+            }),
+            "error" => {
+                // An error may be followed by a retry. A failed turn or EOF
+                // makes it terminal, so a recoverable error cannot discard a
+                // later successful reply.
+                self.error = value
+                    .get("message")
+                    .and_then(|message| message.as_str())
+                    .map(str::to_string);
+                None
+            }
+            _ => None,
+        }
+    }
+}
+
 fn update_session(thread: ThreadId, old_session: &str, new_session: &str) {
     if in_memory_only(old_session) {
         keep_in_memory(new_session);
@@ -889,11 +1033,15 @@ fn read_turn(
     thread: ThreadId,
     session: &str,
     stopped: &AtomicBool,
-) {
+    state: &TurnState,
+) -> Vec<String> {
+    let kind = state.kind;
     let reader = BufReader::new(stdout);
     let mut spoke = false;
     let mut finished = false;
     let mut session = session.to_string();
+    let mut codex = CodexStream::default();
+    let mut adopted_sessions = Vec::new();
 
     for line in reader.lines() {
         let Ok(line) = line else { break };
@@ -909,20 +1057,35 @@ fn read_turn(
             .or_else(|| value.pointer("/init/conversation_id"))
             .or_else(|| value.pointer("/step_update/conversation_id"))
             .or_else(|| value.pointer("/result/conversation_id"))
+            .or_else(|| {
+                (kind == CliKind::Codex && value.get("type")?.as_str()? == "thread.started")
+                    .then(|| value.get("thread_id"))
+                    .flatten()
+            })
             .and_then(|c| c.as_str())
         {
             if !conv_id.is_empty() && conv_id != session {
+                // A queued follow-up already uses the assigned ID. Reserve
+                // it before publishing it, and keep it busy until this child
+                // is reaped, just like the original session key.
+                state.running.lock().unwrap().insert(conv_id.to_string());
+                adopted_sessions.push(conv_id.to_string());
                 update_session(thread, &session, conv_id);
                 session = conv_id.to_string();
             }
         }
-        match stream_part(&value) {
+        let part = if kind == CliKind::Codex {
+            codex.part(&value)
+        } else {
+            stream_part(&value)
+        };
+        match part {
             Some(StreamPart::Chunk(text)) => {
                 apply(&session, AgentEvent::Chunk(thread, text));
             }
             Some(StreamPart::Result { is_error, text }) => {
                 if !is_error {
-                    mark_session_started(&session);
+                    mark_session_started(kind, &session);
                 }
                 apply(
                     &session,
@@ -941,7 +1104,7 @@ fn read_turn(
 
     if !finished && stopped.load(Ordering::SeqCst) {
         finish_one();
-        return;
+        return adopted_sessions;
     }
 
     if !finished {
@@ -949,30 +1112,35 @@ fn read_turn(
             &session,
             AgentEvent::Failed(
                 thread,
-                if spoke {
-                    String::from("the agent process ended before replying")
-                } else {
-                    "the agent could not start on this conversation; send again to \
+                codex.error.unwrap_or_else(|| {
+                    if spoke {
+                        String::from("the agent process ended before replying")
+                    } else if kind == CliKind::Codex {
+                        "Codex returned no events; check its login and configuration, then send again"
+                            .into()
+                    } else {
+                        "the agent could not start on this conversation; send again to \
                      start it the other way round"
-                        .into()
-                },
+                            .into()
+                    }
+                }),
             ),
         );
         finish_one();
         if !spoke {
-            // Nothing at all on stdout means the child could not start, and
-            // there are only two ways that happens: we said `--session-id` for
-            // a session the agent already has, or `--resume` for one it no
-            // longer has. Both are a disagreement between our marker and the
-            // agent's memory, so flipping the marker is the repair. The next
-            // send starts a fresh child the other way round.
-            if session_started(&session) {
-                unmark_session_started(&session);
-            } else {
-                mark_session_started(&session);
+            // Silence can mean our marker disagrees with the agent's saved
+            // conversations. Retrying a failed resume starts fresh; the
+            // older CLIs can also retry creation as a resume of our UUID.
+            if session_started(kind, &session) {
+                unmark_session_started(kind, &session);
+            } else if kind != CliKind::Codex {
+                // Codex cannot create a session with our chosen UUID, so a
+                // silent failure must not make its next send resume that ID.
+                mark_session_started(kind, &session);
             }
         }
     }
+    adopted_sessions
 }
 
 #[cfg(test)]
@@ -983,12 +1151,95 @@ mod test {
     fn a_temporary_thread_s_start_is_kept_in_memory() {
         let uuid = helix_view::review::session::random_uuid();
         keep_in_memory(&uuid);
-        assert!(!session_started(&uuid));
-        mark_session_started(&uuid);
-        assert!(session_started(&uuid), "the next turn resumes it");
-        assert!(!started_marker(&uuid).exists(), "and nothing is written");
-        unmark_session_started(&uuid);
-        assert!(!session_started(&uuid));
+        for kind in [CliKind::Claude, CliKind::Codex] {
+            assert!(!session_started(kind, &uuid));
+            mark_session_started(kind, &uuid);
+            assert!(session_started(kind, &uuid), "the next turn resumes it");
+            assert!(
+                !started_marker(&kind.session_key(&uuid)).exists(),
+                "and nothing is written"
+            );
+            unmark_session_started(kind, &uuid);
+            assert!(!session_started(kind, &uuid));
+        }
+    }
+
+    #[test]
+    fn codex_starts_its_own_conversation_after_another_agent() {
+        let uuid = helix_view::review::session::random_uuid();
+        keep_in_memory(&uuid);
+        mark_session_started(CliKind::Claude, &uuid);
+        assert!(!session_started(CliKind::Codex, &uuid));
+        mark_session_started(CliKind::Codex, &uuid);
+        assert!(session_started(CliKind::Codex, &uuid));
+        unmark_session_started(CliKind::Codex, &uuid);
+        assert!(session_started(CliKind::Claude, &uuid));
+    }
+
+    #[test]
+    fn codex_stream_uses_message_snapshots_once_and_ignores_tool_output() {
+        use serde_json::json;
+
+        let mut stream = CodexStream::default();
+        let events = [
+            json!({"type":"item.started", "item":{"id":"one", "type":"agent_message", "text":""}}),
+            json!({"type":"item.updated", "item":{"id":"one", "type":"agent_message", "text":"Hello"}}),
+            json!({"type":"item.updated", "item":{"id":"one", "type":"agent_message", "text":"Hello world"}}),
+            json!({"type":"item.completed", "item":{"id":"one", "type":"agent_message", "text":"Hello world"}}),
+            json!({"type":"item.completed", "item":{"id":"tool", "type":"command_execution", "aggregated_output":"private tool output"}}),
+            json!({"type":"item.completed", "item":{"id":"reasoning", "type":"reasoning", "text":"private reasoning"}}),
+            json!({"type":"item.completed", "item":{"id":"two", "type":"agent_message", "text":"Done."}}),
+        ];
+        let chunks: Vec<_> = events
+            .iter()
+            .filter_map(|event| match stream.part(event) {
+                Some(StreamPart::Chunk(text)) => Some(text),
+                other => {
+                    assert!(other.is_none(), "{other:?}");
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(chunks, ["Hello", " world", "\n\nDone."]);
+        match stream.part(&json!({"type":"turn.completed", "usage":{}})) {
+            Some(StreamPart::Result { is_error, text }) => {
+                assert!(!is_error);
+                assert_eq!(text, "Hello world\n\nDone.");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn codex_failure_reports_the_error_and_retry_errors_allow_success() {
+        use serde_json::json;
+
+        let mut stream = CodexStream::default();
+        assert!(stream
+            .part(&json!({"type":"error", "message":"Reconnecting"}))
+            .is_none());
+        match stream
+            .part(&json!({"type":"turn.failed", "error":{"message":"Authentication failed"}}))
+        {
+            Some(StreamPart::Result { is_error, text }) => {
+                assert!(is_error);
+                assert_eq!(text, "Authentication failed");
+            }
+            other => panic!("{other:?}"),
+        }
+
+        let mut stream = CodexStream::default();
+        assert!(stream
+            .part(&json!({"type":"error", "message":"Reconnecting"}))
+            .is_none());
+        stream.part(&json!({"type":"item.completed", "item":{"id":"one", "type":"agent_message", "text":"Recovered"}}));
+        match stream.part(&json!({"type":"turn.completed"})) {
+            Some(StreamPart::Result { is_error, text }) => {
+                assert!(!is_error);
+                assert_eq!(text, "Recovered");
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

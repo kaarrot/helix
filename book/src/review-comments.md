@@ -54,7 +54,7 @@ state directory, plus `review`):
 | --- | --- | --- |
 | `<uuid>.threads.json` | Every thread of one review conversation: file, revision, line, messages, any unsent draft | Shortly after anything changes, at most every 0.5 seconds |
 | `<uuid>.json` | A lock: which running Helix owns this review conversation | On your first comment, removed when Helix exits |
-| `<uuid>.started` | A marker that one thread's agent conversation exists, so the next turn continues it rather than starting afresh | After a kept thread's first reply; a temporary thread keeps it in memory |
+| `<uuid>.started`, `<uuid>.codex.started` | A marker that one thread's agent conversation exists, so the next turn continues it rather than starting afresh; Codex uses its own marker | After a kept thread's first reply; a temporary thread keeps it in memory |
 
 The agent's full transcript is not kept by Helix. It lives wherever the agent
 keeps its own sessions. Files nothing has touched for a year are deleted
@@ -95,13 +95,14 @@ nothing is locked until you leave a comment that is kept.
 ```
 
 - **One turn is one process.** Every send starts the agent (`claude -p`,
-  `grok --prompt-file`, or `agy --print`), gives it the prompt, and lets it
-  exit when the reply is done. Nothing stays running between turns.
+  `grok --prompt-file`, `agy --print`, or `codex exec --json`), gives it the
+  prompt, and lets it exit when the reply is done. Nothing stays running
+  between turns.
 - **The first turn creates the thread's agent conversation** (`--session-id
-  <uuid>` for Claude and Grok; `agy` assigns one), and every later turn
-  continues it (`--resume <uuid>`, or `--conversation <uuid>` for `agy`). A
-  follow-up only carries the new text, because the agent already holds the
-  context.
+  <uuid>` for Claude and Grok; Agy and Codex assign one), and every later turn
+  continues it (`--resume <uuid>`, `--conversation <uuid>` for Agy, or
+  `codex exec resume <uuid>` for Codex). A follow-up only carries the new text,
+  because the agent already holds the context.
 - **Several threads can be waiting at once.** Each has its own process, and a
   reply can only land on the thread that asked for it.
 - **One thread waits for one reply at a time.** A follow-up sent while its reply
@@ -208,10 +209,11 @@ Helix that crashed is ignored.
 - **Open a path from a reply.** `gf` or Ctrl+click on a `path:line` or a link in
   a reply opens that file at that line.
 - **Continue in a terminal.** The thread's conversation id is at the right of its
-  header; click it to copy it, then run `claude --resume <uuid>`, `grok --resume <uuid>`, or `agy --conversation <uuid>` in the project.
+  header; click it to copy it, then run `claude --resume <uuid>`, `grok --resume <uuid>`, `agy --conversation <uuid>`, or `codex resume <uuid>` in the project.
   Do not reply from Helix while that session is open elsewhere.
 - **Choice of agent.** Claude Code (`claude`) by default, Grok with
-  `:review-session grok`, or Antigravity with `:review-session agy`.
+  `:review-session grok`, Antigravity with `:review-session agy`, or Codex with
+  `:review-session codex`. Each CLI uses its existing login and configuration.
 - **Hide everything** with one key when you want to read the code alone.
 
 ## Shortcuts
@@ -285,7 +287,7 @@ the whole thread at the cursor, where `d` on a focused box deletes one entry.
 | --- | --- |
 | `:review-session` | Show the current conversation and agent |
 | `:review-session <name>` | Switch to a conversation of that name, which stays put across checkouts; `:review-session <branch checked out>` goes back to following the branch |
-| `:review-session grok` / `claude` / `agy` | Choose the agent for this Helix, without renaming the conversation |
+| `:review-session grok` / `claude` / `agy` / `codex` | Choose the agent for this Helix, without renaming the conversation |
 | `:review-session <name> grok` | Both at once, in either order |
 
 `:q` refuses while a reply is still arriving, as it does with unsaved buffers.

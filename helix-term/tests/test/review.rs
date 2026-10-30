@@ -1170,6 +1170,30 @@ async fn review_session_picks_the_agent_without_renaming() -> anyhow::Result<()>
     assert_eq!(app.editor.diff.session.as_ref().unwrap().name, "work");
     assert_eq!(app.editor.diff.agent_kind, ReviewAgentKind::Agy);
 
+    assert!(
+        harness
+            .send_keys(&mut app, ":review-session codex<ret>")
+            .await?
+    );
+    assert_eq!(app.editor.diff.session.as_ref().unwrap().name, "work");
+    assert_eq!(app.editor.diff.agent_kind, ReviewAgentKind::Codex);
+
+    assert!(
+        harness
+            .send_keys(&mut app, ":review-session codex spike<ret>")
+            .await?
+    );
+    assert_eq!(app.editor.diff.session.as_ref().unwrap().name, "spike");
+    assert_eq!(app.editor.diff.agent_kind, ReviewAgentKind::Codex);
+
+    assert!(
+        harness
+            .send_keys(&mut app, ":review-session work codex<ret>")
+            .await?
+    );
+    assert_eq!(app.editor.diff.session.as_ref().unwrap().name, "work");
+    assert_eq!(app.editor.diff.agent_kind, ReviewAgentKind::Codex);
+
     harness.close(&mut app).await?;
     Ok(())
 }
@@ -3785,6 +3809,192 @@ async fn agent_replies_render_as_markdown_and_can_still_be_deleted() -> anyhow::
         .messages
         .iter()
         .all(|message| message.role != helix_view::review::Role::Agent));
+
+    harness.close(&mut app).await?;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn codex_replies_stay_on_their_thread_and_resume_it() -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir()?;
+    let _cwd = CwdGuard::enter(dir.path()).await?;
+    let fake = dir.path().join("codex");
+    std::fs::write(
+        &fake,
+        r#"#!/usr/bin/env python3
+import json, os, pathlib, sys, time, uuid
+
+args = sys.argv[1:]
+prompt = sys.stdin.read()
+log = pathlib.Path(__file__).with_name('turns.jsonl')
+previous = [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
+resuming = args[:2] == ['exec', 'resume']
+session = args[-2] if resuming else str(uuid.uuid4())
+if resuming and session not in [turn['session'] for turn in previous]:
+    raise SystemExit('unknown conversation')
+answer = 'Follow-up answer' if resuming else ('First answer' if not previous else 'Second answer')
+with log.open('a') as out:
+    out.write(json.dumps({'args': args, 'prompt': prompt, 'session': session, 'cwd': os.getcwd()}) + '\n')
+
+def emit(value):
+    print(json.dumps(value), flush=True)
+
+emit({'type': 'thread.started', 'thread_id': session})
+emit({'type': 'turn.started'})
+emit({'type': 'item.completed', 'item': {'id': 'tool', 'type': 'command_execution', 'aggregated_output': 'tool output'}})
+emit({'type': 'item.updated', 'item': {'id': 'answer', 'type': 'agent_message', 'text': answer[:5]}})
+emit({'type': 'item.updated', 'item': {'id': 'answer', 'type': 'agent_message', 'text': answer}})
+emit({'type': 'item.completed', 'item': {'id': 'answer', 'type': 'agent_message', 'text': answer}})
+emit({'type': 'turn.completed', 'usage': {'input_tokens': 10, 'output_tokens': 5}})
+if not previous:
+    release = pathlib.Path(__file__).with_name('release-first')
+    deadline = time.monotonic() + 5
+    while not release.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+"#,
+    )?;
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755))?;
+
+    struct RestorePath(String);
+    impl Drop for RestorePath {
+        fn drop(&mut self) {
+            std::env::set_var("PATH", &self.0);
+        }
+    }
+    let path = RestorePath(std::env::var("PATH").unwrap_or_default());
+    std::env::set_var("PATH", format!("{}:{}", dir.path().display(), path.0));
+    let file = dir.path().join("code.txt");
+    std::fs::write(&file, "one\ntwo\nthree\n")?;
+    let mut app = AppBuilder::new().with_file(&file, None).build()?;
+    let mut harness = AppTestHarness::new();
+    harness
+        .send_keys(&mut app, ":review-session codex<ret>")
+        .await?;
+
+    for keys in [
+        "<space>mRcFirst question<C-S-s>",
+        "2G<space>mRcSecond question<C-S-s>",
+    ] {
+        harness
+            .send_keys_pumping(&mut app, keys, std::time::Duration::from_millis(200))
+            .await?;
+        for _ in 0..40 {
+            if !app.editor.diff.reviews.any_awaiting() {
+                break;
+            }
+            harness
+                .pump(&mut app, std::time::Duration::from_millis(50))
+                .await;
+        }
+        assert!(
+            !app.editor.diff.reviews.any_awaiting(),
+            "the child did not finish"
+        );
+    }
+
+    // The first reply is complete, but its process still has stdout open.
+    // Its generated Codex ID must stay reserved until that process exits.
+    harness
+        .send_keys_pumping(
+            &mut app,
+            "1Gcfollow up<C-S-s>",
+            std::time::Duration::from_millis(200),
+        )
+        .await?;
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("turns.jsonl"))?
+            .lines()
+            .count(),
+        2
+    );
+    std::fs::write(dir.path().join("release-first"), "release")?;
+    for _ in 0..40 {
+        if !app.editor.diff.reviews.any_awaiting() {
+            break;
+        }
+        harness
+            .pump(&mut app, std::time::Duration::from_millis(50))
+            .await;
+    }
+    assert!(!app.editor.diff.reviews.any_awaiting());
+
+    let first = app
+        .editor
+        .diff
+        .reviews
+        .iter()
+        .find(|thread| thread.line == 0)
+        .unwrap();
+    let second = app
+        .editor
+        .diff
+        .reviews
+        .iter()
+        .find(|thread| thread.line == 1)
+        .unwrap();
+    assert_eq!(
+        first
+            .messages
+            .iter()
+            .map(|message| message.text.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "First question",
+            "First answer",
+            "follow up",
+            "Follow-up answer"
+        ]
+    );
+    assert_eq!(second.messages.last().unwrap().text, "Second answer");
+    assert_ne!(first.agent_session, second.agent_session);
+
+    let turns: Vec<serde_json::Value> = std::fs::read_to_string(dir.path().join("turns.jsonl"))?
+        .lines()
+        .map(serde_json::from_str)
+        .collect::<Result<_, _>>()?;
+    assert_eq!(turns.len(), 3);
+    assert_eq!(turns[0]["session"].as_str(), first.agent_session.as_deref());
+    assert_eq!(
+        turns[1]["session"].as_str(),
+        second.agent_session.as_deref()
+    );
+    let args: Vec<_> = turns[2]["args"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|arg| arg.as_str().unwrap())
+        .collect();
+    assert_eq!(&args[..2], ["exec", "resume"]);
+    assert_eq!(
+        args[args.len() - 2],
+        first.agent_session.as_deref().unwrap()
+    );
+    assert_eq!(args.last(), Some(&"-"));
+    for turn in &turns {
+        assert!(turn["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|arg| arg == "--json"));
+        assert!(turn["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|arg| arg == "--skip-git-repo-check"));
+        assert_eq!(turn["cwd"].as_str(), dir.path().to_str());
+    }
+    assert!(turns[0]["prompt"]
+        .as_str()
+        .unwrap()
+        .contains("First question"));
+    assert!(turns[1]["prompt"]
+        .as_str()
+        .unwrap()
+        .contains("Second question"));
+    assert!(turns[2]["prompt"].as_str().unwrap().contains("follow up"));
 
     harness.close(&mut app).await?;
     Ok(())

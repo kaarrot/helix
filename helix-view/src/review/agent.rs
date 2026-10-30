@@ -10,7 +10,7 @@ use std::fmt;
 
 /// Which child answers review comments.
 ///
-/// Chosen with `:review-session [claude|grok|agy]`, not config. The CLIs take
+/// Chosen with `:review-session [claude|grok|agy|codex]`, not config. The CLIs take
 /// the prompt differently, so the editor picks the spawn path from this. Each
 /// comment is its own conversation either way.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -19,6 +19,7 @@ pub enum ReviewAgentKind {
     Claude,
     Grok,
     Agy,
+    Codex,
 }
 
 impl ReviewAgentKind {
@@ -27,6 +28,7 @@ impl ReviewAgentKind {
             "claude" => Some(Self::Claude),
             "grok" => Some(Self::Grok),
             "agy" => Some(Self::Agy),
+            "codex" => Some(Self::Codex),
             _ => None,
         }
     }
@@ -38,6 +40,7 @@ impl fmt::Display for ReviewAgentKind {
             Self::Claude => "claude",
             Self::Grok => "grok",
             Self::Agy => "agy",
+            Self::Codex => "codex",
         })
     }
 }
@@ -53,9 +56,9 @@ pub trait ReviewAgent: Send + std::fmt::Debug {
     ///
     /// `prompt` is the fully composed message, context included — the agent is
     /// not expected to go looking for it. `session` belongs to that thread
-    /// alone: the first turn creates it (`--session-id`) and a later turn
-    /// resumes it (`--resume`), so two comments never share a conversation and
-    /// a reply cannot be written onto the wrong one.
+    /// alone: the first turn creates it and a later turn resumes it, so two
+    /// comments never share a conversation and a reply cannot be written onto
+    /// the wrong one.
     fn send(&mut self, thread: ThreadId, session: String, prompt: String) -> anyhow::Result<()>;
 
     /// Stop accepting work and let the underlying process finish.

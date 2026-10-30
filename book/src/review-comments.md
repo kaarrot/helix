@@ -7,7 +7,7 @@ working changes is still there the next time you open Helix on the same branch.
 
 ```
    41 │ fn resolve_commit(repo, rev) {
-      ▏ agent 3/5 ──────────────────────────── 1-4 of 12
+      ▏ agent 3/5 ─────────────────────────────────────
       ▏ It falls back to HEAD when the rev is empty,
       ▏ which is why the picker shows nothing on a
       ▏ clean tree.
@@ -196,9 +196,9 @@ Helix that crashed is ignored.
 - **Replies are rendered as markdown**: headings, lists, tables and code blocks
   are laid out rather than shown as source.
 - **One entry on screen at a time.** The header shows which (`3/5`), and you step
-  through the history. A box never takes more than half the window, so the code
-  stays visible; a long reply shows which rows are on screen (`12-40 of 201`)
-  and scrolls inside the box.
+  through the history. The complete message participates in the visual layout,
+  so a long reply can fill the window. The wheel and page keys scroll through
+  its rows just as through code, without snapping back to its anchor line.
 - **Drafts.** Write several comments, then send them all at once. Unsent drafts
   are saved and survive a restart. The status line can show how many are waiting.
 - **Rewind.** Step back to an older entry and reply from there to take the
@@ -241,14 +241,24 @@ they do what they always do.
 
 ### On a box
 
-Moving down onto a commented line stops on its box first: the cursor stays put
-and the box is drawn as focused. The next press moves on. A count such as `10j`
-goes straight through. These keys work once a box is focused:
+`j` and `k` move from code into a comment's displayed rows and through its reply.
+At the ends they return to the code: above the first reply row is the anchored
+code row, and below the last is the following code row. Entering a box keeps
+the part you were reading with the mouse. The status line says `REVIEW`, the
+header gains a `▶`, and the box has a heavier left rail while its keys are active.
+
+`Esc`, clicking code, or another code command returns focus to the buffer.
+A count such as `10j` started in code skips the boxes; inside a reply it moves
+through reply rows. These keys work once a box is focused:
 
 | Key | What it does |
 | --- | --- |
+| `j` / `k` | Move down / up through reply rows, then back into code |
 | `Ctrl-Left` / `Ctrl-Right` | Previous / next entry in the thread |
 | `Ctrl-Up` / `Ctrl-Down` | Move up / down inside a long reply |
+| `PageDown` / `PageUp`, `Ctrl-f` / `Ctrl-b` | Page through reply rows and continue into code |
+| `Ctrl-d` / `Ctrl-u` | Scroll half a pane |
+| `Esc` | Return focus to code |
 | `c` | Reply from the entry on screen |
 | `d` | Delete the entry on screen; deleting the last one removes the thread |
 | `y` | Copy the selected rows, or the whole entry, to the system clipboard |

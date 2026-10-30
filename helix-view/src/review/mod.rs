@@ -1339,14 +1339,12 @@ pub(crate) fn render_comment_rows(
         (true, Some(frame)) => format!("{} {frame}", entry.label),
         _ => entry.label.to_string(),
     };
+    let label = if attention == Attention::Focused {
+        format!("▶ {label}")
+    } else {
+        label
+    };
 
-    // A box is never allowed to outgrow the window. Scrolling *through* one is
-    // not possible: the cursor cannot be inside virtual rows, so any view that
-    // scrolled into the middle of a box would be dragged straight back to the
-    // cursor's line on the next frame. Capping it and scrolling *within* it
-    // keeps the code being reviewed on screen, which is the point of the
-    // exercise.
-    //
     // An agent reply is laid out by the markdown preview renderer when one was
     // given. The source stays the source: deleting the entry is what removes
     // it, and nothing in this path writes the rendered text back.
@@ -1377,14 +1375,19 @@ pub(crate) fn render_comment_rows(
     let last = body.len().saturating_sub(1);
     let cursor = thread.cursor.min(last);
 
-    // The cursor drags the box: it scrolls only when the cursor would otherwise
-    // leave it. Settled here rather than where the cursor moves because only
-    // drawing knows how tall the box was allowed to be.
-    let mut scroll = thread.scroll.get().min(last);
-    if cursor < scroll {
-        scroll = cursor;
-    } else if cursor >= scroll + max_body_rows {
-        scroll = cursor + 1 - max_body_rows;
+    // Bounded consumers can scroll within the body. The editor requests the
+    // complete entry and scrolls its viewport through these virtual rows.
+    let mut scroll = if max_body_rows == usize::MAX {
+        0
+    } else {
+        thread.scroll.get().min(last)
+    };
+    if max_body_rows != usize::MAX {
+        if cursor < scroll {
+            scroll = cursor;
+        } else if cursor >= scroll + max_body_rows {
+            scroll = cursor + 1 - max_body_rows;
+        }
     }
     thread.scroll.set(scroll);
 

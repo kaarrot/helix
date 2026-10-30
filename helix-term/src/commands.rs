@@ -364,6 +364,30 @@ macro_rules! static_commands {
 
 impl MappableCommand {
     pub fn execute(&self, cx: &mut Context) {
+        // A code command returns the keys to the buffer. In particular, focus
+        // must not silently return when a later motion revisits the anchor.
+        let keeps_review = matches!(self, Self::Macro { .. })
+            || self.name().starts_with("review_")
+            || matches!(
+                self.name(),
+                "select_register"
+                    | "command_mode"
+                    | "vsplit"
+                    | "hsplit"
+                    | "wonly"
+                    | "wclose"
+                    | "page_up"
+                    | "page_down"
+                    | "half_page_up"
+                    | "half_page_down"
+                    | "page_cursor_up"
+                    | "page_cursor_down"
+                    | "page_cursor_half_up"
+                    | "page_cursor_half_down"
+            );
+        if !keeps_review {
+            cx.editor.diff.reviews.focused = None;
+        }
         match &self {
             Self::Typable { name, args, doc: _ } => {
                 if let Some(command) = typed::TYPABLE_COMMAND_MAP.get(name.as_str()) {
@@ -535,8 +559,8 @@ impl MappableCommand {
         review_send_or_save_selection, "Send the pending review comment at the cursor, else save the selection to the jumplist",
         review_comment_or_change, "Continue the unsent review draft at the cursor, else reply, else change selection",
         review_delete_or_change, "Delete the focused review entry, else delete selection",
-        review_line_down, "Move down, stopping on a review box",
-        review_line_up, "Move up, stopping on a review box",
+        review_line_down, "Move down through code and review reply rows",
+        review_line_up, "Move up through code and review reply rows",
         review_scroll_down, "Scroll down within the focused review box",
         review_scroll_up, "Scroll up within the focused review box",
         review_toggle_collapse, "Collapse or expand the review thread at the cursor",
@@ -2211,6 +2235,15 @@ fn switch_to_lowercase(cx: &mut Context) {
 
 pub fn scroll(cx: &mut Context, offset: usize, direction: Direction, sync_cursor: bool) {
     use Direction::*;
+    let delta = if direction == Forward {
+        offset as isize
+    } else {
+        -(offset as isize)
+    };
+    let view_id = cx.editor.tree.focus;
+    if review::scroll_view(cx.editor, view_id, delta, sync_cursor) {
+        return;
+    }
     let config = cx.editor.config();
     let (view, doc) = current!(cx.editor);
     let mut view_offset = doc.view_offset(view.id);
@@ -2320,48 +2353,72 @@ pub fn scroll(cx: &mut Context, offset: usize, direction: Direction, sync_cursor
 }
 
 fn page_up(cx: &mut Context) {
+    if review::page_focused_box(cx, false, false) {
+        return;
+    }
     let view = view!(cx.editor);
     let offset = view.inner_height();
     scroll(cx, offset, Direction::Backward, false);
 }
 
 fn page_down(cx: &mut Context) {
+    if review::page_focused_box(cx, true, false) {
+        return;
+    }
     let view = view!(cx.editor);
     let offset = view.inner_height();
     scroll(cx, offset, Direction::Forward, false);
 }
 
 fn half_page_up(cx: &mut Context) {
+    if review::page_focused_box(cx, false, true) {
+        return;
+    }
     let view = view!(cx.editor);
     let offset = view.inner_height() / 2;
     scroll(cx, offset, Direction::Backward, false);
 }
 
 fn half_page_down(cx: &mut Context) {
+    if review::page_focused_box(cx, true, true) {
+        return;
+    }
     let view = view!(cx.editor);
     let offset = view.inner_height() / 2;
     scroll(cx, offset, Direction::Forward, false);
 }
 
 fn page_cursor_up(cx: &mut Context) {
+    if review::page_focused_box(cx, false, false) {
+        return;
+    }
     let view = view!(cx.editor);
     let offset = view.inner_height();
     scroll(cx, offset, Direction::Backward, true);
 }
 
 fn page_cursor_down(cx: &mut Context) {
+    if review::page_focused_box(cx, true, false) {
+        return;
+    }
     let view = view!(cx.editor);
     let offset = view.inner_height();
     scroll(cx, offset, Direction::Forward, true);
 }
 
 fn page_cursor_half_up(cx: &mut Context) {
+    if review::page_focused_box(cx, false, true) {
+        return;
+    }
     let view = view!(cx.editor);
     let offset = view.inner_height() / 2;
     scroll(cx, offset, Direction::Backward, true);
 }
 
 fn page_cursor_half_down(cx: &mut Context) {
+    if review::page_focused_box(cx, true, true) {
+        return;
+    }
     let view = view!(cx.editor);
     let offset = view.inner_height() / 2;
     scroll(cx, offset, Direction::Forward, true);

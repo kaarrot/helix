@@ -362,4 +362,30 @@ mod test {
         assert_eq!(plan.thread_at(4), Some(ThreadId(1)));
         assert_eq!(plan.thread_at(9), None);
     }
+
+    #[test]
+    fn trailing_virtual_rows_are_scroll_positions() {
+        for contents in ["last line", "last line\n", ""] {
+            let text = helix_core::Rope::from(contents);
+            let mut builder = VirtualRowPlanBuilder::new();
+            builder.add_comment_rows(text.len_lines() - 1, vec![VirtualRow::Spacer; 40]);
+            let mut annotations = helix_core::text_annotations::TextAnnotations::default();
+            annotations
+                .add_line_annotation(Box::new(VirtualRowLines::new(Rc::new(builder.build()))));
+            for row in [1, 2, 20, 40, 41, 100] {
+                assert_eq!(
+                    helix_core::char_idx_at_visual_offset(
+                        text.slice(..),
+                        text.len_chars(),
+                        row,
+                        0,
+                        &helix_core::doc_formatter::TextFormat::default(),
+                        &annotations,
+                    ),
+                    (text.len_chars(), (row as usize).min(40)),
+                    "{contents:?}, row {row}"
+                );
+            }
+        }
+    }
 }

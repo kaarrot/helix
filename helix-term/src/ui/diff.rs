@@ -281,7 +281,12 @@ impl Decoration for VirtualRowDecoration {
                         RowMark::Span { .. } | RowMark::None => {}
                     }
                     renderer.set_style(Rect::new(viewport.x, y, viewport.width, 1), style);
-                    renderer.set_stringn(viewport.x, y, MARKER, 1, style);
+                    let marker = if *attention == Attention::Focused {
+                        "▌"
+                    } else {
+                        MARKER
+                    };
+                    renderer.set_stringn(viewport.x, y, marker, 1, style);
                     let text_x = viewport.x + 1;
                     let text_width = viewport.width.saturating_sub(1);
                     if spans.is_empty() {

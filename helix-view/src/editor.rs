@@ -2127,7 +2127,13 @@ impl Editor {
             let doc = doc_mut!(self, &view.doc);
             view.sync_changes(doc);
             view.gutters = config.gutters.clone();
-            view.ensure_cursor_in_view(doc, config.scrolloff)
+            let offset = doc.view_offset(view.id);
+            if view
+                .review_row_at_visual_offset(doc, offset.vertical_offset)
+                .is_none()
+            {
+                view.ensure_cursor_in_view(doc, config.scrolloff);
+            }
         }
     }
 
@@ -2668,7 +2674,13 @@ impl Editor {
         let config = self.config();
         let view = self.tree.get(id);
         let doc = doc_mut!(self, &view.doc);
-        view.ensure_cursor_in_view(doc, config.scrolloff);
+        let offset = doc.view_offset(id);
+        if view
+            .review_row_at_visual_offset(doc, offset.vertical_offset)
+            .is_none()
+        {
+            view.ensure_cursor_in_view(doc, config.scrolloff);
+        }
         self.sync_scroll_to_linked_views(id);
     }
 
@@ -3115,9 +3127,20 @@ impl Editor {
             let Some(source_doc) = self.documents.get(&source_doc_id) else {
                 return;
             };
-            let Some(source_offset) = source_doc.get_view_offset(source_view_id) else {
+            let Some(mut source_offset) = source_doc.get_view_offset(source_view_id) else {
                 return;
             };
+            // A reply row in this pane is not a code row in its partner.
+            // Keep the other pane at the corresponding code anchor while a
+            // long comment scrolls through this one.
+            if self
+                .tree
+                .get(source_view_id)
+                .review_row_at_visual_offset(source_doc, source_offset.vertical_offset)
+                .is_some()
+            {
+                source_offset.vertical_offset = 0;
+            }
             let Some(target_doc) = self.documents.get(&target_doc_id) else {
                 return;
             };
@@ -3408,6 +3431,25 @@ impl Editor {
         }
 
         Ok(())
+    }
+
+    /// The review thread currently taking keys in the focused pane.
+    pub fn focused_review_thread(&self) -> Option<&crate::review::Thread> {
+        if self.diff.reviews.hidden || self.mode != Mode::Normal {
+            return None;
+        }
+        let thread = self.diff.reviews.get(self.diff.reviews.focused?)?;
+        let view = self.tree.try_get(self.tree.focus)?;
+        let doc = self.documents.get(&view.doc)?;
+        let (file, rev) = view.review_identity(doc, &self.diff.views)?;
+        let line = doc
+            .selection(view.id)
+            .primary()
+            .cursor_line(doc.text().slice(..));
+        (thread.file == file
+            && thread.rev == rev
+            && thread.line_in(&doc.review_anchors, doc.text()) == line)
+            .then_some(thread)
     }
 
     /// The worktree review conversations are kept for: the one Helix was

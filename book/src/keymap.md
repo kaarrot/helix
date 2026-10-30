@@ -106,6 +106,11 @@ Normal mode is the default mode when you launch helix. You can return to it from
 | `Q`         | Start/stop macro recording to the selected register (experimental)   | `record_macro`            |
 | `q`         | Play back a recorded macro from the selected register (experimental) | `replay_macro`            |
 
+`j` and `k` also walk through review replies between code lines. A focused
+comment is marked with `▶` and `REVIEW` on the status line. Page keys scroll
+through reply rows and into code; `Esc` or clicking code returns to the buffer.
+A counted motion started in code skips comment boxes.
+
 #### Shell
 
 | Key     | Description                                                                      | Command               |
@@ -380,26 +385,23 @@ thread still has an unsent draft, `c` opens that draft again with the text in
 place and the cursor at the end. `Esc` closes the box and leaves the saved
 draft as it was.
 
-Moving down onto a line that carries a thread stops on its box first: the
-cursor stays put, the box is drawn as focused, and the next press carries on.
-Going up lands on the line with its box focused, and the press after that
-continues. A box cannot hold the cursor itself — it is drawn into virtual rows
-rather than document text — so it is given a stop of its own in the motion. A
-count (`10j`) travels straight through without stopping.
+`j` enters the reply below the current code row, then walks its rendered rows
+before continuing into code. `k` takes the same path upwards. The status line
+shows `REVIEW`, the header gains `▶`, and the box's left edge becomes heavier
+while its cursor has focus. `Esc` or clicking code returns to the buffer. A
+count (`10j`) started in code travels through code without stopping at boxes;
+a count started in a reply moves through its rows.
 
 `C-left` / `C-right` step through that thread's history, and only once its box
 is focused: walking a conversation is an action on the box, not on being near
 it.
 
-A box never takes more than half the window, so the code it is about stays on
-screen. A reply too tall to fit shows the visible range in its header
-(`12-40 of 201`). `C-up` / `C-down` walk a cursor down the reply and the box
-follows it, scrolling only when the cursor would otherwise leave. The mouse
-wheel over a box scrolls the box itself, and the buffer again once the box has
-reached its top or bottom. Scrolling the editor *through* a box is not
-possible — the cursor cannot be inside virtual rows, so the view would be
-pulled straight back to the cursor's line — which is why a box has a cursor of
-its own instead.
+The complete reply participates in the buffer's visual layout, so a long
+message can fill the window. The mouse wheel scrolls through code and reply
+rows together. While reading a reply, `PageUp` / `PageDown` move by a pane and
+`Ctrl-u` / `Ctrl-d` by half a pane, continuing into code at the reply's ends.
+`C-up` / `C-down` also move its cursor. Scrolling keeps the reply cursor
+visible without pulling the view back to the code line the reply belongs to.
 
 **Drag across a reply with the mouse** to select part of it: letting go copies
 it to the **system clipboard**, the way selecting in a terminal does, ready to

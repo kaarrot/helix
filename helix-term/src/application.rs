@@ -107,6 +107,14 @@ fn setup_integration_logging() {
 }
 
 impl Application {
+    #[cfg(feature = "integration")]
+    pub fn resize_test_terminal(&mut self, width: u16, height: u16) {
+        let area = Rect::new(0, 0, width, height);
+        self.terminal.backend_mut().resize(width, height);
+        self.terminal.resize(area).unwrap();
+        self.compositor.resize(area);
+    }
+
     /// The last frame the test backend was sent, one string per terminal row,
     /// so a test can check where something was actually drawn.
     #[cfg(feature = "integration")]

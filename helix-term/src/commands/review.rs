@@ -563,7 +563,12 @@ impl crate::compositor::Component for CommentInput {
             }
             (KeyCode::Home, _) => self.col = 0,
             (KeyCode::End, _) => self.col = self.lines[self.row].chars().count(),
-            _ => return EventResult::Ignored(None),
+            (KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down, m)
+                if m == KeyModifiers::CONTROL =>
+            {
+                return EventResult::Ignored(None)
+            }
+            _ => return EventResult::Consumed(None),
         }
 
         // The box grows as it is written, so the space held for it has to grow
@@ -603,7 +608,9 @@ impl CommentInput {
         viewport: helix_view::graphics::Rect,
         editor: &helix_view::Editor,
     ) -> helix_view::graphics::Rect {
-        let height = (self.lines.len() as u16 + 1).min(viewport.height.max(2));
+        let (view, doc) = current_ref!(editor);
+        let viewport = view.inner_area(doc).intersection(viewport);
+        let height = (self.lines.len() as u16 + 1).min(viewport.height);
         let cursor_row = editor
             .cursor()
             .0
@@ -615,7 +622,7 @@ impl CommentInput {
         let y = if below + height <= viewport.bottom() {
             below
         } else {
-            cursor_row.saturating_sub(height)
+            cursor_row.saturating_sub(height).max(viewport.y)
         };
 
         helix_view::graphics::Rect::new(viewport.x, y, viewport.width, height)
@@ -646,6 +653,13 @@ fn prompt_at_cursor(
     initial: &str,
     callback: impl FnMut(&mut crate::compositor::Context, &str, bool) + 'static,
 ) {
+    // Replacing a tall reply with its input removes its virtual rows. Bring
+    // the code anchor into view before that layout change, so the old offset
+    // cannot become an unrelated position far down the buffer.
+    let scrolloff = cx.editor.config().scrolloff;
+    let (view, doc) = current!(cx.editor);
+    view.ensure_cursor_in_view(doc, scrolloff);
+
     // Hold room for the box being typed into, in place of the thread that lives
     // there. A one-line reply should not leave a tall answer underneath it.
     // A resumed draft may already be several lines, so reserve that up front
@@ -1153,6 +1167,240 @@ fn box_width(cx: &mut Context) -> usize {
     view.inner_width(doc) as usize
 }
 
+/// Visual row of the active cursor, which may live inside a review reply.
+/// Coordinates are relative to the document block containing the view anchor.
+fn cursor_row(editor: &Editor, view_id: ViewId) -> Option<usize> {
+    use helix_view::annotations::rows::VirtualRow;
+    let view = editor.tree.get(view_id);
+    let doc = editor.document(view.doc)?;
+    let text = doc.text().slice(..);
+    let offset = doc.view_offset(view_id);
+    let fmt = doc.text_format(view.inner_width(doc), None);
+    let annotations = view.text_annotations(doc, None);
+    let focused = (editor.tree.focus == view_id)
+        .then(|| editor.focused_review_thread())
+        .flatten();
+    let (pos, extra) = if let Some(thread) = focused {
+        let line = thread.line_in(&doc.review_anchors, doc.text());
+        let cached = view.virtual_rows.borrow();
+        let rows = cached.as_ref()?.plan.rows_at(line);
+        let index = rows
+            .iter()
+            .position(|row| {
+                matches!(row,
+            VirtualRow::Comment { thread: id, body: Some(body), .. }
+                if *id == thread.id && *body == thread.cursor)
+            })
+            .or_else(|| {
+                // A wider pane can wrap the same entry into fewer rows.
+                rows.iter().rposition(|row| {
+                    matches!(row,
+                VirtualRow::Comment { thread: id, body: Some(_), .. } if *id == thread.id)
+                })
+            })
+            .or_else(|| {
+                rows.iter().position(|row| {
+                    matches!(row,
+                VirtualRow::Comment { thread: id, .. } if *id == thread.id)
+                })
+            })?;
+        // Review rows follow the first visual row of a wrapped code line.
+        (text.line_to_char(line), index + 1)
+    } else {
+        (doc.selection(view_id).primary().cursor(text), 0)
+    };
+    helix_core::visual_offset_from_anchor(
+        text,
+        offset.anchor,
+        pos,
+        &fmt,
+        &annotations,
+        offset.vertical_offset + view.inner_height() + 1,
+    )
+    .ok()
+    .map(|(position, _)| position.row + extra)
+}
+
+/// Place the cursor on a visual row without substituting the code line below
+/// a reply for the virtual row the reader actually reached.
+fn point_at_visual_row(editor: &mut Editor, view_id: ViewId, row: usize) {
+    use helix_view::annotations::rows::VirtualRow;
+    let view = editor.tree.get(view_id);
+    let doc = editor.document(view.doc).unwrap();
+    let text = doc.text().slice(..);
+    let offset = doc.view_offset(view_id);
+    let fmt = doc.text_format(view.inner_width(doc), None);
+    let annotations = view.text_annotations(doc, None);
+    let (pos, virtual_offset) = helix_core::char_idx_at_visual_offset(
+        text,
+        offset.anchor,
+        row as isize,
+        0,
+        &fmt,
+        &annotations,
+    );
+    let target = virtual_offset.checked_sub(1).and_then(|index| {
+        let cached = view.virtual_rows.borrow();
+        let rows = cached.as_ref()?.plan.rows_at(text.char_to_line(pos));
+        match rows.get(index)? {
+            VirtualRow::Comment { thread, body, .. } => Some((*thread, body.unwrap_or(0))),
+            _ => None,
+        }
+    });
+    let doc_id = doc.id();
+    drop(annotations);
+    if editor.tree.focus == view_id {
+        editor.diff.reviews.focused = target.map(|(id, _)| id);
+    }
+    if let Some((id, body)) = target {
+        if let Some(thread) = editor.diff.reviews.get_mut(id) {
+            thread.cursor = body;
+            thread.select = None;
+        }
+    }
+    let doc = editor.document_mut(doc_id).unwrap();
+    let mut selection = doc.selection(view_id).clone();
+    *selection.primary_mut() = helix_core::Range::point(pos);
+    doc.set_selection(view_id, selection);
+}
+
+/// Scroll through code and complete replies as one visual document. Cursor
+/// clamping uses virtual rows too, so a screen filled by a reply cannot pull
+/// the view abruptly to the next real line of code.
+pub fn scroll_view(editor: &mut Editor, view_id: ViewId, delta: isize, sync_cursor: bool) -> bool {
+    if editor.mode() != helix_view::document::Mode::Normal
+        || editor.diff.reviews.hidden
+        || editor.diff.reviews.composing.is_some()
+    {
+        return false;
+    }
+    let view = editor.tree.get(view_id);
+    let doc = editor.document(view.doc).unwrap();
+    let has_comments = view.virtual_rows.borrow().as_ref().is_some_and(|cached| {
+        cached.doc_id == doc.id() && cached.plan.comment_lines().next().is_some()
+    });
+    if !has_comments {
+        return false;
+    }
+    let offset = doc.view_offset(view_id);
+    let height = view.inner_height();
+    let margin = editor.config().scrolloff.min(height.saturating_sub(1) / 2);
+    let old_screen_row = cursor_row(editor, view_id)
+        .map(|row| row.saturating_sub(offset.vertical_offset))
+        .unwrap_or(margin);
+    let fmt = doc.text_format(view.inner_width(doc), None);
+    let annotations = view.text_annotations(doc, None);
+    let (anchor, vertical_offset) = helix_core::char_idx_at_visual_offset(
+        doc.text().slice(..),
+        offset.anchor,
+        offset.vertical_offset as isize + delta,
+        0,
+        &fmt,
+        &annotations,
+    );
+    let doc_id = doc.id();
+    drop(annotations);
+    editor.document_mut(doc_id).unwrap().set_view_offset(
+        view_id,
+        helix_view::view::ViewPosition {
+            anchor,
+            vertical_offset,
+            ..offset
+        },
+    );
+    let top = vertical_offset + margin;
+    let bottom = vertical_offset + height.saturating_sub(margin + 1);
+    let current = cursor_row(editor, view_id);
+    let target = if sync_cursor {
+        vertical_offset + old_screen_row
+    } else {
+        current.unwrap_or(if delta >= 0 { top } else { bottom })
+    }
+    .clamp(top, bottom.max(top));
+    if sync_cursor || current != Some(target) {
+        point_at_visual_row(editor, view_id, target);
+    }
+    editor.sync_scroll_to_linked_views(view_id);
+    true
+}
+
+/// Keep the reply cursor visible without insisting that its code anchor is on
+/// screen. Only scroll the distance needed for this row, not the whole box.
+pub fn ensure_box_in_view(editor: &mut Editor) {
+    if editor
+        .diff
+        .reviews
+        .composing
+        .as_ref()
+        .is_some_and(|composing| !composing.peek)
+    {
+        return;
+    }
+    if editor.focused_review_thread().is_none() {
+        return;
+    }
+    let (view, doc) = current_ref!(editor);
+    let Some(row) = cursor_row(editor, view.id) else {
+        return;
+    };
+    let text = doc.text().slice(..);
+    let offset = doc.view_offset(view.id);
+    let fmt = doc.text_format(view.inner_width(doc), None);
+    let annotations = view.text_annotations(doc, None);
+    let margin = editor
+        .config()
+        .scrolloff
+        .min(view.inner_height().saturating_sub(1) / 2);
+    let top = offset.vertical_offset + margin;
+    let bottom = offset.vertical_offset + view.inner_height().saturating_sub(margin + 1);
+    let start = if row < top {
+        row.saturating_sub(margin)
+    } else if row > bottom {
+        row.saturating_sub(view.inner_height().saturating_sub(margin + 1))
+    } else {
+        return;
+    };
+    let (anchor, vertical_offset) = helix_core::char_idx_at_visual_offset(
+        text,
+        offset.anchor,
+        start as isize,
+        0,
+        &fmt,
+        &annotations,
+    );
+    let view_id = view.id;
+    drop(annotations);
+    doc_mut!(editor).set_view_offset(
+        view_id,
+        helix_view::view::ViewPosition {
+            anchor,
+            vertical_offset,
+            ..offset
+        },
+    );
+}
+
+/// Page through a focused reply using the same viewport as ordinary text.
+pub fn page_focused_box(cx: &mut Context, down: bool, half: bool) -> bool {
+    if cx.editor.focused_review_thread().is_none() {
+        return false;
+    }
+    let view = view!(cx.editor);
+    let view_id = view.id;
+    let rows = view.inner_height();
+    let step = if half { (rows / 2).max(1) } else { rows };
+    scroll_view(
+        cx.editor,
+        view_id,
+        if down {
+            step as isize
+        } else {
+            -(step as isize)
+        },
+        true,
+    )
+}
+
 /// Move the cursor inside the focused box, for an entry too tall to show at
 /// once. The box scrolls when the cursor would otherwise leave it.
 fn review_scroll(cx: &mut Context, down: bool) {
@@ -1580,6 +1828,7 @@ pub fn review_mouse_down(editor: &mut Editor, row: u16, column: u16) -> bool {
     editor.diff.reviews.press = None;
 
     let Some(hit) = hit else {
+        editor.diff.reviews.focused = None;
         return false;
     };
     focus_thread(editor, hit.view, hit.thread);
@@ -1679,12 +1928,8 @@ pub fn review_mouse_up(editor: &mut Editor) -> bool {
     true
 }
 
-/// The wheel over a box scrolls the box, so a reply taller than the box can be
-/// read without first walking the in-box cursor down to its bottom edge.
-///
-/// `false` when the box fits, or is already at the end the wheel is turning
-/// towards, so the wheel carries on scrolling the buffer rather than going dead
-/// over a box that has nothing more to show.
+/// Wheel scrolling uses one visual layout across both code and reply rows,
+/// including when the pointer is in the gutter or the reply fills the pane.
 pub fn review_mouse_scroll(
     editor: &mut Editor,
     row: u16,
@@ -1695,36 +1940,27 @@ pub fn review_mouse_scroll(
     if editor.diff.reviews.hidden {
         return false;
     }
-    let Some(hit) = editor.diff.reviews.hit_at(row, column) else {
-        return false;
-    };
-    let Some(view) = editor.tree.try_get(hit.view) else {
-        return false;
-    };
-    let Some(doc) = editor.documents.get(&view.doc) else {
-        return false;
-    };
-    let width = view.inner_width(doc) as usize;
-    let max_rows = view.review_box_rows();
-    let Some(thread) = editor.diff.reviews.get_mut(hit.thread) else {
-        return false;
-    };
-    let total = thread.body_rows(width).len();
-    let last_scroll = total.saturating_sub(max_rows);
-    let scroll = thread.scroll.get().min(last_scroll);
-    let next = if down {
-        scroll.saturating_add(lines).min(last_scroll)
-    } else {
-        scroll.saturating_sub(lines)
-    };
-    if next == scroll {
-        return false;
-    }
-    thread.scroll.set(next);
-    // Drawing scrolls the box to wherever the in-box cursor is, so the cursor
-    // comes along, or the next frame would put the box straight back.
-    thread.cursor = thread.cursor.clamp(next, next + max_rows - 1);
-    true
+    let view = editor.tree.views().find_map(|(view, _)| {
+        let doc = editor.document(view.doc)?;
+        let inner = view.inner_area(doc);
+        (row >= inner.y
+            && row < inner.bottom()
+            && column >= view.area.x
+            && column < view.area.right())
+        .then_some(view.id)
+    });
+    view.is_some_and(|view_id| {
+        scroll_view(
+            editor,
+            view_id,
+            if down {
+                lines as isize
+            } else {
+                -(lines as isize)
+            },
+            false,
+        )
+    })
 }
 
 pub fn review_scroll_down(cx: &mut Context) {
@@ -2327,21 +2563,13 @@ pub fn review_comment_picker_all(cx: &mut Context) {
 
 /// Whether the cursor has stopped on the box below it.
 fn is_focused(cx: &mut Context) -> bool {
-    let Some(focused) = cx.editor.diff.reviews.focused else {
-        return false;
-    };
-    thread_at_cursor(cx) == Some(focused)
+    cx.editor.focused_review_thread().is_some()
 }
 
 /// Vertical motion that treats a comment box as a place the cursor can be.
 ///
-/// A box is painted into virtual rows, which are not document text, so the
-/// cursor cannot physically land in one -- it steps straight over. Instead the
-/// box becomes an extra stop in the motion: going down, one press focuses it
-/// and the next leaves the line; going up, one press lands on the line with it
-/// focused and the next carries on. Either way passing a thread costs one more
-/// press than passing a plain line, which is what makes it possible to stop
-/// there at all.
+/// Enter at the nearest end of a reply, walk its rendered rows, then carry on
+/// into the code. The document cursor stays on the anchor while reading.
 fn review_line_move(cx: &mut Context, down: bool) {
     let plain = |cx: &mut Context| {
         if down {
@@ -2353,13 +2581,94 @@ fn review_line_move(cx: &mut Context, down: bool) {
 
     // A count means the user is travelling, not reading. Stopping at every box
     // on the way would make `10j` mean something unpredictable.
-    if cx.count.is_some() || cx.editor.mode() != helix_view::document::Mode::Normal {
+    if (cx.count.is_some() && !is_focused(cx))
+        || cx.editor.mode() != helix_view::document::Mode::Normal
+    {
         cx.editor.diff.reviews.focused = None;
         plain(cx);
         return;
     }
 
-    let on_line = threads_at_cursor(cx);
+    let count = cx.count.take();
+    let steps = count.map_or(1, std::num::NonZeroUsize::get);
+    for i in 0..steps {
+        if i > 0 && !is_focused(cx) {
+            cx.count = std::num::NonZeroUsize::new(steps - i);
+            plain(cx);
+            break;
+        }
+        review_line_step(cx, down);
+    }
+    cx.count = count;
+}
+
+fn enter_thread(cx: &mut Context, id: ThreadId, down: bool) {
+    let width = box_width(cx);
+    let view_id = cx.editor.tree.focus;
+    let visible = cx
+        .editor
+        .diff
+        .reviews
+        .hits
+        .borrow()
+        .iter()
+        .filter(|hit| hit.view == view_id && hit.thread == id)
+        .filter_map(|hit| hit.body)
+        .fold(None, |range: Option<(usize, usize)>, row| {
+            Some(match range {
+                Some((first, last)) => (first.min(row), last.max(row)),
+                None => (row, row),
+            })
+        });
+    let thread = cx.editor.diff.reviews.get_mut(id).unwrap();
+    let last = thread.body_rows(width).len().saturating_sub(1);
+    thread.cursor = if thread.collapsed || thread.orphaned {
+        0
+    } else if down {
+        visible.map_or(0, |(first, _)| first)
+    } else {
+        visible.map_or(last, |(_, last)| last)
+    };
+    thread.select = None;
+    cx.editor.diff.reviews.focused = Some(id);
+}
+
+/// Boxes follow the first visual row, so wrapped continuation rows remain
+/// ordinary code when j/k passes through the rest of their document line.
+fn cursor_on_comment_anchor_row(cx: &mut Context) -> bool {
+    let (view, doc) = current_ref!(cx.editor);
+    let text = doc.text().slice(..);
+    let pos = doc.selection(view.id).primary().cursor(text);
+    let fmt = doc.text_format(view.inner_width(doc), None);
+    if !fmt.soft_wrap {
+        return true;
+    }
+    let annotations = view.text_annotations(doc, None);
+    helix_core::visual_offset_from_anchor(
+        text,
+        text.line_to_char(text.char_to_line(pos)),
+        pos,
+        &fmt,
+        &annotations,
+        1,
+    )
+    .is_ok_and(|(position, _)| position.row == 0)
+}
+
+fn review_line_step(cx: &mut Context, down: bool) {
+    let plain = |cx: &mut Context| {
+        if down {
+            super::move_visual_line_down(cx)
+        } else {
+            super::move_visual_line_up(cx)
+        }
+    };
+
+    let on_line = if cursor_on_comment_anchor_row(cx) {
+        threads_at_cursor(cx)
+    } else {
+        Vec::new()
+    };
     let focused = cx
         .editor
         .diff
@@ -2368,6 +2677,23 @@ fn review_line_move(cx: &mut Context, down: bool) {
         .and_then(|id| on_line.iter().position(|candidate| *candidate == id));
 
     if let Some(at) = focused {
+        let width = box_width(cx);
+        let thread = cx.editor.diff.reviews.get_mut(on_line[at]).unwrap();
+        let last = if thread.collapsed || thread.orphaned {
+            0
+        } else {
+            thread.body_rows(width).len().saturating_sub(1)
+        };
+        thread.cursor = thread.cursor.min(last);
+        if (down && thread.cursor < last) || (!down && thread.cursor > 0) {
+            thread.cursor = if down {
+                thread.cursor + 1
+            } else {
+                thread.cursor - 1
+            };
+            thread.select = None;
+            return;
+        }
         // Boxes stacked on one line are each a stop, in the order drawn.
         let next = if down {
             on_line.get(at + 1)
@@ -2375,11 +2701,21 @@ fn review_line_move(cx: &mut Context, down: bool) {
             at.checked_sub(1).and_then(|at| on_line.get(at))
         };
         if let Some(&id) = next {
-            cx.editor.diff.reviews.focused = Some(id);
+            enter_thread(cx, id, down);
             return;
         }
         cx.editor.diff.reviews.focused = None;
-        plain(cx);
+        // Above the first reply row is its own code line; below the last is
+        // the following code line.
+        if down {
+            let line = cursor_line(cx);
+            plain(cx);
+            // At EOF there is no code row below the reply. Keep the reader
+            // on its last row instead of returning to the code above it.
+            if cursor_line(cx) == line && cursor_on_comment_anchor_row(cx) {
+                cx.editor.diff.reviews.focused = Some(on_line[at]);
+            }
+        }
         return;
     }
 
@@ -2387,7 +2723,7 @@ fn review_line_move(cx: &mut Context, down: bool) {
         match on_line.first() {
             // Stop on the box without moving: the cursor stays on the line the
             // thread belongs to, which is what the box is about.
-            Some(&id) => cx.editor.diff.reviews.focused = Some(id),
+            Some(&id) => enter_thread(cx, id, true),
             None => plain(cx),
         }
     } else {
@@ -2395,7 +2731,11 @@ fn review_line_move(cx: &mut Context, down: bool) {
         // Landing on a line that carries a thread stops on its box, so going up
         // visits boxes as reliably as going down. The lowest box is the one
         // reached first from below.
-        cx.editor.diff.reviews.focused = threads_at_cursor(cx).last().copied();
+        if cursor_on_comment_anchor_row(cx) {
+            if let Some(id) = threads_at_cursor(cx).last().copied() {
+                enter_thread(cx, id, false);
+            }
+        }
     }
 }
 

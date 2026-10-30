@@ -439,6 +439,7 @@ pub fn test_config() -> Config {
 
 pub fn test_editor_config() -> helix_view::editor::Config {
     helix_view::editor::Config {
+        clipboard_provider: helix_view::clipboard::ClipboardProvider::None,
         lsp: LspConfig {
             enable: false,
             ..Default::default()

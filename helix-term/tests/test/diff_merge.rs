@@ -768,6 +768,8 @@ async fn split_diff_keyboard_and_search_sync_scroll() -> anyhow::Result<()> {
     let _cwd = CwdGuard::enter(repo.path()).await?;
     let tracked_path = repo.file("tracked.txt");
     let mut app = AppBuilder::new().with_file(&tracked_path, None).build()?;
+    // The two search matches must be farther apart than one viewport.
+    app.resize_test_terminal(120, 24);
     let mut harness = AppTestHarness::new();
 
     assert!(harness.send_keys(&mut app, "<space>g").await?);

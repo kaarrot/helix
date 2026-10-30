@@ -155,11 +155,17 @@ async fn scratch_buffers_can_be_diffed_and_update_live() -> anyhow::Result<()> {
         let working_doc = app.editor.document(working_doc_id).unwrap();
         assert!(base_doc.path().is_none());
         assert!(working_doc.path().is_none());
-        assert!(base_doc.diff_handle().is_some());
-        assert!(working_doc.diff_handle().is_some());
-        assert!(base_doc.char_diff_minus_side);
-        assert!(!working_doc.char_diff_minus_side);
-        assert!(!working_doc.diff_handle().unwrap().load().is_empty());
+        let base_diff = base_doc
+            .diff_handle_for_view(diff_state.base_view_id)
+            .unwrap()
+            .load();
+        let working_diff = working_doc
+            .diff_handle_for_view(diff_state.working_view_id)
+            .unwrap()
+            .load();
+        assert!(base_diff.is_inverted());
+        assert!(!working_diff.is_inverted());
+        assert!(!working_diff.is_empty());
     }
 
     let diff_state = main_diff_state(&app);
@@ -172,7 +178,7 @@ async fn scratch_buffers_can_be_diffed_and_update_live() -> anyhow::Result<()> {
         .editor
         .document(working_doc_id)
         .unwrap()
-        .diff_handle()
+        .diff_handle_for_view(diff_state.working_view_id)
         .unwrap()
         .load()
         .diff_base()
@@ -187,13 +193,13 @@ async fn scratch_buffers_can_be_diffed_and_update_live() -> anyhow::Result<()> {
         .editor
         .document(base_doc_id)
         .unwrap()
-        .diff_handle()
+        .diff_handle_for_view(diff_state.base_view_id)
         .is_none());
     assert!(app
         .editor
         .document(working_doc_id)
         .unwrap()
-        .diff_handle()
+        .diff_handle_for_view(diff_state.working_view_id)
         .is_none());
 
     harness.close(&mut app).await?;
@@ -749,11 +755,13 @@ async fn split_diff_keyboard_and_search_sync_scroll() -> anyhow::Result<()> {
     let repo = GitRepoFixture::new()?;
     let mut base = String::new();
     let mut working = String::new();
-    for i in 0..250 {
+    // Keep the matches farther apart than the test viewport, so the next
+    // match requires scrolling even when the first one is centered near EOF.
+    for i in 0..500 {
         if i == 1 {
             base.push_str("one\n");
             working.push_str("one changed\n");
-        } else if i == 200 || i == 240 {
+        } else if i == 200 || i == 440 {
             base.push_str("needle\n");
             working.push_str("needle\n");
         } else {
@@ -1103,7 +1111,7 @@ async fn git_split_diff_stays_in_sync_after_edits() -> anyhow::Result<()> {
         .editor
         .document(diff_state.base_doc_id)
         .unwrap()
-        .diff_handle()
+        .diff_handle_for_view(diff_state.base_view_id)
         .unwrap()
         .load()
         .diff_base()
@@ -1712,12 +1720,11 @@ async fn jumping_back_to_a_split_diff_restores_it() -> anyhow::Result<()> {
             < app.editor.tree.get(working_view).area.x,
         "the base pane sits on the left"
     );
-    assert!(
-        app.editor
-            .document(diff_state.working_doc_id)
-            .unwrap()
-            .char_diff_enabled
-    );
+    assert!(app
+        .editor
+        .document(diff_state.working_doc_id)
+        .unwrap()
+        .char_diff_enabled_for_view(working_view));
     assert_eq!(
         current_cursor_line(&app),
         39,
@@ -1997,7 +2004,7 @@ async fn closing_a_diff_keeps_snapshots_used_by_another_diff() -> anyhow::Result
         assert!(harness.wait_for_idle(&mut app).await?);
         let base = app.editor.document(first.base_doc_id).unwrap();
         assert_eq!(
-            diff_base_text(&app, first.working_doc_id).as_deref(),
+            view_diff_base_text(&app, first.working_doc_id, first.working_view_id).as_deref(),
             Some(base.text().to_string().as_str())
         );
 
@@ -2215,8 +2222,8 @@ async fn diff_buffer_from_the_base_pane_keeps_its_revision() -> anyhow::Result<(
 
 /// The base pane's jumplist holds the working file it showed before the diff
 /// opened. Jumping there showed the working file in both panes, with the left
-/// one still drawn as the base. It leaves the diff instead, which takes the
-/// other pane with it, and the working file is left in one plain pane.
+/// one still drawn as the base. It leaves the diff instead, and jumping
+/// back to the revision brings the diff back around both panes.
 #[tokio::test(flavor = "multi_thread")]
 async fn jumping_the_base_pane_to_the_working_file_leaves_the_diff() -> anyhow::Result<()> {
     let repo = repo_with_a_file_to_jump_to()?;
@@ -2239,10 +2246,19 @@ async fn jumping_the_base_pane_to_the_working_file_leaves_the_diff() -> anyhow::
         app.editor.diff.views.is_empty(),
         "a pane showing the working file is not the base pane"
     );
-    assert_eq!(app.editor.tree.views().count(), 1);
+    assert_eq!(app.editor.tree.views().count(), 2);
     let working_doc = app.editor.document(before.working_doc_id).unwrap();
     assert!(!working_doc.char_diff_enabled);
 
+    assert!(harness.send_keys(&mut app, "<C-i>").await?);
+    assert_eq!(app.editor.diff.views.len(), 2);
+    assert_eq!(app.editor.tree.views().count(), 2);
+    assert_eq!(
+        app.editor.tree.get(before.base_view_id).doc,
+        before.base_doc_id
+    );
+
+    assert!(harness.send_keys(&mut app, "<C-w>o").await?);
     harness.close(&mut app).await?;
     Ok(())
 }
@@ -2309,9 +2325,375 @@ async fn closing_the_working_file_ends_a_single_pane_diff() -> anyhow::Result<()
 }
 
 fn diff_base_text(app: &Application, doc_id: helix_view::DocumentId) -> Option<String> {
+    let view_id =
+        app.editor
+            .diff
+            .views
+            .get(&app.editor.tree.focus)
+            .map_or(app.editor.tree.focus, |state| {
+                if state.base_doc_id == doc_id {
+                    state.base_view_id
+                } else {
+                    state.working_view_id
+                }
+            });
+    view_diff_base_text(app, doc_id, view_id)
+}
+
+fn view_diff_base_text(
+    app: &Application,
+    doc_id: helix_view::DocumentId,
+    view_id: helix_view::ViewId,
+) -> Option<String> {
     let doc = app.editor.document(doc_id).unwrap();
-    doc.diff_handle()
+    doc.diff_handle_for_view(view_id)
         .map(|handle| handle.load().diff_base().to_string())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn comparisons_of_one_buffer_keep_their_own_baselines_and_edits() -> anyhow::Result<()> {
+    let repo = GitRepoFixture::new()?;
+    let older_text = "first\nold-a\nmiddle\nold-b\nlast\n";
+    let head_text = "first\nnew-a\nmiddle\nold-b\nlast\n";
+    let working_text = "first\nnew-a\nmiddle\nnew-b\nlast\n";
+    repo.write_file("tracked.txt", older_text)?;
+    repo.commit_all("first")?;
+    let older = repo.rev_parse("HEAD")?;
+    repo.write_file("tracked.txt", head_text)?;
+    repo.commit_all("second")?;
+    repo.write_file("tracked.txt", working_text)?;
+    let _cwd = CwdGuard::enter(repo.path()).await?;
+    let tracked = repo.file("tracked.txt");
+    let mut app = AppBuilder::new().with_file(&tracked, None).build()?;
+    let mut harness = AppTestHarness::new();
+
+    app.editor.open_diff_view(&tracked, &older, Some(false))?;
+    let first = main_diff_state(&app);
+    app.editor
+        .switch(first.working_doc_id, Action::VerticalSplit);
+    app.editor.open_diff_view(&tracked, "HEAD", Some(false))?;
+    let second = main_diff_state(&app);
+    app.editor
+        .switch(first.working_doc_id, Action::HorizontalSplit);
+    let plain_view = app.editor.tree.focus;
+    assert!(harness.wait_for_idle(&mut app).await?);
+
+    assert_eq!(
+        view_diff_base_text(&app, first.working_doc_id, first.working_view_id).as_deref(),
+        Some(older_text)
+    );
+    assert_eq!(
+        view_diff_base_text(&app, first.working_doc_id, second.working_view_id).as_deref(),
+        Some(head_text)
+    );
+    assert_eq!(
+        view_diff_base_text(&app, first.working_doc_id, plain_view).as_deref(),
+        Some(head_text)
+    );
+    assert!(!app
+        .editor
+        .document(first.working_doc_id)
+        .unwrap()
+        .char_diff_enabled_for_view(plain_view));
+
+    app.editor.focus(first.working_view_id);
+    assert!(
+        harness
+            .send_keys(&mut app, ":toggle-char-diff<ret>")
+            .await?
+    );
+    let doc = app.editor.document(first.working_doc_id).unwrap();
+    assert!(!doc.char_diff_enabled_for_view(first.working_view_id));
+    assert!(doc.char_diff_enabled_for_view(second.working_view_id));
+    assert!(harness.send_keys(&mut app, "gg]gmig").await?);
+    assert_eq!(current_cursor_line(&app), 1);
+    let (view, doc) = helix_view::current_ref!(app.editor);
+    let selection = doc.selection(view.id).primary();
+    assert_eq!(
+        doc.text()
+            .slice(selection.from()..selection.to())
+            .to_string(),
+        "new-a\n"
+    );
+
+    app.editor.focus(second.working_view_id);
+    assert!(harness.send_keys(&mut app, "gg]g").await?);
+    assert_eq!(current_cursor_line(&app), 3);
+    app.editor.focus(first.working_view_id);
+    assert!(
+        harness
+            .send_keys(&mut app, ":reset-diff-change<ret>")
+            .await?
+    );
+    let edited = "first\nold-a\nmiddle\nnew-b\nlast\n";
+    assert_eq!(current_doc_text(&app), edited);
+    assert!(harness.wait_for_idle(&mut app).await?);
+    for view in [first.working_view_id, second.working_view_id, plain_view] {
+        assert_eq!(
+            app.editor
+                .document(first.working_doc_id)
+                .unwrap()
+                .diff_handle_for_view(view)
+                .unwrap()
+                .load()
+                .doc()
+                .to_string(),
+            edited
+        );
+    }
+
+    assert!(app.editor.close_diff_view(second.working_view_id));
+    assert_eq!(
+        view_diff_base_text(&app, first.working_doc_id, first.working_view_id).as_deref(),
+        Some(older_text)
+    );
+    assert_eq!(
+        view_diff_base_text(&app, first.working_doc_id, plain_view).as_deref(),
+        Some(head_text)
+    );
+    app.editor.focus(first.working_view_id);
+    assert!(harness.send_keys(&mut app, "gg]g").await?);
+    assert_eq!(current_cursor_line(&app), 3);
+
+    assert!(harness.send_keys(&mut app, "<C-w>o").await?);
+    harness.close(&mut app).await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn edits_update_comparisons_using_a_buffer_on_opposite_sides() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let a = dir.path().join("a.txt");
+    let b = dir.path().join("b.txt");
+    let c = dir.path().join("c.txt");
+    std::fs::write(&a, "a\n")?;
+    std::fs::write(&b, "b\n")?;
+    std::fs::write(&c, "c\n")?;
+    let mut app = AppBuilder::new().with_file(&a, None).build()?;
+    let mut harness = AppTestHarness::new();
+    let a_id = app.editor.tree.get(app.editor.tree.focus).doc;
+    let b_id = app.editor.open(&b, Action::Load)?;
+    let c_id = app.editor.open(&c, Action::Load)?;
+    app.editor.open_buffer_diff_view(b_id, a_id, Some(false))?;
+    let first = main_diff_state(&app);
+    app.editor.switch(b_id, Action::VerticalSplit);
+    app.editor.open_buffer_diff_view(c_id, b_id, Some(false))?;
+    let second = main_diff_state(&app);
+
+    assert!(harness.send_keys(&mut app, "ggirevised-<esc>").await?);
+    assert!(harness.wait_for_idle(&mut app).await?);
+    assert_eq!(
+        view_diff_base_text(&app, a_id, first.working_view_id).as_deref(),
+        Some("revised-b\n")
+    );
+    assert_eq!(
+        view_diff_base_text(&app, b_id, second.working_view_id).as_deref(),
+        Some("c\n")
+    );
+    assert_eq!(
+        app.editor
+            .document(b_id)
+            .unwrap()
+            .diff_handle_for_view(second.working_view_id)
+            .unwrap()
+            .load()
+            .doc()
+            .to_string(),
+        "revised-b\n"
+    );
+    assert!(app.editor.close_diff_view(first.working_view_id));
+    assert!(harness.send_keys(&mut app, "ggimore-<esc>").await?);
+    assert!(harness.wait_for_idle(&mut app).await?);
+    assert_eq!(
+        app.editor
+            .document(b_id)
+            .unwrap()
+            .diff_handle_for_view(second.working_view_id)
+            .unwrap()
+            .load()
+            .doc()
+            .to_string(),
+        "more-revised-b\n"
+    );
+
+    assert!(harness.send_keys(&mut app, "<C-w>o").await?);
+    harness.close(&mut app).await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn suspending_one_comparison_keeps_the_other_baseline() -> anyhow::Result<()> {
+    let repo = repo_with_a_file_to_jump_to()?;
+    let older = repo.rev_parse("HEAD")?;
+    repo.commit_all("second")?;
+    let head_text = std::fs::read_to_string(repo.file("tracked.txt"))?;
+    let _cwd = CwdGuard::enter(repo.path()).await?;
+    let tracked = repo.file("tracked.txt");
+    let mut app = AppBuilder::new().with_file(&tracked, None).build()?;
+    let mut harness = AppTestHarness::new();
+    app.editor.open_diff_view(&tracked, &older, Some(false))?;
+    let first = main_diff_state(&app);
+    let old_text = app
+        .editor
+        .document(first.base_doc_id)
+        .unwrap()
+        .text()
+        .to_string();
+    app.editor
+        .switch(first.working_doc_id, Action::VerticalSplit);
+    app.editor.open_diff_view(&tracked, "HEAD", Some(false))?;
+    let second = main_diff_state(&app);
+    app.editor.focus(first.working_view_id);
+    open_other(&mut app, &mut harness, &repo.file("other.txt")).await?;
+    assert_eq!(
+        view_diff_base_text(&app, first.working_doc_id, second.working_view_id).as_deref(),
+        Some(head_text.as_str())
+    );
+    assert!(harness.send_keys(&mut app, "ga").await?);
+    assert!(harness.wait_for_idle(&mut app).await?);
+    assert_eq!(
+        view_diff_base_text(&app, first.working_doc_id, first.working_view_id).as_deref(),
+        Some(old_text.as_str())
+    );
+    assert_eq!(
+        view_diff_base_text(&app, first.working_doc_id, second.working_view_id).as_deref(),
+        Some(head_text.as_str())
+    );
+
+    assert!(harness.send_keys(&mut app, "<C-w>o").await?);
+    harness.close(&mut app).await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_diff_open_preserves_the_current_comparison() -> anyhow::Result<()> {
+    let repo = repo_with_a_file_to_jump_to()?;
+    let older = repo.rev_parse("HEAD")?;
+    repo.commit_all("second")?;
+    let _cwd = CwdGuard::enter(repo.path()).await?;
+    let tracked = repo.file("tracked.txt");
+    let mut app = AppBuilder::new().with_file(&tracked, None).build()?;
+    let mut harness = AppTestHarness::new();
+
+    for (split, base_focused) in [(false, false), (true, false), (true, true)] {
+        app.editor.open_diff_view(&tracked, "HEAD", Some(split))?;
+        let before = main_diff_state(&app);
+        if base_focused {
+            app.editor.focus(before.base_view_id);
+        }
+        assert!(harness.send_keys(&mut app, "40gg").await?);
+        let focus = app.editor.tree.focus;
+        let views: Vec<_> = app
+            .editor
+            .tree
+            .views()
+            .map(|(view, _)| (view.id, view.doc, view.area))
+            .collect();
+        let documents: Vec<_> = app.editor.documents.keys().copied().collect();
+
+        for failure in 0..4 {
+            let result = match failure {
+                0 => app
+                    .editor
+                    .open_diff_view(&tracked, "missing-ref", Some(!split)),
+                1 => app.editor.open_diff_view_range(
+                    &tracked,
+                    &older,
+                    Some("missing-ref"),
+                    Some(!split),
+                ),
+                2 => app.editor.open_diff_view_range(
+                    &tracked,
+                    "missing-ref",
+                    Some(&older),
+                    Some(!split),
+                ),
+                _ => app.editor.open_diff_view_with_paths(
+                    &tracked,
+                    repo.path(),
+                    &older,
+                    Some(!split),
+                ),
+            };
+            assert!(result.is_err(), "failure case {failure}");
+            assert_eq!(app.editor.tree.focus, focus);
+            assert_eq!(
+                app.editor
+                    .tree
+                    .views()
+                    .map(|(view, _)| (view.id, view.doc, view.area))
+                    .collect::<Vec<_>>(),
+                views
+            );
+            assert_eq!(
+                app.editor.documents.keys().copied().collect::<Vec<_>>(),
+                documents
+            );
+            let after = main_diff_state(&app);
+            assert_eq!(after.base_doc_id, before.base_doc_id);
+            assert_eq!(after.working_doc_id, before.working_doc_id);
+            assert_eq!(after.is_split(), split);
+            assert_eq!(current_cursor_line(&app), 39);
+            assert!(app.editor.diff.suspended.is_empty());
+        }
+    }
+
+    assert!(harness.send_keys(&mut app, "<C-w>o").await?);
+    harness.close(&mut app).await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_diff_open_keeps_a_suspended_comparison() -> anyhow::Result<()> {
+    let repo = repo_with_a_file_to_jump_to()?;
+    let _cwd = CwdGuard::enter(repo.path()).await?;
+    let tracked = repo.file("tracked.txt");
+    let mut app = AppBuilder::new().with_file(&tracked, None).build()?;
+    let mut harness = AppTestHarness::new();
+    app.editor.open_diff_view(&tracked, "HEAD", Some(true))?;
+    let before = main_diff_state(&app);
+    open_other(&mut app, &mut harness, &repo.file("other.txt")).await?;
+    assert!(app
+        .editor
+        .open_diff_view(&tracked, "missing-ref", Some(false))
+        .is_err());
+    assert_eq!(app.editor.diff.suspended.len(), 1);
+    assert!(harness.send_keys(&mut app, "ga").await?);
+    let restored = main_diff_state(&app);
+    assert_eq!(restored.working_view_id, before.working_view_id);
+    assert_eq!(restored.working_doc_id, before.working_doc_id);
+    assert!(restored.is_split());
+
+    assert!(harness.send_keys(&mut app, "<C-w>o").await?);
+    harness.close(&mut app).await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_split_toggle_keeps_the_original_comparison() -> anyhow::Result<()> {
+    let repo = repo_with_a_file_to_jump_to()?;
+    repo.git(&["branch", "review-base"])?;
+    let _cwd = CwdGuard::enter(repo.path()).await?;
+    let tracked = repo.file("tracked.txt");
+    let mut app = AppBuilder::new().with_file(&tracked, None).build()?;
+    let mut harness = AppTestHarness::new();
+    app.editor
+        .open_diff_view(&tracked, "review-base", Some(false))?;
+    let before = main_diff_state(&app);
+    let preference = app.editor.diff.split_view_override;
+    repo.git(&["branch", "-D", "review-base"])?;
+
+    assert!(harness.send_keys(&mut app, "<space>mv").await?);
+    let after = main_diff_state(&app);
+    assert_eq!(after.base_doc_id, before.base_doc_id);
+    assert_eq!(after.working_doc_id, before.working_doc_id);
+    assert!(!after.is_split());
+    assert_eq!(app.editor.diff.split_view_override, preference);
+    assert_eq!(*app.editor.get_status().unwrap().1, Severity::Error);
+    assert_eq!(app.editor.tree.views().count(), 1);
+
+    harness.close(&mut app).await?;
+    Ok(())
 }
 
 /// A buffer diff takes over the file's own diff against HEAD. Ending it
@@ -2367,6 +2749,7 @@ async fn leaving_a_diff_against_an_older_commit_goes_back_to_head() -> anyhow::R
 
     app.editor.open_diff_view(&tracked, &older, Some(true))?;
     let diff_state = main_diff_state(&app);
+    assert!(harness.wait_for_idle(&mut app).await?);
     assert_eq!(
         diff_base_text(&app, diff_state.working_doc_id).as_deref(),
         Some("one\n")

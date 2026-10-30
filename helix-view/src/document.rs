@@ -153,6 +153,11 @@ pub struct GitRevision {
     pub commit: Option<String>,
 }
 
+struct ViewDiff {
+    handle: DiffHandle,
+    char_diff_enabled: bool,
+}
+
 pub struct Document {
     pub(crate) id: DocumentId,
     text: Rope,
@@ -212,6 +217,8 @@ pub struct Document {
     pub(crate) language_servers: HashMap<LanguageServerName, Arc<Client>>,
 
     diff_handle: Option<DiffHandle>,
+    /// Comparisons shown in individual views, independent of this buffer's Git diff.
+    view_diffs: HashMap<ViewId, ViewDiff>,
     version_control_head: Option<Arc<ArcSwap<Box<str>>>>,
     diff_base_ref: Option<String>,
 
@@ -227,11 +234,11 @@ pub struct Document {
     pub git_revision: Option<GitRevision>,
     /// Override the display name shown in the bufferline / statusline.
     pub display_name_override: Option<String>,
-    /// Character-level diff highlighting enabled for this document.
+    /// Character-level diff highlighting outside comparison views.
     pub char_diff_enabled: bool,
     /// When true this doc is the "minus" (old/base) side; highlights use diff.minus scope.
     pub char_diff_minus_side: bool,
-    /// The paired document in a split diff session.
+    /// The paired snapshot in a merge view's document-level comparison.
     pub linked_diff_doc: Option<DocumentId>,
 
     pub previous_diagnostic_id: Option<String>,
@@ -753,6 +760,7 @@ impl Document {
             modified_since_accessed: false,
             language_servers: HashMap::new(),
             diff_handle: None,
+            view_diffs: HashMap::new(),
             config,
             version_control_head: None,
             diff_base_ref: None,
@@ -1299,12 +1307,9 @@ impl Document {
         self.pickup_last_saved_time();
         self.detect_indent_and_line_ending();
 
-        // A diff this document is one side of owns its handle, a worker shared
-        // with the other side, whose base is that side's text. The new text
-        // already reached it through `apply` above. Giving it HEAD as its
-        // base would redraw both gutters and the spacers against HEAD while
-        // the other pane still shows the other side, or, for a file outside
-        // a repository, drop the diff.
+        // Merge snapshots share their document-level worker with the other
+        // side. Other comparisons were updated by `apply` and are independent
+        // of the buffer's own Git base refreshed here.
         if self.linked_diff_doc.is_none() {
             // Stay on the ref `:diff-base` set, if it still names something.
             let base_ref = self.diff_base_ref.clone();
@@ -1438,6 +1443,7 @@ impl Document {
 
     /// Remove a view's selection and inlay hints from this document.
     pub fn remove_view(&mut self, view_id: ViewId) {
+        self.view_diffs.remove(&view_id);
         self.selections.remove(&view_id);
         self.inlay_hints.remove(&view_id);
         self.jump_labels.remove(&view_id);
@@ -1523,6 +1529,9 @@ impl Document {
         // start computing the diff in parallel
         if let Some(diff_handle) = &self.diff_handle {
             diff_handle.update_document(self.text.clone(), false);
+        }
+        for diff in self.view_diffs.values() {
+            diff.handle.update_document(self.text.clone(), false);
         }
 
         // map diagnostics over changes too
@@ -2008,6 +2017,45 @@ impl Document {
 
     pub fn diff_handle(&self) -> Option<&DiffHandle> {
         self.diff_handle.as_ref()
+    }
+
+    /// The comparison displayed in this view, or the buffer's own Git diff.
+    pub fn diff_handle_for_view(&self, view_id: ViewId) -> Option<&DiffHandle> {
+        self.view_diffs
+            .get(&view_id)
+            .map(|diff| &diff.handle)
+            .or(self.diff_handle.as_ref())
+    }
+
+    pub(crate) fn set_view_diff(&mut self, view_id: ViewId, handle: DiffHandle) {
+        self.view_diffs.insert(
+            view_id,
+            ViewDiff {
+                handle,
+                char_diff_enabled: true,
+            },
+        );
+    }
+
+    pub(crate) fn clear_view_diff(&mut self, view_id: ViewId) {
+        self.view_diffs.remove(&view_id);
+    }
+
+    pub fn char_diff_enabled_for_view(&self, view_id: ViewId) -> bool {
+        self.view_diffs
+            .get(&view_id)
+            .map_or(self.char_diff_enabled, |diff| diff.char_diff_enabled)
+    }
+
+    pub fn toggle_char_diff(&mut self, view_id: ViewId) -> bool {
+        let enabled = self
+            .view_diffs
+            .get_mut(&view_id)
+            .map_or(&mut self.char_diff_enabled, |diff| {
+                &mut diff.char_diff_enabled
+            });
+        *enabled = !*enabled;
+        *enabled
     }
 
     pub fn set_diff_handle(&mut self, diff_handle: DiffHandle) {

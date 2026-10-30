@@ -156,6 +156,7 @@ impl EditorView {
         Self::doc_diagnostics_highlights_into(doc, theme, &mut overlays);
         diff::char_diff_highlights_into(
             doc,
+            view.id,
             theme,
             view_offset.anchor,
             inner.height as usize,

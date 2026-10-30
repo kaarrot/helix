@@ -104,7 +104,7 @@ pub fn diff<'doc>(
     // purely by insertion/removal would therefore paint both panes with a mix
     // of red and green and invert the old pane. Instead, key the whole pane off
     // which side it is — old pane red, new pane green — matching the intraline
-    // char highlighting (which already keys off `char_diff_minus_side`). Only a
+    // char highlighting (which uses the same diff orientation). Only a
     // genuine split (two distinct views) gets this treatment; single-pane diff
     // views and the ordinary git gutter keep per-hunk coloring.
     let side_style = editor.diff.views.get(&view.id).and_then(|state| {
@@ -117,7 +117,7 @@ pub fn diff<'doc>(
         })
     });
 
-    if let Some(diff_handle) = doc.diff_handle() {
+    if let Some(diff_handle) = doc.diff_handle_for_view(view.id) {
         let hunks = diff_handle.load();
         let mut hunk_i = 0;
         let mut hunk = hunks.nth_hunk(hunk_i);

@@ -2637,7 +2637,7 @@ fn reset_diff_change(
     let scrolloff = editor.config().scrolloff;
 
     let (view, doc) = current!(editor);
-    let Some(handle) = doc.diff_handle() else {
+    let Some(handle) = doc.diff_handle_for_view(view.id) else {
         bail!("Diff is not available in the current buffer")
     };
 

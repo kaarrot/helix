@@ -58,6 +58,11 @@ restores the comparison and its split setting without losing your cursor positio
 If both split panes navigate elsewhere, the diff returns when both panes show
 their original buffers again. `:diff-reset` also forgets suspended comparisons.
 
+You can compare the same buffer against different revisions in separate views.
+Each comparison keeps its own highlighting, hunk navigation, and scrolling;
+edits update every comparison. If opening a comparison or toggling its split
+fails, the current diff remains available.
+
 ## Git revision buffers
 
 A range-diff (`:diff-commit REF!`, `:diff-commit REF1..REF2`, `Space-m C`)

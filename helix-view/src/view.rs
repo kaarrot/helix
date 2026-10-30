@@ -693,7 +693,7 @@ impl View {
         diff_views: &std::collections::HashMap<ViewId, crate::diff_view::DiffViewState>,
         documents: &'a std::collections::BTreeMap<DocumentId, Document>,
     ) {
-        let Some(diff_state) = diff_views.get(&self.id) else {
+        let Some(diff_state) = diff_views.get(&self.id).filter(|state| state.is_split()) else {
             return;
         };
         let other_doc_id = if diff_state.is_base_view(self.id) {
@@ -701,7 +701,10 @@ impl View {
         } else {
             diff_state.base_doc_id
         };
-        if let (Some(diff_handle), Some(_)) = (doc.diff_handle(), documents.get(&other_doc_id)) {
+        if let (Some(diff_handle), Some(_)) = (
+            doc.diff_handle_for_view(self.id),
+            documents.get(&other_doc_id),
+        ) {
             text_annotations.add_line_annotation(Box::new(
                 crate::annotations::diff::DiffAlignment::new(diff_handle.clone()),
             ));

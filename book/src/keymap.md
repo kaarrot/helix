@@ -566,7 +566,8 @@ Displays the signature of the selected completion item. Remapping currently not 
 
 Accessed by typing `G` in [space mode](#space-mode). This mode is **sticky**: it
 stays active until `Esc`, and while it is up other keys do not reach normal
-mode. See the [debugger](./debugger.md) documentation for what these do.
+mode, with `Ctrl-w` window commands still available. See the
+[debugger](./debugger.md) documentation for what these do.
 
 | Key      | Description                                        | Command                    |
 | -----    | -----------                                        | -------                    |
@@ -580,7 +581,8 @@ mode. See the [debugger](./debugger.md) documentation for what these do.
 | `n`      | Step to next                                       | `dap_next`                 |
 | `j`      | Jump execution to current line                     | `dap_goto_line`            |
 | `p`      | Evaluate expression                                | `dap_evaluate`             |
-| `Ctrl-d` | Open or close the debug console                    | `dap_console_toggle`       |
+| `Ctrl-d` | Switch focus between source and debug console     | `dap_console_focus`        |
+| `?`      | Show debug console help                           | `dap_console_help`         |
 | `:`      | Enter command mode, staying in the debug menu      | `command_mode`             |
 | `v`      | List / set variables                               | `dap_variables`            |
 | `t`      | End debug session                                  | `dap_terminate`            |

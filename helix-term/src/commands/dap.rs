@@ -24,12 +24,16 @@ use anyhow::{anyhow, bail};
 use helix_view::handlers::dap::{breakpoints_changed, jump_to_stack_frame, select_thread_id};
 
 pub(crate) mod console;
-pub use console::dap_console_toggle;
+pub use console::{dap_console_focus, dap_console_help, dap_console_hide, dap_console_toggle};
 
 fn thread_picker(
     cx: &mut Context,
     callback_fn: impl Fn(&mut Editor, &dap::Thread) + Send + 'static,
 ) {
+    if let Err(err) = ensure_debugger_idle(cx.editor) {
+        cx.editor.set_error(err.to_string());
+        return;
+    }
     let debugger = debugger!(cx.editor);
 
     let future = debugger.threads();
@@ -667,6 +671,10 @@ pub fn dap_launch(cx: &mut Context) {
 }
 
 pub fn dap_restart(cx: &mut Context) {
+    if let Err(err) = ensure_debugger_idle(cx.editor) {
+        cx.editor.set_error(err.to_string());
+        return;
+    }
     let debugger = match cx.editor.debug_adapters.get_active_client_mut() {
         Some(debugger) => debugger,
         None => {
@@ -837,6 +845,7 @@ pub(crate) fn toggle_breakpoint(
     path: PathBuf,
     line: usize,
 ) -> anyhow::Result<()> {
+    ensure_debugger_idle(editor)?;
     // TODO: need to map breakpoints over edits and update them?
     // we shouldn't really allow editing while debug is running though
 
@@ -874,6 +883,7 @@ pub(crate) enum Step {
 /// Moves the stopped thread on. The debugger answers with a "stopped" event when
 /// it gets there, which is what moves the cursor.
 pub(crate) fn step(editor: &mut Editor, jobs: &mut Jobs, step: Step) -> anyhow::Result<()> {
+    ensure_debugger_idle(editor)?;
     let debugger = editor
         .debug_adapters
         .get_active_client_mut()
@@ -976,6 +986,7 @@ pub(crate) fn goto_line(
     path: PathBuf,
     line: usize,
 ) -> anyhow::Result<()> {
+    ensure_debugger_idle(editor)?;
     let debugger = editor
         .debug_adapters
         .get_active_client_mut()
@@ -1022,6 +1033,13 @@ pub(crate) fn goto_line(
 pub(crate) fn report_error(editor: &mut Editor, message: &str) {
     editor.set_error(message.to_string());
     editor.dap_console_print(&format!("*** {message}"));
+}
+
+fn ensure_debugger_idle(editor: &Editor) -> anyhow::Result<()> {
+    if let Some(label) = editor.dap_console_busy() {
+        bail!("Debugger is {label} Wait for the pending inspection before changing execution.");
+    }
+    Ok(())
 }
 
 /// The expression to seed the eval prompt with: the primary selection, when
@@ -1262,18 +1280,143 @@ fn split_assignment(expression: &str) -> Option<(&str, &str, &str)> {
 
 /// Evaluate `expression` in the current frame, asking again for the whole value
 /// when the adapter hands back an elided one.
-fn eval_complete(debugger: &dap::Client, expression: &str, frame_id: usize) -> dap::Result<String> {
-    let mut result = block_on(debugger.eval(expression.to_owned(), Some(frame_id)))?.result;
+#[derive(Clone)]
+pub(crate) struct EvaluationContext {
+    pub adapter: dap::registry::DebugAdapterId,
+    pub requests: dap::RequestHandle,
+    pub frame_id: usize,
+    pub quirks: helix_core::syntax::config::DebuggerQuirks,
+    clipboard_context: bool,
+    set_expression: bool,
+}
+
+impl EvaluationContext {
+    pub fn new(editor: &Editor) -> anyhow::Result<Self> {
+        let debugger = editor
+            .debug_adapters
+            .get_active_client()
+            .ok_or_else(|| anyhow!("Debugger is not running"))?;
+        Ok(Self {
+            adapter: debugger.id(),
+            requests: debugger.request_handle(),
+            frame_id: selected_frame_id(debugger)?,
+            quirks: debugger.quirks.clone(),
+            clipboard_context: debugger.supports_clipboard_context(),
+            set_expression: debugger.supports_set_expression(),
+        })
+    }
+
+    pub async fn eval(
+        &self,
+        expression: String,
+        full: bool,
+    ) -> dap::Result<dap::requests::EvaluateResponse> {
+        self.requests
+            .request::<dap::requests::Evaluate>(dap::requests::EvaluateArguments {
+                expression,
+                frame_id: Some(self.frame_id),
+                context: Some(
+                    if full && self.clipboard_context {
+                        "clipboard"
+                    } else {
+                        "repl"
+                    }
+                    .into(),
+                ),
+                format: None,
+            })
+            .await
+    }
+
+    pub async fn variables(&self, variables_reference: usize) -> dap::Result<Vec<dap::Variable>> {
+        let response = self
+            .requests
+            .request::<dap::requests::Variables>(dap::requests::VariablesArguments {
+                variables_reference,
+                filter: None,
+                start: None,
+                count: None,
+                format: None,
+            })
+            .await?;
+        Ok(response.variables)
+    }
+}
+
+/// Run inspections in submission order. The queue and its callbacks stay off
+/// the editor thread, so navigating, reading output, and switching panes remain
+/// available while an adapter evaluates an expression.
+pub(crate) fn spawn_inspection<T: Send + 'static>(
+    editor: &mut Editor,
+    jobs: &mut Jobs,
+    adapter: dap::registry::DebugAdapterId,
+    label: &'static str,
+    echo: Option<String>,
+    request: impl Future<Output = anyhow::Result<T>> + Send + 'static,
+    callback: impl FnOnce(&mut Editor, &mut Compositor, anyhow::Result<T>) + Send + 'static,
+) {
+    let (ticket, previous, done) = editor.dap_console_begin_request(adapter, label);
+    let console = editor.dap_console_doc();
+    let from_console = echo.is_some();
+    let is_current = move |editor: &Editor| {
+        editor
+            .debug_adapters
+            .get_active_client()
+            .is_some_and(|client| client.id() == adapter)
+            && (!from_console || editor.dap_console_doc() == console)
+    };
+    jobs.spawn(async move {
+        if let Some(previous) = previous {
+            let _ = previous.await;
+        }
+        let (ready, start) = tokio::sync::oneshot::channel();
+        crate::job::dispatch(move |editor, _| {
+            let current = is_current(editor);
+            if current {
+                if let Some(input) = echo {
+                    editor.dap_console_print(&format!(
+                        "{}{}",
+                        helix_view::handlers::dap_console::PROMPT,
+                        input
+                    ));
+                }
+            } else {
+                editor.dap_console_finish_request(ticket);
+            }
+            let _ = ready.send(current);
+        })
+        .await;
+        if !start.await.unwrap_or(false) {
+            let _ = done.send(());
+            return Ok(());
+        }
+        let result = request.await;
+        // Send the result before releasing the queue, so the next command's
+        // echo follows this result in the transcript.
+        crate::job::dispatch(move |editor, compositor| {
+            editor.dap_console_finish_request(ticket);
+            if is_current(editor) {
+                callback(editor, compositor, result);
+            }
+        })
+        .await;
+        let _ = done.send(());
+        Ok(())
+    });
+}
+
+async fn eval_complete(context: &EvaluationContext, expression: &str) -> dap::Result<String> {
+    let mut result = context.eval(expression.to_owned(), false).await?.result;
 
     // A truncated value is useless to copy, so ask for it again in full.
     let retry = full_value_expression(
         &result,
         expression,
-        debugger.quirks.full_value_expression.as_deref(),
-        debugger.supports_clipboard_context(),
+        context.quirks.full_value_expression.as_deref(),
+        context.clipboard_context,
     );
     if let Some(expression) = retry {
-        if let Ok(response) = block_on(debugger.eval_full(expression, Some(frame_id))) {
+        if let Ok(response) = context.eval(expression, true).await {
             result = unquote(&response.result).to_string();
         }
     }
@@ -1312,31 +1455,36 @@ pub(crate) fn selected_frame_id(debugger: &dap::Client) -> anyhow::Result<usize>
 /// that do run statements (the `repl-statements` quirk) are not retried: their
 /// failure may come after the value was computed, and a retry would compute it,
 /// side effects and all, a second time.
-pub(crate) fn evaluate(editor: &Editor, input: &str) -> anyhow::Result<Option<String>> {
-    let debugger = editor
-        .debug_adapters
-        .get_active_client()
-        .ok_or_else(|| anyhow!("Debugger is not running"))?;
-    let frame_id = selected_frame_id(debugger)?;
-
-    let result = match eval_complete(debugger, input, frame_id) {
+pub(crate) async fn evaluate(
+    context: &EvaluationContext,
+    input: &str,
+) -> anyhow::Result<Option<String>> {
+    let result = match eval_complete(context, input).await {
         Ok(value) if value.is_empty() => {
-            let stored = assignment_target(input)
-                .and_then(|target| eval_complete(debugger, target, frame_id).ok());
+            let stored = match assignment_target(input) {
+                Some(target) => eval_complete(context, target).await.ok(),
+                None => None,
+            };
             Ok(stored.filter(|value| !value.is_empty()))
         }
         Ok(value) => Ok(Some(value)),
         Err(err) => match split_assignment(input) {
             Some((target, "=", value))
-                if !debugger.quirks.repl_statements && debugger.supports_set_expression() =>
+                if !context.quirks.repl_statements && context.set_expression =>
             {
-                block_on(debugger.set_expression(
-                    target.to_owned(),
-                    value.to_owned(),
-                    Some(frame_id),
-                ))
-                .map(|response| Some(response.value))
-                .map_err(|_| err)
+                context
+                    .requests
+                    .request::<dap::requests::SetExpression>(
+                        dap::requests::SetExpressionArguments {
+                            expression: target.to_owned(),
+                            value: value.to_owned(),
+                            frame_id: Some(context.frame_id),
+                            format: None,
+                        },
+                    )
+                    .await
+                    .map(|response| Some(response.value))
+                    .map_err(|_| err)
             }
             _ => Err(err),
         },
@@ -1430,8 +1578,7 @@ pub fn dap_evaluate(cx: &mut Context) {
             }
 
             save_eval_history(cx.editor);
-            let result = evaluate(cx.editor, input);
-            report_evaluation(cx.editor, input, result);
+            start_evaluation(cx.editor, cx.jobs, input);
         },
     );
     let prompt = match expression.is_empty() {
@@ -1439,6 +1586,28 @@ pub fn dap_evaluate(cx: &mut Context) {
         false => prompt.with_line(expression, cx.editor),
     };
     cx.push_layer(Box::new(prompt));
+}
+
+pub(crate) fn start_evaluation(editor: &mut Editor, jobs: &mut Jobs, input: &str) {
+    let context = match EvaluationContext::new(editor) {
+        Ok(context) => context,
+        Err(err) => {
+            editor.set_error(err.to_string());
+            return;
+        }
+    };
+    let adapter = context.adapter;
+    let input = input.to_string();
+    let expression = input.clone();
+    spawn_inspection(
+        editor,
+        jobs,
+        adapter,
+        "evaluating…",
+        None,
+        async move { evaluate(&context, &expression).await },
+        move |editor, _, result| report_evaluation(editor, &input, result),
+    );
 }
 
 #[derive(Clone)]
@@ -1698,6 +1867,10 @@ fn reopen_variables_picker(cx: &mut compositor::Context) {
 }
 
 pub fn dap_variables(cx: &mut Context) {
+    if let Err(err) = ensure_debugger_idle(cx.editor) {
+        cx.editor.set_error(err.to_string());
+        return;
+    }
     let Some(items) = collect_variable_items(cx.editor) else {
         return;
     };

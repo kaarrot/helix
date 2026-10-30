@@ -14,7 +14,7 @@ Everything below is reached from the debug menu, `<space>G`.
 > until you press `Esc`. While it is up, keys are looked up in the menu alone —
 > ordinary motions do nothing, and `j`, `b` or `c` run debug commands rather
 > than moving, selecting or changing. Press `Esc` to get back to normal editing;
-> the session keeps running.
+> the session keeps running. `Ctrl-w` window commands remain available.
 
 ### Starting a session
 
@@ -120,21 +120,31 @@ inspecting all happen from there, while the source view beside it follows the
 current frame and stops at the breakpoints set in the gutter.
 
 `Ctrl-d` in the debug menu opens it in a split under the source, ready to type.
-The same key from inside the console closes it again and puts you back in the
-debug menu; the transcript is kept for next time. From the command line,
-`:debug-console` opens it and `:debug-console-toggle` opens or closes it the way
-the key does. `:` works from the debug menu, so neither needs you to leave it. A
-toggle rebound to a plain character, e.g. `[keys.normal.space.G] x = "dap_console_toggle"`, types
-that character on the input line and closes the console only from normal mode.
+Once it is visible, `Ctrl-d` switches between source and console, keeping both
+panes open. Returning to the console puts you on the input line in insert mode;
+returning to source restores the debug menu if it was active. The key also
+works from ordinary normal mode while the console is visible, taking the place
+of half-page down until it is hidden.
+
+`:debug-console` opens and focuses it, `:debug-console-hide` hides it while
+keeping the transcript, and `:debug-console-toggle` shows or hides it from either
+pane. `:` works from the debug menu. The focus command is `dap_console_focus`;
+the explicit visibility commands are `dap_console_hide` and `dap_console_toggle`.
+A command rebound to a plain character in the debug menu types that character
+in insert mode and acts as a command only from normal mode.
 
 Using the console does not leave debug mode: while it has focus, the debug menu
 is set aside so keys type and move as usual, and once focus leaves the console
 the menu is back as you left it — for `s t` to switch thread, for instance. The
 debug menu can also be opened from inside the console with `<space>G`; `Esc`
-closes it again.
+closes it again. `Ctrl-w` window commands work while the debug menu is active.
+While the console is visible, the menu uses a compact hint line so the transcript
+stays visible; `?` in the menu opens console help.
 
-The console is an ordinary buffer with Helix's modes. Only opening it with the
-toggle or `:debug-console` puts you in insert mode. Reaching it any other way,
+The console is labelled `[Debug Console]`, with the selected frame in its status
+line. Its mode says `INPUT` while typing and `BROWSE` while reading the transcript.
+The console keeps Helix's modes: focusing it with `Ctrl-d`, the toggle, or
+`:debug-console` puts you in insert mode. Reaching it through window navigation,
 with `Ctrl-w j` or a mouse click, or pressing `Esc` while typing, leaves you in
 normal mode, where keys are editor commands: `n` searches, `x` selects a line.
 Press `i` or `a` to type; the cursor moves to the end of the `(hx)` line first.
@@ -143,11 +153,11 @@ Press `i` or `a` to type; the cursor moves to the end of the `(hx)` line first.
 | ---                                         | ---                                                           |
 | `<ret>`                                     | Run the input line. Output appears below it, then a new prompt |
 | `<ret>` on an empty line                    | Run the console's previous command again — `n` then `<ret> <ret> <ret>` |
-| `Up`, `Down` (also `Ctrl-p`, `Ctrl-n`)      | Walk the history, shared with the eval prompt                 |
+| `Up`, `Down` (also `Ctrl-p`, `Ctrl-n`)      | Walk the shared eval history; returning to the newest entry restores the unfinished line and its cursor |
 | `Tab`                                       | Complete from the debugger in the selected frame — `p obj.` then `Tab` lists `obj`'s members. Nothing pops up on its own |
 | `Esc`                                       | Normal mode inside the console, to move around the output     |
 | `Esc` in normal mode                        | Back to the source, in the debug menu; the console stays open |
-| `Ctrl-d`                                    | Close the console, back to the source in the debug menu. It takes the place of half-page down and delete-forward here |
+| `Ctrl-d`                                    | Switch focus to source, keeping the console open; from source, switch back ready to type |
 | `gF` in normal mode                         | Show the `file:line` under the cursor in the source view, staying in the console |
 
 Typing always happens on the input line: entering insert mode anywhere in the
@@ -157,6 +167,15 @@ pasted text runs the line so far, as it would in a terminal, and what follows
 the last one stays on the input line. Output that arrives while you type — what
 the program prints, or where it stopped — goes above the input line and leaves
 what you were typing alone.
+
+Evaluations, variable inspection, and completion run asynchronously. A pending
+request is shown as `evaluating…`, `inspecting…`, or `completing…` beside the
+session state. You can switch panes, browse source, search the transcript, or
+hide the console while it runs. Submitted evaluations run in order, in the
+frame selected when each was submitted; their output leaves unfinished input
+alone. Queued inspections and late replies are discarded when the session ends.
+Finish pending inspections before stepping or continuing. A completion reply is
+discarded if you have changed the input, cursor, frame, or focused pane.
 
 An empty line only repeats what the console itself last ran, never an entry of
 the history, which is shared with the eval prompt and kept between sessions.
@@ -190,6 +209,7 @@ in the debug menu:
 | `?`, `??`                                | The selected frame's local variables; `??` every scope     |
 | `expr?`, `expr??`                        | The members of a value, one level; `??` adds special and function members |
 | `p expr`, `pp expr`                      | Evaluate; `pp` lays the value out over several lines       |
+| `h`, `help`                             | Show console commands and navigation help, even without a session |
 | `q`, `quit`, `exit`, `quit()`, `exit()`  | End the session by disconnecting: a launched program is stopped, an attached one keeps running |
 | `!stmt`                                  | Evaluate even what looks like a command, e.g. `!n` for a variable `n` |
 | anything else                            | Evaluate or execute it in the selected frame               |

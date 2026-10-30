@@ -2154,17 +2154,7 @@ fn debug_eval(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> a
         return Ok(());
     }
 
-    if let Some(debugger) = cx.editor.debug_adapters.get_active_client() {
-        let frame_id = match debugger.current_stack_frame() {
-            Some(frame) => frame.id,
-            None => bail!("Cannot find current stack frame to access variables"),
-        };
-
-        // TODO: support no frame_id
-
-        let response = helix_lsp::block_on(debugger.eval(args.join(" "), Some(frame_id)))?;
-        cx.editor.set_status(response.result);
-    }
+    dap::start_evaluation(cx.editor, cx.jobs, &args.join(" "));
     Ok(())
 }
 
@@ -2191,6 +2181,17 @@ fn debug_console_toggle(
     }
 
     dap::console::toggle(cx.editor);
+    Ok(())
+}
+
+fn debug_console_hide(
+    cx: &mut compositor::Context,
+    _args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event == PromptEvent::Validate {
+        cx.editor.dap_console_hide();
+    }
     Ok(())
 }
 
@@ -3830,8 +3831,19 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     TypableCommand {
         name: "debug-console-toggle",
         aliases: &[],
-        doc: "Open the debug console, or close it when it has focus.",
+        doc: "Show or hide the debug console, keeping its transcript.",
         fun: debug_console_toggle,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "debug-console-hide",
+        aliases: &[],
+        doc: "Hide the debug console, keeping its transcript.",
+        fun: debug_console_hide,
         completer: CommandCompleter::none(),
         signature: Signature {
             positionals: (0, Some(0)),

@@ -28,7 +28,7 @@ use helix_core::{
 };
 use helix_view::{
     annotations::diagnostics::DiagnosticFilter,
-    document::{Mode, SCRATCH_BUFFER_NAME},
+    document::Mode,
     editor::{CompleteAction, CursorShapeConfig},
     graphics::{Color, CursorKind, Modifier, Rect, Style},
     input::{KeyEvent, MouseButton, MouseEvent, MouseEventKind},
@@ -39,7 +39,6 @@ use std::{
     mem::take,
     num::NonZeroUsize,
     ops,
-    path::PathBuf,
     rc::Rc,
     time::{Duration, Instant},
 };
@@ -68,6 +67,8 @@ pub struct EditorView {
     /// Whether the debug console had focus at the last look, to tell focus moving
     /// into or out of it from a sticky menu entered while inside.
     console_had_focus: bool,
+    /// Temporarily suspends the debug menu for an ordinary window command.
+    window_sticky: Option<KeyTrieNode>,
 }
 
 #[derive(Debug, Clone)]
@@ -104,6 +105,7 @@ impl EditorView {
             terminal_focused: true,
             parked_sticky: None,
             console_had_focus: false,
+            window_sticky: None,
         }
     }
 
@@ -759,7 +761,6 @@ impl EditorView {
 
     /// Render bufferline at the top
     pub fn render_bufferline(editor: &Editor, viewport: Rect, surface: &mut Surface) {
-        let scratch = PathBuf::from(SCRATCH_BUFFER_NAME); // default filename to use for scratch buffer
         surface.clear_with(
             viewport,
             editor
@@ -784,11 +785,9 @@ impl EditorView {
         for doc in editor.documents() {
             let fname = doc
                 .path()
-                .unwrap_or(&scratch)
-                .file_name()
-                .unwrap_or_default()
-                .to_str()
-                .unwrap_or_default();
+                .and_then(|path| path.file_name())
+                .map(|name| name.to_string_lossy())
+                .unwrap_or_else(|| doc.display_name());
 
             let style = if current_doc == doc.id() {
                 bufferline_active
@@ -1065,7 +1064,26 @@ impl EditorView {
     ) -> Option<KeymapResult> {
         let mut last_mode = mode;
         self.pseudo_pending.extend(self.keymaps.pending());
+        if event == ctrl!('w')
+            && self.keymaps.pending().is_empty()
+            && self
+                .keymaps
+                .sticky
+                .as_ref()
+                .is_some_and(Self::is_debug_menu)
+        {
+            self.window_sticky = self.keymaps.sticky.take();
+        }
         let key_result = self.keymaps.get(mode, event);
+        if self.keymaps.pending().is_empty() {
+            if let Some(sticky) = self.window_sticky.take() {
+                if cxt.editor.is_dap_console_focused() {
+                    self.parked_sticky = Some(sticky);
+                } else {
+                    self.keymaps.sticky = Some(sticky);
+                }
+            }
+        }
         cxt.editor.autoinfo = self.keymaps.sticky().map(|node| node.infobox());
 
         let mut execute_command = |command: &commands::MappableCommand| {
@@ -1139,24 +1157,45 @@ impl EditorView {
         self.console_had_focus = focused;
     }
 
-    /// Whether `key` opens and closes the debug console. It is bound in the debug
-    /// menu, so that is where to look -- a rebinding there moves both ends.
+    /// The console focus or visibility command bound to `key` in the debug menu.
+    /// A rebinding there is honored from the console too.
     ///
     /// A toggle bound to a plain character, `x` say, is text while typing: it only
     /// closes the console from normal mode.
-    fn is_dap_console_toggle(&self, mode: Mode, key: KeyEvent) -> bool {
+    fn dap_console_key_command(
+        &self,
+        mode: Mode,
+        key: KeyEvent,
+    ) -> Option<commands::MappableCommand> {
         if mode == Mode::Insert && matches!(key.code, KeyCode::Char(_)) && key.modifiers.is_empty()
         {
-            return false;
+            return None;
         }
-        let is_toggle = |node: &KeyTrieNode| matches!(node.get(&key), Some(KeyTrie::MappableCommand(cmd)) if cmd.name() == "dap_console_toggle");
+        let command = |node: &KeyTrieNode| match node.get(&key) {
+            Some(KeyTrie::MappableCommand(cmd))
+                if matches!(
+                    cmd.name(),
+                    "dap_console_focus" | "dap_console_toggle" | "dap_console_hide"
+                ) =>
+            {
+                Some(cmd.clone())
+            }
+            _ => None,
+        };
         match &self.parked_sticky {
-            Some(node) => is_toggle(node),
+            Some(node) => command(node),
             None => self.keymaps.map()[&Mode::Normal]
                 .search(&[key!(' '), key!('G')])
                 .and_then(KeyTrie::node)
-                .is_some_and(is_toggle),
+                .and_then(command),
         }
+    }
+
+    fn is_debug_menu(node: &KeyTrieNode) -> bool {
+        node.iter().any(|(_, command)| {
+            matches!(command,
+            KeyTrie::MappableCommand(cmd) if cmd.name() == "dap_continue")
+        })
     }
 
     /// The keys that belong to the debug console rather than to editing: the
@@ -1170,11 +1209,20 @@ impl EditorView {
     ) -> bool {
         use commands::dap::console;
 
-        if self.is_dap_console_toggle(mode, key) {
+        let focused = cx.editor.is_dap_console_focused();
+        if let Some(command) = self.dap_console_key_command(mode, key).filter(|command| {
+            self.keymaps.pending().is_empty()
+                && self.on_next_key.is_none()
+                && (focused
+                    || (mode != Mode::Insert
+                        && command.name() == "dap_console_focus"
+                        && cx.editor.is_dap_console_visible()
+                        && self.keymaps.sticky.as_ref().is_none_or(Self::is_debug_menu)))
+        }) {
             if self.completion.is_some() {
                 self.clear_completion(cx.editor);
             }
-            commands::dap_console_toggle(cx);
+            command.execute(cx);
             let new_mode = cx.editor.mode();
             if new_mode != mode {
                 helix_event::dispatch(OnModeSwitch {
@@ -1184,6 +1232,9 @@ impl EditorView {
                 });
             }
             return true;
+        }
+        if !focused {
+            return false;
         }
         // Keys a half-typed command is waiting for, e.g. the register after `C-r`,
         // are not the console's, nor are those of a sticky menu opened in it.
@@ -1222,7 +1273,7 @@ impl EditorView {
                 true
             }
             (Mode::Insert, key!(Tab)) if console::on_input_line(cx.editor) => {
-                self.complete_in_dap_console(cx.editor);
+                self.complete_in_dap_console(cx.editor, cx.jobs);
                 true
             }
             (Mode::Insert, key) if key.char().is_some() => {
@@ -1239,17 +1290,60 @@ impl EditorView {
 
     /// `Tab` on the debug console's input line: complete from the debug adapter. A
     /// single candidate is taken straight away; several open the completion menu.
-    fn complete_in_dap_console(&mut self, editor: &mut Editor) {
-        use helix_core::completion::CompletionProvider;
-        use helix_view::handlers::completion::ResponseContext;
-
-        let items = match commands::dap::console::completions(editor) {
-            Ok(items) => items,
+    fn complete_in_dap_console(&mut self, editor: &mut Editor, jobs: &mut crate::job::Jobs) {
+        use commands::dap::{console::CompletionRequest, spawn_inspection};
+        let request = match CompletionRequest::new(editor) {
+            Ok(request) => request,
             Err(err) => {
                 editor.set_error(err.to_string());
                 return;
             }
         };
+        let adapter = request.adapter;
+        let handle = request.requests.clone();
+        let args = helix_dap::requests::CompletionsArguments {
+            frame_id: request.frame_id,
+            text: request.input.clone(),
+            column: request.column,
+            line: None,
+        };
+        spawn_inspection(
+            editor,
+            jobs,
+            adapter,
+            "completing…",
+            None,
+            async move {
+                Ok(handle
+                    .request::<helix_dap::requests::Completions>(args)
+                    .await?
+                    .targets)
+            },
+            move |editor, compositor, result| {
+                if !request.is_current(editor) {
+                    return;
+                }
+                match result {
+                    Ok(targets) => {
+                        let items = request.items(editor, targets);
+                        let ui = compositor.find::<EditorView>().unwrap();
+                        if ui.completion.is_none() {
+                            ui.apply_dap_console_completions(editor, items);
+                        }
+                    }
+                    Err(err) => editor.set_error(err.to_string()),
+                }
+            },
+        );
+    }
+
+    fn apply_dap_console_completions(
+        &mut self,
+        editor: &mut Editor,
+        items: Vec<helix_core::CompletionItem>,
+    ) {
+        use helix_core::completion::CompletionProvider;
+        use helix_view::handlers::completion::ResponseContext;
 
         let (view, doc) = current!(editor);
         match items.len() {
@@ -2145,8 +2239,7 @@ impl Component for EditorView {
                 let mode = cx.editor.mode();
 
                 self.sync_dap_console_sticky(cx.editor);
-                let console_key = cx.editor.is_dap_console_focused()
-                    && self.handle_dap_console_key(&mut cx, mode, key);
+                let console_key = self.handle_dap_console_key(&mut cx, mode, key);
 
                 if !console_key && !self.on_next_key(OnKeyCallbackKind::PseudoPending, &mut cx, key)
                 {
@@ -2337,7 +2430,14 @@ impl Component for EditorView {
             self.render_view(cx.editor, doc, view, area, surface, is_focused);
         }
 
-        if config.auto_info {
+        let compact_debug = cx.editor.is_dap_console_visible()
+            && self.keymaps.pending().is_empty()
+            && self
+                .keymaps
+                .sticky
+                .as_ref()
+                .is_some_and(Self::is_debug_menu);
+        if config.auto_info && !compact_debug {
             if let Some(mut info) = cx.editor.autoinfo.take() {
                 info.render(area, surface, cx);
                 cx.editor.autoinfo = Some(info)
@@ -2346,6 +2446,29 @@ impl Component for EditorView {
 
         let key_width = 15u16; // for showing pending keys
         let mut status_msg_width = 0;
+
+        if cx.editor.status_msg.is_none() {
+            let hint = if compact_debug {
+                Some("Debug · n next · i in · o out · p eval · v vars · C-d console · C-w window · Esc browse · ? help".to_string())
+            } else if cx.editor.is_dap_console_focused() {
+                Some(match cx.editor.mode() {
+                    Mode::Insert => "Enter run · Up/Down history · Tab complete · C-d source · Esc browse · h help",
+                    _ => "i input · gF preview · C-d source · Esc source · :debug-console-hide",
+                }.to_string())
+            } else {
+                None
+            };
+            if let Some(hint) = hint {
+                let hint: String = hint.chars().take(area.width as usize).collect();
+                status_msg_width = hint.width();
+                surface.set_string(
+                    area.x,
+                    area.y + area.height.saturating_sub(1),
+                    hint,
+                    cx.editor.theme.get("ui.text.info"),
+                );
+            }
+        }
 
         // render status msg
         if let Some((status_msg, severity)) = &cx.editor.status_msg {

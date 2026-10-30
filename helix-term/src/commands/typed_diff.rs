@@ -168,10 +168,8 @@ pub(crate) fn toggle_char_diff(
         return Ok(());
     }
 
-    let (_view, doc) = current!(cx.editor);
-    doc.char_diff_enabled = !doc.char_diff_enabled;
-
-    let status = if doc.char_diff_enabled {
+    let (view, doc) = current!(cx.editor);
+    let status = if doc.toggle_char_diff(view.id) {
         "Character-level diff highlighting enabled"
     } else {
         "Character-level diff highlighting disabled"

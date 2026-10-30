@@ -1416,6 +1416,11 @@ impl Default for SearchConfig {
     }
 }
 
+enum PreparedGitRevision {
+    Existing(DocumentId),
+    New(Box<Document>),
+}
+
 /// Represents a diff range between two git references.
 #[derive(Debug, Clone)]
 pub struct DiffRange {
@@ -3074,6 +3079,7 @@ impl Editor {
 
     pub fn map_line_between_documents(
         &self,
+        source_view_id: ViewId,
         source_doc_id: DocumentId,
         target_doc_id: DocumentId,
         source_line: usize,
@@ -3085,12 +3091,11 @@ impl Editor {
             return source_line;
         };
 
-        let mapped_line = if let Some(source_diff) = source_doc.diff_handle() {
+        let mapped_line = if let Some(source_diff) = source_doc.diff_handle_for_view(source_view_id)
+        {
             let mut inverted = source_diff.clone();
             inverted.invert();
             Self::map_line_before_to_after(source_line, &inverted)
-        } else if let Some(target_diff) = target_doc.diff_handle() {
-            Self::map_line_before_to_after(source_line, target_diff)
         } else {
             source_line
         };
@@ -3147,7 +3152,7 @@ impl Editor {
                 return;
             };
 
-            if let Some(source_diff) = source_doc.diff_handle() {
+            if let Some(source_diff) = source_doc.diff_handle_for_view(source_view_id) {
                 Self::map_view_offset_using_diff(
                     source_doc,
                     target_doc,
@@ -3155,7 +3160,7 @@ impl Editor {
                     source_diff,
                     true,
                 )
-            } else if let Some(target_diff) = target_doc.diff_handle() {
+            } else if let Some(target_diff) = target_doc.diff_handle_for_view(target_view_id) {
                 Self::map_view_offset_using_diff(
                     source_doc,
                     target_doc,
@@ -3228,26 +3233,23 @@ impl Editor {
         path: &Path,
         git_ref: &str,
     ) -> Result<DocumentId, Error> {
+        let prepared = self.prepare_git_revision_doc(path, git_ref)?;
+        Ok(self.commit_git_revision_doc(prepared, None))
+    }
+
+    /// Fetch and decode a snapshot without changing buffers, views, or suspended diffs.
+    fn prepare_git_revision_doc(
+        &self,
+        path: &Path,
+        git_ref: &str,
+    ) -> Result<PreparedGitRevision, Error> {
         // `HEAD` or a branch may have moved on since a snapshot of it was read.
         // Only one of the commit it names now will do. The snapshot keeps the
         // commit it was read from, so one already open is never wrong as such.
         let commit = self.diff_providers.resolve_commit_id(path, git_ref);
         let snapshots = self.virtual_documents_by_revision(path, git_ref, commit.as_deref());
         if let Some(&(id, _)) = snapshots.iter().find(|(_, current)| *current) {
-            return Ok(id);
-        }
-        // The old ones go when nothing shows them, or there would be two
-        // buffers of the same name in the buffer list, one of them out of date.
-        for (id, _) in snapshots {
-            let in_use = self.tree.views().any(|(view, _)| view.doc == id)
-                || self
-                    .diff
-                    .views
-                    .values()
-                    .any(|state| state.base_doc_id == id || state.working_doc_id == id);
-            if !in_use {
-                let _ = self.close_document(id, true);
-            }
+            return Ok(PreparedGitRevision::Existing(id));
         }
         // Read from the commit just resolved, so the text is that commit's even
         // if the ref moves again in between.
@@ -3261,7 +3263,40 @@ impl Editor {
             self.config.clone(),
             self.syn_loader.clone(),
         )?;
-        Ok(self.insert_git_revision_document(doc))
+        Ok(PreparedGitRevision::New(Box::new(doc)))
+    }
+
+    fn commit_git_revision_doc(
+        &mut self,
+        prepared: PreparedGitRevision,
+        keep_document: Option<DocumentId>,
+    ) -> DocumentId {
+        let doc = match prepared {
+            PreparedGitRevision::Existing(id) => return id,
+            PreparedGitRevision::New(doc) => doc,
+        };
+        let revision = doc.git_revision.as_ref().unwrap();
+        let snapshots = self.virtual_documents_by_revision(
+            &revision.path,
+            &revision.git_ref,
+            revision.commit.as_deref(),
+        );
+        // Both sides may have prepared the same snapshot before either was published.
+        if let Some(&(id, _)) = snapshots.iter().find(|(_, current)| *current) {
+            return id;
+        }
+        for (id, _) in snapshots {
+            let in_use = self.tree.views().any(|(view, _)| view.doc == id)
+                || self
+                    .diff
+                    .views
+                    .values()
+                    .any(|state| state.base_doc_id == id || state.working_doc_id == id);
+            if !in_use && Some(id) != keep_document {
+                let _ = self.close_document(id, true);
+            }
+        }
+        self.insert_git_revision_document(*doc)
     }
 
     fn insert_git_revision_document(&mut self, doc: Document) -> DocumentId {
@@ -3321,6 +3356,24 @@ impl Editor {
         }
     }
 
+    fn register_diff_view(&mut self, state: crate::diff_view::DiffViewState) {
+        let base = self.documents[&state.base_doc_id].text().clone();
+        let working = self.documents[&state.working_doc_id].text().clone();
+        let working_handle = helix_vcs::DiffHandle::new(base, working);
+        let mut base_handle = working_handle.clone();
+        base_handle.invert();
+        self.documents
+            .get_mut(&state.base_doc_id)
+            .unwrap()
+            .set_view_diff(state.base_view_id, base_handle);
+        self.documents
+            .get_mut(&state.working_doc_id)
+            .unwrap()
+            .set_view_diff(state.working_view_id, working_handle);
+        self.diff.views.insert(state.base_view_id, state.clone());
+        self.diff.views.insert(state.working_view_id, state);
+    }
+
     /// Close the other views without dropping buffers the new diff will use.
     /// Link those buffers only after this teardown, which can reset their diffs.
     fn close_other_views_for_diff(&mut self, base_doc_id: DocumentId, working_doc_id: DocumentId) {
@@ -3367,12 +3420,7 @@ impl Editor {
             anyhow::bail!("Diff views aren't available for encrypted files");
         }
 
-        let focused_view = self.tree.focus;
-        self.forget_suspended_diffs(focused_view);
-        if self.diff.views.contains_key(&focused_view) {
-            self.detach_diff_view(focused_view);
-        }
-
+        let base_revision = self.prepare_git_revision_doc(&base_path, git_ref)?;
         // A file deleted from the working tree has nothing to open: `open`
         // would make a new, writable buffer at the path, and `:w` would bring
         // the file back. Show it as an empty read-only pane instead.
@@ -3397,15 +3445,19 @@ impl Editor {
             self.open(&working_path, Action::Load)?
         };
 
-        let base_doc_id = self.get_or_create_git_revision_doc(&base_path, git_ref)?;
+        let base_doc_id = self.commit_git_revision_doc(base_revision, Some(working_doc_id));
+
+        let focused_view = self.tree.focus;
+        self.forget_suspended_diffs(focused_view);
+        if self.diff.views.contains_key(&focused_view) {
+            self.detach_diff_view(focused_view);
+        }
 
         let split_view_override = split_view_override.or(self.diff.split_view_override);
         let split_view = split_view_override.unwrap_or_else(|| self.config().diff.split_view);
         if split_view {
             self.close_other_views_for_diff(base_doc_id, working_doc_id);
         }
-        self.link_shared_diff_handles(base_doc_id, working_doc_id);
-
         if split_view {
             self.switch(base_doc_id, Action::Replace);
             let base_view_id = self.tree.focus;
@@ -3426,8 +3478,7 @@ impl Editor {
             )
             .close_base_doc_on_close();
             diff_state.close_working_doc_on_close = working_is_virtual;
-            self.diff.views.insert(base_view_id, diff_state.clone());
-            self.diff.views.insert(working_view_id, diff_state);
+            self.register_diff_view(diff_state);
         } else {
             self.switch(working_doc_id, Action::Replace);
             let working_view_id = self.tree.focus;
@@ -3446,7 +3497,7 @@ impl Editor {
             )
             .close_base_doc_on_close();
             diff_state.close_working_doc_on_close = working_is_virtual;
-            self.diff.views.insert(working_view_id, diff_state);
+            self.register_diff_view(diff_state);
         }
 
         Ok(())
@@ -3953,12 +4004,6 @@ impl Editor {
             anyhow::bail!("Diff views aren't available for encrypted files");
         }
 
-        let focused_view = self.tree.focus;
-        self.forget_suspended_diffs(focused_view);
-        if self.diff.views.contains_key(&focused_view) {
-            self.detach_diff_view(focused_view);
-        }
-
         let split_view_override = split_view_override.or(self.diff.split_view_override);
 
         match target_ref {
@@ -3969,8 +4014,21 @@ impl Editor {
                 split_view_override,
             ),
             Some(target) => {
-                let base_doc_id = self.get_or_create_git_revision_doc(&base_path, base_ref)?;
-                let target_doc_id = self.get_or_create_git_revision_doc(&target_path, target)?;
+                let base = self.prepare_git_revision_doc(&base_path, base_ref)?;
+                let target_revision = self.prepare_git_revision_doc(&target_path, target)?;
+                let keep_target = match &target_revision {
+                    PreparedGitRevision::Existing(id) => Some(*id),
+                    PreparedGitRevision::New(_) => None,
+                };
+                let base_doc_id = self.commit_git_revision_doc(base, keep_target);
+                let target_doc_id =
+                    self.commit_git_revision_doc(target_revision, Some(base_doc_id));
+
+                let focused_view = self.tree.focus;
+                self.forget_suspended_diffs(focused_view);
+                if self.diff.views.contains_key(&focused_view) {
+                    self.detach_diff_view(focused_view);
+                }
 
                 let split_view =
                     split_view_override.unwrap_or_else(|| self.config().diff.split_view);
@@ -3978,8 +4036,6 @@ impl Editor {
                 if split_view {
                     self.close_other_views_for_diff(base_doc_id, target_doc_id);
                 }
-                self.link_shared_diff_handles(base_doc_id, target_doc_id);
-
                 if split_view {
                     self.switch(base_doc_id, Action::Replace);
                     let base_view_id = self.tree.focus;
@@ -4000,8 +4056,7 @@ impl Editor {
                     )
                     .close_base_doc_on_close()
                     .close_working_doc_on_close();
-                    self.diff.views.insert(base_view_id, diff_state.clone());
-                    self.diff.views.insert(target_view_id, diff_state);
+                    self.register_diff_view(diff_state);
                 } else {
                     self.switch(target_doc_id, Action::Replace);
                     let target_view_id = self.tree.focus;
@@ -4020,7 +4075,7 @@ impl Editor {
                     )
                     .close_base_doc_on_close()
                     .close_working_doc_on_close();
-                    self.diff.views.insert(target_view_id, diff_state);
+                    self.register_diff_view(diff_state);
                 }
 
                 Ok(())
@@ -4079,8 +4134,6 @@ impl Editor {
         if split_view {
             self.close_other_views_for_diff(base_doc_id, working_doc_id);
         }
-        self.link_shared_diff_handles(base_doc_id, working_doc_id);
-
         // Review threads are keyed by these paths. Leaving them empty stored
         // every buffer-diff comment under PathBuf::new(), so unrelated pairs
         // collided and the threads vanished once the diff closed.
@@ -4104,8 +4157,7 @@ impl Editor {
             )
             .with_reopen(base_path, working_path, String::new(), None)
             .with_buffer_reopen();
-            self.diff.views.insert(base_view_id, diff_state.clone());
-            self.diff.views.insert(working_view_id, diff_state);
+            self.register_diff_view(diff_state);
         } else {
             self.switch(working_doc_id, Action::Replace);
             let working_view_id = self.tree.focus;
@@ -4118,7 +4170,7 @@ impl Editor {
             )
             .with_reopen(base_path, working_path, String::new(), None)
             .with_buffer_reopen();
-            self.diff.views.insert(working_view_id, diff_state);
+            self.register_diff_view(diff_state);
         }
 
         Ok(())
@@ -4183,6 +4235,7 @@ impl Editor {
     /// source line.
     pub fn map_position_between_documents(
         &self,
+        source_view_id: ViewId,
         source_doc_id: DocumentId,
         target_doc_id: DocumentId,
         source_pos: usize,
@@ -4197,8 +4250,12 @@ impl Editor {
         let source_line_start = source_text.line_to_char(source_line);
         let source_col = source_pos.saturating_sub(source_line_start);
 
-        let target_line =
-            self.map_line_between_documents(source_doc_id, target_doc_id, source_line);
+        let target_line = self.map_line_between_documents(
+            source_view_id,
+            source_doc_id,
+            target_doc_id,
+            source_line,
+        );
         let target_line_start = target_text.line_to_char(target_line);
         let target_line_end =
             target_text.line_to_char((target_line + 1).min(target_text.len_lines()));
@@ -4251,9 +4308,7 @@ impl Editor {
                 return false;
             }
             self.diff.suspended.remove(index);
-            self.link_shared_diff_handles(state.base_doc_id, state.working_doc_id);
-            self.diff.views.insert(state.base_view_id, state.clone());
-            self.diff.views.insert(state.working_view_id, state);
+            self.register_diff_view(state);
             self.ensure_cursor_in_view(view_id);
             return true;
         }
@@ -4280,8 +4335,6 @@ impl Editor {
             return false;
         }
         self.diff.suspended.remove(index);
-        self.link_shared_diff_handles(base_doc_id, doc_id);
-
         let was_split = state.is_split();
         state.base_doc_id = base_doc_id;
         state.working_doc_id = doc_id;
@@ -4296,7 +4349,12 @@ impl Editor {
             self.tree.swap_split_in_direction(tree::Direction::Left);
             self.focus(view_id);
             state.base_view_id = base_view_id;
+        }
 
+        let base_view_id = state.base_view_id;
+        self.register_diff_view(state);
+
+        if was_split {
             // The new pane starts at the top of its buffer. Put its cursor
             // level with the working pane's: with its scroll following the
             // working pane's below, a cursor left at the top would pull the
@@ -4307,15 +4365,13 @@ impl Editor {
                     .cursor(doc.text().slice(..))
             });
             let mapped = cursor.and_then(|cursor| {
-                self.map_position_between_documents(doc_id, base_doc_id, cursor)
+                self.map_position_between_documents(view_id, doc_id, base_doc_id, cursor)
             });
             if let (Some(mapped), Some(base_doc)) = (mapped, self.document_mut(base_doc_id)) {
                 base_doc.set_selection(base_view_id, Selection::point(mapped));
             }
         }
 
-        self.diff.views.insert(state.base_view_id, state.clone());
-        self.diff.views.insert(view_id, state);
         // Narrower than it was, and the base pane's scroll is not set yet.
         self.ensure_cursor_in_view(view_id);
         true
@@ -4341,53 +4397,16 @@ impl Editor {
         }
     }
 
-    /// Undo what opening the diff did to its two documents, so that neither
-    /// keeps its diff colouring once it is no longer part of the diff.
+    /// Release only this comparison's handles; other views and the buffer's
+    /// ordinary Git diff keep their own workers.
     fn unlink_diff_documents(&mut self, diff_state: &crate::diff_view::DiffViewState) {
-        for doc_id in [diff_state.base_doc_id, diff_state.working_doc_id] {
-            // The same file diffed against the same ref in another view shares
-            // these buffers. That diff still needs them as they are.
-            let in_another_diff = self
-                .diff
-                .views
-                .values()
-                .any(|other| other.base_doc_id == doc_id || other.working_doc_id == doc_id);
-            if !in_another_diff {
-                self.restore_own_diff(doc_id);
+        for (doc_id, view_id) in [
+            (diff_state.base_doc_id, diff_state.base_view_id),
+            (diff_state.working_doc_id, diff_state.working_view_id),
+        ] {
+            if let Some(doc) = self.documents.get_mut(&doc_id) {
+                doc.clear_view_diff(view_id);
             }
-        }
-    }
-
-    /// Put a document back on the diff it has on its own: a file against HEAD,
-    /// or the ref `:diff-base` set, and nothing for a revision or a scratch
-    /// buffer.
-    ///
-    /// Its handle is the worker the diff shares between both sides. Giving that
-    /// one a new base would change the other side's diff too, and leaving it
-    /// kept the file diffed against the other buffer, or a commit no longer on
-    /// screen, with nothing to show for it.
-    fn restore_own_diff(&mut self, doc_id: DocumentId) {
-        let Some(doc) = self.documents.get_mut(&doc_id) else {
-            return;
-        };
-        doc.linked_diff_doc = None;
-        doc.char_diff_enabled = false;
-        doc.char_diff_minus_side = false;
-        let base_ref = doc.diff_base_ref().map(str::to_owned);
-        doc.clear_diff_handle();
-        if doc.is_virtual_base {
-            return;
-        }
-        let Some(path) = doc.path().cloned() else {
-            return;
-        };
-        if let Some(base_ref) = base_ref {
-            if doc.set_diff_base_from_ref(base_ref).is_ok() {
-                return;
-            }
-        }
-        if let Some(diff_base) = self.diff_providers.get_diff_base(&path) {
-            doc.set_diff_base(diff_base);
         }
     }
 

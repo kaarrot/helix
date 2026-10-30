@@ -3262,7 +3262,8 @@ fn extend_line_impl(cx: &mut Context, extend: Extend) {
                 .min(text.len_lines()),
         );
         // a folded block counts as part of its header line
-        let lines = helix_core::fold::grow_over_folds(folds, text.slice(..), Range::new(start, end));
+        let lines =
+            helix_core::fold::grow_over_folds(folds, text.slice(..), Range::new(start, end));
         let (start, end) = (lines.from(), lines.to());
         let (start_line, end_line) = lines.line_range(text.slice(..));
 
@@ -4505,7 +4506,7 @@ fn goto_last_change(cx: &mut Context) {
 fn goto_first_change_impl(cx: &mut Context, reverse: bool) {
     let editor = &mut cx.editor;
     let (view, doc) = current!(editor);
-    if let Some(handle) = doc.diff_handle() {
+    if let Some(handle) = doc.diff_handle_for_view(view.id) {
         let hunk = {
             let diff = handle.load();
             let idx = if reverse {
@@ -4537,7 +4538,7 @@ fn goto_next_change_impl(cx: &mut Context, direction: Direction) {
         let (view, doc) = current!(editor);
         let in_diff_view = editor.diff.views.contains_key(&view.id);
         let doc_text = doc.text().slice(..);
-        let diff_handle = if let Some(diff_handle) = doc.diff_handle() {
+        let diff_handle = if let Some(diff_handle) = doc.diff_handle_for_view(view.id) {
             diff_handle
         } else {
             editor.set_status("Diff is not available in current buffer");
@@ -4598,7 +4599,7 @@ fn goto_next_change_impl(cx: &mut Context, direction: Direction) {
             let (view, doc) = current!(cx.editor);
             let text = doc.text().slice(..);
             let cursor_line = doc.selection(view.id).primary().cursor_line(text);
-            let source_hunk_idx = doc.diff_handle().and_then(|dh| {
+            let source_hunk_idx = doc.diff_handle_for_view(view.id).and_then(|dh| {
                 let diff = dh.load();
                 diff.hunk_at(cursor_line as u32, true)
             });
@@ -4612,7 +4613,7 @@ fn goto_next_change_impl(cx: &mut Context, direction: Direction) {
 
         let mapped_line =
             cx.editor
-                .map_line_between_documents(source_doc_id, other_doc_id, cursor_line);
+                .map_line_between_documents(view_id, source_doc_id, other_doc_id, cursor_line);
 
         let target_line = {
             let Some(other_doc) = cx.editor.documents.get(&other_doc_id) else {
@@ -4620,7 +4621,7 @@ fn goto_next_change_impl(cx: &mut Context, direction: Direction) {
                 return;
             };
             let mut target_line = mapped_line.min(other_doc.text().len_lines().saturating_sub(1));
-            if let Some(target_dh) = other_doc.diff_handle() {
+            if let Some(target_dh) = other_doc.diff_handle_for_view(other_view_id) {
                 let target_diff = target_dh.load();
                 let target_hunk_idx = source_hunk_idx
                     .filter(|&idx| idx < target_diff.len())
@@ -6598,13 +6599,13 @@ fn select_textobject(cx: &mut Context, objtype: textobject::TextObject) {
                     )
                 };
 
-                if ch == 'g' && doc.diff_handle().is_none() {
+                if ch == 'g' && doc.diff_handle_for_view(view.id).is_none() {
                     editor.set_status("Diff is not available in current buffer");
                     return;
                 }
 
                 let textobject_change = |range: Range| -> Range {
-                    let diff_handle = doc.diff_handle().unwrap();
+                    let diff_handle = doc.diff_handle_for_view(view.id).unwrap();
                     let diff = diff_handle.load();
                     let line = range.cursor_line(text);
                     let hunk_idx = if let Some(hunk_idx) = diff.hunk_at(line as u32, false) {

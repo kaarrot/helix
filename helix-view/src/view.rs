@@ -831,7 +831,7 @@ impl View {
                 diff_state.base_doc_id
             };
             if documents.contains_key(&other_doc_id) {
-                if let Some(diff_handle) = doc.diff_handle() {
+                if let Some(diff_handle) = doc.diff_handle_for_view(self.id) {
                     builder.add_diff_spacers(diff_handle);
                 }
             }

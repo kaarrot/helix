@@ -739,11 +739,13 @@ fn capture_diff_toggle_position(
 
     let cursor = selection.primary().cursor(doc.text().slice(..));
     let target_cursor = editor.map_position_between_documents(
+        view_id,
         diff_state.base_doc_id,
         diff_state.working_doc_id,
         cursor,
     )?;
     let target_anchor = editor.map_position_between_documents(
+        view_id,
         diff_state.base_doc_id,
         diff_state.working_doc_id,
         view_offset.anchor,
@@ -783,8 +785,10 @@ fn restore_diff_toggle_position(editor: &mut Editor, position: DiffTogglePositio
     let paired_position = paired.and_then(|(paired_doc_id, paired_view_id)| {
         let doc = editor.document(doc_id)?;
         let cursor = position.selection.primary().cursor(doc.text().slice(..));
-        let mapped_cursor = editor.map_position_between_documents(doc_id, paired_doc_id, cursor)?;
+        let mapped_cursor =
+            editor.map_position_between_documents(view_id, doc_id, paired_doc_id, cursor)?;
         let mapped_anchor = editor.map_position_between_documents(
+            view_id,
             doc_id,
             paired_doc_id,
             position.view_offset.anchor,
@@ -825,15 +829,13 @@ pub fn diff_toggle_split_view(cx: &mut Context) {
     };
     let was_split = diff_state.base_view_id != diff_state.working_view_id;
     let new_split = !was_split;
+    let history = cx.editor.tree.get(view_id).docs_access_history.clone();
     let position = capture_diff_toggle_position(&cx.editor, view_id, &diff_state, new_split);
 
     let base_path = diff_state.base_path.clone();
     let working_path = diff_state.working_path.clone();
     let base_ref = diff_state.base_ref.clone();
     let target_ref = diff_state.target_ref.clone();
-
-    cx.editor.diff.split_view_override = Some(new_split);
-    cx.editor.close_diff_view(view_id);
 
     let result = match diff_state.source {
         helix_view::diff_view::DiffViewSource::Git => {
@@ -860,6 +862,29 @@ pub fn diff_toggle_split_view(cx: &mut Context) {
         cx.editor
             .set_error(format!("Failed to toggle split view: {e}"));
         return;
+    }
+    cx.editor.diff.split_view_override = Some(new_split);
+    // A new working pane inherits the buffers the original pane could return
+    // to, including the ordinary file behind a read-only revision.
+    let working_view = cx.editor.diff.views[&cx.editor.tree.focus].working_view_id;
+    let history: Vec<_> = history
+        .into_iter()
+        .filter(|id| cx.editor.documents.contains_key(id))
+        .collect();
+    let view = cx.editor.tree.get_mut(working_view);
+    for doc in history {
+        if doc != view.doc {
+            view.add_to_history(doc);
+        }
+    }
+    // Starting from the base pane leaves the old working pane in place when
+    // the comparison is detached. A successful collapse no longer needs it.
+    if was_split
+        && !new_split
+        && diff_state.working_view_id != working_view
+        && cx.editor.tree.contains(diff_state.working_view_id)
+    {
+        cx.editor.close(diff_state.working_view_id);
     }
     if let Some(position) = position {
         restore_diff_toggle_position(&mut cx.editor, position);

@@ -351,16 +351,17 @@ fn paint_comment_spans(
 /// Append character-level diff highlight spans to `overlay_highlights`.
 pub(super) fn char_diff_highlights_into(
     doc: &Document,
+    view_id: helix_view::ViewId,
     theme: &Theme,
     viewport_anchor: usize,
     viewport_height: usize,
     overlay_highlights: &mut Vec<OverlayHighlights>,
 ) {
-    if !doc.char_diff_enabled {
+    if !doc.char_diff_enabled_for_view(view_id) {
         return;
     }
 
-    let Some(diff_handle) = doc.diff_handle() else {
+    let Some(diff_handle) = doc.diff_handle_for_view(view_id) else {
         return;
     };
 
@@ -368,7 +369,7 @@ pub(super) fn char_diff_highlights_into(
     let doc_text = doc.text();
     let diff_base = diff.diff_base();
 
-    let highlight_name = if doc.char_diff_minus_side {
+    let highlight_name = if diff.is_inverted() {
         "diff.minus"
     } else {
         "diff.plus"

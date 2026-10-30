@@ -872,6 +872,7 @@ pub fn diff_toggle_split_view(cx: &mut Context) {
 }
 
 pub fn diff_reset(cx: &mut Context) {
+    cx.editor.diff.suspended.clear();
     let view_id = view!(cx.editor).id;
     if cx.editor.diff.views.contains_key(&view_id) {
         cx.editor.close_diff_view(view_id);

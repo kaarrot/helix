@@ -2140,7 +2140,7 @@ impl Editor {
     pub(crate) fn replace_document_in_view(&mut self, current_view: ViewId, doc_id: DocumentId) {
         // Every way of putting another buffer in a view comes through here, so
         // none can leave the view registered as a diff pane it no longer
-        // shows. `switch` suspends the diff first, so a jump back restores it;
+        // shows. `switch` suspends the diff first, so returning restores it;
         // the rest (closing a buffer, the debugger showing a frame) end it.
         if self.leaves_diff(current_view, doc_id) {
             self.detach_diff_view(current_view);
@@ -2155,7 +2155,8 @@ impl Editor {
         view.sync_changes(doc);
         doc.mark_as_focused();
 
-        view.ensure_cursor_in_view(doc, scrolloff)
+        view.ensure_cursor_in_view(doc, scrolloff);
+        self.resume_diff_view(current_view);
     }
 
     pub fn switch(&mut self, id: DocumentId, action: Action) {
@@ -2184,6 +2185,7 @@ impl Editor {
                         && doc.path().is_none()
                         && !doc.is_virtual_base
                         && !doc.is_transcript
+                        && !self.diff_document_is_referenced(current_doc_id)
                         && id != current_doc_id
                         && !self
                             .tree
@@ -3319,6 +3321,28 @@ impl Editor {
         }
     }
 
+    /// Close the other views without dropping buffers the new diff will use.
+    /// Link those buffers only after this teardown, which can reset their diffs.
+    fn close_other_views_for_diff(&mut self, base_doc_id: DocumentId, working_doc_id: DocumentId) {
+        let keep_documents = [base_doc_id, working_doc_id];
+        let views_to_close: Vec<ViewId> = self
+            .tree
+            .views()
+            .filter_map(|(view, focus)| (!focus).then_some(view.id))
+            .collect();
+        for view_id in views_to_close {
+            if let Some(state) = self.diff.views.get_mut(&view_id) {
+                if keep_documents.contains(&state.base_doc_id) {
+                    state.close_base_doc_on_close = false;
+                }
+                if keep_documents.contains(&state.working_doc_id) {
+                    state.close_working_doc_on_close = false;
+                }
+            }
+            self.close(view_id);
+        }
+    }
+
     pub fn open_diff_view(
         &mut self,
         path: &Path,
@@ -3374,20 +3398,15 @@ impl Editor {
         };
 
         let base_doc_id = self.get_or_create_git_revision_doc(&base_path, git_ref)?;
-        self.link_shared_diff_handles(base_doc_id, working_doc_id);
 
         let split_view_override = split_view_override.or(self.diff.split_view_override);
         let split_view = split_view_override.unwrap_or_else(|| self.config().diff.split_view);
+        if split_view {
+            self.close_other_views_for_diff(base_doc_id, working_doc_id);
+        }
+        self.link_shared_diff_handles(base_doc_id, working_doc_id);
 
         if split_view {
-            let views_to_close: Vec<ViewId> = self
-                .tree
-                .views()
-                .filter_map(|(v, focus)| if !focus { Some(v.id) } else { None })
-                .collect();
-            for view_id in views_to_close {
-                self.close(view_id);
-            }
             self.switch(base_doc_id, Action::Replace);
             let base_view_id = self.tree.focus;
             self.switch(working_doc_id, Action::VerticalSplit);
@@ -3952,21 +3971,16 @@ impl Editor {
             Some(target) => {
                 let base_doc_id = self.get_or_create_git_revision_doc(&base_path, base_ref)?;
                 let target_doc_id = self.get_or_create_git_revision_doc(&target_path, target)?;
-                self.link_shared_diff_handles(base_doc_id, target_doc_id);
 
                 let split_view =
                     split_view_override.unwrap_or_else(|| self.config().diff.split_view);
                 let display = format!("{}..{}", base_ref, target);
+                if split_view {
+                    self.close_other_views_for_diff(base_doc_id, target_doc_id);
+                }
+                self.link_shared_diff_handles(base_doc_id, target_doc_id);
 
                 if split_view {
-                    let views_to_close: Vec<ViewId> = self
-                        .tree
-                        .views()
-                        .filter_map(|(v, focus)| if !focus { Some(v.id) } else { None })
-                        .collect();
-                    for view_id in views_to_close {
-                        self.close(view_id);
-                    }
                     self.switch(base_doc_id, Action::Replace);
                     let base_view_id = self.tree.focus;
                     self.switch(target_doc_id, Action::VerticalSplit);
@@ -4060,6 +4074,11 @@ impl Editor {
             anyhow::bail!("A buffer to diff was closed with the previous diff");
         }
 
+        let split_view_override = split_view_override.or(self.diff.split_view_override);
+        let split_view = split_view_override.unwrap_or_else(|| self.config().diff.split_view);
+        if split_view {
+            self.close_other_views_for_diff(base_doc_id, working_doc_id);
+        }
         self.link_shared_diff_handles(base_doc_id, working_doc_id);
 
         // Review threads are keyed by these paths. Leaving them empty stored
@@ -4068,19 +4087,9 @@ impl Editor {
         let base_path = Self::document_review_path(self.documents.get(&base_doc_id).unwrap());
         let working_path = Self::document_review_path(self.documents.get(&working_doc_id).unwrap());
 
-        let split_view_override = split_view_override.or(self.diff.split_view_override);
-        let split_view = split_view_override.unwrap_or_else(|| self.config().diff.split_view);
         let display = format!("buffer {base_doc_id}..{working_doc_id}");
 
         if split_view {
-            let views_to_close: Vec<ViewId> = self
-                .tree
-                .views()
-                .filter_map(|(v, focus)| if !focus { Some(v.id) } else { None })
-                .collect();
-            for view_id in views_to_close {
-                self.close(view_id);
-            }
             self.enter_normal_mode();
             self.replace_document_in_view(self.tree.focus, base_doc_id);
             let base_view_id = self.tree.focus;
@@ -4126,6 +4135,15 @@ impl Editor {
             .is_some_and(|state| doc_id != state.doc_in_view(view_id))
     }
 
+    /// Active and suspended comparisons both keep their buffers alive.
+    fn diff_document_is_referenced(&self, doc_id: DocumentId) -> bool {
+        self.diff
+            .views
+            .values()
+            .chain(self.diff.suspended.iter().map(|suspended| &suspended.state))
+            .any(|state| state.base_doc_id == doc_id || state.working_doc_id == doc_id)
+    }
+
     /// Take `view_id` out of its diff because another buffer is about to be
     /// shown in it, and remember the diff.
     ///
@@ -4151,12 +4169,13 @@ impl Editor {
         self.detach_diff_view(view_id);
     }
 
-    /// Forget the diffs `view_id` was taken out of. The view starts or ends a
-    /// diff of its own, or is gone, so they are not the ones to come back to.
+    /// Forget the diffs `view_id` was taken out of, or whose base pane left
+    /// this working pane behind. Starting or ending a diff here supersedes
+    /// either kind of suspended comparison.
     fn forget_suspended_diffs(&mut self, view_id: ViewId) {
-        self.diff
-            .suspended
-            .retain(|suspended| suspended.view_id != view_id);
+        self.diff.suspended.retain(|suspended| {
+            suspended.view_id != view_id && suspended.state.working_view_id != view_id
+        });
     }
 
     /// The position in `target_doc_id` that matches `source_pos` in
@@ -4204,31 +4223,37 @@ impl Editor {
         let Some(doc_id) = self.tree.try_get(view_id).map(|view| view.doc) else {
             return false;
         };
-        let Some(index) =
-            self.diff.suspended.iter().position(|suspended| {
-                suspended.view_id == view_id && suspended.shown_doc() == doc_id
-            })
-        else {
+        let Some(index) = self.diff.suspended.iter().position(|suspended| {
+            (suspended.view_id == view_id && suspended.shown_doc() == doc_id)
+                || (suspended.view_id != suspended.state.working_view_id
+                    && suspended.state.working_view_id == view_id
+                    && suspended.state.working_doc_id == doc_id)
+        }) else {
             return false;
         };
-        let mut state = self.diff.suspended.remove(index).state;
+        let suspended = self.diff.suspended[index].clone();
+        let mut state = suspended.state;
 
-        if view_id != state.working_view_id {
-            // The base pane came back. The working pane never left the tree,
-            // unless it has since been closed or been given another diff.
-            let partner = state.working_view_id;
-            let partner_is_intact = !self.diff.views.contains_key(&partner)
-                && self
-                    .tree
-                    .try_get(partner)
-                    .is_some_and(|view| view.doc == state.working_doc_id)
-                && self.documents.contains_key(&state.working_doc_id);
-            if !partner_is_intact {
+        if suspended.view_id != state.working_view_id {
+            // Leaving the base pane keeps both views. Either may be the last
+            // to return; retain the comparison until both buffers are back.
+            let panes_are_intact = [
+                (state.base_view_id, state.base_doc_id),
+                (state.working_view_id, state.working_doc_id),
+            ]
+            .into_iter()
+            .all(|(pane, doc)| {
+                !self.diff.views.contains_key(&pane)
+                    && self.tree.try_get(pane).is_some_and(|view| view.doc == doc)
+                    && self.documents.contains_key(&doc)
+            });
+            if !panes_are_intact {
                 return false;
             }
+            self.diff.suspended.remove(index);
             self.link_shared_diff_handles(state.base_doc_id, state.working_doc_id);
-            self.diff.views.insert(view_id, state.clone());
-            self.diff.views.insert(partner, state);
+            self.diff.views.insert(state.base_view_id, state.clone());
+            self.diff.views.insert(state.working_view_id, state);
             self.ensure_cursor_in_view(view_id);
             return true;
         }
@@ -4254,6 +4279,7 @@ impl Editor {
         if base_doc_id == doc_id {
             return false;
         }
+        self.diff.suspended.remove(index);
         self.link_shared_diff_handles(base_doc_id, doc_id);
 
         let was_split = state.is_split();
@@ -4395,10 +4421,14 @@ impl Editor {
             self.forget_suspended_diffs(diff_state.working_view_id);
             self.unlink_diff_documents(&diff_state);
 
-            if diff_state.close_base_doc_on_close {
+            if diff_state.close_base_doc_on_close
+                && !self.diff_document_is_referenced(diff_state.base_doc_id)
+            {
                 let _ = self.close_document(diff_state.base_doc_id, true);
             }
-            if diff_state.close_working_doc_on_close {
+            if diff_state.close_working_doc_on_close
+                && !self.diff_document_is_referenced(diff_state.working_doc_id)
+            {
                 let _ = self.close_document(diff_state.working_doc_id, true);
             }
 

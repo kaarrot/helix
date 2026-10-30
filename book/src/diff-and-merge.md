@@ -56,6 +56,11 @@ Once a diff view is open:
 - `Space-m s` toggles synchronized scrolling between split panes. When enabled (the default), mouse wheel, `j`/`k`/arrows, page scrolling, and search keep both viewports aligned. Hunk jumps (`]g`/`[g`) still move both cursors as well.
 - `Space-m q` closes the current diff or merge view.
 
+Returning to a diff's buffer with `Space-b`, `ga`, buffer cycling, or jump history
+restores the comparison and its split setting without losing your cursor position.
+If both split panes navigate elsewhere, the diff returns when both panes show
+their original buffers again. `:diff-reset` also forgets suspended comparisons.
+
 ## Git revision buffers
 
 A range-diff (`:diff-commit REF!`, `:diff-commit REF1..REF2`, `Space-m C`)

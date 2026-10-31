@@ -1436,14 +1436,17 @@ impl DiffRange {
     pub fn parse(range_str: &str) -> anyhow::Result<Self> {
         if let Some((base, target)) = range_str.split_once("..") {
             anyhow::ensure!(
-                !base.is_empty() && !target.is_empty(),
+                !base.is_empty() && !target.is_empty() && !target.starts_with('.'),
                 "invalid range: both sides must be non-empty"
             );
             Ok(Self {
                 base_ref: base.to_string(),
                 target_ref: Some(target.to_string()),
             })
-        } else if let Some(base) = range_str.strip_suffix('!') {
+        } else if let Some(base) = range_str
+            .strip_suffix("^!")
+            .or_else(|| range_str.strip_suffix('!'))
+        {
             anyhow::ensure!(
                 !base.is_empty(),
                 "invalid range: '!' must follow a reference"
@@ -1458,6 +1461,45 @@ impl DiffRange {
                 base_ref: range_str.to_string(),
                 target_ref: None,
             })
+        }
+    }
+
+    /// Resolve range syntax that needs repository information, then validate
+    /// both endpoints before changing the editor's active range.
+    pub fn resolve(cwd: &Path, input: &str) -> anyhow::Result<Self> {
+        #[cfg(feature = "git")]
+        {
+            let range = if let Some((base, target)) = input.split_once("...") {
+                anyhow::ensure!(
+                    !base.is_empty() && !target.is_empty(),
+                    "both range endpoints are required"
+                );
+                Self {
+                    base_ref: helix_vcs::git::merge_base(cwd, base, target)?,
+                    target_ref: Some(target.to_string()),
+                }
+            } else {
+                Self::parse(input)?
+            };
+            range.validate(cwd)?;
+            Ok(range)
+        }
+        #[cfg(not(feature = "git"))]
+        {
+            let _ = (cwd, input);
+            anyhow::bail!("git support not compiled in")
+        }
+    }
+
+    pub fn validate(&self, cwd: &Path) -> anyhow::Result<()> {
+        #[cfg(feature = "git")]
+        {
+            helix_vcs::git::validate_diff_range(cwd, &self.base_ref, self.target_ref.as_deref())
+        }
+        #[cfg(not(feature = "git"))]
+        {
+            let _ = cwd;
+            anyhow::bail!("git support not compiled in")
         }
     }
 
@@ -1487,6 +1529,9 @@ mod diff_range_tests {
         assert_eq!(range.base_ref, "abc1234^");
         assert_eq!(range.target_ref.as_deref(), Some("abc1234"));
         assert_eq!(range.display(), "abc1234^..abc1234");
+        let git_style = DiffRange::parse("HEAD^!").unwrap();
+        assert_eq!(git_style.base_ref, "HEAD^");
+        assert_eq!(git_style.target_ref.as_deref(), Some("HEAD"));
     }
 
     #[test]
@@ -1508,9 +1553,12 @@ mod diff_range_tests {
     }
 }
 
-/// State for a 3-way merge session (OURS | THEIRS on top, RESULT editable below).
+/// An editable result with side snapshots and an optional base reference.
 #[derive(Debug, Clone)]
 pub struct MergeViewState {
+    pub marker_size: usize,
+    pub base_doc_id: Option<DocumentId>,
+    pub base_view_id: Option<ViewId>,
     pub ours_doc_id: DocumentId,
     pub theirs_doc_id: DocumentId,
     pub result_doc_id: DocumentId,
@@ -1518,6 +1566,20 @@ pub struct MergeViewState {
     pub theirs_view_id: ViewId,
     pub result_view_id: ViewId,
     pub sync_scroll: bool,
+    pub fingerprint: String,
+    pub stale: bool,
+    pub finished: bool,
+    pub ours_label: String,
+    pub theirs_label: String,
+    pub ours_diff: helix_vcs::DiffHandle,
+    pub theirs_diff: helix_vcs::DiffHandle,
+    pub base_diff: Option<helix_vcs::DiffHandle>,
+    pub whole_file: bool,
+    pub ours_deleted: bool,
+    pub theirs_deleted: bool,
+    pub delete_result: bool,
+    pub result_on_disk: Option<Arc<[u8]>>,
+    pub review_range: Option<DiffRange>,
     /// Tracks the last accept so a follow-up accept (e.g. ours → theirs)
     /// replaces the inserted text instead of searching for markers that
     /// no longer exist. Cleared on conflict navigation.
@@ -1525,8 +1587,22 @@ pub struct MergeViewState {
 }
 
 impl MergeViewState {
+    pub fn doc_in_view(&self, id: ViewId) -> DocumentId {
+        if id == self.ours_view_id {
+            self.ours_doc_id
+        } else if id == self.theirs_view_id {
+            self.theirs_doc_id
+        } else if Some(id) == self.base_view_id {
+            self.base_doc_id.unwrap()
+        } else {
+            self.result_doc_id
+        }
+    }
     pub fn contains_view(&self, id: ViewId) -> bool {
-        id == self.ours_view_id || id == self.theirs_view_id || id == self.result_view_id
+        id == self.ours_view_id
+            || id == self.theirs_view_id
+            || id == self.result_view_id
+            || self.base_view_id == Some(id)
     }
 }
 
@@ -2197,11 +2273,11 @@ impl Editor {
                             .traverse()
                             .any(|(_, v)| v.doc == current_doc_id && v.id != view_id);
                     let leaving_diff = self.leaves_diff(view_id, id);
-                    let leaving_merge = self.diff.merge_views.get(&view_id).is_some_and(|state| {
-                        id != state.ours_doc_id
-                            && id != state.theirs_doc_id
-                            && id != state.result_doc_id
-                    });
+                    let leaving_merge = self
+                        .diff
+                        .merge_views
+                        .get(&view_id)
+                        .is_some_and(|state| id != state.doc_in_view(view_id));
                     (view_id, remove_empty_scratch, leaving_diff, leaving_merge)
                 };
 
@@ -2247,7 +2323,7 @@ impl Editor {
                 self.replace_document_in_view(view_id, id);
 
                 if leaving_merge {
-                    self.close_merge_session_leaving_view(view_id);
+                    self.close_merge_session_leaving_view(view_id, &[id]);
                 }
 
                 dispatch(DocumentFocusLost {
@@ -2486,6 +2562,26 @@ impl Editor {
             self.close_diff_view(view_id);
         }
 
+        // Tear down merges before deciding whether to close or replace their
+        // views. `close` deliberately keeps a merge's last view alive; doing
+        // that after this decision would leave it pointing at the removed
+        // result document when it has no previous buffer.
+        let merge_views: Vec<ViewId> = self
+            .diff
+            .merge_views
+            .iter()
+            .filter(|(_, state)| {
+                state.result_doc_id == doc_id
+                    || state.ours_doc_id == doc_id
+                    || state.theirs_doc_id == doc_id
+                    || state.base_doc_id == Some(doc_id)
+            })
+            .map(|(&view_id, _)| view_id)
+            .collect();
+        for view_id in merge_views {
+            self.close_merge_view(view_id);
+        }
+
         enum Action {
             Close(ViewId),
             ReplaceDoc(ViewId, DocumentId),
@@ -2627,6 +2723,32 @@ impl Editor {
     pub fn focus(&mut self, view_id: ViewId) {
         if self.tree.focus == view_id {
             return;
+        }
+
+        // The other pane's cursor may still be where it was before several
+        // pages of synchronized scrolling. Map the active cursor before
+        // ensuring visibility, or focusing it scrolls both panes backwards.
+        if let Some(state) = self.diff.views.get(&self.tree.focus).cloned() {
+            if state.sync_scroll && state.paired_view(self.tree.focus) == Some(view_id) {
+                let source_id = self.tree.get(self.tree.focus).doc;
+                let target_id = self.tree.get(view_id).doc;
+                let source = &self.documents[&source_id];
+                let cursor = source
+                    .selection(self.tree.focus)
+                    .primary()
+                    .cursor(source.text().slice(..));
+                if let Some(pos) = self.map_position_between_documents(
+                    self.tree.focus,
+                    source_id,
+                    target_id,
+                    cursor,
+                ) {
+                    self.documents
+                        .get_mut(&target_id)
+                        .unwrap()
+                        .set_selection(view_id, Selection::point(pos));
+                }
+            }
         }
 
         // Reset mode to normal and ensure any pending changes are committed in the old document.
@@ -3104,6 +3226,60 @@ impl Editor {
     }
 
     pub fn sync_scroll_to_linked_views(&mut self, source_view_id: ViewId) {
+        if let Some(state) = self.diff.merge_views.get(&source_view_id).cloned() {
+            if !state.sync_scroll {
+                return;
+            }
+            let sides = [
+                Some((
+                    state.ours_view_id,
+                    state.ours_doc_id,
+                    state.ours_diff.clone(),
+                )),
+                Some((
+                    state.theirs_view_id,
+                    state.theirs_doc_id,
+                    state.theirs_diff.clone(),
+                )),
+                state
+                    .base_view_id
+                    .zip(state.base_doc_id)
+                    .zip(state.base_diff.clone())
+                    .map(|((view, doc), diff)| (view, doc, diff)),
+            ];
+            // BASE is a reference view. Reading it must not move the result
+            // cursor away from the conflict selected for an accept command.
+            if source_view_id != state.result_view_id && state.base_view_id != Some(source_view_id)
+            {
+                if let Some((side_view, side_doc, diff)) = sides
+                    .iter()
+                    .flatten()
+                    .find(|(id, _, _)| *id == source_view_id)
+                {
+                    self.sync_merge_pair(
+                        *side_view,
+                        *side_doc,
+                        state.result_view_id,
+                        state.result_doc_id,
+                        diff,
+                        false,
+                    );
+                }
+            }
+            for (side_view, side_doc, diff) in sides.into_iter().flatten() {
+                if side_view != source_view_id {
+                    self.sync_merge_pair(
+                        state.result_view_id,
+                        state.result_doc_id,
+                        side_view,
+                        side_doc,
+                        &diff,
+                        true,
+                    );
+                }
+            }
+            return;
+        }
         let Some(diff_state) = self.diff.views.get(&source_view_id).cloned() else {
             return;
         };
@@ -3130,11 +3306,14 @@ impl Editor {
             return;
         }
 
+        let Some(mut source_offset) =
+            self.normalize_comparison_offset(source_view_id, source_doc_id)
+        else {
+            return;
+        };
+
         let mapped_offset = {
             let Some(source_doc) = self.documents.get(&source_doc_id) else {
-                return;
-            };
-            let Some(mut source_offset) = source_doc.get_view_offset(source_view_id) else {
                 return;
             };
             // A reply row in this pane is not a code row in its partner.
@@ -3176,6 +3355,74 @@ impl Editor {
         if let Some(target_doc) = self.documents.get_mut(&target_doc_id) {
             target_doc.set_view_offset(target_view_id, mapped_offset);
         }
+    }
+
+    fn sync_merge_pair(
+        &mut self,
+        source_view: ViewId,
+        source_doc: DocumentId,
+        target_view: ViewId,
+        target_doc: DocumentId,
+        diff: &helix_vcs::DiffHandle,
+        source_is_after: bool,
+    ) {
+        let Some(offset) = self.normalize_comparison_offset(source_view, source_doc) else {
+            return;
+        };
+        let source = &self.documents[&source_doc];
+        let target = &self.documents[&target_doc];
+        let mapped =
+            Self::map_view_offset_using_diff(source, target, offset, diff, source_is_after);
+        let line = source
+            .selection(source_view)
+            .primary()
+            .cursor_line(source.text().slice(..));
+        let mut mapping = diff.clone();
+        if source_is_after {
+            mapping.invert();
+        }
+        let target_line = Self::map_line_before_to_after(line, &mapping)
+            .min(target.text().len_lines().saturating_sub(1));
+        let pos = target.text().line_to_char(target_line);
+        let target = self.documents.get_mut(&target_doc).unwrap();
+        target.set_selection(target_view, Selection::point(pos));
+        target.set_view_offset(target_view, mapped);
+    }
+
+    fn normalize_comparison_offset(
+        &mut self,
+        view_id: ViewId,
+        doc_id: DocumentId,
+    ) -> Option<crate::view::ViewPosition> {
+        let doc = self.documents.get(&doc_id)?;
+        let view = self.tree.try_get(view_id)?;
+        let mut offset = doc.get_view_offset(view_id)?;
+        let format = doc.text_format(view.inner_width(doc), None);
+        let annotations = view.text_annotations(doc, None);
+        // A goto can leave anchor at line 1 with a large vertical offset.
+        // Map the actual viewport line, including its wrapped-row offset.
+        let (anchor, extra) = helix_core::char_idx_at_visual_offset(
+            doc.text().slice(..),
+            offset.anchor,
+            offset.vertical_offset as isize,
+            0,
+            &format,
+            &annotations,
+        );
+        let (position, block_start) = helix_core::visual_offset_from_block(
+            doc.text().slice(..),
+            anchor,
+            anchor,
+            &format,
+            &annotations,
+        );
+        offset.anchor = block_start;
+        offset.vertical_offset = position.row.saturating_add(extra);
+        drop(annotations);
+        self.documents
+            .get_mut(&doc_id)?
+            .set_view_offset(view_id, offset);
+        Some(offset)
     }
 
     // -------------------------------------------------------------------------
@@ -3374,25 +3621,35 @@ impl Editor {
         self.diff.views.insert(state.working_view_id, state);
     }
 
-    /// Close the other views without dropping buffers the new diff will use.
-    /// Link those buffers only after this teardown, which can reset their diffs.
-    fn close_other_views_for_diff(&mut self, base_doc_id: DocumentId, working_doc_id: DocumentId) {
-        let keep_documents = [base_doc_id, working_doc_id];
-        let views_to_close: Vec<ViewId> = self
-            .tree
-            .views()
-            .filter_map(|(view, focus)| (!focus).then_some(view.id))
-            .collect();
-        for view_id in views_to_close {
-            if let Some(state) = self.diff.views.get_mut(&view_id) {
-                if keep_documents.contains(&state.base_doc_id) {
-                    state.close_base_doc_on_close = false;
-                }
-                if keep_documents.contains(&state.working_doc_id) {
-                    state.close_working_doc_on_close = false;
-                }
+    /// A comparison replaces only the focused pane and its old partner.
+    /// Unrelated splits and their navigation state belong to the user.
+    fn detach_diff_for_replacement(&mut self, view_id: ViewId) {
+        let partner = self
+            .diff
+            .views
+            .get(&view_id)
+            .and_then(|state| state.paired_view(view_id))
+            .filter(|&partner| partner != view_id);
+        self.detach_diff_view(view_id);
+        if let Some(partner) = partner {
+            if self.tree.contains(partner) {
+                self.close(partner);
             }
-            self.close(view_id);
+        }
+    }
+
+    fn inherit_comparison_history(&mut self, previous: &View) {
+        let view = self.tree.get_mut(self.tree.focus);
+        view.jumps = previous.jumps.clone();
+        view.docs_access_history = previous
+            .docs_access_history
+            .iter()
+            .copied()
+            .filter(|id| self.documents.contains_key(id))
+            .collect();
+        view.last_modified_docs = previous.last_modified_docs;
+        if previous.doc != view.doc && self.documents.contains_key(&previous.doc) {
+            view.add_to_history(previous.doc);
         }
     }
 
@@ -3418,6 +3675,18 @@ impl Editor {
         let working_path = helix_stdx::path::canonicalize(working_path);
         if self.is_encrypted_path(&base_path) || self.is_encrypted_path(&working_path) {
             anyhow::bail!("Diff views aren't available for encrypted files");
+        }
+
+        if working_path.exists() {
+            let mut file = fs::File::open(&working_path)?;
+            let mut header = [0; 8192];
+            let size = io::Read::read(&mut file, &mut header)?;
+            anyhow::ensure!(
+                content_inspector::inspect(&header[..size])
+                    != content_inspector::ContentType::BINARY,
+                "Binary file {}; text comparison is unavailable",
+                working_path.display()
+            );
         }
 
         let base_revision = self.prepare_git_revision_doc(&base_path, git_ref)?;
@@ -3448,16 +3717,14 @@ impl Editor {
         let base_doc_id = self.commit_git_revision_doc(base_revision, Some(working_doc_id));
 
         let focused_view = self.tree.focus;
+        let previous_view = self.tree.get(focused_view).clone();
         self.forget_suspended_diffs(focused_view);
         if self.diff.views.contains_key(&focused_view) {
-            self.detach_diff_view(focused_view);
+            self.detach_diff_for_replacement(focused_view);
         }
 
         let split_view_override = split_view_override.or(self.diff.split_view_override);
         let split_view = split_view_override.unwrap_or_else(|| self.config().diff.split_view);
-        if split_view {
-            self.close_other_views_for_diff(base_doc_id, working_doc_id);
-        }
         if split_view {
             self.switch(base_doc_id, Action::Replace);
             let base_view_id = self.tree.focus;
@@ -3498,6 +3765,10 @@ impl Editor {
             .close_base_doc_on_close();
             diff_state.close_working_doc_on_close = working_is_virtual;
             self.register_diff_view(diff_state);
+        }
+
+        if split_view {
+            self.inherit_comparison_history(&previous_view);
         }
 
         Ok(())
@@ -4025,17 +4296,15 @@ impl Editor {
                     self.commit_git_revision_doc(target_revision, Some(base_doc_id));
 
                 let focused_view = self.tree.focus;
+                let previous_view = self.tree.get(focused_view).clone();
                 self.forget_suspended_diffs(focused_view);
                 if self.diff.views.contains_key(&focused_view) {
-                    self.detach_diff_view(focused_view);
+                    self.detach_diff_for_replacement(focused_view);
                 }
 
                 let split_view =
                     split_view_override.unwrap_or_else(|| self.config().diff.split_view);
                 let display = format!("{}..{}", base_ref, target);
-                if split_view {
-                    self.close_other_views_for_diff(base_doc_id, target_doc_id);
-                }
                 if split_view {
                     self.switch(base_doc_id, Action::Replace);
                     let base_view_id = self.tree.focus;
@@ -4078,6 +4347,10 @@ impl Editor {
                     self.register_diff_view(diff_state);
                 }
 
+                if split_view {
+                    self.inherit_comparison_history(&previous_view);
+                }
+
                 Ok(())
             }
         }
@@ -4108,7 +4381,11 @@ impl Editor {
         }
 
         let focused_view = self.tree.focus;
+        let previous_view = self.tree.get(focused_view).clone();
         self.forget_suspended_diffs(focused_view);
+        if self.diff.merge_views.contains_key(&focused_view) {
+            self.close_merge_session_leaving_view(focused_view, &[base_doc_id, working_doc_id]);
+        }
         if let Some(state) = self.diff.views.get_mut(&focused_view) {
             // The diff being replaced closes its revision buffers with it, and
             // the new one may be made of one of them: the base pane's revision
@@ -4131,16 +4408,17 @@ impl Editor {
 
         let split_view_override = split_view_override.or(self.diff.split_view_override);
         let split_view = split_view_override.unwrap_or_else(|| self.config().diff.split_view);
-        if split_view {
-            self.close_other_views_for_diff(base_doc_id, working_doc_id);
-        }
         // Review threads are keyed by these paths. Leaving them empty stored
         // every buffer-diff comment under PathBuf::new(), so unrelated pairs
         // collided and the threads vanished once the diff closed.
         let base_path = Self::document_review_path(self.documents.get(&base_doc_id).unwrap());
         let working_path = Self::document_review_path(self.documents.get(&working_doc_id).unwrap());
 
-        let display = format!("buffer {base_doc_id}..{working_doc_id}");
+        let display = format!(
+            "{} vs {}",
+            self.documents[&base_doc_id].display_name(),
+            self.documents[&working_doc_id].display_name()
+        );
 
         if split_view {
             self.enter_normal_mode();
@@ -4173,6 +4451,9 @@ impl Editor {
             self.register_diff_view(diff_state);
         }
 
+        if split_view {
+            self.inherit_comparison_history(&previous_view);
+        }
         Ok(())
     }
 
@@ -4410,20 +4691,33 @@ impl Editor {
         }
     }
 
-    fn close_merge_session_leaving_view(&mut self, view_id: ViewId) {
-        if let Some(state) = self.diff.merge_views.remove(&view_id) {
-            self.diff.merge_views.remove(&state.ours_view_id);
-            self.diff.merge_views.remove(&state.theirs_view_id);
-            self.diff.merge_views.remove(&state.result_view_id);
-
-            let _ = self.close_document(state.ours_doc_id, true);
-            let _ = self.close_document(state.theirs_doc_id, true);
+    fn close_merge_session_leaving_view(&mut self, view_id: ViewId, keep_documents: &[DocumentId]) {
+        if let Some(state) = self.take_merge_state(view_id) {
+            for id in [
+                Some(state.ours_doc_id),
+                Some(state.theirs_doc_id),
+                state.base_doc_id,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if !keep_documents.contains(&id) && !self.diff_document_is_referenced(id) {
+                    let _ = self.close_document(id, true);
+                } else if let Some(doc) = self.documents.get_mut(&id) {
+                    doc.linked_diff_doc = None;
+                    doc.clear_diff_handle();
+                }
+            }
 
             for other in [
-                state.ours_view_id,
-                state.theirs_view_id,
-                state.result_view_id,
-            ] {
+                Some(state.ours_view_id),
+                Some(state.theirs_view_id),
+                Some(state.result_view_id),
+                state.base_view_id,
+            ]
+            .into_iter()
+            .flatten()
+            {
                 if other != view_id && self.tree.contains(other) {
                     self.close(other);
                 }
@@ -4472,12 +4766,12 @@ impl Editor {
     // 3-way merge view
     // -------------------------------------------------------------------------
 
-    /// Open a 3-way merge view for a file that contains conflict markers.
+    /// Open the index stages and editable result of a conflicted file.
     ///
     /// Layout (horizontal split):
-    ///   top-left:  OURS   (read-only git revision, char diff vs THEIRS)
-    ///   top-right: THEIRS (read-only incoming revision, char diff vs OURS)
-    ///   bottom:    RESULT (editable conflicted file — source of truth)
+    ///   top:          RESULT (editable file — source of truth)
+    ///   bottom-left:  HEAD   (read-only index stage 2)
+    ///   bottom-right: incoming (read-only index stage 3)
     pub fn open_merge_view(&mut self, path: &Path) -> Result<(), Error> {
         #[cfg(not(feature = "git"))]
         {
@@ -4487,92 +4781,122 @@ impl Editor {
 
         #[cfg(feature = "git")]
         {
-            use crate::merge_view;
-            use anyhow::Context as _;
-
             let path = helix_stdx::path::canonicalize(path);
             if self.is_encrypted_path(&path) {
                 anyhow::bail!("Merge views aren't available for encrypted files");
             }
 
-            let focused_view = self.tree.focus;
-            if self.diff.merge_views.contains_key(&focused_view) {
-                self.close_merge_view(focused_view);
-            }
-            if self.diff.views.contains_key(&focused_view) {
-                self.close_diff_view(focused_view);
-            }
-
-            // 1. Open the conflicted file as the editable RESULT doc.
-            let result_doc_id = if let Some(id) = self.non_virtual_document_id_by_path(&path) {
-                id
+            let inputs = helix_vcs::git::get_merge_inputs(&path)?;
+            let existing = self.non_virtual_document_id_by_path(&path);
+            // Prepare every input before changing the current session or layout.
+            // Reopening a clean buffer picks up a merge started outside Helix;
+            // unsaved result edits are always kept.
+            let result = if existing.is_some_and(|id| self.documents[&id].is_modified()) {
+                None
             } else {
-                self.open(&path, Action::Load)?
+                Some(Document::open(
+                    &path,
+                    None,
+                    true,
+                    self.config.clone(),
+                    self.syn_loader.clone(),
+                )?)
             };
-
-            // 2. Ensure there are conflicts to resolve.
-            let doc = self
-                .documents
-                .get(&result_doc_id)
-                .ok_or_else(|| anyhow::anyhow!("document not found"))?;
-            if merge_view::conflict_count(doc.text()) == 0 {
-                anyhow::bail!("No conflict markers found in file");
-            }
-
-            // 3. Fetch OURS (stage 2) and THEIRS (stage 3) from git index.
-            let (ours_bytes, theirs_bytes) = helix_vcs::git::get_merge_versions(&path)
-                .context("Failed to fetch merge versions from git index")?;
-
-            // 4. Create virtual read-only documents.
+            let text = result
+                .as_ref()
+                .map(Document::text)
+                .unwrap_or_else(|| self.documents[&existing.unwrap()].text())
+                .clone();
+            let scan = crate::merge_view::scan_conflicts_with_size(&text, inputs.marker_size);
+            let conflicts = scan.regions;
+            let whole_file = scan.marker_lines == 0;
+            let ours_deleted = inputs.ours.is_none();
+            let theirs_deleted = inputs.theirs.is_none();
             // OURS is the file as HEAD has it, so it is that commit's snapshot.
             // THEIRS is an index stage and names no commit.
             let ours_doc = Document::from_git_revision(
-                ours_bytes,
+                inputs.ours.unwrap_or_default(),
                 &path,
-                "HEAD",
+                &inputs.ours_label,
                 self.diff_providers.resolve_commit_id(&path, "HEAD"),
                 self.config.clone(),
                 self.syn_loader.clone(),
             )?;
             let theirs_doc = Document::from_git_revision(
-                theirs_bytes,
+                inputs.theirs.unwrap_or_default(),
                 &path,
-                "incoming",
+                &inputs.theirs_label,
                 None,
                 self.config.clone(),
                 self.syn_loader.clone(),
             )?;
-
+            let base_doc = inputs
+                .base
+                .map(|bytes| {
+                    Document::from_git_revision(
+                        bytes,
+                        &path,
+                        "BASE",
+                        None,
+                        self.config.clone(),
+                        self.syn_loader.clone(),
+                    )
+                })
+                .transpose()?;
+            let result_on_disk = match std::fs::read(&path) {
+                Ok(bytes) => Some(Arc::<[u8]>::from(bytes)),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+                Err(err) => return Err(err.into()),
+            };
+            if let Some(bytes) = &result_on_disk {
+                anyhow::ensure!(content_inspector::inspect(&bytes[..bytes.len().min(8192)]) != content_inspector::ContentType::BINARY,
+                    "Binary conflict: resolve by choosing the file with Git, then refresh the changed-file picker");
+            }
+            let result_doc_id = match existing {
+                Some(id) => id,
+                None => self.open(&path, Action::Load)?,
+            };
+            let focused_view = self.tree.focus;
+            self.close_merge_view(focused_view);
+            if self.diff.views.contains_key(&self.tree.focus) {
+                self.close_diff_view(self.tree.focus);
+            }
             let ours_doc_id = self.insert_git_revision_document(ours_doc);
             let theirs_doc_id = self.insert_git_revision_document(theirs_doc);
-
-            // 5. Wire char-diff: OURS shows diff vs THEIRS and vice-versa.
+            let base_doc_id = base_doc.map(|doc| self.insert_git_revision_document(doc));
             self.link_shared_diff_handles(ours_doc_id, theirs_doc_id);
 
-            // 6. Build layout: close non-focused panes, then split.
-            let views_to_close: Vec<ViewId> = self
-                .tree
-                .views()
-                .filter_map(|(v, focus)| if !focus { Some(v.id) } else { None })
-                .collect();
-            for id in views_to_close {
-                self.close(id);
-            }
-
-            // Bottom pane = RESULT (editable).
+            // Keep the user's other splits. The result stays in the original
+            // pane, and removing only these new panes restores its space.
             self.switch(result_doc_id, Action::Replace);
             let result_view_id = self.tree.focus;
-
-            // Top pane (horizontal split) starts with OURS.
+            if result.is_some() {
+                let (view, doc) = current!(self);
+                let tx = helix_core::diff::compare_ropes(doc.text(), &text);
+                doc.apply(&tx, view.id);
+                doc.append_changes_to_history(view);
+                doc.reset_modified();
+                doc.pickup_last_saved_time();
+            }
             self.switch(ours_doc_id, Action::HorizontalSplit);
             let ours_view_id = self.tree.focus;
-
-            // THEIRS goes in a vertical split within the top pane.
             self.switch(theirs_doc_id, Action::VerticalSplit);
             let theirs_view_id = self.tree.focus;
-
-            // 7. Register merge state.
+            let ours_diff = helix_vcs::DiffHandle::new(
+                self.documents[&ours_doc_id].text().clone(),
+                text.clone(),
+            );
+            let theirs_diff =
+                helix_vcs::DiffHandle::new(self.documents[&theirs_doc_id].text().clone(), text);
+            // These handles follow result edits even though its two side
+            // comparisons use the side view ids as their distinct keys.
+            let doc = self.documents.get_mut(&result_doc_id).unwrap();
+            doc.set_view_diff(ours_view_id, ours_diff.clone());
+            doc.set_view_diff(theirs_view_id, theirs_diff.clone());
             let state = MergeViewState {
+                marker_size: inputs.marker_size,
+                base_doc_id,
+                base_view_id: None,
                 ours_doc_id,
                 theirs_doc_id,
                 result_doc_id,
@@ -4580,29 +4904,66 @@ impl Editor {
                 theirs_view_id,
                 result_view_id,
                 sync_scroll: true,
+                fingerprint: inputs.fingerprint,
+                stale: false,
+                finished: false,
+                ours_label: inputs.ours_label,
+                theirs_label: inputs.theirs_label,
+                ours_diff,
+                theirs_diff,
+                base_diff: None,
+                whole_file,
+                ours_deleted,
+                theirs_deleted,
+                delete_result: false,
+                result_on_disk,
+                review_range: None,
                 last_resolution: None,
             };
             self.diff.merge_views.insert(ours_view_id, state.clone());
             self.diff.merge_views.insert(theirs_view_id, state.clone());
             self.diff.merge_views.insert(result_view_id, state);
-
-            // Focus RESULT pane so the user starts editing conflicts immediately.
-            // `focus` rather than setting `tree.focus`, so RESULT is marked
-            // focused and THEIRS (the last pane opened) gets its focus-lost event.
             self.focus(result_view_id);
-
+            if let Some(first) = conflicts.first() {
+                let doc = self.documents.get_mut(&result_doc_id).unwrap();
+                let pos = doc.text().line_to_char(first.start_line);
+                doc.set_selection(result_view_id, Selection::point(pos));
+                self.ensure_cursor_in_view(result_view_id);
+                self.set_status(format!(
+                    "Conflict 1/{} — space m: merge actions",
+                    conflicts.len()
+                ));
+            } else {
+                self.set_status(if ours_deleted && theirs_deleted { "Both sides deleted this path; inspect other rename-conflict paths, then choose a side or edit the result" }
+                    else if ours_deleted { "Delete/modify conflict: HEAD deleted this file; o deletes, t keeps, f saves and stages" }
+                    else if theirs_deleted { "Modify/delete conflict: incoming deleted this file; o keeps, t deletes, f saves and stages" }
+                    else { "No markers: edit the result or accept a whole side; f saves and stages the resolved file" });
+            }
+            if scan.malformed {
+                self.set_warning("Merge opened with malformed markers; repair them in RESULT before accepting or finishing");
+            }
+            self.sync_scroll_to_linked_views(result_view_id);
             Ok(())
         }
     }
 
     pub fn close_merge_view(&mut self, view_id: ViewId) -> bool {
-        if let Some(state) = self.diff.merge_views.remove(&view_id) {
-            self.diff.merge_views.remove(&state.ours_view_id);
-            self.diff.merge_views.remove(&state.theirs_view_id);
-            self.diff.merge_views.remove(&state.result_view_id);
-
-            let _ = self.close_document(state.ours_doc_id, true);
-            let _ = self.close_document(state.theirs_doc_id, true);
+        if let Some(state) = self.take_merge_state(view_id) {
+            for id in [
+                Some(state.ours_doc_id),
+                Some(state.theirs_doc_id),
+                state.base_doc_id,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if !self.diff_document_is_referenced(id) {
+                    let _ = self.close_document(id, true);
+                } else if let Some(doc) = self.documents.get_mut(&id) {
+                    doc.linked_diff_doc = None;
+                    doc.clear_diff_handle();
+                }
+            }
 
             if self.tree.contains(state.ours_view_id) {
                 self.close(state.ours_view_id);
@@ -4610,11 +4971,246 @@ impl Editor {
             if self.tree.contains(state.theirs_view_id) {
                 self.close(state.theirs_view_id);
             }
+            if let Some(base) = state.base_view_id.filter(|&id| self.tree.contains(id)) {
+                self.close(base);
+            }
 
             true
         } else {
             false
         }
+    }
+
+    fn take_merge_state(&mut self, view_id: ViewId) -> Option<MergeViewState> {
+        let state = self.diff.merge_views.remove(&view_id)?;
+        for id in [
+            Some(state.ours_view_id),
+            Some(state.theirs_view_id),
+            Some(state.result_view_id),
+            state.base_view_id,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            self.diff.merge_views.remove(&id);
+        }
+        if let Some(doc) = self.documents.get_mut(&state.result_doc_id) {
+            doc.clear_view_diff(state.ours_view_id);
+            doc.clear_view_diff(state.theirs_view_id);
+            if let Some(base_view) = state.base_view_id {
+                doc.clear_view_diff(base_view);
+            }
+        }
+        Some(state)
+    }
+
+    pub fn show_merge_base(&mut self, view_id: ViewId) -> anyhow::Result<()> {
+        self.ensure_merge_inputs_current(view_id)?;
+        let state = self
+            .diff
+            .merge_views
+            .get(&view_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("Not in a merge view"))?;
+        let base_doc = state
+            .base_doc_id
+            .ok_or_else(|| anyhow!("This add/add conflict has no base version"))?;
+        if let Some(base_view) = state.base_view_id {
+            self.focus(base_view);
+        } else {
+            self.focus(state.ours_view_id);
+            self.switch(base_doc, Action::HorizontalSplit);
+            let base_view = self.tree.focus;
+            let diff = helix_vcs::DiffHandle::new(
+                self.documents[&base_doc].text().clone(),
+                self.documents[&state.result_doc_id].text().clone(),
+            );
+            self.documents
+                .get_mut(&state.result_doc_id)
+                .unwrap()
+                .set_view_diff(base_view, diff.clone());
+            let mut new_state = state.clone();
+            new_state.base_view_id = Some(base_view);
+            new_state.base_diff = Some(diff);
+            for entry in self
+                .diff
+                .merge_views
+                .values_mut()
+                .filter(|entry| entry.result_view_id == state.result_view_id)
+            {
+                *entry = new_state.clone();
+            }
+            self.diff.merge_views.insert(base_view, new_state);
+            self.sync_scroll_to_linked_views(state.result_view_id);
+        }
+        Ok(())
+    }
+
+    /// Reject side operations once an external Git operation replaced the
+    /// stages the user is looking at. Result edits remain untouched.
+    pub fn ensure_merge_inputs_current(&mut self, view_id: ViewId) -> anyhow::Result<()> {
+        #[cfg(feature = "git")]
+        if let Some(state) = self.diff.merge_views.get(&view_id).cloned() {
+            anyhow::ensure!(
+                !state.finished,
+                "This conflict resolution is already staged"
+            );
+            let path = self.documents[&state.result_doc_id]
+                .path()
+                .ok_or_else(|| anyhow!("Merge result has no file path"))?;
+            let current = helix_vcs::git::merge_fingerprint(path)?;
+            if current != state.fingerprint {
+                for entry in self
+                    .diff
+                    .merge_views
+                    .values_mut()
+                    .filter(|entry| entry.result_view_id == state.result_view_id)
+                {
+                    entry.stale = true;
+                }
+                anyhow::bail!("Merge inputs changed outside Helix; save your result edits if needed, then use :diff-refresh");
+            }
+        }
+        let _ = view_id;
+        Ok(())
+    }
+
+    pub fn refresh_comparison_state(&mut self) {
+        #[cfg(feature = "git")]
+        {
+            let diffs: Vec<_> = self
+                .diff
+                .views
+                .iter()
+                .filter(|(id, state)| **id == state.working_view_id)
+                .map(|(_, state)| state.clone())
+                .collect();
+            for state in diffs {
+                if state.source != crate::diff_view::DiffViewSource::Git {
+                    continue;
+                }
+                let stale = [state.base_doc_id, state.working_doc_id].iter().any(|id| {
+                    if *id == state.working_doc_id
+                        && state.target_ref.is_none()
+                        && state.close_working_doc_on_close
+                    {
+                        return false; // synthetic empty pane for a deleted file
+                    }
+                    self.documents
+                        .get(id)
+                        .and_then(|doc| doc.git_revision.as_ref())
+                        .is_some_and(|revision| {
+                            self.diff_providers
+                                .resolve_commit_id(&revision.path, &revision.git_ref)
+                                != revision.commit
+                        })
+                });
+                for id in [state.base_view_id, state.working_view_id] {
+                    if let Some(entry) = self.diff.views.get_mut(&id) {
+                        self.needs_redraw |= entry.stale != stale;
+                        entry.stale = stale;
+                    }
+                }
+            }
+            let merges: Vec<_> = self
+                .diff
+                .merge_views
+                .iter()
+                .filter(|(id, state)| **id == state.result_view_id)
+                .map(|(_, state)| state.clone())
+                .collect();
+            for state in merges {
+                if state.finished {
+                    continue;
+                }
+                let stale = self
+                    .documents
+                    .get(&state.result_doc_id)
+                    .and_then(Document::path)
+                    .is_none_or(|path| {
+                        helix_vcs::git::merge_fingerprint(path)
+                            .map_or(true, |current| current != state.fingerprint)
+                    });
+                for entry in self
+                    .diff
+                    .merge_views
+                    .values_mut()
+                    .filter(|entry| entry.result_view_id == state.result_view_id)
+                {
+                    self.needs_redraw |= entry.stale != stale;
+                    entry.stale = stale;
+                }
+            }
+        }
+    }
+
+    pub fn comparison_label(&self, view_id: ViewId) -> String {
+        if let Some(state) = self.diff.merge_views.get(&view_id) {
+            let role = if view_id == state.result_view_id {
+                "RESULT"
+            } else if view_id == state.ours_view_id {
+                &state.ours_label
+            } else if view_id == state.theirs_view_id {
+                &state.theirs_label
+            } else {
+                "BASE"
+            };
+            let scan = crate::merge_view::scan_conflicts_with_size(
+                self.documents[&state.result_doc_id].text(),
+                state.marker_size,
+            );
+            let progress = if state.finished {
+                "staged".to_string()
+            } else if scan.malformed {
+                "malformed markers".to_string()
+            } else if state.delete_result {
+                "delete pending".to_string()
+            } else if state.whole_file {
+                "file conflict".to_string()
+            } else {
+                format!("{} left", scan.regions.len())
+            };
+            return format!(
+                "[{}{}; {}] ",
+                if state.stale { "STALE " } else { "" },
+                role,
+                progress
+            );
+        }
+        if let Some(state) = self.diff.views.get(&view_id) {
+            let endpoint = |id: DocumentId, fallback: &str| {
+                self.documents[&id]
+                    .git_revision
+                    .as_ref()
+                    .map(|revision| {
+                        let short = revision
+                            .commit
+                            .as_ref()
+                            .map(|id| id.chars().take(8).collect::<String>());
+                        match short {
+                            Some(short) => format!("{}@{}", revision.git_ref, short),
+                            None if id == state.base_doc_id => {
+                                format!("{} (empty tree)", revision.git_ref)
+                            }
+                            None => revision.git_ref.clone(),
+                        }
+                    })
+                    .unwrap_or_else(|| fallback.to_string())
+            };
+            let role = if state.source == crate::diff_view::DiffViewSource::Buffers {
+                format!("DIFF {}", state.git_ref)
+            } else if state.is_split() && view_id == state.base_view_id {
+                format!("BASE {}", endpoint(state.base_doc_id, &state.base_ref))
+            } else {
+                format!(
+                    "{} vs {}",
+                    endpoint(state.working_doc_id, "WORKTREE"),
+                    endpoint(state.base_doc_id, &state.base_ref)
+                )
+            };
+            return format!("[{}{}] ", if state.stale { "STALE " } else { "" }, role);
+        }
+        String::new()
     }
 }
 

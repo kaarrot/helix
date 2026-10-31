@@ -721,11 +721,20 @@ impl MappableCommand {
         diff_toggle_split_view, "Toggle between single-pane and side-by-side diff",
         diff_toggle_sync_scroll, "Toggle synchronized scrolling in split diff",
         diff_reset, "Reset diff base to HEAD",
+        diff_refresh, "Refresh the current diff or merge comparison",
+        diff_revert_hunk, "Revert diff hunks under the selections",
+        diff_next_file, "Open the next changed file in this comparison",
+        diff_prev_file, "Open the previous changed file in this comparison",
         diff_commit_from_selection, "Set diff range from selected git log lines, bottom line as base",
         diff_show_commit_from_selection, "Show changes introduced by selected commit",
         merge_accept_ours, "Accept HEAD version for current conflict",
         merge_accept_theirs, "Accept incoming version for current conflict",
         merge_accept_both, "Accept both versions for current conflict",
+        merge_accept_base, "Accept the base version for the current conflict",
+        merge_show_base, "Show the index base version",
+        merge_accept_ours_and_next, "Accept HEAD and jump to the next conflict",
+        merge_accept_theirs_and_next, "Accept incoming and jump to the next conflict",
+        merge_accept_both_and_next, "Accept both and jump to the next conflict",
         merge_next_conflict, "Jump to next merge conflict",
         merge_prev_conflict, "Jump to previous merge conflict",
         merge_finish, "Save and stage the resolved file",
@@ -3560,6 +3569,11 @@ fn ensure_selections_forward(cx: &mut Context) {
 }
 
 fn enter_insert_mode(cx: &mut Context) {
+    if doc!(cx.editor).is_virtual_base {
+        cx.editor
+            .set_error("This revision is read-only; switch to the working or result pane to edit");
+        return;
+    }
     cx.editor.mode = Mode::Insert;
 }
 
@@ -4548,6 +4562,12 @@ fn goto_next_change_impl(cx: &mut Context, direction: Direction) {
             return;
         };
 
+        if diff_handle.load().is_empty() {
+            editor.set_status("No diff hunks in this comparison");
+            return;
+        }
+        let mut found = false;
+
         let selection = doc.selection(view.id).clone().transform(|range| {
             let cursor_line = range.cursor_line(doc_text) as u32;
 
@@ -4563,6 +4583,7 @@ fn goto_next_change_impl(cx: &mut Context, direction: Direction) {
             let Some(hunk_idx) = hunk_idx else {
                 return range;
             };
+            found = true;
             let hunk = diff.nth_hunk(hunk_idx);
             let new_range = hunk_range(hunk, doc_text);
             if in_diff_view {
@@ -4583,7 +4604,13 @@ fn goto_next_change_impl(cx: &mut Context, direction: Direction) {
         });
 
         push_jump(view, doc);
-        doc.set_selection(view.id, selection)
+        doc.set_selection(view.id, selection);
+        if !found {
+            editor.set_status(match direction {
+                Direction::Forward => "Last diff hunk",
+                Direction::Backward => "First diff hunk",
+            });
+        }
     };
     cx.editor.apply_motion(motion);
 

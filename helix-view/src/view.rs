@@ -808,11 +808,13 @@ impl View {
     ///
     /// `layout_agent` is the markdown preview layout for agent replies. `None`
     /// wraps that source as plain text.
+    #[allow(clippy::too_many_arguments)]
     pub fn virtual_row_plan(
         &self,
         doc: &Document,
         diff_views: &std::collections::HashMap<ViewId, crate::diff_view::DiffViewState>,
         documents: &std::collections::BTreeMap<DocumentId, Document>,
+        tree: &crate::tree::Tree,
         reviews: &crate::review::ReviewStore,
         spinner: Option<&str>,
         mut layout_agent: Option<
@@ -825,13 +827,41 @@ impl View {
 
         // Spacers: only a real two-pane diff needs its sides aligned.
         if let Some(diff_state) = diff_views.get(&self.id).filter(|s| s.is_split()) {
-            let other_doc_id = if diff_state.is_base_view(self.id) {
-                diff_state.working_doc_id
+            let (other_doc_id, other_view_id) = if diff_state.is_base_view(self.id) {
+                (diff_state.working_doc_id, diff_state.working_view_id)
             } else {
-                diff_state.base_doc_id
+                (diff_state.base_doc_id, diff_state.base_view_id)
             };
-            if documents.contains_key(&other_doc_id) {
-                if let Some(diff_handle) = doc.diff_handle_for_view(self.id) {
+            if let (Some(diff_handle), Some(other_doc), Some(other_view)) = (
+                doc.diff_handle_for_view(self.id),
+                documents.get(&other_doc_id),
+                tree.try_get(other_view_id),
+            ) {
+                let format = doc.text_format(self.inner_width(doc), None);
+                let peer_format = other_doc.text_format(other_view.inner_width(other_doc), None);
+                if format.soft_wrap || peer_format.soft_wrap {
+                    // Only measure lines that can appear in this viewport.
+                    // Counting the whole file on every render makes wrapped
+                    // large diffs slow. Every line takes a row at least, so
+                    // this reaches past a large vertical offset too.
+                    let text = doc.text();
+                    let offset = doc.view_offset(self.id);
+                    let first = text
+                        .char_to_line(offset.anchor.min(text.len_chars()))
+                        .saturating_sub(1);
+                    let end = first
+                        .saturating_add(offset.vertical_offset)
+                        .saturating_add(self.inner_height())
+                        .saturating_add(3)
+                        .min(text.len_lines());
+                    builder.add_wrapped_diff_spacers(
+                        diff_handle,
+                        text,
+                        &format,
+                        &peer_format,
+                        first..end,
+                    );
+                } else {
                     builder.add_diff_spacers(diff_handle);
                 }
             }

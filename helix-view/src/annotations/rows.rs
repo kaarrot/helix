@@ -8,10 +8,11 @@
 //! than were reserved overwrites real text, and the damage shows up wherever the
 //! rows are rather than where the mistake was made.
 
-use helix_core::text_annotations::LineAnnotation;
-use helix_core::Position;
+use helix_core::doc_formatter::{DocumentFormatter, TextFormat};
+use helix_core::text_annotations::{LineAnnotation, TextAnnotations};
+use helix_core::{Position, Rope};
 use helix_vcs::DiffHandle;
-use std::{cell::Cell, collections::BTreeMap, rc::Rc};
+use std::{cell::Cell, collections::BTreeMap, ops::Range, rc::Rc};
 
 use crate::graphics::Style;
 use crate::review::ThreadId;
@@ -214,6 +215,80 @@ impl VirtualRowPlanBuilder {
         }
     }
 
+    /// Alignment padding for a side-by-side diff when either pane soft-wraps,
+    /// so one document line can take a different number of rows on each side.
+    ///
+    /// Lines in `visible` are measured against the line they face. Measuring
+    /// means formatting, so a hunk outside `visible` falls back to its line
+    /// count, which keeps anything measuring past the viewport close until the
+    /// hunk is drawn.
+    ///
+    /// Padding goes below a hunk rather than above it: a replacement pairs its
+    /// lines off from the top, and the rows it is short of are its last ones.
+    pub fn add_wrapped_diff_spacers(
+        &mut self,
+        diff_handle: &DiffHandle,
+        text: &Rope,
+        format: &TextFormat,
+        peer_format: &TextFormat,
+        visible: Range<usize>,
+    ) {
+        let diff = diff_handle.load();
+        let peer = diff.diff_base();
+        let mut padding = BTreeMap::<usize, usize>::new();
+
+        for line in visible.clone() {
+            let mut peer_line = Some(line);
+            for index in 0..diff.len() {
+                let hunk = diff.nth_hunk(index);
+                if line < hunk.after.start as usize {
+                    break;
+                }
+                if line < hunk.after.end as usize {
+                    let offset = line - hunk.after.start as usize;
+                    peer_line = (offset < hunk.before.len() as usize)
+                        .then_some(hunk.before.start as usize + offset);
+                    break;
+                }
+                peer_line = Some(
+                    line.saturating_add(hunk.before.end as usize)
+                        .saturating_sub(hunk.after.end as usize),
+                );
+            }
+            if let Some(peer_line) = peer_line.filter(|&line| line < peer.len_lines()) {
+                let deficit = line_height(peer, peer_line, peer_format)
+                    .saturating_sub(line_height(text, line, format));
+                if deficit > 0 {
+                    *padding.entry(line).or_default() += deficit;
+                }
+            }
+        }
+
+        for index in 0..diff.len() {
+            let hunk = diff.nth_hunk(index);
+            let missing = hunk.before.start as usize + hunk.after.len() as usize;
+            let before_end = hunk.before.end as usize;
+            if missing >= before_end {
+                continue;
+            }
+            let emit_after = (hunk.after.end as usize).saturating_sub(1);
+            *padding.entry(emit_after).or_default() += if visible.contains(&emit_after) {
+                (missing..before_end)
+                    .map(|line| line_height(peer, line, peer_format))
+                    .sum()
+            } else {
+                before_end - missing
+            };
+        }
+
+        for (line, rows) in padding {
+            self.by_line
+                .entry(line)
+                .or_default()
+                .extend(std::iter::repeat(VirtualRow::Spacer).take(rows));
+        }
+    }
+
     pub fn add_comment_rows(&mut self, doc_line: usize, rows: Vec<VirtualRow>) {
         if rows.is_empty() {
             return;
@@ -270,6 +345,23 @@ impl LineAnnotation for VirtualRowLines {
             Position::default()
         }
     }
+}
+
+fn line_height(text: &Rope, line: usize, format: &TextFormat) -> usize {
+    if !format.soft_wrap {
+        return 1;
+    }
+    let annotations = TextAnnotations::default();
+    DocumentFormatter::new_at_prev_checkpoint(
+        text.slice(..),
+        format,
+        &annotations,
+        text.line_to_char(line),
+    )
+    .take_while(|grapheme| grapheme.line_idx == line)
+    .map(|grapheme| grapheme.visual_pos.row + 1)
+    .max()
+    .unwrap_or(1)
 }
 
 /// Greedy wrap of plain comment text to `width` columns.
@@ -361,6 +453,69 @@ mod test {
         assert_eq!(plan.comment_lines().collect::<Vec<_>>(), vec![4]);
         assert_eq!(plan.thread_at(4), Some(ThreadId(1)));
         assert_eq!(plan.thread_at(9), None);
+    }
+
+    async fn settled_diff(before: &Rope, after: &Rope) -> DiffHandle {
+        let handle = DiffHandle::new(before.clone(), after.clone());
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while handle.load().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        handle
+    }
+
+    #[tokio::test]
+    async fn wrapped_replacements_and_unequal_widths_align_following_text() {
+        let before = Rope::from("a long unchanged line that wraps differently\nshort\ntail\n");
+        let after = Rope::from("a long unchanged line that wraps differently\na long changed line that wraps over several rows\ntail\n");
+        let handle = settled_diff(&before, &after).await;
+        let format = TextFormat {
+            soft_wrap: true,
+            viewport_width: 18,
+            ..TextFormat::default()
+        };
+        let peer_format = TextFormat {
+            viewport_width: 19,
+            ..format.clone()
+        };
+        let mut reverse = handle.clone();
+        reverse.invert();
+        let tail_row = |diff: &DiffHandle, text: &Rope, format: &TextFormat, peer: &TextFormat| {
+            let mut builder = VirtualRowPlanBuilder::new();
+            builder.add_wrapped_diff_spacers(diff, text, format, peer, 0..text.len_lines());
+            let mut annotations = TextAnnotations::default();
+            annotations
+                .add_line_annotation(Box::new(VirtualRowLines::new(Rc::new(builder.build()))));
+            let row =
+                DocumentFormatter::new_at_prev_checkpoint(text.slice(..), format, &annotations, 0)
+                    .find(|grapheme| grapheme.line_idx == 2)
+                    .unwrap()
+                    .visual_pos
+                    .row;
+            row
+        };
+        assert_eq!(
+            tail_row(&reverse, &before, &peer_format, &format),
+            tail_row(&handle, &after, &format, &peer_format),
+        );
+    }
+
+    #[tokio::test]
+    async fn wrapped_spacers_outside_the_viewport_keep_their_line_count() {
+        let before = Rope::from("one\ntwo\nthree\nfour\n");
+        let after = Rope::from("one\nfour\n");
+        let handle = settled_diff(&before, &after).await;
+        let format = TextFormat {
+            soft_wrap: true,
+            viewport_width: 40,
+            ..TextFormat::default()
+        };
+        let mut builder = VirtualRowPlanBuilder::new();
+        builder.add_wrapped_diff_spacers(&handle, &after, &format, &format, 1..2);
+        assert_eq!(builder.build().rows_at(0), vec![VirtualRow::Spacer; 2]);
     }
 
     #[test]

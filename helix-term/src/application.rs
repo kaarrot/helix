@@ -630,6 +630,7 @@ impl Application {
     }
 
     pub async fn handle_idle_timeout(&mut self) {
+        self.editor.refresh_comparison_state();
         let mut cx = crate::compositor::Context {
             editor: &mut self.editor,
             jobs: &mut self.jobs,

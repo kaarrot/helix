@@ -508,13 +508,42 @@ impl Theme {
         let (styles, scopes, highlights, rainbow_length, load_errors) =
             build_theme_values(toml_keys);
 
-        let theme = Self {
+        let mut theme = Self {
             styles,
             scopes,
             highlights,
             rainbow_length,
             ..Default::default()
         };
+        // Intraline overlays get their own scopes, so syntax highlighting and
+        // a theme's explicit diff backgrounds are never rewritten globally.
+        for (scope, parent) in [
+            ("diff.plus.intraline", "diff.plus"),
+            ("diff.minus.intraline", "diff.minus"),
+        ] {
+            if theme.styles.contains_key(scope) {
+                continue;
+            }
+            let original = theme.try_get(parent).unwrap_or_default();
+            let style = if original.bg.is_some() {
+                original
+            } else if let (Some(Color::Rgb(r, g, b)), Some(Color::Rgb(br, bg, bb))) =
+                (original.fg, theme.get("ui.background").bg)
+            {
+                Style::default()
+                    .bg(Color::Rgb(
+                        ((3 * br as u16 + r as u16) / 4) as u8,
+                        ((3 * bg as u16 + g as u16) / 4) as u8,
+                        ((3 * bb as u16 + b as u16) / 4) as u8,
+                    ))
+                    .underline_style(UnderlineStyle::Line)
+            } else {
+                original.underline_style(UnderlineStyle::Line)
+            };
+            theme.styles.insert(scope.into(), style);
+            theme.scopes.push(scope.into());
+            theme.highlights.push(style);
+        }
         (theme, load_errors)
     }
 }
@@ -829,5 +858,26 @@ mod tests {
     fn out_of_bounds() {
         let highlight = Highlight::new(Theme::rgb_highlight(0, 0, 0).get() - 1);
         Theme::default().highlight(highlight);
+    }
+
+    #[test]
+    fn intraline_defaults_keep_explicit_backgrounds_and_support_terminal_themes() {
+        let theme: Theme = toml::from_str(
+            r##"
+            "ui.background" = { bg = "#101010" }
+            "diff.plus" = { fg = "#00ff00", bg = "#204020" }
+            "diff.minus" = "red"
+        "##,
+        )
+        .unwrap();
+        assert_eq!(
+            theme.get("diff.plus.intraline").bg,
+            Some(Color::Rgb(0x20, 0x40, 0x20))
+        );
+        assert_eq!(theme.get("diff.minus.intraline").bg, None);
+        assert_eq!(
+            theme.get("diff.minus.intraline").underline_style,
+            Some(UnderlineStyle::Line)
+        );
     }
 }

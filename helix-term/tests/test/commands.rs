@@ -1506,6 +1506,11 @@ async fn test_copy_path_command() -> anyhow::Result<()> {
     let file = tempfile::NamedTempFile::new()?;
     // Empty tempfile: cursor is on line 1, so the copied path is `path:1`.
     let expected = format!("{}:1", file.path().to_string_lossy());
+    // Exercise the saved clipboard register without depending on a desktop
+    // clipboard service being available in the test environment.
+    let mut config = test_config();
+    config.editor.clipboard_provider = helix_view::clipboard::ClipboardProvider::None;
+    let builder = || AppBuilder::new().with_config(config.clone());
 
     // The default, an explicit `absolute`, and `url` outside a diff pane all
     // copy the absolute path plus cursor line: there is no commit to link to.
@@ -1516,7 +1521,7 @@ async fn test_copy_path_command() -> anyhow::Result<()> {
     ] {
         let expected = expected.clone();
         test_key_sequence(
-            &mut AppBuilder::new().with_file(file.path(), None).build()?,
+            &mut builder().with_file(file.path(), None).build()?,
             Some(command),
             Some(&move |app: &Application| {
                 let copied = app
@@ -1540,7 +1545,7 @@ async fn test_copy_path_command() -> anyhow::Result<()> {
     let file = helpers::temp_file_with_contents("one\ntwo\nthree\nfour\n")?;
     let expected = format!("{}:3", file.path().to_string_lossy());
     test_key_sequence(
-        &mut AppBuilder::new().with_file(file.path(), None).build()?,
+        &mut builder().with_file(file.path(), None).build()?,
         Some("2j:copy-path<ret>"),
         Some(&move |app: &Application| {
             let copied = app
@@ -1560,7 +1565,7 @@ async fn test_copy_path_command() -> anyhow::Result<()> {
     .await?;
 
     test_key_sequence(
-        &mut AppBuilder::new().build()?,
+        &mut builder().build()?,
         Some(":copy-path<ret>"),
         Some(&|app| {
             assert_eq!(
@@ -1573,7 +1578,7 @@ async fn test_copy_path_command() -> anyhow::Result<()> {
     .await?;
 
     test_key_sequence(
-        &mut AppBuilder::new().with_file(file.path(), None).build()?,
+        &mut builder().with_file(file.path(), None).build()?,
         Some(":copy-path relative<ret>"),
         Some(&|app| {
             assert_eq!(

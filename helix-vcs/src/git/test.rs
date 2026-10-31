@@ -1062,3 +1062,107 @@ fn file_web_link_prefers_the_tracking_branch_remote() {
     let link = git::file_web_link(&repo.join("file.txt"), "HEAD").unwrap();
     assert_eq!(link.remote_url, "git@example.com:grp/upstream.git");
 }
+
+#[test]
+fn revision_resolution_supports_git_ancestry_and_annotated_tags() {
+    let repo = empty_git_repo();
+    write_repo_file(repo.path(), "file.txt", "one\n");
+    create_commit_with_message(repo.path(), "root");
+    let root = exec_git_cmd_output("rev-parse HEAD", repo.path());
+    write_repo_file(repo.path(), "file.txt", "two\n");
+    create_commit_with_message(repo.path(), "second");
+    exec_git_cmd("tag -a release -m release", repo.path());
+    for rev in ["HEAD~1", "HEAD^1", "release~1", "HEAD~0^1"] {
+        assert_eq!(
+            git::resolve_commit_id(repo.path(), rev).unwrap(),
+            root,
+            "{rev}"
+        );
+    }
+    assert_eq!(
+        git::resolve_commit_id(repo.path(), "release").unwrap(),
+        exec_git_cmd_output("rev-parse HEAD", repo.path())
+    );
+    assert!(git::validate_diff_range(repo.path(), "HEAD~20", None).is_err());
+    assert!(git::validate_diff_range(repo.path(), "HEAD", Some("missing")).is_err());
+}
+
+#[test]
+fn merge_base_uses_the_common_ancestor_of_diverged_branches() {
+    let repo = empty_git_repo();
+    write_repo_file(repo.path(), "base.txt", "base\n");
+    create_commit_with_message(repo.path(), "root");
+    let root = exec_git_cmd_output("rev-parse HEAD", repo.path());
+    let original_branch = exec_git_cmd_output("branch --show-current", repo.path());
+    checkout_new_branch(repo.path(), "feature");
+    write_repo_file(repo.path(), "feature.txt", "feature\n");
+    create_commit_with_message(repo.path(), "feature");
+    checkout_branch(repo.path(), &original_branch);
+    write_repo_file(repo.path(), "main.txt", "main\n");
+    create_commit_with_message(repo.path(), "main");
+    assert_eq!(
+        git::merge_base(repo.path(), "HEAD", "feature").unwrap(),
+        root
+    );
+}
+
+#[test]
+fn staged_and_historical_renames_keep_both_paths() {
+    let repo = empty_git_repo();
+    let original = (0..40).map(|i| format!("line {i}\n")).collect::<String>();
+    write_repo_file(repo.path(), "old.txt", &original);
+    create_commit_with_message(repo.path(), "base");
+    exec_git_cmd("mv old.txt new.txt", repo.path());
+    write_repo_file(
+        repo.path(),
+        "new.txt",
+        &original.replace("line 20", "edited line 20"),
+    );
+    let check = |base: &str, target: Option<&str>| {
+        let changes = RefCell::new(Vec::new());
+        git::for_each_changed_file_between_refs(repo.path(), base, target, |change| {
+            changes.borrow_mut().push(change.unwrap());
+            true
+        })
+        .unwrap();
+        assert!(changes.borrow().iter().any(|change| matches!(change,
+            FileChange::Renamed { from_path, to_path } if from_path.ends_with("old.txt") && to_path.ends_with("new.txt"))), "{:?}", changes.borrow());
+    };
+    check("HEAD", None);
+    create_commit_with_message(repo.path(), "rename");
+    check("HEAD^", Some("HEAD"));
+}
+
+#[test]
+fn conflict_marker_size_reads_worktree_attributes() {
+    let repo = empty_git_repo();
+    write_repo_file(repo.path(), "file.txt", "text\n");
+    create_commit_with_message(repo.path(), "base");
+    write_repo_file(
+        repo.path(),
+        ".gitattributes",
+        "*.txt conflict-marker-size=3\n",
+    );
+    assert_eq!(
+        git::conflict_marker_size(&repo.path().join("file.txt")).unwrap(),
+        3
+    );
+}
+
+#[test]
+fn selected_unstaged_rename_resolves_its_base_without_a_full_untracked_scan() {
+    let repo = empty_git_repo();
+    let original = (0..40).map(|i| format!("line {i}\n")).collect::<String>();
+    write_repo_file(repo.path(), "old.txt", &original);
+    create_commit_with_message(repo.path(), "base");
+    std::fs::rename(repo.path().join("old.txt"), repo.path().join("new.txt")).unwrap();
+    write_repo_file(
+        repo.path(),
+        "new.txt",
+        &original.replace("line 20", "changed line 20"),
+    );
+    assert_eq!(
+        git::find_rename_source(&repo.path().join("new.txt"), "HEAD").unwrap(),
+        Some(repo.path().join("old.txt"))
+    );
+}

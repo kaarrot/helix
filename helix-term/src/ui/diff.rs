@@ -370,9 +370,9 @@ pub(super) fn char_diff_highlights_into(
     let diff_base = diff.diff_base();
 
     let highlight_name = if diff.is_inverted() {
-        "diff.minus"
+        "diff.minus.intraline"
     } else {
-        "diff.plus"
+        "diff.plus.intraline"
     };
     let Some(diff_highlight) = theme.find_highlight_exact(highlight_name) else {
         return;

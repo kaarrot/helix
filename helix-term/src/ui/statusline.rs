@@ -109,10 +109,12 @@ pub fn render(context: &mut RenderContext, viewport: Rect, surface: &mut Surface
     // Width of the empty space between the left and center area and between the center and right area.
     let spacing = 1u16;
 
-    let left_width = context.parts.left.width() as u16;
-    let right_width = context.parts.right.width() as u16;
+    let left_width = context.parts.left.width().min(viewport.width as usize) as u16;
+    let right_width = context.parts.right.width().min(viewport.width as usize) as u16;
     let edge_width = left_width.max(right_width);
-    let center_max_width = viewport.width.saturating_sub(2 * edge_width + 2 * spacing);
+    let center_max_width = viewport
+        .width
+        .saturating_sub(edge_width.saturating_mul(2).saturating_add(2 * spacing));
     let center_width = center_max_width.min(context.parts.center.width() as u16);
     let center_start = viewport.x + viewport.width / 2 - center_width / 2;
     let right_start = viewport.x + viewport.width.saturating_sub(right_width);
@@ -162,7 +164,9 @@ pub fn completion_suggestion_index_at(
     let left_width = left.width.min(u16::MAX as usize) as u16;
     let right_width = right.width.min(u16::MAX as usize) as u16;
     let edge_width = left_width.max(right_width);
-    let center_max_width = viewport.width.saturating_sub(2 * edge_width + 2 * spacing);
+    let center_max_width = viewport
+        .width
+        .saturating_sub(edge_width.saturating_mul(2).saturating_add(2 * spacing));
     let center_width = center_max_width.min(center.width.min(u16::MAX as usize) as u16);
 
     let center_start = viewport.x + viewport.width / 2 - center_width / 2;
@@ -269,7 +273,9 @@ fn paint_completion_chips(
     let left_width = left.width.min(u16::MAX as usize) as u16;
     let right_width = right.width.min(u16::MAX as usize) as u16;
     let edge_width = left_width.max(right_width);
-    let center_max_width = viewport.width.saturating_sub(2 * edge_width + 2 * spacing);
+    let center_max_width = viewport
+        .width
+        .saturating_sub(edge_width.saturating_mul(2).saturating_add(2 * spacing));
     let center_width = center_max_width.min(center.width.min(u16::MAX as usize) as u16);
 
     let center_start = viewport.x + viewport.width / 2 - center_width / 2;
@@ -738,8 +744,13 @@ where
     if suggestions_taking_over(context) {
         return;
     }
-    let title =
-        console_title(context).unwrap_or_else(|| format!(" {} ", context.doc.display_name()));
+    let title = console_title(context).unwrap_or_else(|| {
+        format!(
+            " {}{} ",
+            context.editor.comparison_label(context.view.id),
+            context.doc.display_name()
+        )
+    });
 
     write(context, title.into());
 }
@@ -752,12 +763,23 @@ where
         return;
     }
     let title = console_title(context).unwrap_or_else(|| {
+        if context.doc.git_revision.is_some() {
+            return format!(
+                " {}{} ",
+                context.editor.comparison_label(context.view.id),
+                context.doc.display_name()
+            );
+        }
         let path = context.doc.path();
         let path = path
             .as_ref()
             .map(|p| p.to_string_lossy())
             .unwrap_or_else(|| context.doc.display_name());
-        format!(" {} ", path)
+        format!(
+            " {}{} ",
+            context.editor.comparison_label(context.view.id),
+            path
+        )
     });
 
     write(context, title.into());
@@ -796,12 +818,23 @@ where
         return;
     }
     let title = console_title(context).unwrap_or_else(|| {
+        if context.doc.git_revision.is_some() {
+            return format!(
+                " {}{} ",
+                context.editor.comparison_label(context.view.id),
+                context.doc.display_name()
+            );
+        }
         let rel_path = context.doc.relative_path();
         let path = rel_path
             .as_ref()
             .and_then(|p| p.file_name().map(|s| s.to_string_lossy()))
             .unwrap_or_else(|| context.doc.display_name());
-        format!(" {} ", path)
+        format!(
+            " {}{} ",
+            context.editor.comparison_label(context.view.id),
+            path
+        )
     });
 
     write(context, title.into());

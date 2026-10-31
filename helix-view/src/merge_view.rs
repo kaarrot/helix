@@ -9,6 +9,7 @@ pub struct LastResolution {
     /// Absolute char offset where the replacement ends (exclusive).
     pub end_char: usize,
     pub ours: String,
+    pub base: Option<String>,
     pub theirs: String,
     pub both: String,
     /// `Document::version()` after the accept that produced this range.
@@ -33,33 +34,82 @@ impl LastResolution {
 
 /// Parse `<<<<<<<` / `=======` / `>>>>>>>` conflict markers from a rope
 /// and return the line ranges of each conflict block.
+#[derive(Debug, Clone)]
 pub struct ConflictRegion {
+    pub marker_size: usize,
     /// Line of `<<<<<<<` marker (inclusive)
     pub start_line: usize,
     /// Line of `>>>>>>>` marker (inclusive)
     pub end_line: usize,
 }
 
-pub fn find_conflicts(text: &Rope) -> Vec<ConflictRegion> {
-    let mut regions = Vec::new();
-    let mut start: Option<usize> = None;
+#[derive(Debug, Default)]
+pub struct ConflictScan {
+    pub regions: Vec<ConflictRegion>,
+    pub marker_lines: usize,
+    pub malformed: bool,
+}
+
+/// Scan all marker-shaped lines, including orphaned markers. A malformed
+/// block must never become an apparently resolved file, or a smaller block
+/// whose acceptance silently discards content.
+pub fn scan_conflicts(text: &Rope) -> ConflictScan {
+    scan_conflicts_with_size(text, 7)
+}
+
+pub fn scan_conflicts_with_size(text: &Rope, marker_size: usize) -> ConflictScan {
+    let mut scan = ConflictScan::default();
+    let mut start: Option<(usize, usize)> = None;
+    let mut state = 0;
 
     for (i, line) in text.lines().enumerate() {
-        let s: String = line.chars().collect();
+        let s = line.to_string();
         let s = s.trim_end_matches(['\n', '\r']);
-        if s.starts_with("<<<<<<<") {
-            start = Some(i);
-        } else if s.starts_with(">>>>>>>") {
-            if let Some(s_line) = start.take() {
-                regions.push(ConflictRegion {
-                    start_line: s_line,
-                    end_line: i,
-                });
+        let Some((kind, width)) = marker(s, marker_size) else {
+            continue;
+        };
+        scan.marker_lines += 1;
+        if start.is_some_and(|(_, expected)| width != expected) {
+            scan.malformed = true;
+        }
+        match kind {
+            '<' if start.is_none() => {
+                start = Some((i, width));
+                state = 1;
             }
+            '|' if state == 1 => state = 2,
+            '=' if state == 1 || state == 2 => state = 3,
+            '>' => {
+                if let Some((start_line, width)) = start.take() {
+                    scan.regions.push(ConflictRegion {
+                        marker_size: width,
+                        start_line,
+                        end_line: i,
+                    });
+                } else {
+                    scan.malformed = true;
+                }
+                scan.malformed |= state != 3;
+                state = 0;
+            }
+            _ => scan.malformed = true,
         }
     }
+    scan.malformed |= start.is_some();
+    scan
+}
 
-    regions
+fn marker(line: &str, marker_size: usize) -> Option<(char, usize)> {
+    let kind = line.chars().next()?;
+    if !matches!(kind, '<' | '|' | '=' | '>') {
+        return None;
+    }
+    let width = line.bytes().take_while(|&b| b == kind as u8).count();
+    (width >= 7 || width == marker_size).then_some((kind, width))
+}
+
+pub fn find_conflicts(text: &Rope) -> Vec<ConflictRegion> {
+    scan_conflicts(text).regions
 }
 
 /// Count remaining (unresolved) conflict blocks.
@@ -73,6 +123,9 @@ pub fn extract_sides(
     text: &Rope,
     region: &ConflictRegion,
 ) -> Option<(String, Option<String>, String)> {
+    if scan_conflicts_with_size(text, region.marker_size).malformed {
+        return None;
+    }
     let mut ours = Vec::new();
     let mut base: Option<Vec<String>> = None;
     let mut theirs = Vec::new();
@@ -85,11 +138,12 @@ pub fn extract_sides(
         }
         let s: String = line.chars().collect();
         let s_trim = s.trim_end_matches(['\n', '\r']);
-        if i == region.start_line && s_trim.starts_with("<<<<<<<") {
+        let kind = marker(s_trim, region.marker_size).map(|(kind, _)| kind);
+        if i == region.start_line && kind == Some('<') {
             state = 1;
             continue;
         }
-        if s_trim.starts_with("|||||||") {
+        if kind == Some('|') {
             if state != 1 || base.is_some() || seen_separator {
                 return None;
             }
@@ -97,7 +151,7 @@ pub fn extract_sides(
             state = 2;
             continue;
         }
-        if s_trim.starts_with("=======") {
+        if kind == Some('=') {
             if !(state == 1 || state == 2) || seen_separator {
                 return None;
             }
@@ -105,7 +159,7 @@ pub fn extract_sides(
             state = 3;
             continue;
         }
-        if s_trim.starts_with(">>>>>>>") {
+        if kind == Some('>') {
             break;
         }
         match state {
@@ -199,11 +253,38 @@ mod tests {
     }
 
     #[test]
+    fn orphaned_and_nested_markers_are_not_resolved() {
+        for input in [
+            "=======\ntheirs\n>>>>>>> theirs\n",
+            "<<<<<<< ours\nours\n=======\ntheirs\n",
+            "||||||| base\nbase\n",
+            "<<<<<<< ours\n<<<<<<< quoted\nours\n=======\ntheirs\n>>>>>>> theirs\n",
+            "<<<<<<< ours\nours\n=======\ntheirs\n>>>>>>> quoted\nmore\n>>>>>>> theirs\n",
+        ] {
+            let scan = scan_conflicts(&rope(input));
+            assert!(scan.malformed, "{input}");
+            assert!(scan.marker_lines > 0);
+        }
+    }
+
+    #[test]
+    fn supports_long_markers_and_crlf_without_losing_content() {
+        let text = rope("<<<<<<<<< ours\r\nours\r\n||||||||| base\r\nbase\r\n=========\r\ntheirs\r\n>>>>>>>>> theirs\r\n");
+        let scan = scan_conflicts(&text);
+        assert!(!scan.malformed);
+        let (ours, base, theirs) = extract_sides(&text, &scan.regions[0]).unwrap();
+        assert_eq!(ours, "ours\r\n");
+        assert_eq!(base.as_deref(), Some("base\r\n"));
+        assert_eq!(theirs, "theirs\r\n");
+    }
+
+    #[test]
     fn last_resolution_contains_cursor_is_exclusive() {
         let prior = LastResolution {
             start_char: 10,
             end_char: 20,
             ours: String::new(),
+            base: None,
             theirs: String::new(),
             both: String::new(),
             doc_version: 1,
@@ -220,6 +301,7 @@ mod tests {
             start_char: 5,
             end_char: 5,
             ours: String::new(),
+            base: None,
             theirs: String::new(),
             both: String::new(),
             doc_version: 1,

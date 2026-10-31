@@ -249,18 +249,27 @@
 | `vsplit_new` | Vertical right split scratch buffer | normal: `` <C-w>nv ``, `` <space>wnv ``, `` <C-w>n<C-v> ``, `` <space>wn<C-v> ``, select: `` <C-w>nv ``, `` <space>wnv ``, `` <C-w>n<C-v> ``, `` <space>wn<C-v> `` |
 | `wclose` | Close window | normal: `` <C-w>q ``, `` <space>wq ``, `` <C-w><C-q> ``, `` <space>w<C-q> ``, select: `` <C-w>q ``, `` <space>wq ``, `` <C-w><C-q> ``, `` <space>w<C-q> `` |
 | `wonly` | Close windows except current | normal: `` <C-w>o ``, `` <space>wo ``, `` <C-w><C-o> ``, `` <space>w<C-o> ``, select: `` <C-w>o ``, `` <space>wo ``, `` <C-w><C-o> ``, `` <space>w<C-o> `` |
-| `close_diff_or_merge_view` | Close diff or merge view | normal: `` <space>mq ``, select: `` <space>mq `` |
-| `diff_toggle_split_view` | Toggle between single-pane and side-by-side diff | normal: `` <space>mv ``, select: `` <space>mv `` |
-| `diff_toggle_sync_scroll` | Toggle synchronized scrolling in split diff | normal: `` <space>ms ``, select: `` <space>ms `` |
-| `diff_reset` | Reset diff base to HEAD | normal: `` <space>mr ``, select: `` <space>mr `` |
-| `diff_commit_from_selection` | Set diff range from selected git log lines, bottom line as base | normal: `` <space>mc ``, select: `` <space>mc `` |
-| `diff_show_commit_from_selection` | Show changes introduced by selected commit | normal: `` <space>mC ``, select: `` <space>mC `` |
-| `merge_accept_ours` | Accept HEAD version for current conflict | normal: `` <space>mo ``, select: `` <space>mo `` |
-| `merge_accept_theirs` | Accept incoming version for current conflict | normal: `` <space>mt ``, select: `` <space>mt `` |
-| `merge_accept_both` | Accept both versions for current conflict | normal: `` <space>mb ``, select: `` <space>mb `` |
-| `merge_next_conflict` | Jump to next merge conflict | normal: `` <space>mn ``, select: `` <space>mn `` |
-| `merge_prev_conflict` | Jump to previous merge conflict | normal: `` <space>mp ``, select: `` <space>mp `` |
-| `merge_finish` | Save and stage the resolved file | normal: `` <space>mf ``, select: `` <space>mf `` |
+| `close_diff_or_merge_view` | Close diff or merge view | normal: `` <space>Mq ``, `` <space>mq ``, select: `` <space>Mq ``, `` <space>mq `` |
+| `diff_toggle_split_view` | Toggle between single-pane and side-by-side diff | normal: `` <space>Mv ``, `` <space>mv ``, select: `` <space>Mv ``, `` <space>mv `` |
+| `diff_toggle_sync_scroll` | Toggle synchronized scrolling in split diff | normal: `` <space>Ms ``, `` <space>ms ``, select: `` <space>Ms ``, `` <space>ms `` |
+| `diff_reset` | Reset diff base to HEAD | normal: `` <space>Mr ``, `` <space>mr ``, select: `` <space>Mr ``, `` <space>mr `` |
+| `diff_refresh` | Refresh the current diff or merge comparison | normal: `` <space>Mu ``, `` <space>mu ``, select: `` <space>Mu ``, `` <space>mu `` |
+| `diff_revert_hunk` | Revert diff hunks under the selections | normal: `` <space>Md ``, `` <space>md ``, select: `` <space>Md ``, `` <space>md `` |
+| `diff_next_file` | Open the next changed file in this comparison | normal: `` ]F ``, select: `` ]F `` |
+| `diff_prev_file` | Open the previous changed file in this comparison | normal: `` [F ``, select: `` [F `` |
+| `diff_commit_from_selection` | Set diff range from selected git log lines, bottom line as base | normal: `` <space>Mc ``, `` <space>mc ``, select: `` <space>Mc ``, `` <space>mc `` |
+| `diff_show_commit_from_selection` | Show changes introduced by selected commit | normal: `` <space>MC ``, `` <space>mC ``, select: `` <space>MC ``, `` <space>mC `` |
+| `merge_accept_ours` | Accept HEAD version for current conflict | normal: `` <space>Mo ``, `` <space>mo ``, select: `` <space>Mo ``, `` <space>mo `` |
+| `merge_accept_theirs` | Accept incoming version for current conflict | normal: `` <space>Mt ``, `` <space>mt ``, select: `` <space>Mt ``, `` <space>mt `` |
+| `merge_accept_both` | Accept both versions for current conflict | normal: `` <space>Mb ``, `` <space>mb ``, select: `` <space>Mb ``, `` <space>mb `` |
+| `merge_accept_base` | Accept the base version for the current conflict | normal: `` <space>Ma ``, `` <space>ma ``, select: `` <space>Ma ``, `` <space>ma `` |
+| `merge_show_base` | Show the index base version | normal: `` <space>MB ``, `` <space>mB ``, select: `` <space>MB ``, `` <space>mB `` |
+| `merge_accept_ours_and_next` | Accept HEAD and jump to the next conflict | normal: `` <space>MO ``, `` <space>mO ``, select: `` <space>MO ``, `` <space>mO `` |
+| `merge_accept_theirs_and_next` | Accept incoming and jump to the next conflict | normal: `` <space>MT ``, `` <space>mT ``, select: `` <space>MT ``, `` <space>mT `` |
+| `merge_accept_both_and_next` | Accept both and jump to the next conflict | normal: `` <space>MA ``, `` <space>mA ``, select: `` <space>MA ``, `` <space>mA `` |
+| `merge_next_conflict` | Jump to next merge conflict | normal: `` <space>Mn ``, `` <space>mn ``, select: `` <space>Mn ``, `` <space>mn `` |
+| `merge_prev_conflict` | Jump to previous merge conflict | normal: `` <space>Mp ``, `` <space>mp ``, select: `` <space>Mp ``, `` <space>mp `` |
+| `merge_finish` | Save and stage the resolved file | normal: `` <space>Mf ``, `` <space>mf ``, select: `` <space>Mf ``, `` <space>mf `` |
 | `select_register` | Select register | normal: `` " ``, select: `` " `` |
 | `insert_register` | Insert register | insert: `` <C-r> `` |
 | `copy_between_registers` | Copy between two registers |  |

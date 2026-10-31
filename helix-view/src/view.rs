@@ -692,22 +692,37 @@ impl View {
         text_annotations: &mut helix_core::text_annotations::TextAnnotations<'a>,
         diff_views: &std::collections::HashMap<ViewId, crate::diff_view::DiffViewState>,
         documents: &'a std::collections::BTreeMap<DocumentId, Document>,
-    ) {
+        tree: &crate::tree::Tree,
+    ) -> Option<crate::annotations::diff::AlignmentPadding> {
         let Some(diff_state) = diff_views.get(&self.id).filter(|state| state.is_split()) else {
-            return;
+            return None;
         };
         let other_doc_id = if diff_state.is_base_view(self.id) {
             diff_state.working_doc_id
         } else {
             diff_state.base_doc_id
         };
-        if let (Some(diff_handle), Some(_)) = (
+        let other_view_id = if diff_state.is_base_view(self.id) {
+            diff_state.working_view_id
+        } else {
+            diff_state.base_view_id
+        };
+        if let (Some(diff_handle), Some(other_doc)) = (
             doc.diff_handle_for_view(self.id),
             documents.get(&other_doc_id),
         ) {
-            text_annotations.add_line_annotation(Box::new(
-                crate::annotations::diff::DiffAlignment::new(diff_handle.clone()),
-            ));
+            let alignment = crate::annotations::diff::DiffAlignment::new(diff_handle.clone())
+                .with_wrapping(
+                    doc.text().clone(),
+                    doc.text_format(self.inner_width(doc), None),
+                    other_doc.text_format(tree.get(other_view_id).inner_width(other_doc), None),
+                    self.inner_height(),
+                );
+            let padding = alignment.padding_rows();
+            text_annotations.add_line_annotation(Box::new(alignment));
+            Some(padding)
+        } else {
+            None
         }
     }
 }

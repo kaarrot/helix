@@ -58,7 +58,6 @@
 | `:lsp-workspace-command` | Open workspace command picker |
 | `:lsp-restart` | Restarts the given language servers, or all language servers that are used by the current file if no arguments are supplied |
 | `:lsp-stop` | Stops the given language servers, or all language servers that are used by the current file if no arguments are supplied |
-| `:markdown-preview`, `:md-preview`, `:mdp` | Render the current buffer as markdown in a side panel for reading. |
 | `:tree-sitter-scopes` | Display tree sitter scopes, primarily for theming and development. |
 | `:tree-sitter-highlight-name` | Display name of tree-sitter highlight scope under the cursor. |
 | `:tree-sitter-layers` | Display language names of tree-sitter injection layers under the cursor. |
@@ -97,7 +96,8 @@
 | `:noop` | Does nothing. |
 | `:toggle-char-diff`, `:tcd` | Toggle character-level diff highlighting for the current buffer. |
 | `:diff-buffer`, `:dbuf` | Compare the current buffer against another open buffer. |
-| `:diff-commit`, `:dc` | Set the diff range for the space+g changed-file picker. Accepts: REF (REF vs working tree), REF! (changes introduced by REF, i.e. REF^..REF), or REF1..REF2 (changes between two refs). |
-| `:diff-reset`, `:dr` | Reset the diff base to HEAD (default behavior). |
-| `:diff-files`, `:df` | Show a picker with all files changed between current branch and specified commit. |
+| `:diff-commit`, `:dc` | Set and validate the space+g diff range: REF vs working tree, REF! or REF^! for one commit, A..B for two snapshots, A...B for merge-base(A,B) vs B. Git revisions such as HEAD~N are supported. |
+| `:diff-refresh` | Refresh the current comparison's Git snapshots, preserving unsaved result edits unless merge inputs changed. |
+| `:diff-reset`, `:dr` | Close active diff and merge sessions, forget suspended comparisons and layout overrides, and restore ordinary HEAD diffs. |
+| `:diff-files`, `:df` | Show a one-off picker comparing REF with the working tree, without changing the space+g range. |
 | `:merge`, `:3way` | Open a 3-way merge view for the current conflicted file. |

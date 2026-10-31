@@ -329,6 +329,9 @@ entry opens the 3-way merge view.
 
 Accessed by typing `Space-m` in [space mode](#space-mode).
 
+`Space-M` opens the same menu with sticky keys; `Esc` leaves it.
+`]F` and `[F` open the next and previous changed file in the current comparison.
+
 These mappings control diff review, commit-range selection, and merge
 resolution. The commands that open diff or merge views are documented in
 [Diff and merge](./diff-and-merge.md).
@@ -338,12 +341,19 @@ resolution. The commands that open diff or merge views are documented in
 | `c` | Set the changed-file picker range from selected git log lines, with the bottom line as the excluded base (`OLDER..NEWER`, or `COMMIT` vs working tree) | `diff_commit_from_selection` |
 | `C` | Set the changed-file picker range to show the selected commit only (`COMMIT^..COMMIT`) | `diff_show_commit_from_selection` |
 | `r` | Reset diff state back to `HEAD` vs working tree | `diff_reset` |
+| `R` | Refresh the current comparison's Git inputs | `diff_refresh` |
+| `d` | Revert diff hunks intersecting the selections | `diff_revert_hunk` |
 | `v` | Toggle side-by-side split diff view | `diff_toggle_split_view` |
 | `s` | Toggle synchronized scrolling in split diff view | `diff_toggle_sync_scroll` |
 | `q` | Close the current diff or merge view | `close_diff_or_merge_view` |
 | `o` | Accept the `HEAD` version for the current conflict | `merge_accept_ours` |
 | `t` | Accept the incoming version for the current conflict | `merge_accept_theirs` |
 | `b` | Accept both sides for the current conflict | `merge_accept_both` |
+| `a` | Accept the base version for the current conflict | `merge_accept_base` |
+| `B` | Show the index base version | `merge_show_base` |
+| `O` | Accept HEAD and advance | `merge_accept_ours_and_next` |
+| `T` | Accept incoming and advance | `merge_accept_theirs_and_next` |
+| `A` | Accept both and advance | `merge_accept_both_and_next` |
 | `n` | Jump to the next unresolved conflict | `merge_next_conflict` |
 | `p` | Jump to the previous unresolved conflict | `merge_prev_conflict` |
 | `f` | Save and stage the resolved file (`git add`) | `merge_finish` |

@@ -579,6 +579,13 @@ fn new_file(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> an
 fn focused_file_revision(editor: &Editor) -> (Option<PathBuf>, Option<String>) {
     let view = view!(editor);
 
+    if let Some(revision) = editor
+        .document(view.doc)
+        .and_then(|doc| doc.git_revision.clone())
+    {
+        return (Some(revision.path), revision.commit);
+    }
+
     if let Some(state) = editor.diff.views.get(&view.id) {
         if state.source == helix_view::diff_view::DiffViewSource::Git {
             if view.doc == state.base_doc_id && !state.base_path.as_os_str().is_empty() {
@@ -588,13 +595,6 @@ fn focused_file_revision(editor: &Editor) -> (Option<PathBuf>, Option<String>) {
                 return (Some(state.working_path.clone()), state.target_ref.clone());
             }
         }
-    }
-
-    if let Some(revision) = editor
-        .document(view.doc)
-        .and_then(|doc| doc.git_revision.clone())
-    {
-        return (Some(revision.path), Some(revision.git_ref));
     }
 
     // Merge panes are index stages rather than commits, so only the path of the
@@ -619,6 +619,7 @@ fn focused_file_revision(editor: &Editor) -> (Option<PathBuf>, Option<String>) {
 }
 
 /// The 1-based, inclusive line span covered by the primary selection.
+#[cfg(feature = "git")]
 fn selected_line_span(editor: &Editor) -> (usize, usize) {
     let (view, doc) = current_ref!(editor);
     let text = doc.text().slice(..);
@@ -656,6 +657,7 @@ fn copy_path_to_clipboard(
     // In a working-tree pane there is no commit to point at, so `url` copies
     // the path just like the default does.
     let (copied, what) = match rev.filter(|_| as_url) {
+        #[cfg(feature = "git")]
         Some(rev) => {
             let link = helix_vcs::git::file_web_link(&path, &rev)?;
             let base = helix_vcs::web_url::web_base(&link.remote_url).ok_or_else(|| {
@@ -673,6 +675,8 @@ fn copy_path_to_clipboard(
             );
             (url, "URL")
         }
+        #[cfg(not(feature = "git"))]
+        Some(_) => anyhow::bail!("git support not compiled in"),
         None => (path.to_string_lossy().into_owned(), "path"),
     };
 
@@ -2633,10 +2637,32 @@ fn reset_diff_change(
         return Ok(());
     }
 
-    let editor = &mut cx.editor;
+    let changes = revert_diff_changes(cx.editor)?;
+    cx.editor.set_status(format!(
+        "Reset {changes} change{}",
+        if changes == 1 { "" } else { "s" }
+    ));
+    Ok(())
+}
+
+pub(super) fn revert_diff_changes(editor: &mut Editor) -> anyhow::Result<usize> {
+    editor.refresh_comparison_state();
+    editor.ensure_merge_inputs_current(editor.tree.focus)?;
+    anyhow::ensure!(
+        !editor
+            .diff
+            .views
+            .get(&editor.tree.focus)
+            .is_some_and(|state| state.stale),
+        "Comparison is stale; use :diff-refresh before reverting changes"
+    );
     let scrolloff = editor.config().scrolloff;
 
     let (view, doc) = current!(editor);
+    anyhow::ensure!(
+        !doc.is_virtual_base,
+        "Cannot revert changes in a read-only revision"
+    );
     let Some(handle) = doc.diff_handle_for_view(view.id) else {
         bail!("Diff is not available in the current buffer")
     };
@@ -2666,14 +2692,10 @@ fn reset_diff_change(
     }
 
     drop(diff); // make borrow check happy
-    doc.apply(&transaction, view.id);
+    anyhow::ensure!(doc.apply(&transaction, view.id), "Cannot apply hunk revert");
     doc.append_changes_to_history(view);
     view.ensure_cursor_in_view(doc, scrolloff);
-    cx.editor.set_status(format!(
-        "Reset {changes} change{}",
-        if changes == 1 { "" } else { "s" }
-    ));
-    Ok(())
+    Ok(changes)
 }
 
 fn clear_register(
@@ -3951,7 +3973,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     TypableCommand {
         name: "diff-commit",
         aliases: &["dc"],
-        doc: "Set the diff range for the space+g changed-file picker. Accepts: REF (REF vs working tree), REF! (changes introduced by REF, i.e. REF^..REF), or REF1..REF2 (changes between two refs).",
+        doc: "Set and validate the space+g diff range: REF vs working tree, REF! or REF^! for one commit, A..B for two snapshots, A...B for merge-base(A,B) vs B. Git revisions such as HEAD~N are supported.",
         fun: typed_diff::diff_commit,
         completer: CommandCompleter::none(),
         signature: Signature {
@@ -3960,9 +3982,17 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         },
     },
     TypableCommand {
+        name: "diff-refresh",
+        aliases: &[],
+        doc: "Refresh the current comparison's Git snapshots, preserving unsaved result edits unless merge inputs changed.",
+        fun: typed_diff::diff_refresh,
+        completer: CommandCompleter::none(),
+        signature: Signature { positionals: (0, Some(0)), ..Signature::DEFAULT },
+    },
+    TypableCommand {
         name: "diff-reset",
         aliases: &["dr"],
-        doc: "Reset the diff base to HEAD (default behavior).",
+        doc: "Close active diff and merge sessions, forget suspended comparisons and layout overrides, and restore ordinary HEAD diffs.",
         fun: typed_diff::diff_reset_typed,
         completer: CommandCompleter::none(),
         signature: Signature {
@@ -3973,7 +4003,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     TypableCommand {
         name: "diff-files",
         aliases: &["df"],
-        doc: "Show a picker with all files changed between current branch and specified commit.",
+        doc: "Show a one-off picker comparing REF with the working tree, without changing the space+g range.",
         fun: typed_diff::diff_files,
         completer: CommandCompleter::none(),
         signature: Signature {

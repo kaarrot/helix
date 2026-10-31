@@ -26,11 +26,15 @@ You can change the picker's scope before opening it:
 - `:diff-commit REF` compares `REF` to the working tree.
 - `:diff-commit REF!` shows only the changes introduced by `REF`.
 - `:diff-commit REF1..REF2` compares two refs directly.
+- `:diff-commit REF1...REF2` compares their merge base to `REF2`.
 - `Space-m c` reads selected git log lines, with the bottom line as the base
   (not included): one line is `COMMIT` versus the working tree; two or more
   lines are `OLDER..NEWER`.
 - `Space-m C` reads one selected git log line and sets the range to
   `COMMIT^..COMMIT`.
 
-For a one-off picker of files changed between a ref and the current branch, use
+For a one-off picker comparing a ref with the working tree, use
 `:diff-files REF`.
+
+The current file is preselected from either comparison pane. `]F` and `[F`
+continue through the comparison's changed files without reopening the picker.

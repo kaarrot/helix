@@ -212,62 +212,259 @@ pub fn resolve_commit_id(path: &Path, rev: &str) -> Result<String> {
     Ok(commit)
 }
 
-/// Fetch OURS (stage 2) and THEIRS (stage 3) versions of a conflicted file
-/// from the git index. Returns `(ours_bytes, theirs_bytes)`.
-pub fn get_merge_versions(file: &Path) -> Result<(Vec<u8>, Vec<u8>)> {
-    debug_assert!(file.is_absolute());
+/// Whether a file still has unresolved index stages, including a file whose
+/// markers have already been removed by hand but which is not staged yet.
+pub fn is_conflicted(file: &Path) -> Result<bool> {
     let file = resolve_file_path(file)?;
-
-    let repo_dir = get_repo_dir(&file)?;
-    let repo = open_repo(repo_dir)
-        .context("failed to open git repo")?
-        .to_thread_local();
-
-    let work_dir = repo
-        .workdir()
-        .ok_or_else(|| anyhow::anyhow!("not a working tree"))?;
-    let rela_path = file.strip_prefix(work_dir)?;
-    let rela_path = gix::path::try_into_bstr(rela_path)?;
-
+    let repo = open_repo(get_repo_dir(&file)?)?.to_thread_local();
+    let work_dir = repo.workdir().context("not a working tree")?;
+    let path = gix::path::try_into_bstr(file.strip_prefix(work_dir)?)?;
     let index = repo.index_or_load_from_head()?;
-    let mut ours_oid = None;
-    let mut theirs_oid = None;
+    Ok(index.entries().iter().any(|entry| {
+        entry.path(&index) == path.as_ref()
+            && entry.stage() != gix::index::entry::Stage::Unconflicted
+    }))
+}
 
+#[derive(Debug)]
+pub struct MergeInputs {
+    pub marker_size: usize,
+    pub base: Option<Vec<u8>>,
+    pub ours: Option<Vec<u8>>,
+    pub theirs: Option<Vec<u8>>,
+    pub fingerprint: String,
+    pub ours_label: String,
+    pub theirs_label: String,
+}
+
+struct MergeIndex {
+    marker_size: usize,
+    repo: Repository,
+    path: PathBuf,
+    stages: [Option<ObjectId>; 3],
+    fingerprint: String,
+    ours_label: String,
+    theirs_label: String,
+}
+
+fn merge_index(file: &Path) -> Result<MergeIndex> {
+    let file = resolve_file_path(file)?;
+    let repo = open_repo(get_repo_dir(&file)?)?.to_thread_local();
+    let path = file
+        .strip_prefix(repo.workdir().context("not a working tree")?)?
+        .to_path_buf();
+    let rela_path = gix::path::try_into_bstr(path.as_path())?;
+    let index = repo.index_or_load_from_head()?;
+    let mut stages = [None; 3];
     for entry in index.entries() {
         if entry.path(&index) == rela_path.as_ref() {
             match entry.stage() {
-                gix::index::entry::Stage::Ours => ours_oid = Some(entry.id),
-                gix::index::entry::Stage::Theirs => theirs_oid = Some(entry.id),
+                gix::index::entry::Stage::Base => stages[0] = Some(entry.id),
+                gix::index::entry::Stage::Ours => stages[1] = Some(entry.id),
+                gix::index::entry::Stage::Theirs => stages[2] = Some(entry.id),
                 _ => {}
             }
         }
     }
+    let marker_size = marker_size_for_path(&repo, &index, &path)?;
+    let state = repo.state();
+    let rebase = matches!(
+        state,
+        Some(
+            gix::state::InProgress::Rebase
+                | gix::state::InProgress::RebaseInteractive
+                | gix::state::InProgress::ApplyMailboxRebase
+        )
+    );
+    let head = repo
+        .head_id()
+        .ok()
+        .map(|id| id.to_hex().to_string())
+        .unwrap_or_default();
+    let incoming = ["REBASE_HEAD", "CHERRY_PICK_HEAD", "MERGE_HEAD"]
+        .into_iter()
+        .find_map(|name| {
+            resolve_commit(&repo, name)
+                .ok()
+                .map(|commit| commit.id().to_hex().to_string())
+        })
+        .unwrap_or_default();
+    let short = |id: &str| id.chars().take(8).collect::<String>();
+    let ours_label = format!(
+        "{} {}",
+        if rebase { "upstream HEAD" } else { "HEAD" },
+        short(&head)
+    );
+    let theirs_label = format!(
+        "{} {}",
+        if rebase {
+            "replayed commit"
+        } else {
+            "incoming"
+        },
+        short(&incoming)
+    );
+    let ours_label = if stages[1].is_none() {
+        format!("{ours_label} (deleted)")
+    } else {
+        ours_label
+    };
+    let theirs_label = if stages[2].is_none() {
+        format!("{theirs_label} (deleted)")
+    } else {
+        theirs_label
+    };
+    let fingerprint = format!("{state:?}:{head}:{incoming}:{stages:?}:{marker_size}");
+    drop(index);
+    Ok(MergeIndex {
+        marker_size,
+        repo,
+        path,
+        stages,
+        fingerprint,
+        ours_label,
+        theirs_label,
+    })
+}
 
-    let ours_oid = ours_oid.ok_or_else(|| {
-        anyhow::anyhow!("OURS (stage 2) not in index — is there an active merge?")
-    })?;
-    let theirs_oid = theirs_oid.ok_or_else(|| anyhow::anyhow!("THEIRS (stage 3) not in index"))?;
+pub fn merge_fingerprint(file: &Path) -> Result<String> {
+    Ok(merge_index(file)?.fingerprint)
+}
 
-    let (mut pipeline, _) = repo.filter_pipeline(None)?;
+pub fn conflict_marker_size(file: &Path) -> Result<usize> {
+    let file = resolve_file_path(file)?;
+    let repo = open_repo(get_repo_dir(&file)?)?.to_thread_local();
+    let path = file.strip_prefix(repo.workdir().context("not a working tree")?)?;
+    let index = repo.index_or_load_from_head()?;
+    marker_size_for_path(&repo, &index, path)
+}
 
-    let ours_data = repo.find_object(ours_oid)?.detach().data;
-    let mut ours_out =
-        pipeline.convert_to_worktree(&ours_data, rela_path.as_ref(), Delay::Forbid)?;
-    let mut ours_buf = Vec::with_capacity(ours_data.len());
-    ours_out.read_to_end(&mut ours_buf)?;
+fn marker_size_for_path(
+    repo: &Repository,
+    index: &gix::index::State,
+    path: &Path,
+) -> Result<usize> {
+    let mut attrs = repo.attributes_only(
+        index,
+        gix::worktree::stack::state::attributes::Source::WorktreeThenIdMapping,
+    )?;
+    let mut matches = attrs.selected_attribute_matches(["conflict-marker-size"]);
+    attrs.at_path(path, None)?.matching_attributes(&mut matches);
+    let size = matches.iter_selected().find_map(|attr| {
+        attr.assignment
+            .state
+            .as_bstr()
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|&size| size > 0)
+    });
+    Ok(size.unwrap_or(7))
+}
 
-    let (mut pipeline2, _) = repo.filter_pipeline(None)?;
-    let theirs_data = repo.find_object(theirs_oid)?.detach().data;
-    let mut theirs_out =
-        pipeline2.convert_to_worktree(&theirs_data, rela_path.as_ref(), Delay::Forbid)?;
-    let mut theirs_buf = Vec::with_capacity(theirs_data.len());
-    theirs_out.read_to_end(&mut theirs_buf)?;
+/// Read all available conflict stages. Missing sides describe deletions;
+/// add/add conflicts have no base.
+pub fn get_merge_inputs(file: &Path) -> Result<MergeInputs> {
+    let state = merge_index(file)?;
+    anyhow::ensure!(
+        state.stages.iter().any(Option::is_some),
+        "File has no unresolved index stages"
+    );
+    let read = |id: Option<ObjectId>| -> Result<Option<Vec<u8>>> {
+        let Some(id) = id else {
+            return Ok(None);
+        };
+        let data = state.repo.find_object(id)?.detach().data;
+        let (mut pipeline, _) = state.repo.filter_pipeline(None)?;
+        let path = gix::path::try_into_bstr(state.path.as_path())?;
+        let mut outcome = pipeline.convert_to_worktree(&data, path.as_ref(), Delay::Forbid)?;
+        let mut bytes = Vec::with_capacity(data.len());
+        outcome.read_to_end(&mut bytes)?;
+        Ok(Some(bytes))
+    };
+    Ok(MergeInputs {
+        marker_size: state.marker_size,
+        base: read(state.stages[0])?,
+        ours: read(state.stages[1])?,
+        theirs: read(state.stages[2])?,
+        fingerprint: state.fingerprint,
+        ours_label: state.ours_label,
+        theirs_label: state.theirs_label,
+    })
+}
 
-    Ok((ours_buf, theirs_buf))
+/// Fetch the two sides for callers that require a text/text conflict.
+pub fn get_merge_versions(file: &Path) -> Result<(Vec<u8>, Vec<u8>)> {
+    anyhow::ensure!(
+        is_conflicted(file)?,
+        "OURS (stage 2) not in index — is there an active merge?"
+    );
+    let inputs = get_merge_inputs(file)?;
+    Ok((
+        inputs.ours.context("OURS (stage 2) not in index")?,
+        inputs.theirs.context("THEIRS (stage 3) not in index")?,
+    ))
 }
 
 pub fn for_each_changed_file(cwd: &Path, f: impl Fn(Result<FileChange>) -> bool) -> Result<()> {
     status(&open_repo(cwd)?.to_thread_local(), UntrackedFiles::Files, f)
+}
+
+/// Resolve the old name only for a selected new file. This avoids hashing
+/// every untracked file during the changed-file picker's initial scan.
+pub fn find_rename_source(file: &Path, base_ref: &str) -> Result<Option<PathBuf>> {
+    let file = resolve_file_path(file)?;
+    let repo = open_repo(get_repo_dir(&file)?)?.to_thread_local();
+    let tree = resolve_tree(&repo, base_ref)?;
+    match find_file_in_tree(&repo, &tree, &file) {
+        Ok(_) => return Ok(None),
+        Err(err) if err.is::<FileNotFoundInRevision>() => {}
+        Err(err) => return Err(err),
+    }
+    let workdir = repo.workdir().context("not a working tree")?;
+    let candidates = std::cell::RefCell::new(Vec::new());
+    for_each_tracked_change(workdir, base_ref, None, |change| {
+        if let Ok(FileChange::Deleted { path }) = change {
+            candidates.borrow_mut().push(path);
+        }
+        true
+    })?;
+    let selected = std::fs::read(&file)?;
+    if selected.is_empty() {
+        return Ok(None);
+    }
+    let mut selected_lines = std::collections::HashMap::new();
+    for line in selected.lines() {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        *selected_lines.entry(line).or_insert(0usize) += 1;
+    }
+    let mut best = None;
+    let mut best_score = 0.0;
+    let mut tied = false;
+    for path in candidates.into_inner() {
+        let oid = find_file_in_tree(&repo, &tree, &path)?;
+        let data = repo.find_object(oid)?.detach().data;
+        let mut remaining = selected_lines.clone();
+        let mut common = 0;
+        for line in data.lines() {
+            let line = line.strip_suffix(b"\r").unwrap_or(line);
+            if let Some(count) = remaining.get_mut(line).filter(|count| **count > 0) {
+                *count -= 1;
+                common += line.len() + 1;
+            }
+        }
+        let score = common as f64 / data.len().max(selected.len()) as f64;
+        if score < 0.5 {
+            continue;
+        }
+        if score > best_score {
+            best_score = score;
+            best = Some(path);
+            tied = false;
+        } else if score == best_score && best.is_some() {
+            tied = true;
+        }
+    }
+    Ok(best.filter(|_| !tied))
 }
 
 /// Iterate over changed files between a git ref and the working tree, or between two refs.
@@ -313,6 +510,9 @@ fn for_each_change_impl(
     match target_ref {
         None => {
             let base_tree = resolve_tree(&repo, base_ref)?;
+            if repo.head()?.is_unborn() {
+                return status(&repo, untracked, f);
+            }
             let head_commit = repo.head_commit()?;
             let head_tree = head_commit.tree()?;
 
@@ -334,8 +534,7 @@ fn for_each_change_impl(
                     use gix::object::tree::diff::Change;
                     let file_change = match change {
                         Change::Addition { entry_mode, .. }
-                        | Change::Modification { entry_mode, .. }
-                        | Change::Rewrite { entry_mode, .. } => {
+                        | Change::Modification { entry_mode, .. } => {
                             if entry_mode.is_blob() {
                                 Some(FileChange::Modified {
                                     path: work_dir.join(gix::path::from_bstr(change.location())),
@@ -344,6 +543,15 @@ fn for_each_change_impl(
                                 None
                             }
                         }
+                        Change::Rewrite {
+                            source_location,
+                            location,
+                            entry_mode,
+                            ..
+                        } => entry_mode.is_blob().then(|| FileChange::Renamed {
+                            from_path: work_dir.join(gix::path::from_bstr(source_location)),
+                            to_path: work_dir.join(gix::path::from_bstr(location)),
+                        }),
                         Change::Deletion { entry_mode, .. } => {
                             if entry_mode.is_blob() {
                                 Some(FileChange::Deleted {
@@ -367,7 +575,12 @@ fn for_each_change_impl(
 
             if !cancelled {
                 status(&repo, untracked, |change| match &change {
-                    Ok(fc) if seen.contains(fc.path()) => true,
+                    Ok(fc)
+                        if seen.contains(fc.path())
+                            && !matches!(fc, FileChange::Conflict { .. }) =>
+                    {
+                        true
+                    }
                     _ => f(change),
                 })?;
             }
@@ -386,8 +599,7 @@ fn for_each_change_impl(
                     use gix::object::tree::diff::Change;
                     let file_change = match change {
                         Change::Addition { entry_mode, .. }
-                        | Change::Modification { entry_mode, .. }
-                        | Change::Rewrite { entry_mode, .. } => {
+                        | Change::Modification { entry_mode, .. } => {
                             if entry_mode.is_blob() {
                                 Some(FileChange::Modified {
                                     path: work_dir.join(gix::path::from_bstr(change.location())),
@@ -396,6 +608,15 @@ fn for_each_change_impl(
                                 None
                             }
                         }
+                        Change::Rewrite {
+                            source_location,
+                            location,
+                            entry_mode,
+                            ..
+                        } => entry_mode.is_blob().then(|| FileChange::Renamed {
+                            from_path: work_dir.join(gix::path::from_bstr(source_location)),
+                            to_path: work_dir.join(gix::path::from_bstr(location)),
+                        }),
                         Change::Deletion { entry_mode, .. } => {
                             if entry_mode.is_blob() {
                                 Some(FileChange::Deleted {
@@ -520,9 +741,7 @@ pub fn for_each_changed_file_between_commits(
         |change| -> Result<_, std::convert::Infallible> {
             use gix::object::tree::diff::Change;
             let file_change = match change {
-                Change::Addition { entry_mode, .. }
-                | Change::Modification { entry_mode, .. }
-                | Change::Rewrite { entry_mode, .. } => {
+                Change::Addition { entry_mode, .. } | Change::Modification { entry_mode, .. } => {
                     if entry_mode.is_blob() {
                         Some(FileChange::Modified {
                             path: work_dir.join(gix::path::from_bstr(change.location())),
@@ -531,6 +750,15 @@ pub fn for_each_changed_file_between_commits(
                         None
                     }
                 }
+                Change::Rewrite {
+                    source_location,
+                    location,
+                    entry_mode,
+                    ..
+                } => entry_mode.is_blob().then(|| FileChange::Renamed {
+                    from_path: work_dir.join(gix::path::from_bstr(source_location)),
+                    to_path: work_dir.join(gix::path::from_bstr(location)),
+                }),
                 Change::Deletion { entry_mode, .. } => {
                     if entry_mode.is_blob() {
                         Some(FileChange::Deleted {
@@ -557,6 +785,9 @@ pub fn for_each_changed_file_between_commits(
 /// parent of a root commit (`ROOT^`, which `Space-m c` builds from a log line)
 /// is the empty tree, so the root commit's own files read as added.
 fn resolve_tree<'a>(repo: &'a Repository, ref_name: &str) -> Result<Tree<'a>> {
+    if ref_name == "HEAD" && repo.head()?.is_unborn() {
+        return Ok(repo.empty_tree());
+    }
     if let Some(base) = ref_name.strip_suffix('^') {
         let commit = resolve_commit(repo, base)?;
         if commit.parent_ids().next().is_none() {
@@ -566,7 +797,28 @@ fn resolve_tree<'a>(repo: &'a Repository, ref_name: &str) -> Result<Tree<'a>> {
     Ok(resolve_commit(repo, ref_name)?.tree()?)
 }
 
-/// Resolve a git reference or commit hash (full or short, with optional `^` parent suffix).
+/// Validate both ends before a command publishes a new comparison range.
+pub fn validate_diff_range(cwd: &Path, base: &str, target: Option<&str>) -> Result<()> {
+    let repo = open_repo(cwd)?.to_thread_local();
+    resolve_tree(&repo, base).with_context(|| format!("invalid diff base '{base}'"))?;
+    if let Some(target) = target {
+        resolve_commit(&repo, target).with_context(|| format!("invalid diff target '{target}'"))?;
+    }
+    Ok(())
+}
+
+/// The base used by `git diff A...B`: the common ancestor of A and B.
+pub fn merge_base(cwd: &Path, base: &str, target: &str) -> Result<String> {
+    let repo = open_repo(cwd)?.to_thread_local();
+    let base = resolve_commit(&repo, base)?;
+    let target = resolve_commit(&repo, target)?;
+    Ok(repo
+        .merge_base(base.id().detach(), target.id().detach())?
+        .to_hex()
+        .to_string())
+}
+
+/// Resolve a Git revision and peel annotated tags to commits.
 fn resolve_commit<'a>(repo: &'a Repository, ref_name: &str) -> Result<Commit<'a>> {
     if let Some(base) = ref_name.strip_suffix('^') {
         let commit = resolve_commit(repo, base)?;
@@ -580,37 +832,25 @@ fn resolve_commit<'a>(repo: &'a Repository, ref_name: &str) -> Result<Commit<'a>
             .context(format!("parent of '{}' is not a commit", base));
     }
 
-    if let Ok(reference) = repo.find_reference(ref_name) {
-        let object_id = reference.into_fully_peeled_id()?.detach();
-        return repo
-            .find_object(object_id)?
-            .try_into_commit()
-            .context(format!("'{}' is not a commit", ref_name));
-    }
-
-    let prefix = gix::hash::Prefix::from_hex(ref_name).context(format!(
-        "'{}' is not a valid reference or commit hash",
+    // This gix version traverses the starting object without first peeling
+    // annotated tags. Normalize just that starting object, leaving all Git
+    // revision operators to its revision parser.
+    let normalized;
+    let spec = if let Some(index) = ref_name.find(['^', '~']).filter(|&index| index > 0) {
+        let start = repo
+            .rev_parse_single(ref_name[..index].as_bytes().as_bstr())?
+            .object()?
+            .peel_to_commit()?;
+        normalized = format!("{}{}", start.id, &ref_name[index..]);
+        normalized.as_str()
+    } else {
         ref_name
-    ))?;
-
-    let maybe_oid = repo
-        .objects
-        .lookup_prefix(prefix, None)
-        .context("failed to lookup object by hash")?;
-
-    let object_id = match maybe_oid {
-        Some(oid) => oid.map_err(|_| {
-            anyhow::anyhow!(
-                "ambiguous hash prefix '{}'; try using more characters",
-                ref_name
-            )
-        })?,
-        None => bail!("no commit found with hash '{}'", ref_name),
     };
-
-    repo.find_object(object_id)?
-        .try_into_commit()
-        .context(format!("'{}' is not a commit", ref_name))
+    repo.rev_parse_single(spec.as_bytes().as_bstr())
+        .with_context(|| format!("cannot resolve revision '{ref_name}'"))?
+        .object()?
+        .peel_to_commit()
+        .with_context(|| format!("'{ref_name}' is not a commit"))
 }
 
 fn open_repo(path: &Path) -> Result<ThreadSafeRepository> {
@@ -687,6 +927,14 @@ fn status(
     // `or_empty` covers an unborn HEAD, where every indexed file reads as added.
     let head_tree_id = repo.head_tree_id_or_empty()?;
 
+    let index = repo.index_or_empty()?;
+    let conflicted: std::collections::HashSet<_> = index
+        .entries()
+        .iter()
+        .filter(|entry| entry.stage() != gix::index::entry::Stage::Unconflicted)
+        .map(|entry| work_dir.join(gix::path::from_bstr(entry.path(&index))))
+        .collect();
+
     let status_platform = repo
         .status(gix::progress::Discard)?
         // Here we discard the `status.showUntrackedFiles` config, as it makes little sense in
@@ -701,10 +949,9 @@ fn status(
         // renamed file surfaces as an untracked + deleted pair instead.
         .index_worktree_rewrites(None::<Rewrites>)
         .head_tree(head_tree_id)
-        // Likewise off between head tree and index, for consistency with the
-        // above rather than cost: both sides are already-hashed objects here, so
-        // this one is cheap. A staged rename surfaces as a deletion + addition.
-        .tree_index_track_renames(gix::status::tree_index::TrackRenames::Disabled);
+        // Staged renames use already-hashed objects; this does not walk or
+        // hash the untracked worktree files.
+        .tree_index_track_renames(gix::status::tree_index::TrackRenames::AsConfigured);
 
     // No filtering based on path
     let empty_patterns = vec![];
@@ -800,7 +1047,16 @@ fn status(
             }
         };
 
-        if !seen.insert(change.path().to_path_buf()) {
+        let change = if conflicted.contains(change.path()) {
+            FileChange::Conflict {
+                path: change.path().to_path_buf(),
+            }
+        } else {
+            change
+        };
+        if !seen.insert(change.path().to_path_buf())
+            && !matches!(change, FileChange::Renamed { .. })
+        {
             continue;
         }
         if !f(Ok(change)) {

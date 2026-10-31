@@ -266,8 +266,10 @@ We use a similar set of scopes as
 - `diff` - version control changes
   - `plus` - additions
     - `gutter` - gutter indicator
+    - `intraline` - changed characters on the added side
   - `minus` - deletions
     - `gutter` - gutter indicator
+    - `intraline` - changed characters on the removed side
   - `delta` - modifications
     - `moved` - renamed or moved files/changes
     - `conflict` - merge conflicts

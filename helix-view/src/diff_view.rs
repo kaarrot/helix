@@ -56,6 +56,7 @@ impl SuspendedDiff {
 /// for, so the cache can be reused only when the range still matches.
 #[derive(Debug)]
 pub struct ChangedFileCache {
+    pub cwd: PathBuf,
     pub base_ref: String,
     pub target_ref: Option<String>,
     /// Shared, not `Vec`: the listing is handed out as a picker seed (twice on
@@ -72,6 +73,7 @@ pub enum DiffViewSource {
 
 #[derive(Debug, Clone)]
 pub struct DiffViewState {
+    pub stale: bool,
     pub base_doc_id: DocumentId,
     pub working_doc_id: DocumentId,
     pub base_view_id: ViewId,
@@ -97,6 +99,7 @@ impl DiffViewState {
         git_ref: String,
     ) -> Self {
         Self {
+            stale: false,
             base_doc_id,
             working_doc_id,
             base_view_id,

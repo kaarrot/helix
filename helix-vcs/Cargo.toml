@@ -22,7 +22,7 @@ arc-swap = { version = "1.7.1" }
 # (its non-parallel path collects into a Vec), and the index<->worktree
 # modification checks all run on one thread — ~13s on the first `space g` over a
 # large repo on NFS, vs ~50ms parallel.
-gix = { version = "0.74.1", features = ["attributes", "status", "parallel"], default-features = false, optional = true }
+gix = { version = "0.74.1", features = ["attributes", "status", "parallel", "revision"], default-features = false, optional = true }
 # Untracked files are enumerated with the parallel `ignore` walker rather than
 # gix's single-threaded dirwalk: on a network filesystem the concurrent I/O
 # hides per-entry latency (~1.8s vs ~3s+ for a few thousand untracked files).

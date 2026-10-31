@@ -30,25 +30,15 @@ struct IntralineRange {
 /// Paints a tinted background on virtual spacer lines produced by `DiffAlignment`
 /// so the "no content here" regions are visually distinct from real lines.
 pub(super) struct DiffSpacerDecoration {
-    spacer_rows: Vec<(usize, usize)>,
+    spacer_rows: helix_view::annotations::diff::AlignmentPadding,
     style: Style,
 }
 
 impl DiffSpacerDecoration {
-    pub(super) fn new(diff_handle: &helix_vcs::DiffHandle, theme: &Theme) -> Self {
-        let diff = diff_handle.load();
-        let mut padding = std::collections::BTreeMap::<usize, usize>::new();
-        for i in 0..diff.len() {
-            let hunk = diff.nth_hunk(i);
-            let before_len = hunk.before.len() as usize;
-            let after_len = hunk.after.len() as usize;
-            if before_len > after_len {
-                let deficit = before_len - after_len;
-                let doc_line = hunk.after.start as usize;
-                let emit_after = doc_line.saturating_sub(1);
-                *padding.entry(emit_after).or_insert(0) += deficit;
-            }
-        }
+    pub(super) fn new(
+        padding: helix_view::annotations::diff::AlignmentPadding,
+        theme: &Theme,
+    ) -> Self {
         let style = theme.try_get("ui.diff.spacer").unwrap_or_else(|| {
             let bg_style = theme.get("ui.background");
             match bg_style.bg {
@@ -73,7 +63,7 @@ impl DiffSpacerDecoration {
             }
         });
         Self {
-            spacer_rows: padding.into_iter().collect(),
+            spacer_rows: padding,
             style,
         }
     }
@@ -86,11 +76,11 @@ impl Decoration for DiffSpacerDecoration {
         pos: LinePos,
         virt_off: Position,
     ) -> Position {
-        let rows = self
-            .spacer_rows
+        let padding = self.spacer_rows.borrow();
+        let rows = padding
             .binary_search_by_key(&pos.doc_line, |(line, _)| *line)
             .ok()
-            .map(|idx| self.spacer_rows[idx].1)
+            .map(|idx| padding[idx].1)
             .unwrap_or(0);
 
         if rows > 0 {
@@ -133,9 +123,9 @@ pub(super) fn char_diff_highlights_into(
     let diff_base = diff.diff_base();
 
     let highlight_name = if diff.is_inverted() {
-        "diff.minus"
+        "diff.minus.intraline"
     } else {
-        "diff.plus"
+        "diff.plus.intraline"
     };
     let Some(diff_highlight) = theme.find_highlight_exact(highlight_name) else {
         return;

@@ -74,7 +74,7 @@ pub fn render(context: &mut RenderContext, viewport: Rect, surface: &mut Surface
         viewport.x,
         viewport.y,
         &context.parts.left,
-        context.parts.left.width() as u16,
+        context.parts.left.width().min(viewport.width as usize) as u16,
     );
 
     // Right side of the status line.
@@ -93,7 +93,7 @@ pub fn render(context: &mut RenderContext, viewport: Rect, surface: &mut Surface
                 .saturating_sub(context.parts.right.width() as u16),
         viewport.y,
         &context.parts.right,
-        context.parts.right.width() as u16,
+        context.parts.right.width().min(viewport.width as usize) as u16,
     );
 
     // Center of the status line.
@@ -109,7 +109,9 @@ pub fn render(context: &mut RenderContext, viewport: Rect, surface: &mut Surface
     let spacing = 1u16;
 
     let edge_width = context.parts.left.width().max(context.parts.right.width()) as u16;
-    let center_max_width = viewport.width.saturating_sub(2 * edge_width + 2 * spacing);
+    let center_max_width = viewport
+        .width
+        .saturating_sub(edge_width.saturating_mul(2).saturating_add(2 * spacing));
     let center_width = center_max_width.min(context.parts.center.width() as u16);
 
     surface.set_spans(
@@ -446,14 +448,11 @@ fn render_file_name<'a, F>(context: &mut RenderContext<'a>, write: F)
 where
     F: Fn(&mut RenderContext<'a>, Span<'a>) + Copy,
 {
-    let title = {
-        let rel_path = context.doc.relative_path();
-        let path = rel_path
-            .as_ref()
-            .map(|p| p.to_string_lossy())
-            .unwrap_or_else(|| SCRATCH_BUFFER_NAME.into());
-        format!(" {} ", path)
-    };
+    let title = format!(
+        " {}{} ",
+        context.editor.comparison_label(context.view.id),
+        context.doc.display_name()
+    );
 
     write(context, title.into());
 }
@@ -462,13 +461,23 @@ fn render_file_absolute_path<'a, F>(context: &mut RenderContext<'a>, write: F)
 where
     F: Fn(&mut RenderContext<'a>, Span<'a>) + Copy,
 {
-    let title = {
+    let title = if context.doc.git_revision.is_some() {
+        format!(
+            " {}{} ",
+            context.editor.comparison_label(context.view.id),
+            context.doc.display_name()
+        )
+    } else {
         let path = context.doc.path();
         let path = path
             .as_ref()
             .map(|p| p.to_string_lossy())
             .unwrap_or_else(|| SCRATCH_BUFFER_NAME.into());
-        format!(" {} ", path)
+        format!(
+            " {}{} ",
+            context.editor.comparison_label(context.view.id),
+            path
+        )
     };
 
     write(context, title.into());
@@ -503,13 +512,23 @@ fn render_file_base_name<'a, F>(context: &mut RenderContext<'a>, write: F)
 where
     F: Fn(&mut RenderContext<'a>, Span<'a>) + Copy,
 {
-    let title = {
+    let title = if context.doc.git_revision.is_some() {
+        format!(
+            " {}{} ",
+            context.editor.comparison_label(context.view.id),
+            context.doc.display_name()
+        )
+    } else {
         let rel_path = context.doc.relative_path();
         let path = rel_path
             .as_ref()
             .and_then(|p| p.file_name().map(|s| s.to_string_lossy()))
             .unwrap_or_else(|| SCRATCH_BUFFER_NAME.into());
-        format!(" {} ", path)
+        format!(
+            " {}{} ",
+            context.editor.comparison_label(context.view.id),
+            path
+        )
     };
 
     write(context, title.into());

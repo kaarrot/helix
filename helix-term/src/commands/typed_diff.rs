@@ -11,6 +11,22 @@ pub(crate) fn diff_base(
         return Ok(());
     }
 
+    let view_id = cx.editor.tree.focus;
+    if let Some(state) = cx.editor.diff.views.get(&view_id).cloned() {
+        anyhow::ensure!(
+            state.source == helix_view::diff_view::DiffViewSource::Git,
+            "This comparison uses buffers; use :diff-buffer to change its base"
+        );
+        let base = args.first().unwrap_or("HEAD");
+        diff::change_comparison_base(cx.editor, base)?;
+        cx.editor.set_status(format!("Diff base set to: {base}"));
+        return Ok(());
+    }
+    anyhow::ensure!(
+        !cx.editor.diff.merge_views.contains_key(&view_id),
+        "Use :diff-refresh to refresh a merge's index stages"
+    );
+
     let scrolloff = cx.editor.config().scrolloff;
     let (view, doc) = current!(cx.editor);
 
@@ -73,10 +89,7 @@ struct DiffBufferMeta {
 }
 
 fn diff_buffer_name(doc: &Document) -> String {
-    doc.relative_path()
-        .and_then(|path| path.to_str())
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| doc.display_name().into_owned())
+    doc.display_name().into_owned()
 }
 
 fn resolve_diff_buffer_arg(
@@ -158,10 +171,8 @@ fn open_diff_buffer_picker(
                         cx.editor
                             .set_error(format!("Failed to open buffer diff: {e}"));
                     } else {
-                        cx.editor.set_status(format!(
-                            "Diffing buffer {} against current buffer",
-                            meta.id
-                        ));
+                        cx.editor
+                            .set_status(format!("Diffing {} against current buffer", meta.name));
                     }
                 })
                 .with_preview(|_editor, meta| Some((meta.id.into(), None)));
@@ -196,7 +207,8 @@ pub(crate) fn diff_buffer(
         .open_buffer_diff_view(base_doc_id, working_doc_id, Some(true))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     cx.editor.set_status(format!(
-        "Diffing buffer {base_doc_id} against current buffer"
+        "Diffing {} against current buffer",
+        cx.editor.document(base_doc_id).unwrap().display_name()
     ));
 
     Ok(())
@@ -213,8 +225,8 @@ pub(crate) fn diff_commit(
 
     let range_str = args.first().context("missing git reference argument")?;
 
-    let diff_range = DiffRange::parse(range_str)
-        .with_context(|| format!("failed to parse diff range: {}", range_str))?;
+    let diff_range = DiffRange::resolve(&helix_stdx::env::current_working_dir(), range_str)
+        .map_err(|err| anyhow::anyhow!("Cannot set diff range: {err:#}"))?;
     let display = diff_range.display();
     cx.editor.diff.range = Some(diff_range);
     cx.editor.set_status(format!(
@@ -251,36 +263,18 @@ pub(crate) fn diff_reset_typed(
         return Ok(());
     }
 
-    cx.editor.diff.suspended.clear();
-    let view_id = view!(cx.editor).id;
-    if cx.editor.diff.views.contains_key(&view_id) {
-        cx.editor.close_diff_view(view_id);
+    diff::reset_diff_state(cx.editor);
+    Ok(())
+}
+
+pub(crate) fn diff_refresh(
+    cx: &mut compositor::Context,
+    _args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event == PromptEvent::Validate {
+        diff::refresh_diff(cx.editor)?;
     }
-    cx.editor.diff.range = None;
-
-    let diff_docs: Vec<_> = cx
-        .editor
-        .documents
-        .iter()
-        .filter_map(|(id, doc)| (!doc.is_virtual_base && doc.path().is_some()).then_some(*id))
-        .collect();
-
-    for (_, doc) in cx.editor.documents.iter_mut() {
-        doc.char_diff_enabled = false;
-        doc.char_diff_minus_side = false;
-        doc.linked_diff_doc = None;
-        if doc.is_virtual_base || doc.path().is_none() {
-            doc.clear_diff_handle();
-        }
-    }
-    for id in diff_docs {
-        if let Some(doc) = cx.editor.documents.get_mut(&id) {
-            let _ = doc.reset_diff_base();
-        }
-    }
-
-    cx.editor.set_status("Diff reset to HEAD");
-
     Ok(())
 }
 
@@ -318,11 +312,15 @@ pub(crate) fn diff_files(
             return Ok(());
         }
 
+        helix_vcs::git::validate_diff_range(&cwd, &base_ref, None)
+            .map_err(|err| anyhow::anyhow!("Cannot list changes: {err:#}"))?;
+
         cx.editor.diff.changed_file_request = cx.editor.diff.changed_file_request.wrapping_add(1);
         #[cfg(not(feature = "integration"))]
         let request = cx.editor.diff.changed_file_request;
 
-        let seed = diff::changed_file_seed(cx.editor, &cwd, &base_ref, target_ref.as_deref());
+        let seed = diff::changed_file_seed(cx.editor, &cwd, &base_ref, target_ref.as_deref())
+            .map_err(|err| anyhow::anyhow!("Cannot list changes: {err:#}"))?;
 
         // The picker isn't `Send`, and a typed command has no direct compositor,
         // so build and push it on the main thread via a compositor callback.

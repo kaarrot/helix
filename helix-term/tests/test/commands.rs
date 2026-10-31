@@ -849,6 +849,11 @@ async fn global_search_with_multibyte_chars() -> anyhow::Result<()> {
 async fn test_copy_path_command() -> anyhow::Result<()> {
     let file = tempfile::NamedTempFile::new()?;
     let expected = file.path().to_string_lossy().into_owned();
+    // Exercise the saved clipboard register without depending on a desktop
+    // clipboard service being available in the test environment.
+    let mut config = test_config();
+    config.editor.clipboard_provider = helix_view::clipboard::ClipboardProvider::None;
+    let builder = || AppBuilder::new().with_config(config.clone());
 
     // The default, an explicit `absolute`, and `url` outside a diff pane all
     // copy the absolute path: there is no commit to link to.
@@ -859,7 +864,7 @@ async fn test_copy_path_command() -> anyhow::Result<()> {
     ] {
         let expected = expected.clone();
         test_key_sequence(
-            &mut AppBuilder::new().with_file(file.path(), None).build()?,
+            &mut builder().with_file(file.path(), None).build()?,
             Some(command),
             Some(&move |app: &Application| {
                 let copied = app
@@ -880,7 +885,7 @@ async fn test_copy_path_command() -> anyhow::Result<()> {
     }
 
     test_key_sequence(
-        &mut AppBuilder::new().build()?,
+        &mut builder().build()?,
         Some(":copy-path<ret>"),
         Some(&|app| {
             assert_eq!(
@@ -893,7 +898,7 @@ async fn test_copy_path_command() -> anyhow::Result<()> {
     .await?;
 
     test_key_sequence(
-        &mut AppBuilder::new().with_file(file.path(), None).build()?,
+        &mut builder().with_file(file.path(), None).build()?,
         Some(":copy-path relative<ret>"),
         Some(&|app| {
             assert_eq!(

@@ -5,7 +5,7 @@ use super::{KeyTrie, Mode};
 use helix_core::hashmap;
 
 pub fn default() -> HashMap<Mode, KeyTrie> {
-    let normal = keymap!({ "Normal mode"
+    let mut normal = keymap!({ "Normal mode"
         "h" | "left" => move_char_left,
         "j" | "down" => move_visual_line_down,
         "k" | "up" => move_visual_line_up,
@@ -114,6 +114,7 @@ pub fn default() -> HashMap<Mode, KeyTrie> {
             "g" => goto_prev_change,
             "G" => goto_first_change,
             "f" => goto_prev_function,
+            "F" => diff_prev_file,
             "t" => goto_prev_class,
             "a" => goto_prev_parameter,
             "c" => goto_prev_comment,
@@ -129,6 +130,7 @@ pub fn default() -> HashMap<Mode, KeyTrie> {
             "g" => goto_next_change,
             "G" => goto_last_change,
             "f" => goto_next_function,
+            "F" => diff_next_file,
             "t" => goto_next_class,
             "a" => goto_next_parameter,
             "c" => goto_next_comment,
@@ -236,16 +238,23 @@ pub fn default() -> HashMap<Mode, KeyTrie> {
             "g" => changed_file_picker,
             "a" => code_action,
             "'" => last_picker,
-            "m" => { "Merge/Diff"
+            "m" | "M" => { "Merge/Diff"
                 "o" => merge_accept_ours,
                 "t" => merge_accept_theirs,
                 "b" => merge_accept_both,
+                "a" => merge_accept_base,
+                "B" => merge_show_base,
+                "O" => merge_accept_ours_and_next,
+                "T" => merge_accept_theirs_and_next,
+                "A" => merge_accept_both_and_next,
                 "n" => merge_next_conflict,
                 "p" => merge_prev_conflict,
                 "f" => merge_finish,
                 "v" => diff_toggle_split_view,
                 "s" => diff_toggle_sync_scroll,
                 "r" => diff_reset,
+                "R" => diff_refresh,
+                "d" => diff_revert_hunk,
                 "c" => diff_commit_from_selection,
                 "C" => diff_show_commit_from_selection,
                 "q" => close_diff_or_merge_view,
@@ -353,6 +362,20 @@ pub fn default() -> HashMap<Mode, KeyTrie> {
         "C-a" => increment,
         "C-x" => decrement,
     });
+    let space_key: helix_view::input::KeyEvent = "space".parse().unwrap();
+    let sticky_key: helix_view::input::KeyEvent = "M".parse().unwrap();
+    normal
+        .node_mut()
+        .unwrap()
+        .get_mut(&space_key)
+        .unwrap()
+        .node_mut()
+        .unwrap()
+        .get_mut(&sticky_key)
+        .unwrap()
+        .node_mut()
+        .unwrap()
+        .is_sticky = true;
     let mut select = normal.clone();
     select.merge_nodes(keymap!({ "Select mode"
         "h" | "left" => extend_char_left,

@@ -1964,6 +1964,9 @@ impl Document {
         // `HEAD` before and after a commit are two snapshots, which can be
         // open together. Each needs a file, and a URI, of its own.
         commit.hash(&mut hasher);
+        if commit.is_none() {
+            content.hash(&mut hasher);
+        }
         let filename = real_path
             .file_name()
             .unwrap_or_else(|| std::ffi::OsStr::new("unknown"));
@@ -1988,6 +1991,12 @@ impl Document {
         config: Arc<dyn DynAccess<Config>>,
         syn_loader: Arc<ArcSwap<syntax::Loader>>,
     ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            content_inspector::inspect(&content[..content.len().min(8192)])
+                != content_inspector::ContentType::BINARY,
+            "Binary revision of {}; text comparison is unavailable",
+            real_path.display()
+        );
         let (text, encoding, has_bom) = from_reader(&mut content.as_slice(), None)
             .map_err(|e| anyhow::anyhow!("decode git revision content: {e}"))?;
         let mut doc = Self::from(text, Some((encoding, has_bom)), config, syn_loader.clone());
@@ -2067,6 +2076,11 @@ impl Document {
         self.diff_base_ref = None;
     }
 
+    pub fn reset_diff_comparison(&mut self) {
+        self.clear_diff_handle();
+        self.view_diffs.clear();
+    }
+
     /// Intialize/updates the differ for this document with a new base.
     pub fn set_diff_base(&mut self, diff_base: Vec<u8>) {
         if let Ok((diff_base, ..)) = from_reader(&mut diff_base.as_slice(), Some(self.encoding)) {
@@ -2082,6 +2096,10 @@ impl Document {
 
     /// Set the diff base to an arbitrary git ref (branch, tag, or commit hash).
     pub fn set_diff_base_from_ref(&mut self, ref_name: String) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.path().is_some() && !self.is_virtual_base,
+            "A git diff base needs a working-tree file"
+        );
         #[cfg(feature = "git")]
         {
             if let Some(path) = self.path() {
@@ -2101,6 +2119,10 @@ impl Document {
 
     /// Reset the diff base back to HEAD.
     pub fn reset_diff_base(&mut self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.path().is_some() && !self.is_virtual_base,
+            "A git diff base needs a working-tree file"
+        );
         #[cfg(feature = "git")]
         {
             if let Some(path) = self.path() {

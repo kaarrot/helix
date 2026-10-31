@@ -94,18 +94,17 @@ impl EditorView {
         let view_offset = doc.view_offset(view.id);
 
         let mut text_annotations = view.text_annotations(doc, Some(theme));
-        view.apply_diff_alignment(
+        let alignment = view.apply_diff_alignment(
             doc,
             &mut text_annotations,
             &editor.diff.views,
             &editor.documents,
+            &editor.tree,
         );
         let mut decorations = DecorationManager::default();
 
-        if editor.diff.views.contains_key(&view.id) {
-            if let Some(diff_handle) = doc.diff_handle() {
-                decorations.add_decoration(diff::DiffSpacerDecoration::new(diff_handle, theme));
-            }
+        if let Some(padding) = alignment {
+            decorations.add_decoration(diff::DiffSpacerDecoration::new(padding, theme));
         }
 
         if is_focused && config.cursorline {
@@ -646,6 +645,11 @@ impl EditorView {
                 .unwrap_or_default()
                 .to_str()
                 .unwrap_or_default();
+            let name = if doc.display_name_override.is_some() {
+                doc.display_name()
+            } else {
+                fname.into()
+            };
 
             let style = if current_doc == doc.id() {
                 bufferline_active
@@ -653,15 +657,15 @@ impl EditorView {
                 bufferline_inactive
             };
 
-            let text = format!(" {}{} ", fname, if doc.is_modified() { "[+]" } else { "" });
-            let used_width = viewport.x.saturating_sub(x);
-            let rem_width = surface.area.width.saturating_sub(used_width);
+            let text = format!(" {}{} ", name, if doc.is_modified() { "[+]" } else { "" });
+            let used_width = x.saturating_sub(viewport.x);
+            let rem_width = viewport.width.saturating_sub(used_width);
 
             x = surface
                 .set_stringn(x, viewport.y, text, rem_width as usize, style)
                 .0;
 
-            if x >= surface.area.right() {
+            if x >= viewport.right() {
                 break;
             }
         }
@@ -1260,14 +1264,54 @@ impl EditorView {
                     _ => unreachable!(),
                 };
 
-                match pos_and_view(cxt.editor, row, column, false) {
-                    Some((_, view_id)) => cxt.editor.tree.focus = view_id,
+                let hovered = cxt.editor.tree.views().find_map(|(view, _)| {
+                    (column >= view.area.x
+                        && column < view.area.right()
+                        && row >= view.area.y
+                        && row < view.area.bottom())
+                    .then_some(view.id)
+                });
+                match hovered {
+                    Some(view_id) => cxt.editor.tree.focus = view_id,
                     None => return EventResult::Ignored(None),
                 }
 
                 let offset = config.scroll_lines.unsigned_abs();
                 commands::scroll(cxt, offset, direction, false);
-
+                let scrolled = cxt.editor.tree.focus;
+                cxt.editor.sync_scroll_to_linked_views(scrolled);
+                let paired = cxt.editor.diff.views.get(&scrolled).is_some_and(|state| {
+                    state.sync_scroll && state.paired_view(scrolled) == Some(current_view)
+                }) || cxt
+                    .editor
+                    .diff
+                    .merge_views
+                    .get(&scrolled)
+                    .is_some_and(|state| state.sync_scroll && state.contains_view(current_view));
+                if paired && scrolled != current_view {
+                    // Map the focused cursor too, so visibility enforcement
+                    // does not immediately undo the wheel's viewport change.
+                    let source_doc_id = cxt.editor.tree.get(scrolled).doc;
+                    let target_doc_id = cxt.editor.tree.get(current_view).doc;
+                    let source = cxt.editor.document(source_doc_id).unwrap();
+                    let cursor = source
+                        .selection(scrolled)
+                        .primary()
+                        .cursor(source.text().slice(..));
+                    if cxt.editor.diff.views.contains_key(&scrolled) {
+                        if let Some(pos) = cxt.editor.map_position_between_documents(
+                            scrolled,
+                            source_doc_id,
+                            target_doc_id,
+                            cursor,
+                        ) {
+                            cxt.editor
+                                .document_mut(target_doc_id)
+                                .unwrap()
+                                .set_selection(current_view, Selection::point(pos));
+                        }
+                    }
+                }
                 cxt.editor.tree.focus = current_view;
                 cxt.editor.ensure_cursor_in_view(current_view);
 
@@ -1523,6 +1567,10 @@ impl Component for EditorView {
                         for callback in callbacks {
                             callback(compositor, cx)
                         }
+                        if !cx.editor.should_close() {
+                            let view_id = cx.editor.tree.focus;
+                            cx.editor.sync_scroll_to_linked_views(view_id);
+                        }
                     });
                     Some(callback)
                 };
@@ -1533,6 +1581,7 @@ impl Component for EditorView {
             Event::Mouse(event) => self.handle_mouse_event(event, &mut cx),
             Event::IdleTimeout => self.handle_idle_timeout(&mut cx),
             Event::FocusGained => {
+                cx.editor.refresh_comparison_state();
                 self.terminal_focused = true;
                 EventResult::Consumed(None)
             }

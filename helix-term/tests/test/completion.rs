@@ -1,3 +1,4 @@
+use helix_term::application::Application;
 use helix_view::editor::{CompletionDisplay, StatusLineElement};
 
 use super::*;
@@ -59,6 +60,8 @@ fn statusline_completion_config() -> Config {
     config
 }
 
+const DIAGNOSTIC_WORD: &str = "statux";
+
 fn completion_source_text() -> String {
     let mut text = String::from("\n");
 
@@ -72,6 +75,62 @@ fn completion_source_text() -> String {
     }
 
     text
+}
+
+fn diagnostic_source_text() -> String {
+    let mut text = String::from(DIAGNOSTIC_WORD);
+    text.push('\n');
+
+    for _ in 0..OFFSCREEN_BLANK_LINES {
+        text.push('\n');
+    }
+
+    for label in COMPLETION_LABELS {
+        text.push_str(label);
+        text.push('\n');
+    }
+
+    text
+}
+
+fn insert_error_diagnostic(app: &mut Application, start: usize, end: usize, line: usize) {
+    use helix_core::diagnostic::{
+        Diagnostic, DiagnosticProvider, LanguageServerId, Range, Severity,
+    };
+
+    let (_, doc) = helix_view::current!(app.editor);
+    doc.replace_diagnostics(
+        [Diagnostic {
+            range: Range { start, end },
+            ends_at_word: true,
+            starts_at_word: true,
+            zero_width: false,
+            line,
+            message: "undefined".into(),
+            severity: Some(Severity::Error),
+            code: None,
+            provider: DiagnosticProvider::Lsp {
+                server_id: LanguageServerId::default(),
+                identifier: None,
+            },
+            tags: Vec::new(),
+            source: None,
+            data: None,
+        }],
+        &[],
+        None,
+    );
+}
+
+fn click_screen_text(app: &Application, needle: &str, char_offset: usize) -> [u16; 2] {
+    let lines = screen_lines(app);
+    let (row, line) = lines
+        .iter()
+        .enumerate()
+        .find(|(_, line)| line.contains(needle))
+        .unwrap_or_else(|| panic!("expected {needle:?} to be visible"));
+    let column = line.find(needle).expect("expected needle column") + char_offset;
+    [row as u16, column as u16]
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -191,6 +250,166 @@ async fn statusline_completion_accepts_mouse_click_on_padding_row() -> anyhow::R
     let (_, doc) = helix_view::current_ref!(app.editor);
     assert_eq!(
         format!("{}\n", COMPLETION_LABELS[1]),
+        doc.text().line(0).to_string()
+    );
+
+    test_key_sequence(&mut app, Some("<esc>:q!<ret>"), None, true).await?;
+
+    Ok(())
+}
+
+/// An app with the flagged word on the first line, followed by `tail`, in insert mode with
+/// completions open: clicking only brings completions up while a session is active.
+async fn app_with_open_completion_and_diagnostic_word(
+    file: &tempfile::NamedTempFile,
+    tail: &str,
+) -> anyhow::Result<Application> {
+    let mut config = statusline_completion_config();
+    config.editor.auto_completion = false;
+    config.editor.completion_mouse_append_whitespace = true;
+    let mut app = AppBuilder::new()
+        .with_config(config)
+        .with_file(file.path(), None)
+        .build()?;
+
+    run_event_loop_until_idle(&mut app).await;
+    if !tail.is_empty() {
+        dispatch_key_sequence(&mut app, &format!("A{tail}<esc>")).await?;
+    }
+    insert_error_diagnostic(&mut app, 0, DIAGNOSTIC_WORD.chars().count(), 0);
+    dispatch_key_sequence(&mut app, "ostat<C-x>").await?;
+    assert!(
+        count_screen_occurrences(&app, COMPLETION_LABELS[0]) >= 1,
+        "expected completions to be open before clicking the diagnostic"
+    );
+
+    Ok(app)
+}
+
+fn statusline_with_completions(app: &Application) -> String {
+    screen_lines(app)
+        .into_iter()
+        .find(|line| line.contains(COMPLETION_LABELS[0]))
+        .expect("expected statusline completions to render")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn statusline_completion_for_clicked_word_ignores_click_position() -> anyhow::Result<()> {
+    let file = temp_file_with_contents(diagnostic_source_text())?;
+    let mut app = app_with_open_completion_and_diagnostic_word(&file, " tail").await?;
+
+    let word_len = DIAGNOSTIC_WORD.chars().count();
+    let mut suggestions = Vec::new();
+    // From the first letter to just past the last one, where all of `statux` is before the
+    // cursor: it fuzzy matches none of the labels, so filtering by it would hide them all.
+    for offset in [0, 1, 3, word_len - 1, word_len] {
+        let [row, column] = click_screen_text(&app, DIAGNOSTIC_WORD, offset);
+        dispatch_events(&mut app, left_click_events(row, column)).await?;
+        suggestions.push(statusline_with_completions(&app));
+    }
+
+    for label in COMPLETION_LABELS {
+        assert!(
+            suggestions[0].contains(label),
+            "expected completion label {label:?} in {:?}",
+            suggestions[0]
+        );
+    }
+    assert!(
+        suggestions.iter().all(|line| line == &suggestions[0]),
+        "expected the same suggestions at every click position: {suggestions:#?}"
+    );
+
+    test_key_sequence(&mut app, Some("<esc>:q!<ret>"), None, true).await?;
+
+    Ok(())
+}
+
+async fn assert_clicked_word_replaced_without_extra_space(
+    offset: usize,
+    tail: &str,
+) -> anyhow::Result<()> {
+    let file = temp_file_with_contents(diagnostic_source_text())?;
+    let mut app = app_with_open_completion_and_diagnostic_word(&file, tail).await?;
+
+    let [row, column] = click_screen_text(&app, DIAGNOSTIC_WORD, offset);
+    dispatch_events(&mut app, left_click_events(row, column)).await?;
+    let [row, column] = click_screen_text(&app, COMPLETION_LABELS[1], 0);
+    dispatch_events(&mut app, left_click_events(row, column)).await?;
+
+    let (view, doc) = helix_view::current_ref!(app.editor);
+    assert_eq!(
+        format!("{}{tail}\n", COMPLETION_LABELS[1]),
+        doc.text().line(0).to_string(),
+        "the word should be replaced and nothing added after it"
+    );
+    assert_eq!(
+        COMPLETION_LABELS[1].chars().count(),
+        doc.selection(view.id)
+            .primary()
+            .cursor(doc.text().slice(..)),
+        "the cursor should end up right after the replaced word"
+    );
+
+    test_key_sequence(&mut app, Some("<esc>:q!<ret>"), None, true).await?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn statusline_completion_replaces_word_clicked_inside() -> anyhow::Result<()> {
+    assert_clicked_word_replaced_without_extra_space(3, " tail").await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn statusline_completion_replaces_word_clicked_past_its_end() -> anyhow::Result<()> {
+    assert_clicked_word_replaced_without_extra_space(DIAGNOSTIC_WORD.chars().count(), " tail").await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn statusline_completion_replaces_word_clicked_at_line_end() -> anyhow::Result<()> {
+    assert_clicked_word_replaced_without_extra_space(3, "").await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn statusline_completion_for_clicked_word_filters_once_typing() -> anyhow::Result<()> {
+    let file = temp_file_with_contents(diagnostic_source_text())?;
+    let mut app = app_with_open_completion_and_diagnostic_word(&file, " tail").await?;
+
+    let [row, column] = click_screen_text(&app, DIAGNOSTIC_WORD, 3);
+    dispatch_events(&mut app, left_click_events(row, column)).await?;
+    assert_eq!(1, count_screen_occurrences(&app, COMPLETION_LABELS[0]));
+
+    dispatch_key_sequence(&mut app, "b").await?;
+
+    assert_eq!(1, count_screen_occurrences(&app, COMPLETION_LABELS[1]));
+    assert_eq!(0, count_screen_occurrences(&app, COMPLETION_LABELS[0]));
+    assert_eq!(0, count_screen_occurrences(&app, COMPLETION_LABELS[2]));
+
+    test_key_sequence(&mut app, Some("<esc>:q!<ret>"), None, true).await?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn statusline_completion_of_typed_word_keeps_extra_space() -> anyhow::Result<()> {
+    let file = temp_file_with_contents(completion_source_text())?;
+    let mut config = statusline_completion_config();
+    config.editor.completion_mouse_append_whitespace = true;
+    let mut app = AppBuilder::new()
+        .with_config(config)
+        .with_file(file.path(), None)
+        .build()?;
+
+    run_event_loop_until_idle(&mut app).await;
+    dispatch_key_sequence(&mut app, &format!("i{COMPLETION_PREFIX}<C-x>")).await?;
+
+    let [row, column] = click_screen_text(&app, COMPLETION_LABELS[1], 0);
+    dispatch_events(&mut app, left_click_events(row, column)).await?;
+
+    let (_, doc) = helix_view::current_ref!(app.editor);
+    assert_eq!(
+        format!("{} \n", COMPLETION_LABELS[1]),
         doc.text().line(0).to_string()
     );
 

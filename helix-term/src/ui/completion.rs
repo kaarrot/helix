@@ -122,6 +122,10 @@ pub struct Completion {
     #[allow(dead_code)]
     trigger_offset: usize,
     filter: String,
+    /// Replacing an existing word as a whole, rather than completing one being typed.
+    whole_word: bool,
+    /// Show every item whatever the `filter`, until the user types.
+    unfiltered: bool,
     // TODO: move to helix-view/central handler struct in the future
     resolve_handler: ResolveHandler,
 }
@@ -129,9 +133,14 @@ pub struct Completion {
 impl Completion {
     pub const ID: &'static str = "completion";
 
-    pub fn new(editor: &Editor, items: Vec<CompletionItem>, trigger_offset: usize) -> Self {
+    pub fn new(
+        editor: &Editor,
+        items: Vec<CompletionItem>,
+        trigger_offset: usize,
+        whole_word: bool,
+    ) -> Self {
         let preview_completion_insert = editor.config().preview_completion_insert;
-        let replace_mode = editor.config().completion_replace;
+        let replace_mode = whole_word || editor.config().completion_replace;
 
         let dir_style = editor.theme.get("ui.text.directory");
 
@@ -278,7 +287,10 @@ impl Completion {
                     }
                     // we could have just inserted a trigger char (like a `crate::` completion for rust
                     // so we want to retrigger immediately when accepting a completion.
-                    trigger_auto_completion(editor, true);
+                    // A replaced word is finished with, even if it ends in a trigger char.
+                    if !whole_word {
+                        trigger_auto_completion(editor, true);
+                    }
                 }
             };
 
@@ -311,6 +323,8 @@ impl Completion {
             // TODO: expand nucleo api to allow moving straight to a Utf32String here
             // and avoid allocation during matching
             filter: String::from(fragment),
+            whole_word,
+            unfiltered: whole_word,
             resolve_handler: ResolveHandler::new(),
         };
 
@@ -321,7 +335,14 @@ impl Completion {
     }
 
     fn score(&mut self, incremental: bool) {
-        let pattern = &self.filter;
+        // An existing word may be misspelled, and then it does not fuzzy match its own
+        // corrections (`tihs` and `this`). The language server already ranked its items
+        // against that word, so only start filtering once the user types.
+        let pattern = if self.unfiltered {
+            ""
+        } else {
+            self.filter.as_str()
+        };
         let mut matcher = MATCHER.lock();
         matcher.config = Config::DEFAULT;
         // slight preference towards prefix matches
@@ -408,6 +429,7 @@ impl Completion {
     /// Appends (`c: Some(c)`) or removes (`c: None`) a character to/from the filter
     /// this should be called whenever the user types or deletes a character in insert mode.
     pub fn update_filter(&mut self, c: Option<char>) {
+        self.unfiltered = false;
         // recompute menu based on matches
         let menu = self.popup.contents_mut();
         match c {
@@ -442,6 +464,12 @@ impl Completion {
 
     pub fn is_empty(&self) -> bool {
         self.popup.contents().is_empty()
+    }
+
+    /// Whether this replaces an existing word as a whole, rather than completing
+    /// one being typed.
+    pub fn whole_word(&self) -> bool {
+        self.whole_word
     }
 
     /// Iterator over the currently-matched completion items, each paired with

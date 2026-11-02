@@ -360,7 +360,8 @@ pub struct Config {
     pub completion_display: CompletionDisplay,
     /// When `completion-display` is `statusline`, append a space after a completion
     /// selected via mouse click. Skipped when the accepted item is a snippet with
-    /// remaining placeholders. Defaults to `false`.
+    /// remaining placeholders or replaces an existing word that was clicked.
+    /// Defaults to `false`.
     pub completion_mouse_append_whitespace: bool,
     /// `true` if helix should automatically add a line comment token if you're currently in a comment
     /// and press `enter`.

@@ -56,6 +56,8 @@ pub enum CompletionEvent {
         cursor: usize,
         doc: DocumentId,
         view: ViewId,
+        /// Complete the whole word around the cursor, not just the part before it.
+        whole_word: bool,
     },
     /// Some text was deleted and the cursor is now at `pos`
     DeleteText { cursor: usize },

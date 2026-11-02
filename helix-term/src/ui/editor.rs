@@ -1055,9 +1055,10 @@ impl EditorView {
         editor: &mut Editor,
         items: Vec<CompletionItem>,
         trigger_offset: usize,
+        whole_word: bool,
         size: Rect,
     ) -> Option<Rect> {
-        let mut completion = Completion::new(editor, items, trigger_offset);
+        let mut completion = Completion::new(editor, items, trigger_offset, whole_word);
 
         if completion.is_empty() {
             // skip if we got no completion results
@@ -1246,7 +1247,7 @@ impl EditorView {
         let cursor = doc.selection(view.id).primary().cursor(text);
         editor
             .handlers
-            .trigger_completions(cursor, doc.id(), view.id);
+            .trigger_word_completions(cursor, doc.id(), view.id);
     }
 
     fn clear_completion_for_mouse_reposition(&mut self, editor: &mut Editor) -> bool {
@@ -1470,13 +1471,18 @@ impl EditorView {
 
             MouseEventKind::Up(MouseButton::Left) => {
                 if let Some(down_index) = self.statusline_completion_mouse_down.take() {
+                    // The word was already there, and so is whatever follows it.
+                    let replaced_word =
+                        self.completion.as_ref().is_some_and(Completion::whole_word);
                     if self.statusline_area_contains(cxt.editor, row, column)
                         && self.select_completion(cxt.editor, down_index, PromptEvent::Validate)
                     {
                         if let Some(cb) = self.clear_completion(cxt.editor) {
                             self.on_next_key = Some((cb, OnKeyCallbackKind::Fallback));
                         }
-                        self.append_whitespace_after_statusline_completion(cxt.editor);
+                        if !replaced_word {
+                            self.append_whitespace_after_statusline_completion(cxt.editor);
+                        }
                     }
 
                     return EventResult::Consumed(None);

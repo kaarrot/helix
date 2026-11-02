@@ -105,7 +105,7 @@ fn show_completion(
     word::retain_valid_completions(trigger, doc, view.id, &mut items);
     editor.handlers.completions.active_completions = context;
 
-    let completion_area = ui.set_completion(editor, items, trigger.pos, size);
+    let completion_area = ui.set_completion(editor, items, trigger.pos, trigger.whole_word, size);
     let signature_help_area = compositor
         .find_id::<Popup<SignatureHelp>>(SignatureHelp::ID)
         .map(|signature_help| signature_help.area(size, editor));

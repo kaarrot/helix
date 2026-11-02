@@ -1219,7 +1219,7 @@ mod tests {
             })
             .collect();
 
-        Completion::new(editor, items, 0)
+        Completion::new(editor, items, 0, false)
     }
 
     fn render_statusline(

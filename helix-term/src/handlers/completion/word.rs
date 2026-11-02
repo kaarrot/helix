@@ -1,9 +1,11 @@
 use std::{borrow::Cow, sync::Arc};
 
 use helix_core::{
-    self as core, chars::char_is_word, completion::CompletionProvider, movement, Transaction,
+    self as core, chars::char_is_word, completion::CompletionProvider, movement, RopeSlice,
+    Transaction,
 };
 use helix_event::TaskHandle;
+use helix_lsp::util::generate_transaction_from_completion_edit;
 use helix_stdx::rope::RopeSliceExt as _;
 use helix_view::{
     document::SavePoint, handlers::completion::ResponseContext, Document, Editor, ViewId,
@@ -12,6 +14,18 @@ use helix_view::{
 use super::{request::TriggerKind, CompletionItem, CompletionItems, CompletionResponse, Trigger};
 
 const COMPLETION_KIND: &str = "word";
+/// Shortest part of a misspelled word to search for: anything less matches
+/// too many unrelated words.
+const MIN_WHOLE_WORD_PATTERN_LEN: usize = 2;
+
+/// The end of the word that `cursor` is in, or `cursor` if no word follows it.
+pub(super) fn word_end(text: RopeSlice, cursor: usize) -> usize {
+    cursor
+        + text
+            .chars_at(cursor)
+            .take_while(|&ch| char_is_word(ch))
+            .count()
+}
 
 pub(super) fn completion(
     editor: &Editor,
@@ -36,7 +50,10 @@ pub(super) fn completion(
     let word_index = editor.handlers.word_index().clone();
     let text = doc.text().slice(..);
     let selection = doc.selection(view.id).clone();
-    let pos = selection.primary().cursor(text);
+    let mut pos = selection.primary().cursor(text);
+    if trigger.whole_word {
+        pos = word_end(text, pos);
+    }
 
     let cursor = movement::move_prev_word_start(text, core::Range::point(pos), 1);
     if cursor.head == pos {
@@ -72,15 +89,38 @@ pub(super) fn completion(
     let future = move || {
         let text = rope.slice(..);
         let typed_word: Cow<_> = text.slice(typed_word_range).into();
-        let items = word_index
-            .matches(&typed_word)
+        let matches = |pattern: &str| {
+            let mut words = word_index.matches(pattern);
+            words.retain(|word| word.as_str() != typed_word.as_ref());
+            words
+        };
+        let mut pattern = typed_word.to_string();
+        let mut words = matches(&pattern);
+        // A misspelled word only fuzzy matches its correction up to the typo.
+        while trigger.whole_word
+            && words.is_empty()
+            && pattern.chars().count() > MIN_WHOLE_WORD_PATTERN_LEN
+        {
+            pattern.pop();
+            words = matches(&pattern);
+        }
+        let items = words
             .into_iter()
-            .filter(|word| word.as_str() != typed_word.as_ref())
             .map(|word| {
-                let transaction = Transaction::change_by_selection(&rope, &selection, |range| {
-                    let cursor = range.cursor(text);
-                    (cursor - edit_diff, cursor, Some((&word).into()))
-                });
+                let transaction = if trigger.whole_word {
+                    generate_transaction_from_completion_edit(
+                        &rope,
+                        &selection,
+                        None,
+                        true,
+                        word.clone(),
+                    )
+                } else {
+                    Transaction::change_by_selection(&rope, &selection, |range| {
+                        let cursor = range.cursor(text);
+                        (cursor - edit_diff, cursor, Some((&word).into()))
+                    })
+                };
                 CompletionItem::Other(core::CompletionItem {
                     transaction,
                     label: word.into(),

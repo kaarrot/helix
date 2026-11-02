@@ -4,8 +4,10 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use futures_util::Future;
+use helix_core::chars::char_is_word;
 use helix_core::completion::CompletionProvider;
 use helix_core::syntax::config::LanguageServerFeature;
+use helix_core::RopeSlice;
 use helix_event::{cancelable_future, TaskController, TaskHandle};
 use helix_lsp::lsp;
 use helix_lsp::lsp::{CompletionContext, CompletionTriggerKind};
@@ -43,6 +45,8 @@ pub(super) struct Trigger {
     pub(super) view: ViewId,
     pub(super) doc: DocumentId,
     pub(super) kind: TriggerKind,
+    /// Complete the whole word around `pos`, not just the part before it.
+    pub(super) whole_word: bool,
 }
 
 #[derive(Debug)]
@@ -94,6 +98,7 @@ impl helix_event::AsyncHook for CompletionHandler {
                         view,
                         doc,
                         kind: TriggerKind::Auto,
+                        whole_word: false,
                     });
                 }
             }
@@ -105,15 +110,22 @@ impl helix_event::AsyncHook for CompletionHandler {
                     view,
                     doc,
                     kind: TriggerKind::TriggerChar,
+                    whole_word: false,
                 });
             }
-            CompletionEvent::ManualTrigger { cursor, doc, view } => {
+            CompletionEvent::ManualTrigger {
+                cursor,
+                doc,
+                view,
+                whole_word,
+            } => {
                 // immediately request completions and drop all auto completion requests
                 self.trigger = Some(Trigger {
                     pos: cursor,
                     view,
                     doc,
                     kind: TriggerKind::Manual,
+                    whole_word,
                 });
                 // stop debouncing immediately and request the completion
                 self.finish_debounce();
@@ -193,6 +205,11 @@ fn request_completions(
     let savepoint = doc.savepoint(view);
     let text = doc.text();
     let trigger_text = text.slice(..cursor);
+    let request_pos = if trigger.whole_word {
+        whole_word_request_pos(text.slice(..), cursor)
+    } else {
+        cursor
+    };
 
     let mut seen_language_servers = HashSet::new();
     let language_servers: Vec<_> = doc
@@ -234,19 +251,23 @@ fn request_completions(
         requests.spawn(request_completions_from_language_server(
             ls,
             doc,
-            view.id,
+            request_pos,
             context,
             -(priority as i8),
             savepoint.clone(),
         ));
     }
-    if let Some(path_completion_request) = path_completion(
-        doc.selection(view.id).clone(),
-        doc,
-        handle.clone(),
-        savepoint.clone(),
-    ) {
-        requests.spawn_blocking(path_completion_request);
+    // Path completions only replace what is before the cursor, the rest of the
+    // word would be left behind.
+    if !trigger.whole_word {
+        if let Some(path_completion_request) = path_completion(
+            doc.selection(view.id).clone(),
+            doc,
+            handle.clone(),
+            savepoint.clone(),
+        ) {
+            requests.spawn_blocking(path_completion_request);
+        }
     }
     if let Some(word_completion_request) =
         word::completion(editor, trigger, handle.clone(), savepoint)
@@ -289,19 +310,29 @@ fn request_completions(
     tokio::spawn(cancelable_future(request_completions, handle));
 }
 
+/// Where to ask language servers about the word around `cursor`. They rank against the
+/// text before the position they are given, so the end of the word gets the same answer
+/// wherever the cursor is in it.
+fn whole_word_request_pos(text: RopeSlice, cursor: usize) -> usize {
+    let mut end = word::word_end(text, cursor);
+    // A misplaced apostrophe does not split a word in two, as in `does'nt`.
+    while text.get_char(end) == Some('\'') && text.get_char(end + 1).is_some_and(char_is_word) {
+        end = word::word_end(text, end + 1);
+    }
+    end
+}
+
 fn request_completions_from_language_server(
     ls: &helix_lsp::Client,
     doc: &Document,
-    view: ViewId,
+    request_pos: usize,
     context: lsp::CompletionContext,
     priority: i8,
     savepoint: Arc<SavePoint>,
 ) -> impl Future<Output = CompletionResponse> {
     let provider = ls.id();
     let offset_encoding = ls.offset_encoding();
-    let text = doc.text();
-    let cursor = doc.selection(view).primary().cursor(text.slice(..));
-    let pos = pos_to_lsp_pos(text, cursor, offset_encoding);
+    let pos = pos_to_lsp_pos(doc.text(), request_pos, offset_encoding);
     let doc_id = doc.identifier();
 
     // it's important that this is before the async block (and that this is not an async function)
@@ -355,10 +386,14 @@ pub fn request_incomplete_completion_list(editor: &mut Editor, handle: TaskHandl
         };
         let (view, doc) = current!(editor);
         let savepoint = savepoint.get_or_insert_with(|| doc.savepoint(view)).clone();
+        let cursor = doc
+            .selection(view.id)
+            .primary()
+            .cursor(doc.text().slice(..));
         let request = request_completions_from_language_server(
             ls,
             doc,
-            view.id,
+            cursor,
             CompletionContext {
                 trigger_kind: CompletionTriggerKind::TRIGGER_FOR_INCOMPLETE_COMPLETIONS,
                 trigger_character: None,
@@ -370,5 +405,38 @@ pub fn request_incomplete_completion_list(editor: &mut Editor, handle: TaskHandl
     }
     if !requests.is_empty() {
         tokio::spawn(replace_completions(handle, requests, true));
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use helix_core::Rope;
+
+    use super::whole_word_request_pos;
+
+    #[test]
+    fn whole_word_request_pos_is_the_same_anywhere_in_the_word() {
+        let text = Rope::from("I does'nt know 'them' ok");
+        let text = text.slice(..);
+
+        // From the first letter, over the apostrophe, to just past the last letter.
+        for cursor in 2..=9 {
+            assert_eq!(
+                9,
+                whole_word_request_pos(text, cursor),
+                "cursor at {cursor}"
+            );
+        }
+        // A closing quote is not part of the word.
+        for cursor in 16..=20 {
+            assert_eq!(
+                20,
+                whole_word_request_pos(text, cursor),
+                "cursor at {cursor}"
+            );
+        }
+        // No word to move to.
+        assert_eq!(1, whole_word_request_pos(text, 1));
+        assert_eq!(24, whole_word_request_pos(text, 24));
     }
 }

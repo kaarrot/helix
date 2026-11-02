@@ -37,6 +37,18 @@ impl Handlers {
             cursor: trigger_pos,
             doc,
             view,
+            whole_word: false,
+        });
+    }
+
+    /// Trigger completion for the existing word around `trigger_pos`, wherever
+    /// in that word it is
+    pub fn trigger_word_completions(&self, trigger_pos: usize, doc: DocumentId, view: ViewId) {
+        self.completions.event(CompletionEvent::ManualTrigger {
+            cursor: trigger_pos,
+            doc,
+            view,
+            whole_word: true,
         });
     }
 

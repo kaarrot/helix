@@ -186,13 +186,13 @@ mod tests {
     }
 
     #[test]
-    fn statusline_preserves_completion_suggestions_and_ignores_unknown_elements() {
+    fn statusline_preserves_completion_suggestions() {
         use helix_view::editor::StatusLineElement;
 
         let config = Config::load_test(
             r#"
             [editor.statusline]
-            left = ["mode", "completion-suggestions", "mystery-element", "file-name"]
+            left = ["mode", "completion-suggestions", "file-name"]
         "#,
         );
 

@@ -17,23 +17,26 @@ supported: opening one shows an error.
 ### Building with encryption support
 
 Encryption support is a build option, the `pgp` Cargo feature, and is off by
-default. Build Helix with it:
+default. Its dependencies need Rust 1.88 or newer, while this repository pins
+Rust 1.82 for builds without encryption. Update and explicitly select the
+stable toolchain to build Helix with encryption:
 
 ```sh
-cargo install --path helix-term --locked --features pgp
+rustup update stable
+cargo +stable install --path helix-term --locked --features pgp
 ```
 
 or, to build without installing:
 
 ```sh
-cargo build --release --bin hx --features pgp
+cargo +stable build --release --bin hx --locked --features pgp
 ```
 
 It adds the [rPGP](https://github.com/rpgp/rpgp) crate and its pure-Rust
-cryptography dependencies, which need Rust 1.88 or newer. A Helix built
-without the feature opens `.gpg` files as it always did, as text, and has no
-`:pgp-forget` command. `hx --version` doesn't show which way it was built; open
-an encrypted file to check.
+cryptography dependencies. A Helix built without the feature opens `.gpg`
+files as it always did, as text, and has no `:pgp-forget` command.
+`hx --version` doesn't show which way it was built; open an encrypted file
+to check.
 
 ### Opening
 

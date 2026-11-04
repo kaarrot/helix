@@ -50,12 +50,14 @@ RUSTFLAGS="-C target-feature=-crt-static"
    Either command will create the `hx` executable and construct the tree-sitter
    grammars in the local `runtime` folder.
 
-> 💡 If you do not want to fetch or build grammars, set an environment variable `HELIX_DISABLE_AUTO_GRAMMAR_BUILD`
+> If you do not want to fetch or build grammars, set an environment variable `HELIX_DISABLE_AUTO_GRAMMAR_BUILD`
 
-> 💡 Editing [encrypted files](./encrypted-files.md) needs the `pgp` feature,
-> which is off by default: add `--features pgp` to either command.
+> Editing [encrypted files](./encrypted-files.md) needs Rust 1.88 or newer
+> and the `pgp` feature, which is off by default. Run `rustup update stable`,
+> use `cargo +stable install` in either command, and add `--features pgp`.
+> The `+stable` override is needed because this repository pins Rust 1.82.
 
-> 💡 Tree-sitter grammars can be fetched and compiled if not pre-packaged. Fetch
+> Tree-sitter grammars can be fetched and compiled if not pre-packaged. Fetch
 > grammars with `hx --grammar fetch` and compile them with
 > `hx --grammar build`. This will install them in
 > the `runtime` directory within the user's helix config directory (more
@@ -89,7 +91,7 @@ Cmd:
 setx HELIX_RUNTIME "%userprofile%\src\helix\runtime"
 ```
 
-> 💡 `%userprofile%` resolves to your user directory like
+> `%userprofile%` resolves to your user directory like
 > `C:\Users\Your-Name\` for example.
 
 Or, create a symlink in `%appdata%\helix\` that links to the source code directory:
@@ -99,7 +101,7 @@ Or, create a symlink in `%appdata%\helix\` that links to the source code directo
 | PowerShell | `New-Item -ItemType Junction -Target "runtime" -Path "$Env:AppData\helix\runtime"`     |
 | Cmd        | `cd %appdata%\helix` <br/> `mklink /D runtime "%userprofile%\src\helix\runtime"`       |
 
-> 💡 On Windows, creating a symbolic link may require running PowerShell or
+> On Windows, creating a symbolic link may require running PowerShell or
 > Cmd as an administrator.
 
 #### Multiple runtime directories
@@ -193,10 +195,10 @@ use the following command to build the release binary and package it into a `.de
 cargo deb -- --locked
 ```
 
-> 💡 This locks you into the `--release` profile. But you can also build helix in any way you like.
+> This locks you into the `--release` profile. But you can also build helix in any way you like.
 > As long as you leave a `target/release/hx` file, it will get packaged with `cargo deb --no-build`
 
-> 💡 Don't worry about the following:
+> Don't worry about the following:
 > ```
 > warning: Failed to find dependency specification
 > ```

@@ -301,11 +301,39 @@ pub struct Picker<T: 'static + Send + Sync, D: 'static> {
     pub sort_mode: PickerSortMode,
     /// Cache of file modification times for timestamp sorting (thread-safe for background population)
     pub mtime_cache: std::sync::Arc<std::sync::Mutex<HashMap<std::path::PathBuf, std::time::SystemTime>>>,
+    /// The matches' indices in modification-time order, newest first. The
+    /// cursor indexes into this in [`PickerSortMode::Modified`]. Kept in step
+    /// with the matches by [`Self::refresh_mtime_order`]. Empty in the other
+    /// modes.
+    mtime_order: Vec<u32>,
+}
 
+/// The indices of all of `snapshot`'s matches, sorted by modification time,
+/// newest first. Matches without a known time go last, and ties keep their
+/// fuzzy-score order. Empty when no times are known, as in pickers whose
+/// items aren't files.
+fn mtime_order<T: 'static + Send + Sync>(
+    snapshot: &nucleo::Snapshot<T>,
+    mtime_cache: &std::sync::Mutex<HashMap<std::path::PathBuf, std::time::SystemTime>>,
+) -> Vec<u32> {
+    use std::any::Any;
 
+    let Ok(cache) = mtime_cache.lock() else {
+        return Vec::new();
+    };
+    if cache.is_empty() {
+        return Vec::new();
+    }
 
-    /// Mapping from display cursor position to nucleo index (when sorted)
-    pub sorted_indices: Vec<u32>,
+    let mut order: Vec<u32> = (0..snapshot.matched_item_count()).collect();
+    order.sort_by_cached_key(|&idx| {
+        let mtime = snapshot
+            .get_matched_item(idx)
+            .and_then(|item| (item.data as &dyn Any).downcast_ref::<std::path::PathBuf>())
+            .and_then(|path| cache.get(path).copied());
+        std::cmp::Reverse(mtime)
+    });
+    order
 }
 
 impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
@@ -442,10 +470,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
 
             sort_mode: PickerSortMode::Score,  // Default to normal fuzzy scoring
             mtime_cache: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
-
-
-
-            sorted_indices: Vec::new(),
+            mtime_order: Vec::new(),
         }
     }
 
@@ -579,33 +604,34 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
 
     pub fn selection(&self) -> Option<&T> {
         let snapshot = self.matcher.snapshot();
+        let index = self.match_index(self.cursor)?;
+        snapshot.get_matched_item(index).map(|item| item.data)
+    }
 
-        // If we're in timestamp sort mode and have a sorted index mapping, use it
-        if self.sort_mode == PickerSortMode::Modified && !self.sorted_indices.is_empty() {
-            // The sorted_indices are relative to the current page offset
-            // We stored indices as (nucleo_idx - offset), so cursor position in page
-            // directly indexes into sorted_indices
-            // Note: This only works while we're on the same page that was rendered
-            // If cursor moves to a new page, sorted_indices will be rebuilt during next render
-            let cursor_in_page = (self.cursor as usize) % self.sorted_indices.len().max(1);
-            let nucleo_idx_relative = *self.sorted_indices.get(cursor_in_page)?;
+    /// Brings [`Self::mtime_order`] up to date. Call it after every
+    /// `matcher.tick`, with whether the tick changed the matches.
+    ///
+    /// Sorting by modification time orders the whole match list, not just
+    /// the rows on screen, or the newest file would only come first if its
+    /// fuzzy score already put it on the cursor's page.
+    fn refresh_mtime_order(&mut self, matches_changed: bool) {
+        let snapshot = self.matcher.snapshot();
+        if self.sort_mode != PickerSortMode::Modified {
+            self.mtime_order.clear();
+        } else if matches_changed
+            || self.mtime_order.len() != snapshot.matched_item_count() as usize
+        {
+            self.mtime_order = mtime_order(snapshot, &self.mtime_cache);
+        }
+    }
 
-            // Calculate page offset (same logic as render_picker)
-            // We need to figure out how many rows per page - but we don't have area here
-            // For now, use a simple approach: if cursor is within sorted_indices length,
-            // the mapping should work. Otherwise fall back to unsorted.
-            if cursor_in_page < self.sorted_indices.len() {
-                // Calculate actual offset by looking at cursor position
-                let offset = self.cursor - (cursor_in_page as u32);
-                let nucleo_idx = nucleo_idx_relative + offset;
-                snapshot.get_matched_item(nucleo_idx).map(|item| item.data)
-            } else {
-                // Cursor moved to a different page, use unsorted until next render
-                snapshot.get_matched_item(self.cursor).map(|item| item.data)
-            }
+    /// The match shown at row `row` of the list, which differs from the
+    /// matcher's own order when sorting by modification time.
+    fn match_index(&self, row: u32) -> Option<u32> {
+        if self.mtime_order.is_empty() {
+            Some(row)
         } else {
-            // Normal fuzzy-score sorting: use cursor directly
-            snapshot.get_matched_item(self.cursor).map(|item| item.data)
+            self.mtime_order.get(row as usize).copied()
         }
     }
 
@@ -617,6 +643,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
     /// coalescing) would confirm against a stale snapshot.
     fn tick_matcher(&mut self, timeout: u64) -> nucleo::Status {
         let status = self.matcher.tick(timeout);
+        self.refresh_mtime_order(status.changed);
         if status.changed {
             self.cursor = self.cursor.min(
                 self.matcher
@@ -679,6 +706,8 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
         };
         // Reset cursor to top when changing sort mode so preview updates correctly
         self.cursor = 0;
+        // Rebuilt for the new mode on the next render.
+        self.mtime_order.clear();
     }
 
     fn prompt_handle_event(&mut self, event: &Event, cx: &mut Context) -> EventResult {
@@ -847,13 +876,15 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
         // until the target item shows up or everything has loaded. User
         // navigation or a query edit cancels the pre-selection.
         if let Some(pred) = self.pre_select_fn.as_deref() {
-            let found = (0..snapshot.matched_item_count()).find(|&idx| {
-                snapshot
-                    .get_matched_item(idx)
+            // Search rows, not matches, so the cursor lands on the item when
+            // sorting by modification time too.
+            let found = (0..snapshot.matched_item_count()).find(|&row| {
+                self.match_index(row)
+                    .and_then(|idx| snapshot.get_matched_item(idx))
                     .is_some_and(|item| pred(item.data))
             });
-            if let Some(idx) = found {
-                self.cursor = idx;
+            if let Some(row) = found {
+                self.cursor = row;
                 self.pre_select_fn = None;
             } else if !status.running && self.matcher.active_injectors() == 0 {
                 self.pre_select_fn = None;
@@ -955,50 +986,13 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             matcher.config.set_match_paths()
         }
 
-        // Collect matched items with their original indices for potential re-sorting
-        let mut items_with_idx: Vec<_> = snapshot
-            .matched_items(offset..end)
-            .enumerate()
-            .map(|(idx, item)| (offset + idx as u32, item))
-            .collect();
-
-        // Apply timestamp sort if in Modified mode and mtime cache is available
-        if self.sort_mode == PickerSortMode::Modified {
-            if let Ok(cache) = self.mtime_cache.lock() {
-                if !cache.is_empty() {
-                    use std::any::Any;
-                    items_with_idx.sort_by_cached_key(|(_, item)| {
-                        // Try to extract PathBuf from item.data
-                        // This is safe because we only populate mtime_cache for file pickers
-                        if let Some(path) = (item.data as &dyn Any).downcast_ref::<std::path::PathBuf>() {
-                            std::cmp::Reverse(
-                                cache
-                                    .get(path)
-                                    .copied()
-                                    .unwrap_or(std::time::UNIX_EPOCH)
-                            )
-                        } else {
-                            std::cmp::Reverse(std::time::UNIX_EPOCH)
-                        }
-                    });
-                }
-            }
-        }
-
-        // Extract sorted indices for selection mapping (relative to cursor page)
-        // Store in self for selection() to use
-        if self.sort_mode == PickerSortMode::Modified {
-            self.sorted_indices = items_with_idx
-                .iter()
-                .map(|(idx, _)| *idx - offset)
-                .collect();
+        let items: Vec<_> = if self.mtime_order.is_empty() {
+            snapshot.matched_items(offset..end).collect()
         } else {
-            // Clear sorted indices when not in Modified mode
-            self.sorted_indices.clear();
-        }
-
-        // Extract just the items for rendering
-        let items: Vec<_> = items_with_idx.into_iter().map(|(_, item)| item).collect();
+            (offset..end)
+                .filter_map(|row| snapshot.get_matched_item(self.match_index(row)?))
+                .collect()
+        };
 
         let options = items.into_iter().map(|item| {
             let mut widths = self.widths.iter_mut();
@@ -1766,5 +1760,66 @@ mod tests {
             "centered side-by-side preview should still show preceding context:\n{}",
             lines.join("\n")
         );
+    }
+}
+
+#[cfg(test)]
+mod mtime_order_tests {
+    use super::mtime_order;
+    use nucleo::{Config, Nucleo};
+    use std::{
+        collections::HashMap,
+        path::PathBuf,
+        sync::{Arc, Mutex},
+        time::{Duration, SystemTime},
+    };
+
+    fn matcher_with(paths: &[&str]) -> Nucleo<PathBuf> {
+        let mut matcher = Nucleo::new(Config::DEFAULT, Arc::new(|| {}), Some(1), 1);
+        let injector = matcher.injector();
+        for path in paths {
+            injector.push(PathBuf::from(path), |path, columns| {
+                columns[0] = path.to_string_lossy().as_ref().into();
+            });
+        }
+        while matcher.tick(10).running {}
+        matcher
+    }
+
+    #[test]
+    fn mtime_order_sorts_every_match_newest_first() {
+        // 200 files, oldest first, so in the matcher's own order the newest
+        // one is far past the first page of rows.
+        let names: Vec<String> = (0..200).map(|i| format!("f{i:03}")).collect();
+        let mut paths: Vec<&str> = names.iter().map(String::as_str).collect();
+        paths.push("no-time");
+        let matcher = matcher_with(&paths);
+
+        let base = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let cache: HashMap<_, _> = names
+            .iter()
+            .zip(0..)
+            .map(|(name, secs)| (PathBuf::from(name), base + Duration::from_secs(secs)))
+            .collect();
+
+        let snapshot = matcher.snapshot();
+        let order = mtime_order(snapshot, &Mutex::new(cache));
+        let sorted: Vec<PathBuf> = order
+            .iter()
+            .map(|&idx| snapshot.get_matched_item(idx).unwrap().data.clone())
+            .collect();
+
+        assert_eq!(sorted.len(), 201);
+        assert_eq!(sorted[0], PathBuf::from("f199"));
+        assert_eq!(sorted[1], PathBuf::from("f198"));
+        assert_eq!(sorted[199], PathBuf::from("f000"));
+        // A file whose time is unknown goes last.
+        assert_eq!(sorted[200], PathBuf::from("no-time"));
+    }
+
+    #[test]
+    fn mtime_order_is_empty_without_known_times() {
+        let matcher = matcher_with(&["a", "b"]);
+        assert!(mtime_order(matcher.snapshot(), &Mutex::new(HashMap::new())).is_empty());
     }
 }

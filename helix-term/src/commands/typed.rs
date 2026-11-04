@@ -658,7 +658,7 @@ fn copy_path_to_clipboard(
     let as_url = match args.first() {
         None | Some("absolute") => false,
         Some("url") => true,
-        Some(arg) => anyhow::bail!("Unknown argument '{arg}', expected 'url'"),
+        Some(arg) => anyhow::bail!("Unknown argument '{arg}', expected 'absolute' or 'url'"),
     };
 
     let (path, rev) = focused_file_revision(cx.editor);
@@ -3291,7 +3291,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     TypableCommand {
         name: "copy-path",
         aliases: &["cp"],
-        doc: "Copy the current file's absolute path and cursor line (`path:line`) to the system clipboard. Use ':copy-path url' to copy a link to the file at this pane's commit instead.",
+        doc: "Copy the current file's absolute path and cursor line (`path:line`) to the system clipboard. In a pane showing a commit, ':copy-path url' copies a link to the file at that commit instead.",
         fun: copy_path_to_clipboard,
         completer: CommandCompleter::positional(&[completers::copy_path_kind]),
         signature: Signature {

@@ -1702,7 +1702,7 @@ async fn test_copy_path_command() -> anyhow::Result<()> {
         Some(":copy-path relative<ret>"),
         Some(&|app| {
             assert_eq!(
-                "'copy-path': Unknown argument 'relative', expected 'url'",
+                "'copy-path': Unknown argument 'relative', expected 'absolute' or 'url'",
                 app.editor.get_status().unwrap().0
             );
         }),

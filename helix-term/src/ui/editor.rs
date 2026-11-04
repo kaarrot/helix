@@ -1090,7 +1090,8 @@ impl EditorView {
     }
 
     pub fn handle_idle_timeout(&mut self, cx: &mut commands::Context) -> EventResult {
-        let auto_reloaded = self.auto_reload_current_buffer(cx);
+        let auto_reloaded = auto_reload_current_buffer(cx.editor);
+        watch_current_file(cx.editor);
         commands::compute_inlay_hints_for_all_views(cx.editor, cx.jobs);
 
         if auto_reloaded {
@@ -1099,53 +1100,102 @@ impl EditorView {
             EventResult::Ignored(None)
         }
     }
+}
 
-    fn auto_reload_current_buffer(&mut self, cx: &mut commands::Context) -> bool {
-        if !cx.editor.config().auto_reload {
-            return false;
-        }
+/// Reloads the current buffer when its file changed on disk, or warns when the
+/// buffer has unsaved changes that a reload would throw away. Returns whether
+/// it did either, or reported an error.
+fn auto_reload_current_buffer(editor: &mut Editor) -> bool {
+    if !editor.config().auto_reload {
+        return false;
+    }
 
-        match doc!(cx.editor).has_newer_file_on_disk() {
-            Ok(true) => {}
-            Ok(false) => return false,
-            Err(err) => {
-                cx.editor
-                    .set_error(format!("failed to check file for auto-reload: {err}"));
-                return true;
-            }
-        }
-
-        if doc!(cx.editor).is_modified() {
-            cx.editor.set_warning(
-                "File changed on disk; buffer has unsaved changes. Use :reload to discard changes.",
-            );
+    match doc!(editor).has_newer_file_on_disk() {
+        Ok(true) => {}
+        Ok(false) => return false,
+        Err(err) => {
+            editor.set_error(format!("failed to check file for auto-reload: {err}"));
             return true;
         }
+    }
 
-        let scrolloff = cx.editor.config().scrolloff;
-        let reload_result = {
-            let (view, doc) = current!(cx.editor);
-            doc.reload(view, &cx.editor.diff_providers).map(|()| {
-                view.ensure_cursor_in_view(doc, scrolloff);
-                doc.path().map(|path| path.to_owned())
-            })
-        };
+    if doc!(editor).is_modified() {
+        editor.set_warning(
+            "File changed on disk; buffer has unsaved changes. Use :reload to discard changes.",
+        );
+        return true;
+    }
 
-        match reload_result {
-            Ok(Some(path)) => {
-                cx.editor
-                    .language_servers
-                    .file_event_handler
-                    .file_changed(path);
-                true
-            }
-            Ok(None) => true,
-            Err(err) => {
-                cx.editor.set_error(format!("auto-reload failed: {err}"));
-                true
-            }
+    let scrolloff = editor.config().scrolloff;
+    let reload_result = {
+        let (view, doc) = current!(editor);
+        doc.reload(view, &editor.diff_providers).map(|()| {
+            view.ensure_cursor_in_view(doc, scrolloff);
+            doc.path().map(|path| path.to_owned())
+        })
+    };
+
+    match reload_result {
+        Ok(Some(path)) => {
+            editor
+                .language_servers
+                .file_event_handler
+                .file_changed(path);
+            true
+        }
+        Ok(None) => true,
+        Err(err) => {
+            editor.set_error(format!("auto-reload failed: {err}"));
+            true
         }
     }
+}
+
+/// How often an idle editor looks at the current file for changes on disk.
+const AUTO_RELOAD_POLL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Watches the current buffer's file while the editor sits idle, so a change on
+/// disk is reloaded, or reported when the buffer has unsaved changes, without
+/// waiting for the next keypress. Each call replaces the watch before it, and a
+/// watch ends after the first change it sees.
+fn watch_current_file(editor: &Editor) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static WATCH: AtomicU64 = AtomicU64::new(0);
+    let watch = WATCH.fetch_add(1, Ordering::Relaxed) + 1;
+
+    if !editor.config().auto_reload {
+        return;
+    }
+    let Some(path) = doc!(editor).path().cloned() else {
+        return;
+    };
+    let seen = path
+        .metadata()
+        .and_then(|metadata| metadata.modified())
+        .ok();
+
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(AUTO_RELOAD_POLL).await;
+            if WATCH.load(Ordering::Relaxed) != watch {
+                return;
+            }
+            let modified = tokio::fs::metadata(&path)
+                .await
+                .and_then(|metadata| metadata.modified())
+                .ok();
+            if modified != seen {
+                break;
+            }
+        }
+        crate::job::dispatch(move |editor, _compositor| {
+            if WATCH.load(Ordering::Relaxed) == watch {
+                auto_reload_current_buffer(editor);
+                watch_current_file(editor);
+            }
+        })
+        .await;
+    });
 }
 
 impl EditorView {
@@ -1555,7 +1605,8 @@ impl Component for EditorView {
             Event::IdleTimeout => self.handle_idle_timeout(&mut cx),
             Event::FocusGained => {
                 self.terminal_focused = true;
-                self.auto_reload_current_buffer(&mut cx);
+                auto_reload_current_buffer(cx.editor);
+                watch_current_file(cx.editor);
                 EventResult::Consumed(None)
             }
             Event::FocusLost => {

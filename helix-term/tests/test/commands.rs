@@ -676,6 +676,50 @@ async fn test_insert_stream_output_keeps_characters_split_across_reads() -> anyh
     Ok(())
 }
 
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_insert_stream_output_from_a_file_writes_to_a_scratch_buffer() -> anyhow::Result<()> {
+    let _lock = Arc::clone(&STREAM_TEST_LOCK).lock_owned().await;
+    let source_file = helpers::temp_file_with_contents("source\n")?;
+    let mut app = AppBuilder::new()
+        .with_file(source_file.path(), None)
+        .build()?;
+    let source_doc_id = doc!(app.editor).id();
+
+    // The first stream from a file opens a scratch buffer for its output
+    // rather than writing into the file at the cursor.
+    send_key_sequence(&mut app, ":insert-stream-output echo one<ret>").await?;
+    wait_for_condition(&mut app, "output in a scratch buffer", |app| {
+        let doc = doc!(app.editor);
+        doc.path().is_none() && doc.text().to_string().contains("echo one\none")
+    })
+    .await?;
+    let output_doc_id = doc!(app.editor).id();
+    assert_ne!(output_doc_id, source_doc_id);
+
+    // Later ones from the file go to that same buffer.
+    app.editor.switch(source_doc_id, Action::Replace);
+    send_key_sequence(&mut app, ":insert-stream-output echo two<ret>").await?;
+    wait_for_condition(&mut app, "output appended to the same buffer", |app| {
+        let doc = doc!(app.editor);
+        doc.id() == output_doc_id && doc.text().to_string().contains("echo two\ntwo")
+    })
+    .await?;
+
+    assert_eq!(
+        app.editor
+            .document(source_doc_id)
+            .unwrap()
+            .text()
+            .to_string(),
+        "source\n",
+        "the file should not get any output"
+    );
+
+    close_app(&mut app).await?;
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn test_insert_stream_output_reuses_last_stream_buffer() -> anyhow::Result<()> {
     let _lock = Arc::clone(&STREAM_TEST_LOCK).lock_owned().await;

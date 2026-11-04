@@ -6708,24 +6708,32 @@ fn cancel_stream_command(cx: &mut compositor::Context) {
     }
 }
 
+/// Picks the buffer a new stream session writes to.
+///
+/// Output never goes into a file. Started from a file buffer, a session
+/// appends to the buffer the last stream wrote to, or opens a scratch buffer
+/// for its output when there is none, so the first `::` from a file lands in
+/// the same kind of place as every later one. A fresh scratch buffer (`:new`)
+/// takes the output in place.
 fn prepare_stream_output_buffer(cx: &mut compositor::Context) {
     let (current_doc_id, current_is_file_buffer, current_len_chars) = {
         let (_, doc) = current!(cx.editor);
         (doc.id(), doc.path().is_some(), doc.text().len_chars())
     };
     let last_doc_id = *LAST_STREAM_DOC_ID.lock().unwrap();
-    let Some(doc_id) = last_doc_id.filter(|doc_id| cx.editor.document(*doc_id).is_some()) else {
-        return;
-    };
+    let last_doc_id = last_doc_id.filter(|doc_id| cx.editor.document(*doc_id).is_some());
 
-    if doc_id != current_doc_id {
+    match last_doc_id {
+        Some(doc_id) if doc_id == current_doc_id => {}
         // Preserve existing behavior for a fresh scratch buffer (`:new`) where
         // users expect the first stream to start in the current buffer.
-        let should_reuse_last = current_is_file_buffer || current_len_chars > 1;
-        if !should_reuse_last {
+        Some(_) if !current_is_file_buffer && current_len_chars <= 1 => return,
+        Some(doc_id) => cx.editor.switch(doc_id, Action::Replace),
+        None if current_is_file_buffer => {
+            cx.editor.new_file(Action::Replace);
             return;
         }
-        cx.editor.switch(doc_id, Action::Replace);
+        None => return,
     }
 
     let view_id = {

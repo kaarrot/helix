@@ -106,6 +106,20 @@ fn setup_integration_logging() {
         .apply();
 }
 
+/// "Config <done> with N warning(s): ...", for the status line.
+fn config_warnings_message(done: &str, warnings: &[ConfigLoadWarning]) -> String {
+    format!(
+        "Config {done} with {} warning{}: {}",
+        warnings.len(),
+        if warnings.len() == 1 { "" } else { "s" },
+        warnings
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("; ")
+    )
+}
+
 impl Application {
     #[cfg(feature = "integration")]
     pub fn resize_test_terminal(&mut self, width: u16, height: u16) {
@@ -457,6 +471,16 @@ impl Application {
         }
     }
 
+    /// Shows the warnings from loading the config at startup in the status line.
+    /// They are printed to the terminal too, but the editor covers that until
+    /// it exits, so a misspelled key would otherwise go unnoticed.
+    pub fn show_config_warnings(&mut self, warnings: &[ConfigLoadWarning]) {
+        if !warnings.is_empty() {
+            self.editor
+                .set_warning(config_warnings_message("loaded", warnings));
+        }
+    }
+
     fn refresh_config(&mut self) {
         let mut refresh_config = || -> Result<Vec<ConfigLoadWarning>, Error> {
             let (default_config, warnings) = Config::load_default_with_warnings()
@@ -502,16 +526,8 @@ impl Application {
                     for warning in &warnings {
                         warn!("Config warning: {warning}");
                     }
-                    self.editor.set_warning(format!(
-                        "Config refreshed with {} warning{}: {}",
-                        warnings.len(),
-                        if warnings.len() == 1 { "" } else { "s" },
-                        warnings
-                            .iter()
-                            .map(ToString::to_string)
-                            .collect::<Vec<_>>()
-                            .join("; ")
-                    ));
+                    self.editor
+                        .set_warning(config_warnings_message("refreshed", &warnings));
                 }
             }
             Err(err) => {

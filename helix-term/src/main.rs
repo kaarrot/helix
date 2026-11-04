@@ -131,16 +131,16 @@ FLAGS:
         helix_stdx::env::set_current_working_dir(path)?;
     }
 
-    let config = match Config::load_default_with_warnings() {
+    let (config, config_warnings) = match Config::load_default_with_warnings() {
         Ok((config, warnings)) => {
-            for warning in warnings {
+            for warning in &warnings {
                 log::warn!("Config warning: {warning}");
                 eprintln!("Config warning: {warning}");
             }
-            config
+            (config, warnings)
         }
         Err(ConfigLoadError::Error(err)) if err.kind() == std::io::ErrorKind::NotFound => {
-            Config::default()
+            (Config::default(), Vec::new())
         }
         Err(ConfigLoadError::Error(err)) => {
             log::error!("Failed to load config: {err}");
@@ -152,7 +152,7 @@ FLAGS:
             eprintln!("Press <ENTER> to continue with default config");
             use std::io::Read;
             let _ = std::io::stdin().read(&mut []);
-            Config::default()
+            (Config::default(), Vec::new())
         }
     };
 
@@ -167,6 +167,7 @@ FLAGS:
 
     // TODO: use the thread local executor to spawn the application task separately from the work pool
     let mut app = Application::new(args, config, lang_loader).context("unable to start Helix")?;
+    app.show_config_warnings(&config_warnings);
     let mut events = app.event_stream();
 
     let exit_code = app.run(&mut events).await?;

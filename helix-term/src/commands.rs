@@ -2466,37 +2466,44 @@ enum SearchPhase {
 }
 
 /// Builds the ordered search phases for a global search rooted at `search_root`:
-/// the current file first, then its parent directory (pruning the current
-/// file), then the workspace root (pruning that directory). A location covered
-/// by an earlier phase is recorded as the next phase's `skip` so the later walk
-/// does not revisit it. With no current file (e.g. a scratch buffer) this is
-/// just a plain walk of the workspace root.
+/// the current file first, then its directory, then each directory above that
+/// in turn up to the search root. Each walk prunes what the phase before it
+/// covered, so nothing is searched twice, and matches come in order of how
+/// close they are to the current file. With no current file (e.g. a scratch
+/// buffer) this is just a plain walk of the search root.
 ///
-/// The directory phase only runs when that directory lies inside the search
-/// root. For a file opened from elsewhere, such as `~/.bashrc`, it would walk
-/// a tree the search was never meant to cover, and before the root at that.
-/// Such a file is still searched itself, first.
+/// The directory phases only run inside the search root. For a file opened
+/// from elsewhere, such as `~/.bashrc`, they would walk a tree the search was
+/// never meant to cover, and before the root at that. Such a file is still
+/// searched itself, first.
 fn global_search_phases(current_file: Option<PathBuf>, search_root: PathBuf) -> Vec<SearchPhase> {
-    let sibling_dir = current_file
-        .as_ref()
-        .and_then(|path| path.parent())
-        .filter(|dir| dir.starts_with(&search_root))
-        .map(PathBuf::from);
+    let Some(file) = current_file else {
+        return vec![SearchPhase::Walk {
+            root: search_root,
+            skip: None,
+        }];
+    };
 
-    let mut phases = Vec::new();
-    if let Some(file) = &current_file {
-        phases.push(SearchPhase::File(file.clone()));
-    }
-    if let Some(dir) = &sibling_dir {
+    let mut phases = vec![SearchPhase::File(file.clone())];
+    let Some(dir) = file.parent().filter(|dir| dir.starts_with(&search_root)) else {
         phases.push(SearchPhase::Walk {
-            root: dir.clone(),
-            skip: current_file,
+            root: search_root,
+            skip: None,
         });
+        return phases;
+    };
+
+    let mut searched = file.clone();
+    for dir in dir
+        .ancestors()
+        .take_while(|dir| dir.starts_with(&search_root))
+    {
+        phases.push(SearchPhase::Walk {
+            root: dir.to_path_buf(),
+            skip: Some(searched),
+        });
+        searched = dir.to_path_buf();
     }
-    phases.push(SearchPhase::Walk {
-        root: search_root,
-        skip: sibling_dir,
-    });
     phases
 }
 
@@ -7062,9 +7069,9 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
-    fn global_search_phases_orders_current_file_then_directory_then_root() {
-        // Nested current file: search the file, then its directory, then the
-        // workspace root — each later phase pruning what an earlier one covered.
+    fn global_search_phases_climb_from_the_current_file_to_the_root() {
+        // Nested current file: search the file, then its directory, then each
+        // directory above it up to the root, each walk pruning the one before.
         let phases = global_search_phases(
             Some(PathBuf::from("/project/src/app/main.rs")),
             PathBuf::from("/project"),
@@ -7079,18 +7086,21 @@ mod tests {
                     skip: Some(PathBuf::from("/project/src/app/main.rs")),
                 },
                 SearchPhase::Walk {
-                    root: PathBuf::from("/project"),
+                    root: PathBuf::from("/project/src"),
                     skip: Some(PathBuf::from("/project/src/app")),
+                },
+                SearchPhase::Walk {
+                    root: PathBuf::from("/project"),
+                    skip: Some(PathBuf::from("/project/src")),
                 },
             ]
         );
     }
 
     #[test]
-    fn global_search_phases_prune_current_directory_from_the_root_walk() {
-        // When the current file sits directly in the workspace root, the second
-        // phase already covers the root, so the third phase prunes the root and
-        // contributes nothing — no duplicate results.
+    fn global_search_phases_walk_the_root_once_for_a_file_in_it() {
+        // When the current file sits directly in the search root, its
+        // directory is the root, so there is nothing further to climb.
         let phases = global_search_phases(
             Some(PathBuf::from("/project/main.rs")),
             PathBuf::from("/project"),
@@ -7103,10 +7113,6 @@ mod tests {
                 SearchPhase::Walk {
                     root: PathBuf::from("/project"),
                     skip: Some(PathBuf::from("/project/main.rs")),
-                },
-                SearchPhase::Walk {
-                    root: PathBuf::from("/project"),
-                    skip: Some(PathBuf::from("/project")),
                 },
             ]
         );

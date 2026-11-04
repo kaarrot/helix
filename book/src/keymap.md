@@ -315,7 +315,7 @@ This layer is a kludge of mappings, mostly pickers.
 | `/`     | Global search in workspace folder                                       | `global_search`                            |
 | `?`     | Open command palette                                                    | `command_palette`                          |
 
-> 💡 Global search displays results in a fuzzy picker, use `Space + '` to bring it back up after opening a file. Matches are ordered by proximity: the current file first, then its directory and subdirectories, then the rest of the workspace.
+> 💡 Global search displays results in a fuzzy picker, use `Space + '` to bring it back up after opening a file. Matches are ordered by proximity: the current file first, then its directory, then each parent directory in turn up to the workspace root.
 
 ##### Popup
 

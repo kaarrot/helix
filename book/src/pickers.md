@@ -2,7 +2,7 @@
 
 Helix has a variety of pickers, which are interactive windows used to select various kinds of items. These include a file picker, global search picker, and more. Most pickers are accessed via keybindings in [space mode](./keymap.md#space-mode). Pickers have their own [keymap](./keymap.md#picker) for navigation.
 
-The global search picker (`Space` `/`) searches the whole workspace but orders matches by proximity to the current file: the current file first, then its directory and subdirectories, then the rest of the workspace, without repeating locations that were already searched. The directory step is skipped when the current file lies outside the workspace, so only the file itself is searched ahead of it.
+The global search picker (`Space` `/`) searches the whole workspace but orders matches by proximity to the current file: the current file first, then its directory, then each parent directory in turn up to the workspace root, without repeating locations that were already searched. The directory steps are skipped when the current file lies outside the workspace, so only the file itself is searched ahead of it.
 
 ### Filtering Picker Results
 

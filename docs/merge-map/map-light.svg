@@ -1,0 +1,959 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="820" height="834" viewBox="0 0 820 834" role="img" aria-labelledby="title description">
+<title id="title">main-kuba pairwise merge conflict map</title>
+<desc id="description">Merge order from the 3 November 2026 review. Rows are steps 2 to 22; columns are earlier steps 1 to 21. Purple intensity represents 1, 2 to 3, 4 to 9, or 10 or more conflicting files. Outlined cells mean no conflict. The selected pair is step 21, feat/comment-hunk, with step 20, dev-3-way-diff-second-attempt: 17 files. The README provides feature descriptions, merge order, and conflict counts as text.</desc>
+<style>text{font-family:Recursive,ui-sans-serif,system-ui,sans-serif}.mono{font-family:Recursive,ui-monospace,Consolas,"Liberation Mono",monospace}</style>
+<rect x="0.5" y="0.5" width="819" height="833" rx="8" fill="#ffffff" stroke="#e3e0ea"/>
+<rect x="16" y="17" width="12" height="12" rx="3" fill="#a998ee" stroke="none">
+</rect>
+<text x="36" y="28" font-size="13" fill="#4c4957" text-anchor="start" font-weight="400">1 file</text>
+<rect x="112" y="17" width="12" height="12" rx="3" fill="#7d63e0" stroke="none">
+</rect>
+<text x="132" y="28" font-size="13" fill="#4c4957" text-anchor="start" font-weight="400">2–3 files</text>
+<rect x="224" y="17" width="12" height="12" rx="3" fill="#5634c4" stroke="none">
+</rect>
+<text x="244" y="28" font-size="13" fill="#4c4957" text-anchor="start" font-weight="400">4–9 files</text>
+<rect x="336" y="17" width="12" height="12" rx="3" fill="#33198a" stroke="none">
+</rect>
+<text x="356" y="28" font-size="13" fill="#4c4957" text-anchor="start" font-weight="400">10 or more</text>
+<rect x="478" y="17" width="12" height="12" rx="3" fill="#ffffff" stroke="#6c687a">
+</rect>
+<text x="498" y="28" font-size="13" fill="#4c4957" text-anchor="start" font-weight="400">no conflict</text>
+<text x="16" y="66" font-size="11" fill="#6c687a" text-anchor="start" font-weight="400" class="mono">step</text>
+<text x="330" y="66" font-size="11" fill="#6c687a" text-anchor="middle" font-weight="400" class="mono">1</text>
+<text x="352" y="66" font-size="11" fill="#6c687a" text-anchor="middle" font-weight="400" class="mono">2</text>
+<text x="374" y="66" font-size="11" fill="#6c687a" text-anchor="middle" font-weight="400" class="mono">3</text>
+<text x="396" y="66" font-size="11" fill="#6c687a" text-anchor="middle" font-weight="400" class="mono">4</text>
+<text x="418" y="66" font-size="11" fill="#6c687a" text-anchor="middle" font-weight="400" class="mono">5</text>
+<text x="440" y="66" font-size="11" fill="#6c687a" text-anchor="middle" font-weight="400" class="mono">6</text>
+<text x="462" y="66" font-size="11" fill="#6c687a" text-anchor="middle" font-weight="400" class="mono">7</text>
+<text x="484" y="66" font-size="11" fill="#6c687a" text-anchor="middle" font-weight="400" class="mono">8</text>
+<text x="506" y="66" font-size="11" fill="#6c687a" text-anchor="middle" font-weight="400" class="mono">9</text>
+<text x="528" y="66" font-size="11" fill="#6c687a" text-anchor="middle" font-weight="400" class="mono">10</text>
+<text x="550" y="66" font-size="11" fill="#6c687a" text-anchor="middle" font-weight="400" class="mono">11</text>
+<text x="572" y="66" font-size="11" fill="#6c687a" text-anchor="middle" font-weight="400" class="mono">12</text>
+<text x="594" y="66" font-size="11" fill="#6c687a" text-anchor="middle" font-weight="400" class="mono">13</text>
+<text x="616" y="66" font-size="11" fill="#6c687a" text-anchor="middle" font-weight="400" class="mono">14</text>
+<text x="638" y="66" font-size="11" fill="#6c687a" text-anchor="middle" font-weight="400" class="mono">15</text>
+<text x="660" y="66" font-size="11" fill="#6c687a" text-anchor="middle" font-weight="400" class="mono">16</text>
+<text x="682" y="66" font-size="11" fill="#6c687a" text-anchor="middle" font-weight="400" class="mono">17</text>
+<text x="704" y="66" font-size="11" fill="#6c687a" text-anchor="middle" font-weight="400" class="mono">18</text>
+<text x="726" y="66" font-size="11" fill="#6c687a" text-anchor="middle" font-weight="400" class="mono">19</text>
+<text x="748" y="66" font-size="11" fill="#1b1922" text-anchor="middle" font-weight="700" class="mono">20</text>
+<text x="770" y="66" font-size="11" fill="#6c687a" text-anchor="middle" font-weight="400" class="mono">21</text>
+<text x="16" y="90" font-size="12" fill="#6c687a" text-anchor="start" font-weight="400" class="mono">2</text>
+<text x="46" y="90" font-size="12" fill="#4c4957" text-anchor="start" font-weight="400" class="mono">feat/yank-multi-selection</text>
+<rect x="320" y="76" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 2 feat/yank-multi-selection with step 1 feat/recoverable-config: 0 files in conflict</title>
+</rect>
+<text x="16" y="112" font-size="12" fill="#6c687a" text-anchor="start" font-weight="400" class="mono">3</text>
+<text x="46" y="112" font-size="12" fill="#4c4957" text-anchor="start" font-weight="400" class="mono">feat/balanced-tripple-quotes</text>
+<rect x="320" y="98" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 3 feat/balanced-tripple-quotes with step 1 feat/recoverable-config: 0 files in conflict</title>
+</rect>
+<rect x="342" y="98" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 3 feat/balanced-tripple-quotes with step 2 feat/yank-multi-selection: 0 files in conflict</title>
+</rect>
+<text x="16" y="134" font-size="12" fill="#6c687a" text-anchor="start" font-weight="400" class="mono">4</text>
+<text x="46" y="134" font-size="12" fill="#4c4957" text-anchor="start" font-weight="400" class="mono">feat/fuzzy-commands</text>
+<rect x="320" y="120" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 4 feat/fuzzy-commands with step 1 feat/recoverable-config: 0 files in conflict</title>
+</rect>
+<rect x="342" y="120" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 4 feat/fuzzy-commands with step 2 feat/yank-multi-selection: 0 files in conflict</title>
+</rect>
+<rect x="364" y="120" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 4 feat/fuzzy-commands with step 3 feat/balanced-tripple-quotes: 0 files in conflict</title>
+</rect>
+<text x="16" y="156" font-size="12" fill="#6c687a" text-anchor="start" font-weight="400" class="mono">5</text>
+<text x="46" y="156" font-size="12" fill="#4c4957" text-anchor="start" font-weight="400" class="mono">feat/key-bindings-description</text>
+<rect x="320" y="142" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 5 feat/key-bindings-description with step 1 feat/recoverable-config: 0 files in conflict</title>
+</rect>
+<rect x="342" y="142" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 5 feat/key-bindings-description with step 2 feat/yank-multi-selection: 0 files in conflict</title>
+</rect>
+<rect x="364" y="142" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 5 feat/key-bindings-description with step 3 feat/balanced-tripple-quotes: 0 files in conflict</title>
+</rect>
+<rect x="386" y="142" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 5 feat/key-bindings-description with step 4 feat/fuzzy-commands: 0 files in conflict</title>
+</rect>
+<text x="16" y="178" font-size="12" fill="#6c687a" text-anchor="start" font-weight="400" class="mono">6</text>
+<text x="46" y="178" font-size="12" fill="#4c4957" text-anchor="start" font-weight="400" class="mono">feat/scroll-redraw</text>
+<rect x="320" y="164" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 6 feat/scroll-redraw with step 1 feat/recoverable-config: 0 files in conflict</title>
+</rect>
+<rect x="342" y="164" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 6 feat/scroll-redraw with step 2 feat/yank-multi-selection: 0 files in conflict</title>
+</rect>
+<rect x="364" y="164" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 6 feat/scroll-redraw with step 3 feat/balanced-tripple-quotes: 0 files in conflict</title>
+</rect>
+<rect x="386" y="164" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 6 feat/scroll-redraw with step 4 feat/fuzzy-commands: 0 files in conflict</title>
+</rect>
+<rect x="408" y="164" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 6 feat/scroll-redraw with step 5 feat/key-bindings-description: 0 files in conflict</title>
+</rect>
+<text x="16" y="200" font-size="12" fill="#6c687a" text-anchor="start" font-weight="400" class="mono">7</text>
+<text x="46" y="200" font-size="12" fill="#4c4957" text-anchor="start" font-weight="400" class="mono">improve-long-lines</text>
+<rect x="320" y="186" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 7 improve-long-lines with step 1 feat/recoverable-config: 0 files in conflict</title>
+</rect>
+<rect x="342" y="186" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 7 improve-long-lines with step 2 feat/yank-multi-selection: 0 files in conflict</title>
+</rect>
+<rect x="364" y="186" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 7 improve-long-lines with step 3 feat/balanced-tripple-quotes: 0 files in conflict</title>
+</rect>
+<rect x="386" y="186" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 7 improve-long-lines with step 4 feat/fuzzy-commands: 0 files in conflict</title>
+</rect>
+<rect x="408" y="186" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 7 improve-long-lines with step 5 feat/key-bindings-description: 0 files in conflict</title>
+</rect>
+<rect x="430" y="186" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 7 improve-long-lines with step 6 feat/scroll-redraw: 0 files in conflict</title>
+</rect>
+<text x="16" y="222" font-size="12" fill="#6c687a" text-anchor="start" font-weight="400" class="mono">8</text>
+<text x="46" y="222" font-size="12" fill="#4c4957" text-anchor="start" font-weight="400" class="mono">feat/scoped-file-open</text>
+<rect x="320" y="208" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 8 feat/scoped-file-open with step 1 feat/recoverable-config: 0 files in conflict</title>
+</rect>
+<rect x="342" y="208" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 8 feat/scoped-file-open with step 2 feat/yank-multi-selection: 0 files in conflict</title>
+</rect>
+<rect x="364" y="208" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 8 feat/scoped-file-open with step 3 feat/balanced-tripple-quotes: 0 files in conflict</title>
+</rect>
+<rect x="386" y="208" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 8 feat/scoped-file-open with step 4 feat/fuzzy-commands: 0 files in conflict</title>
+</rect>
+<rect x="408" y="208" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 8 feat/scoped-file-open with step 5 feat/key-bindings-description: 0 files in conflict</title>
+</rect>
+<rect x="430" y="208" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 8 feat/scoped-file-open with step 6 feat/scroll-redraw: 0 files in conflict</title>
+</rect>
+<rect x="452" y="208" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 8 feat/scoped-file-open with step 7 improve-long-lines: 0 files in conflict</title>
+</rect>
+<text x="16" y="244" font-size="12" fill="#6c687a" text-anchor="start" font-weight="400" class="mono">9</text>
+<text x="46" y="244" font-size="12" fill="#4c4957" text-anchor="start" font-weight="400" class="mono">feat/markdown-preview-v2</text>
+<rect x="320" y="230" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 9 feat/markdown-preview-v2 with step 1 feat/recoverable-config: 0 files in conflict</title>
+</rect>
+<rect x="342" y="230" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 9 feat/markdown-preview-v2 with step 2 feat/yank-multi-selection: 0 files in conflict</title>
+</rect>
+<rect x="364" y="230" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 9 feat/markdown-preview-v2 with step 3 feat/balanced-tripple-quotes: 0 files in conflict</title>
+</rect>
+<rect x="386" y="230" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 9 feat/markdown-preview-v2 with step 4 feat/fuzzy-commands: 0 files in conflict</title>
+</rect>
+<rect x="408" y="230" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 9 feat/markdown-preview-v2 with step 5 feat/key-bindings-description: 0 files in conflict</title>
+</rect>
+<rect x="430" y="230" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 9 feat/markdown-preview-v2 with step 6 feat/scroll-redraw: 0 files in conflict</title>
+</rect>
+<rect x="452" y="230" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 9 feat/markdown-preview-v2 with step 7 improve-long-lines: 0 files in conflict</title>
+</rect>
+<rect x="474" y="230" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 9 feat/markdown-preview-v2 with step 8 feat/scoped-file-open: 0 files in conflict</title>
+</rect>
+<text x="16" y="266" font-size="12" fill="#6c687a" text-anchor="start" font-weight="400" class="mono">10</text>
+<text x="46" y="266" font-size="12" fill="#4c4957" text-anchor="start" font-weight="400" class="mono">feat/theme-remove-modifier</text>
+<rect x="320" y="252" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 10 feat/theme-remove-modifier with step 1 feat/recoverable-config: 0 files in conflict</title>
+</rect>
+<rect x="342" y="252" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 10 feat/theme-remove-modifier with step 2 feat/yank-multi-selection: 0 files in conflict</title>
+</rect>
+<rect x="364" y="252" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 10 feat/theme-remove-modifier with step 3 feat/balanced-tripple-quotes: 0 files in conflict</title>
+</rect>
+<rect x="386" y="252" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 10 feat/theme-remove-modifier with step 4 feat/fuzzy-commands: 0 files in conflict</title>
+</rect>
+<rect x="408" y="252" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 10 feat/theme-remove-modifier with step 5 feat/key-bindings-description: 0 files in conflict</title>
+</rect>
+<rect x="430" y="252" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 10 feat/theme-remove-modifier with step 6 feat/scroll-redraw: 0 files in conflict</title>
+</rect>
+<rect x="452" y="252" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 10 feat/theme-remove-modifier with step 7 improve-long-lines: 0 files in conflict</title>
+</rect>
+<rect x="474" y="252" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 10 feat/theme-remove-modifier with step 8 feat/scoped-file-open: 0 files in conflict</title>
+</rect>
+<rect x="496" y="252" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 10 feat/theme-remove-modifier with step 9 feat/markdown-preview-v2: 0 files in conflict</title>
+</rect>
+<text x="16" y="288" font-size="12" fill="#6c687a" text-anchor="start" font-weight="400" class="mono">11</text>
+<text x="46" y="288" font-size="12" fill="#4c4957" text-anchor="start" font-weight="400" class="mono">feat/pgp</text>
+<rect x="320" y="274" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 11 feat/pgp with step 1 feat/recoverable-config: 0 files in conflict</title>
+</rect>
+<rect x="342" y="274" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 11 feat/pgp with step 2 feat/yank-multi-selection: 0 files in conflict</title>
+</rect>
+<rect x="364" y="274" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 11 feat/pgp with step 3 feat/balanced-tripple-quotes: 0 files in conflict</title>
+</rect>
+<rect x="386" y="274" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 11 feat/pgp with step 4 feat/fuzzy-commands: 0 files in conflict</title>
+</rect>
+<rect x="408" y="274" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 11 feat/pgp with step 5 feat/key-bindings-description: 0 files in conflict</title>
+</rect>
+<rect x="430" y="274" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 11 feat/pgp with step 6 feat/scroll-redraw: 0 files in conflict</title>
+</rect>
+<rect x="452" y="274" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 11 feat/pgp with step 7 improve-long-lines: 0 files in conflict</title>
+</rect>
+<rect x="474" y="274" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 11 feat/pgp with step 8 feat/scoped-file-open: 0 files in conflict</title>
+</rect>
+<rect x="496" y="274" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 11 feat/pgp with step 9 feat/markdown-preview-v2: 0 files in conflict</title>
+</rect>
+<rect x="518" y="274" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 11 feat/pgp with step 10 feat/theme-remove-modifier: 0 files in conflict</title>
+</rect>
+<text x="16" y="310" font-size="12" fill="#6c687a" text-anchor="start" font-weight="400" class="mono">12</text>
+<text x="46" y="310" font-size="12" fill="#4c4957" text-anchor="start" font-weight="400" class="mono">feat/scoped-search</text>
+<rect x="320" y="296" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 12 feat/scoped-search with step 1 feat/recoverable-config: 0 files in conflict</title>
+</rect>
+<rect x="342" y="296" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 12 feat/scoped-search with step 2 feat/yank-multi-selection: 0 files in conflict</title>
+</rect>
+<rect x="364" y="296" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 12 feat/scoped-search with step 3 feat/balanced-tripple-quotes: 0 files in conflict</title>
+</rect>
+<rect x="386" y="296" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 12 feat/scoped-search with step 4 feat/fuzzy-commands: 0 files in conflict</title>
+</rect>
+<rect x="408" y="296" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 12 feat/scoped-search with step 5 feat/key-bindings-description: 0 files in conflict</title>
+</rect>
+<rect x="430" y="296" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 12 feat/scoped-search with step 6 feat/scroll-redraw: 0 files in conflict</title>
+</rect>
+<rect x="452" y="296" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 12 feat/scoped-search with step 7 improve-long-lines: 0 files in conflict</title>
+</rect>
+<rect x="474" y="296" width="20" height="20" rx="3" fill="#a998ee" stroke="none">
+<title>Step 12 feat/scoped-search with step 8 feat/scoped-file-open: 1 file in conflict
+helix-term/src/keymap.rs</title>
+</rect>
+<rect x="496" y="296" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 12 feat/scoped-search with step 9 feat/markdown-preview-v2: 0 files in conflict</title>
+</rect>
+<rect x="518" y="296" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 12 feat/scoped-search with step 10 feat/theme-remove-modifier: 0 files in conflict</title>
+</rect>
+<rect x="540" y="296" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 12 feat/scoped-search with step 11 feat/pgp: 0 files in conflict</title>
+</rect>
+<text x="16" y="332" font-size="12" fill="#6c687a" text-anchor="start" font-weight="400" class="mono">13</text>
+<text x="46" y="332" font-size="12" fill="#4c4957" text-anchor="start" font-weight="400" class="mono">dev-vertical-preview</text>
+<rect x="320" y="318" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 13 dev-vertical-preview with step 1 feat/recoverable-config: 0 files in conflict</title>
+</rect>
+<rect x="342" y="318" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 13 dev-vertical-preview with step 2 feat/yank-multi-selection: 0 files in conflict</title>
+</rect>
+<rect x="364" y="318" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 13 dev-vertical-preview with step 3 feat/balanced-tripple-quotes: 0 files in conflict</title>
+</rect>
+<rect x="386" y="318" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 13 dev-vertical-preview with step 4 feat/fuzzy-commands: 0 files in conflict</title>
+</rect>
+<rect x="408" y="318" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 13 dev-vertical-preview with step 5 feat/key-bindings-description: 0 files in conflict</title>
+</rect>
+<rect x="430" y="318" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 13 dev-vertical-preview with step 6 feat/scroll-redraw: 0 files in conflict</title>
+</rect>
+<rect x="452" y="318" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 13 dev-vertical-preview with step 7 improve-long-lines: 0 files in conflict</title>
+</rect>
+<rect x="474" y="318" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 13 dev-vertical-preview with step 8 feat/scoped-file-open: 0 files in conflict</title>
+</rect>
+<rect x="496" y="318" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 13 dev-vertical-preview with step 9 feat/markdown-preview-v2: 0 files in conflict</title>
+</rect>
+<rect x="518" y="318" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 13 dev-vertical-preview with step 10 feat/theme-remove-modifier: 0 files in conflict</title>
+</rect>
+<rect x="540" y="318" width="20" height="20" rx="3" fill="#a998ee" stroke="none">
+<title>Step 13 dev-vertical-preview with step 11 feat/pgp: 1 file in conflict
+helix-term/src/ui/prompt.rs</title>
+</rect>
+<rect x="562" y="318" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 13 dev-vertical-preview with step 12 feat/scoped-search: 0 files in conflict</title>
+</rect>
+<text x="16" y="354" font-size="12" fill="#6c687a" text-anchor="start" font-weight="400" class="mono">14</text>
+<text x="46" y="354" font-size="12" fill="#4c4957" text-anchor="start" font-weight="400" class="mono">feat/per-mode-cursorline</text>
+<rect x="320" y="340" width="20" height="20" rx="3" fill="#7d63e0" stroke="none">
+<title>Step 14 feat/per-mode-cursorline with step 1 feat/recoverable-config: 3 files in conflict
+helix-term/src/application.rs
+helix-term/src/config.rs
+helix-term/src/main.rs</title>
+</rect>
+<rect x="342" y="340" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 14 feat/per-mode-cursorline with step 2 feat/yank-multi-selection: 0 files in conflict</title>
+</rect>
+<rect x="364" y="340" width="20" height="20" rx="3" fill="#7d63e0" stroke="none">
+<title>Step 14 feat/per-mode-cursorline with step 3 feat/balanced-tripple-quotes: 3 files in conflict
+helix-term/src/application.rs
+helix-term/src/config.rs
+helix-term/src/main.rs</title>
+</rect>
+<rect x="386" y="340" width="20" height="20" rx="3" fill="#7d63e0" stroke="none">
+<title>Step 14 feat/per-mode-cursorline with step 4 feat/fuzzy-commands: 3 files in conflict
+helix-term/src/application.rs
+helix-term/src/config.rs
+helix-term/src/main.rs</title>
+</rect>
+<rect x="408" y="340" width="20" height="20" rx="3" fill="#7d63e0" stroke="none">
+<title>Step 14 feat/per-mode-cursorline with step 5 feat/key-bindings-description: 3 files in conflict
+helix-term/src/application.rs
+helix-term/src/config.rs
+helix-term/src/main.rs</title>
+</rect>
+<rect x="430" y="340" width="20" height="20" rx="3" fill="#7d63e0" stroke="none">
+<title>Step 14 feat/per-mode-cursorline with step 6 feat/scroll-redraw: 3 files in conflict
+helix-term/src/application.rs
+helix-term/src/config.rs
+helix-term/src/main.rs</title>
+</rect>
+<rect x="452" y="340" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 14 feat/per-mode-cursorline with step 7 improve-long-lines: 0 files in conflict</title>
+</rect>
+<rect x="474" y="340" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 14 feat/per-mode-cursorline with step 8 feat/scoped-file-open: 0 files in conflict</title>
+</rect>
+<rect x="496" y="340" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 14 feat/per-mode-cursorline with step 9 feat/markdown-preview-v2: 0 files in conflict</title>
+</rect>
+<rect x="518" y="340" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 14 feat/per-mode-cursorline with step 10 feat/theme-remove-modifier: 0 files in conflict</title>
+</rect>
+<rect x="540" y="340" width="20" height="20" rx="3" fill="#7d63e0" stroke="none">
+<title>Step 14 feat/per-mode-cursorline with step 11 feat/pgp: 3 files in conflict
+helix-term/src/application.rs
+helix-term/src/config.rs
+helix-term/src/main.rs</title>
+</rect>
+<rect x="562" y="340" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 14 feat/per-mode-cursorline with step 12 feat/scoped-search: 0 files in conflict</title>
+</rect>
+<rect x="584" y="340" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 14 feat/per-mode-cursorline with step 13 dev-vertical-preview: 0 files in conflict</title>
+</rect>
+<text x="16" y="376" font-size="12" fill="#6c687a" text-anchor="start" font-weight="400" class="mono">15</text>
+<text x="46" y="376" font-size="12" fill="#4c4957" text-anchor="start" font-weight="400" class="mono">feat/buffer-reload-on-change</text>
+<rect x="320" y="362" width="20" height="20" rx="3" fill="#a998ee" stroke="none">
+<title>Step 15 feat/buffer-reload-on-change with step 1 feat/recoverable-config: 1 file in conflict
+helix-term/src/config.rs</title>
+</rect>
+<rect x="342" y="362" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 15 feat/buffer-reload-on-change with step 2 feat/yank-multi-selection: 0 files in conflict</title>
+</rect>
+<rect x="364" y="362" width="20" height="20" rx="3" fill="#a998ee" stroke="none">
+<title>Step 15 feat/buffer-reload-on-change with step 3 feat/balanced-tripple-quotes: 1 file in conflict
+helix-term/src/config.rs</title>
+</rect>
+<rect x="386" y="362" width="20" height="20" rx="3" fill="#a998ee" stroke="none">
+<title>Step 15 feat/buffer-reload-on-change with step 4 feat/fuzzy-commands: 1 file in conflict
+helix-term/src/config.rs</title>
+</rect>
+<rect x="408" y="362" width="20" height="20" rx="3" fill="#a998ee" stroke="none">
+<title>Step 15 feat/buffer-reload-on-change with step 5 feat/key-bindings-description: 1 file in conflict
+helix-term/src/config.rs</title>
+</rect>
+<rect x="430" y="362" width="20" height="20" rx="3" fill="#a998ee" stroke="none">
+<title>Step 15 feat/buffer-reload-on-change with step 6 feat/scroll-redraw: 1 file in conflict
+helix-term/src/config.rs</title>
+</rect>
+<rect x="452" y="362" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 15 feat/buffer-reload-on-change with step 7 improve-long-lines: 0 files in conflict</title>
+</rect>
+<rect x="474" y="362" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 15 feat/buffer-reload-on-change with step 8 feat/scoped-file-open: 0 files in conflict</title>
+</rect>
+<rect x="496" y="362" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 15 feat/buffer-reload-on-change with step 9 feat/markdown-preview-v2: 0 files in conflict</title>
+</rect>
+<rect x="518" y="362" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 15 feat/buffer-reload-on-change with step 10 feat/theme-remove-modifier: 0 files in conflict</title>
+</rect>
+<rect x="540" y="362" width="20" height="20" rx="3" fill="#a998ee" stroke="none">
+<title>Step 15 feat/buffer-reload-on-change with step 11 feat/pgp: 1 file in conflict
+helix-term/src/config.rs</title>
+</rect>
+<rect x="562" y="362" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 15 feat/buffer-reload-on-change with step 12 feat/scoped-search: 0 files in conflict</title>
+</rect>
+<rect x="584" y="362" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 15 feat/buffer-reload-on-change with step 13 dev-vertical-preview: 0 files in conflict</title>
+</rect>
+<rect x="606" y="362" width="20" height="20" rx="3" fill="#a998ee" stroke="none">
+<title>Step 15 feat/buffer-reload-on-change with step 14 feat/per-mode-cursorline: 1 file in conflict
+helix-term/src/config.rs</title>
+</rect>
+<text x="16" y="398" font-size="12" fill="#6c687a" text-anchor="start" font-weight="400" class="mono">16</text>
+<text x="46" y="398" font-size="12" fill="#4c4957" text-anchor="start" font-weight="400" class="mono">feat/statusline-completion</text>
+<rect x="320" y="384" width="20" height="20" rx="3" fill="#a998ee" stroke="none">
+<title>Step 16 feat/statusline-completion with step 1 feat/recoverable-config: 1 file in conflict
+helix-term/src/config.rs</title>
+</rect>
+<rect x="342" y="384" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 16 feat/statusline-completion with step 2 feat/yank-multi-selection: 0 files in conflict</title>
+</rect>
+<rect x="364" y="384" width="20" height="20" rx="3" fill="#a998ee" stroke="none">
+<title>Step 16 feat/statusline-completion with step 3 feat/balanced-tripple-quotes: 1 file in conflict
+helix-term/src/config.rs</title>
+</rect>
+<rect x="386" y="384" width="20" height="20" rx="3" fill="#a998ee" stroke="none">
+<title>Step 16 feat/statusline-completion with step 4 feat/fuzzy-commands: 1 file in conflict
+helix-term/src/config.rs</title>
+</rect>
+<rect x="408" y="384" width="20" height="20" rx="3" fill="#a998ee" stroke="none">
+<title>Step 16 feat/statusline-completion with step 5 feat/key-bindings-description: 1 file in conflict
+helix-term/src/config.rs</title>
+</rect>
+<rect x="430" y="384" width="20" height="20" rx="3" fill="#a998ee" stroke="none">
+<title>Step 16 feat/statusline-completion with step 6 feat/scroll-redraw: 1 file in conflict
+helix-term/src/config.rs</title>
+</rect>
+<rect x="452" y="384" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 16 feat/statusline-completion with step 7 improve-long-lines: 0 files in conflict</title>
+</rect>
+<rect x="474" y="384" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 16 feat/statusline-completion with step 8 feat/scoped-file-open: 0 files in conflict</title>
+</rect>
+<rect x="496" y="384" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 16 feat/statusline-completion with step 9 feat/markdown-preview-v2: 0 files in conflict</title>
+</rect>
+<rect x="518" y="384" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 16 feat/statusline-completion with step 10 feat/theme-remove-modifier: 0 files in conflict</title>
+</rect>
+<rect x="540" y="384" width="20" height="20" rx="3" fill="#a998ee" stroke="none">
+<title>Step 16 feat/statusline-completion with step 11 feat/pgp: 1 file in conflict
+helix-term/src/config.rs</title>
+</rect>
+<rect x="562" y="384" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 16 feat/statusline-completion with step 12 feat/scoped-search: 0 files in conflict</title>
+</rect>
+<rect x="584" y="384" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 16 feat/statusline-completion with step 13 dev-vertical-preview: 0 files in conflict</title>
+</rect>
+<rect x="606" y="384" width="20" height="20" rx="3" fill="#7d63e0" stroke="none">
+<title>Step 16 feat/statusline-completion with step 14 feat/per-mode-cursorline: 2 files in conflict
+helix-term/src/config.rs
+helix-view/src/editor.rs</title>
+</rect>
+<rect x="628" y="384" width="20" height="20" rx="3" fill="#a998ee" stroke="none">
+<title>Step 16 feat/statusline-completion with step 15 feat/buffer-reload-on-change: 1 file in conflict
+helix-term/src/config.rs</title>
+</rect>
+<text x="16" y="420" font-size="12" fill="#6c687a" text-anchor="start" font-weight="400" class="mono">17</text>
+<text x="46" y="420" font-size="12" fill="#4c4957" text-anchor="start" font-weight="400" class="mono">dev-insert-stream-command</text>
+<rect x="320" y="406" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 17 dev-insert-stream-command with step 1 feat/recoverable-config: 0 files in conflict</title>
+</rect>
+<rect x="342" y="406" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 17 dev-insert-stream-command with step 2 feat/yank-multi-selection: 0 files in conflict</title>
+</rect>
+<rect x="364" y="406" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 17 dev-insert-stream-command with step 3 feat/balanced-tripple-quotes: 0 files in conflict</title>
+</rect>
+<rect x="386" y="406" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 17 dev-insert-stream-command with step 4 feat/fuzzy-commands: 0 files in conflict</title>
+</rect>
+<rect x="408" y="406" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 17 dev-insert-stream-command with step 5 feat/key-bindings-description: 0 files in conflict</title>
+</rect>
+<rect x="430" y="406" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 17 dev-insert-stream-command with step 6 feat/scroll-redraw: 0 files in conflict</title>
+</rect>
+<rect x="452" y="406" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 17 dev-insert-stream-command with step 7 improve-long-lines: 0 files in conflict</title>
+</rect>
+<rect x="474" y="406" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 17 dev-insert-stream-command with step 8 feat/scoped-file-open: 0 files in conflict</title>
+</rect>
+<rect x="496" y="406" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 17 dev-insert-stream-command with step 9 feat/markdown-preview-v2: 0 files in conflict</title>
+</rect>
+<rect x="518" y="406" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 17 dev-insert-stream-command with step 10 feat/theme-remove-modifier: 0 files in conflict</title>
+</rect>
+<rect x="540" y="406" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 17 dev-insert-stream-command with step 11 feat/pgp: 0 files in conflict</title>
+</rect>
+<rect x="562" y="406" width="20" height="20" rx="3" fill="#a998ee" stroke="none">
+<title>Step 17 dev-insert-stream-command with step 12 feat/scoped-search: 1 file in conflict
+helix-term/tests/test/commands.rs</title>
+</rect>
+<rect x="584" y="406" width="20" height="20" rx="3" fill="#a998ee" stroke="none">
+<title>Step 17 dev-insert-stream-command with step 13 dev-vertical-preview: 1 file in conflict
+helix-term/tests/test/command_line.rs</title>
+</rect>
+<rect x="606" y="406" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 17 dev-insert-stream-command with step 14 feat/per-mode-cursorline: 0 files in conflict</title>
+</rect>
+<rect x="628" y="406" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 17 dev-insert-stream-command with step 15 feat/buffer-reload-on-change: 0 files in conflict</title>
+</rect>
+<rect x="650" y="406" width="20" height="20" rx="3" fill="#7d63e0" stroke="none">
+<title>Step 17 dev-insert-stream-command with step 16 feat/statusline-completion: 2 files in conflict
+helix-term/src/ui/statusline.rs
+helix-term/tests/test/helpers.rs</title>
+</rect>
+<text x="16" y="442" font-size="12" fill="#6c687a" text-anchor="start" font-weight="400" class="mono">18</text>
+<text x="46" y="442" font-size="12" fill="#4c4957" text-anchor="start" font-weight="400" class="mono">dev-buffer-file-path</text>
+<rect x="320" y="428" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 18 dev-buffer-file-path with step 1 feat/recoverable-config: 0 files in conflict</title>
+</rect>
+<rect x="342" y="428" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 18 dev-buffer-file-path with step 2 feat/yank-multi-selection: 0 files in conflict</title>
+</rect>
+<rect x="364" y="428" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 18 dev-buffer-file-path with step 3 feat/balanced-tripple-quotes: 0 files in conflict</title>
+</rect>
+<rect x="386" y="428" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 18 dev-buffer-file-path with step 4 feat/fuzzy-commands: 0 files in conflict</title>
+</rect>
+<rect x="408" y="428" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 18 dev-buffer-file-path with step 5 feat/key-bindings-description: 0 files in conflict</title>
+</rect>
+<rect x="430" y="428" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 18 dev-buffer-file-path with step 6 feat/scroll-redraw: 0 files in conflict</title>
+</rect>
+<rect x="452" y="428" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 18 dev-buffer-file-path with step 7 improve-long-lines: 0 files in conflict</title>
+</rect>
+<rect x="474" y="428" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 18 dev-buffer-file-path with step 8 feat/scoped-file-open: 0 files in conflict</title>
+</rect>
+<rect x="496" y="428" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 18 dev-buffer-file-path with step 9 feat/markdown-preview-v2: 0 files in conflict</title>
+</rect>
+<rect x="518" y="428" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 18 dev-buffer-file-path with step 10 feat/theme-remove-modifier: 0 files in conflict</title>
+</rect>
+<rect x="540" y="428" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 18 dev-buffer-file-path with step 11 feat/pgp: 0 files in conflict</title>
+</rect>
+<rect x="562" y="428" width="20" height="20" rx="3" fill="#a998ee" stroke="none">
+<title>Step 18 dev-buffer-file-path with step 12 feat/scoped-search: 1 file in conflict
+helix-term/tests/test/commands.rs</title>
+</rect>
+<rect x="584" y="428" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 18 dev-buffer-file-path with step 13 dev-vertical-preview: 0 files in conflict</title>
+</rect>
+<rect x="606" y="428" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 18 dev-buffer-file-path with step 14 feat/per-mode-cursorline: 0 files in conflict</title>
+</rect>
+<rect x="628" y="428" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 18 dev-buffer-file-path with step 15 feat/buffer-reload-on-change: 0 files in conflict</title>
+</rect>
+<rect x="650" y="428" width="20" height="20" rx="3" fill="#a998ee" stroke="none">
+<title>Step 18 dev-buffer-file-path with step 16 feat/statusline-completion: 1 file in conflict
+helix-term/src/ui/statusline.rs</title>
+</rect>
+<rect x="672" y="428" width="20" height="20" rx="3" fill="#7d63e0" stroke="none">
+<title>Step 18 dev-buffer-file-path with step 17 dev-insert-stream-command: 2 files in conflict
+book/src/generated/typable-cmd.md
+helix-term/src/ui/statusline.rs</title>
+</rect>
+<text x="16" y="464" font-size="12" fill="#6c687a" text-anchor="start" font-weight="400" class="mono">19</text>
+<text x="46" y="464" font-size="12" fill="#4c4957" text-anchor="start" font-weight="400" class="mono">dev-timestamp-sort-file-picker</text>
+<rect x="320" y="450" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 19 dev-timestamp-sort-file-picker with step 1 feat/recoverable-config: 0 files in conflict</title>
+</rect>
+<rect x="342" y="450" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 19 dev-timestamp-sort-file-picker with step 2 feat/yank-multi-selection: 0 files in conflict</title>
+</rect>
+<rect x="364" y="450" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 19 dev-timestamp-sort-file-picker with step 3 feat/balanced-tripple-quotes: 0 files in conflict</title>
+</rect>
+<rect x="386" y="450" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 19 dev-timestamp-sort-file-picker with step 4 feat/fuzzy-commands: 0 files in conflict</title>
+</rect>
+<rect x="408" y="450" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 19 dev-timestamp-sort-file-picker with step 5 feat/key-bindings-description: 0 files in conflict</title>
+</rect>
+<rect x="430" y="450" width="20" height="20" rx="3" fill="#a998ee" stroke="none">
+<title>Step 19 dev-timestamp-sort-file-picker with step 6 feat/scroll-redraw: 1 file in conflict
+helix-term/src/ui/picker.rs</title>
+</rect>
+<rect x="452" y="450" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 19 dev-timestamp-sort-file-picker with step 7 improve-long-lines: 0 files in conflict</title>
+</rect>
+<rect x="474" y="450" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 19 dev-timestamp-sort-file-picker with step 8 feat/scoped-file-open: 0 files in conflict</title>
+</rect>
+<rect x="496" y="450" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 19 dev-timestamp-sort-file-picker with step 9 feat/markdown-preview-v2: 0 files in conflict</title>
+</rect>
+<rect x="518" y="450" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 19 dev-timestamp-sort-file-picker with step 10 feat/theme-remove-modifier: 0 files in conflict</title>
+</rect>
+<rect x="540" y="450" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 19 dev-timestamp-sort-file-picker with step 11 feat/pgp: 0 files in conflict</title>
+</rect>
+<rect x="562" y="450" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 19 dev-timestamp-sort-file-picker with step 12 feat/scoped-search: 0 files in conflict</title>
+</rect>
+<rect x="584" y="450" width="20" height="20" rx="3" fill="#a998ee" stroke="none">
+<title>Step 19 dev-timestamp-sort-file-picker with step 13 dev-vertical-preview: 1 file in conflict
+helix-term/src/ui/picker.rs</title>
+</rect>
+<rect x="606" y="450" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 19 dev-timestamp-sort-file-picker with step 14 feat/per-mode-cursorline: 0 files in conflict</title>
+</rect>
+<rect x="628" y="450" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 19 dev-timestamp-sort-file-picker with step 15 feat/buffer-reload-on-change: 0 files in conflict</title>
+</rect>
+<rect x="650" y="450" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 19 dev-timestamp-sort-file-picker with step 16 feat/statusline-completion: 0 files in conflict</title>
+</rect>
+<rect x="672" y="450" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 19 dev-timestamp-sort-file-picker with step 17 dev-insert-stream-command: 0 files in conflict</title>
+</rect>
+<rect x="694" y="450" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 19 dev-timestamp-sort-file-picker with step 18 dev-buffer-file-path: 0 files in conflict</title>
+</rect>
+<text x="16" y="486" font-size="12" fill="#6c687a" text-anchor="start" font-weight="400" class="mono">20</text>
+<text x="46" y="486" font-size="12" fill="#4c4957" text-anchor="start" font-weight="400" class="mono">dev-3-way-diff-second-attempt</text>
+<rect x="320" y="472" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 20 dev-3-way-diff-second-attempt with step 1 feat/recoverable-config: 0 files in conflict</title>
+</rect>
+<rect x="342" y="472" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 20 dev-3-way-diff-second-attempt with step 2 feat/yank-multi-selection: 0 files in conflict</title>
+</rect>
+<rect x="364" y="472" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 20 dev-3-way-diff-second-attempt with step 3 feat/balanced-tripple-quotes: 0 files in conflict</title>
+</rect>
+<rect x="386" y="472" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 20 dev-3-way-diff-second-attempt with step 4 feat/fuzzy-commands: 0 files in conflict</title>
+</rect>
+<rect x="408" y="472" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 20 dev-3-way-diff-second-attempt with step 5 feat/key-bindings-description: 0 files in conflict</title>
+</rect>
+<rect x="430" y="472" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 20 dev-3-way-diff-second-attempt with step 6 feat/scroll-redraw: 0 files in conflict</title>
+</rect>
+<rect x="452" y="472" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 20 dev-3-way-diff-second-attempt with step 7 improve-long-lines: 0 files in conflict</title>
+</rect>
+<rect x="474" y="472" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 20 dev-3-way-diff-second-attempt with step 8 feat/scoped-file-open: 0 files in conflict</title>
+</rect>
+<rect x="496" y="472" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 20 dev-3-way-diff-second-attempt with step 9 feat/markdown-preview-v2: 0 files in conflict</title>
+</rect>
+<rect x="518" y="472" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 20 dev-3-way-diff-second-attempt with step 10 feat/theme-remove-modifier: 0 files in conflict</title>
+</rect>
+<rect x="540" y="472" width="20" height="20" rx="3" fill="#5634c4" stroke="none">
+<title>Step 20 dev-3-way-diff-second-attempt with step 11 feat/pgp: 6 files in conflict
+book/src/SUMMARY.md
+helix-term/Cargo.toml
+helix-view/Cargo.toml
+helix-view/src/document.rs
+helix-view/src/editor.rs
+helix-view/src/lib.rs</title>
+</rect>
+<rect x="562" y="472" width="20" height="20" rx="3" fill="#a998ee" stroke="none">
+<title>Step 20 dev-3-way-diff-second-attempt with step 12 feat/scoped-search: 1 file in conflict
+helix-term/tests/test/commands.rs</title>
+</rect>
+<rect x="584" y="472" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 20 dev-3-way-diff-second-attempt with step 13 dev-vertical-preview: 0 files in conflict</title>
+</rect>
+<rect x="606" y="472" width="20" height="20" rx="3" fill="#a998ee" stroke="none">
+<title>Step 20 dev-3-way-diff-second-attempt with step 14 feat/per-mode-cursorline: 1 file in conflict
+helix-term/src/ui/editor.rs</title>
+</rect>
+<rect x="628" y="472" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 20 dev-3-way-diff-second-attempt with step 15 feat/buffer-reload-on-change: 0 files in conflict</title>
+</rect>
+<rect x="650" y="472" width="20" height="20" rx="3" fill="#7d63e0" stroke="none">
+<title>Step 20 dev-3-way-diff-second-attempt with step 16 feat/statusline-completion: 2 files in conflict
+helix-term/src/ui/statusline.rs
+helix-term/tests/integration.rs</title>
+</rect>
+<rect x="672" y="472" width="20" height="20" rx="3" fill="#7d63e0" stroke="none">
+<title>Step 20 dev-3-way-diff-second-attempt with step 17 dev-insert-stream-command: 3 files in conflict
+helix-term/src/commands.rs
+helix-term/src/ui/statusline.rs
+helix-view/src/document.rs</title>
+</rect>
+<rect x="694" y="472" width="20" height="20" rx="3" fill="#5634c4" stroke="none">
+<title>Step 20 dev-3-way-diff-second-attempt with step 18 dev-buffer-file-path: 8 files in conflict
+helix-term/src/commands.rs
+helix-term/src/commands/typed.rs
+helix-term/src/ui/mod.rs
+helix-term/src/ui/statusline.rs
+helix-term/tests/test/commands.rs
+helix-vcs/src/git/test.rs
+helix-view/src/document.rs
+helix-view/src/editor.rs</title>
+</rect>
+<rect x="716" y="472" width="20" height="20" rx="3" fill="#a998ee" stroke="none">
+<title>Step 20 dev-3-way-diff-second-attempt with step 19 dev-timestamp-sort-file-picker: 1 file in conflict
+helix-term/src/ui/picker.rs</title>
+</rect>
+<text x="16" y="508" font-size="12" fill="#6c687a" text-anchor="start" font-weight="700" class="mono">21</text>
+<text x="46" y="508" font-size="12" fill="#1b1922" text-anchor="start" font-weight="700" class="mono">feat/comment-hunk</text>
+<rect x="320" y="494" width="20" height="20" rx="3" fill="#7d63e0" stroke="none">
+<title>Step 21 feat/comment-hunk with step 1 feat/recoverable-config: 3 files in conflict
+helix-term/src/application.rs
+helix-term/src/config.rs
+helix-term/src/main.rs</title>
+</rect>
+<rect x="342" y="494" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 21 feat/comment-hunk with step 2 feat/yank-multi-selection: 0 files in conflict</title>
+</rect>
+<rect x="364" y="494" width="20" height="20" rx="3" fill="#a998ee" stroke="none">
+<title>Step 21 feat/comment-hunk with step 3 feat/balanced-tripple-quotes: 1 file in conflict
+helix-term/src/config.rs</title>
+</rect>
+<rect x="386" y="494" width="20" height="20" rx="3" fill="#a998ee" stroke="none">
+<title>Step 21 feat/comment-hunk with step 4 feat/fuzzy-commands: 1 file in conflict
+helix-term/src/config.rs</title>
+</rect>
+<rect x="408" y="494" width="20" height="20" rx="3" fill="#a998ee" stroke="none">
+<title>Step 21 feat/comment-hunk with step 5 feat/key-bindings-description: 1 file in conflict
+helix-term/src/config.rs</title>
+</rect>
+<rect x="430" y="494" width="20" height="20" rx="3" fill="#a998ee" stroke="none">
+<title>Step 21 feat/comment-hunk with step 6 feat/scroll-redraw: 1 file in conflict
+helix-term/src/config.rs</title>
+</rect>
+<rect x="452" y="494" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 21 feat/comment-hunk with step 7 improve-long-lines: 0 files in conflict</title>
+</rect>
+<rect x="474" y="494" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 21 feat/comment-hunk with step 8 feat/scoped-file-open: 0 files in conflict</title>
+</rect>
+<rect x="496" y="494" width="20" height="20" rx="3" fill="#7d63e0" stroke="none">
+<title>Step 21 feat/comment-hunk with step 9 feat/markdown-preview-v2: 2 files in conflict
+helix-term/src/ui/markdown.rs
+helix-term/src/ui/mod.rs</title>
+</rect>
+<rect x="518" y="494" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 21 feat/comment-hunk with step 10 feat/theme-remove-modifier: 0 files in conflict</title>
+</rect>
+<rect x="540" y="494" width="20" height="20" rx="3" fill="#5634c4" stroke="none">
+<title>Step 21 feat/comment-hunk with step 11 feat/pgp: 7 files in conflict
+book/src/SUMMARY.md
+helix-term/Cargo.toml
+helix-term/src/config.rs
+helix-view/Cargo.toml
+helix-view/src/document.rs
+helix-view/src/editor.rs
+helix-view/src/lib.rs</title>
+</rect>
+<rect x="562" y="494" width="20" height="20" rx="3" fill="#a998ee" stroke="none">
+<title>Step 21 feat/comment-hunk with step 12 feat/scoped-search: 1 file in conflict
+helix-term/tests/test/commands.rs</title>
+</rect>
+<rect x="584" y="494" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 21 feat/comment-hunk with step 13 dev-vertical-preview: 0 files in conflict</title>
+</rect>
+<rect x="606" y="494" width="20" height="20" rx="3" fill="#5634c4" stroke="none">
+<title>Step 21 feat/comment-hunk with step 14 feat/per-mode-cursorline: 4 files in conflict
+helix-term/src/application.rs
+helix-term/src/config.rs
+helix-term/src/main.rs
+helix-term/src/ui/editor.rs</title>
+</rect>
+<rect x="628" y="494" width="20" height="20" rx="3" fill="#5634c4" stroke="none">
+<title>Step 21 feat/comment-hunk with step 15 feat/buffer-reload-on-change: 5 files in conflict
+book/src/editor.md
+helix-term/src/config.rs
+helix-term/src/ui/editor.rs
+helix-term/tests/test/auto_reload.rs
+helix-view/src/document.rs</title>
+</rect>
+<rect x="650" y="494" width="20" height="20" rx="3" fill="#5634c4" stroke="none">
+<title>Step 21 feat/comment-hunk with step 16 feat/statusline-completion: 4 files in conflict
+helix-term/src/config.rs
+helix-term/src/ui/editor.rs
+helix-term/tests/integration.rs
+helix-view/src/view.rs</title>
+</rect>
+<rect x="672" y="494" width="20" height="20" rx="3" fill="#a998ee" stroke="none">
+<title>Step 21 feat/comment-hunk with step 17 dev-insert-stream-command: 1 file in conflict
+helix-view/src/document.rs</title>
+</rect>
+<rect x="694" y="494" width="20" height="20" rx="3" fill="#5634c4" stroke="none">
+<title>Step 21 feat/comment-hunk with step 18 dev-buffer-file-path: 7 files in conflict
+book/src/generated/typable-cmd.md
+helix-term/src/commands/typed.rs
+helix-term/src/ui/mod.rs
+helix-term/tests/test/commands.rs
+helix-vcs/src/git/test.rs
+helix-view/src/document.rs
+helix-view/src/editor.rs</title>
+</rect>
+<rect x="716" y="494" width="20" height="20" rx="3" fill="#a998ee" stroke="none">
+<title>Step 21 feat/comment-hunk with step 19 dev-timestamp-sort-file-picker: 1 file in conflict
+helix-term/src/ui/picker.rs</title>
+</rect>
+<rect x="738" y="494" width="20" height="20" rx="3" fill="#33198a" stroke="none">
+<title>Step 21 feat/comment-hunk with step 20 dev-3-way-diff-second-attempt: 17 files in conflict
+book/src/diff-and-merge.md
+book/src/generated/static-cmd.md
+book/src/pickers.md
+helix-term/src/commands.rs
+helix-term/src/commands/diff.rs
+helix-term/src/commands/typed.rs
+helix-term/src/ui/diff.rs
+helix-term/src/ui/editor.rs
+helix-term/tests/test/diff_merge.rs
+helix-vcs/src/git.rs
+helix-vcs/src/git/test.rs
+helix-vcs/src/lib.rs
+helix-view/src/annotations/diff.rs
+helix-view/src/document.rs
+helix-view/src/editor.rs
+helix-view/src/gutter.rs
+helix-view/src/view.rs</title>
+</rect>
+<text x="16" y="530" font-size="12" fill="#6c687a" text-anchor="start" font-weight="400" class="mono">22</text>
+<text x="46" y="530" font-size="12" fill="#4c4957" text-anchor="start" font-weight="400" class="mono">dev-python-dap-console</text>
+<rect x="320" y="516" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 22 dev-python-dap-console with step 1 feat/recoverable-config: 0 files in conflict</title>
+</rect>
+<rect x="342" y="516" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 22 dev-python-dap-console with step 2 feat/yank-multi-selection: 0 files in conflict</title>
+</rect>
+<rect x="364" y="516" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 22 dev-python-dap-console with step 3 feat/balanced-tripple-quotes: 0 files in conflict</title>
+</rect>
+<rect x="386" y="516" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 22 dev-python-dap-console with step 4 feat/fuzzy-commands: 0 files in conflict</title>
+</rect>
+<rect x="408" y="516" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 22 dev-python-dap-console with step 5 feat/key-bindings-description: 0 files in conflict</title>
+</rect>
+<rect x="430" y="516" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 22 dev-python-dap-console with step 6 feat/scroll-redraw: 0 files in conflict</title>
+</rect>
+<rect x="452" y="516" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 22 dev-python-dap-console with step 7 improve-long-lines: 0 files in conflict</title>
+</rect>
+<rect x="474" y="516" width="20" height="20" rx="3" fill="#a998ee" stroke="none">
+<title>Step 22 dev-python-dap-console with step 8 feat/scoped-file-open: 1 file in conflict
+helix-term/src/commands.rs</title>
+</rect>
+<rect x="496" y="516" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 22 dev-python-dap-console with step 9 feat/markdown-preview-v2: 0 files in conflict</title>
+</rect>
+<rect x="518" y="516" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 22 dev-python-dap-console with step 10 feat/theme-remove-modifier: 0 files in conflict</title>
+</rect>
+<rect x="540" y="516" width="20" height="20" rx="3" fill="#7d63e0" stroke="none">
+<title>Step 22 dev-python-dap-console with step 11 feat/pgp: 2 files in conflict
+book/src/SUMMARY.md
+helix-view/src/document.rs</title>
+</rect>
+<rect x="562" y="516" width="20" height="20" rx="3" fill="#a998ee" stroke="none">
+<title>Step 22 dev-python-dap-console with step 12 feat/scoped-search: 1 file in conflict
+helix-term/src/commands.rs</title>
+</rect>
+<rect x="584" y="516" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 22 dev-python-dap-console with step 13 dev-vertical-preview: 0 files in conflict</title>
+</rect>
+<rect x="606" y="516" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 22 dev-python-dap-console with step 14 feat/per-mode-cursorline: 0 files in conflict</title>
+</rect>
+<rect x="628" y="516" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 22 dev-python-dap-console with step 15 feat/buffer-reload-on-change: 0 files in conflict</title>
+</rect>
+<rect x="650" y="516" width="20" height="20" rx="3" fill="#5634c4" stroke="none">
+<title>Step 22 dev-python-dap-console with step 16 feat/statusline-completion: 5 files in conflict
+helix-term/src/ui/completion.rs
+helix-term/src/ui/editor.rs
+helix-term/src/ui/popup.rs
+helix-term/src/ui/statusline.rs
+helix-term/tests/integration.rs</title>
+</rect>
+<rect x="672" y="516" width="20" height="20" rx="3" fill="#5634c4" stroke="none">
+<title>Step 22 dev-python-dap-console with step 17 dev-insert-stream-command: 4 files in conflict
+book/src/editor.md
+helix-term/src/commands.rs
+helix-term/src/ui/statusline.rs
+helix-view/src/document.rs</title>
+</rect>
+<rect x="694" y="516" width="20" height="20" rx="3" fill="#7d63e0" stroke="none">
+<title>Step 22 dev-python-dap-console with step 18 dev-buffer-file-path: 2 files in conflict
+helix-term/src/commands.rs
+helix-view/src/document.rs</title>
+</rect>
+<rect x="716" y="516" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
+<title>Step 22 dev-python-dap-console with step 19 dev-timestamp-sort-file-picker: 0 files in conflict</title>
+</rect>
+<rect x="738" y="516" width="20" height="20" rx="3" fill="#5634c4" stroke="none">
+<title>Step 22 dev-python-dap-console with step 20 dev-3-way-diff-second-attempt: 8 files in conflict
+book/src/SUMMARY.md
+book/src/keymap.md
+helix-term/src/commands.rs
+helix-term/src/ui/editor.rs
+helix-term/src/ui/statusline.rs
+helix-term/tests/integration.rs
+helix-view/src/document.rs
+helix-view/src/editor.rs</title>
+</rect>
+<rect x="760" y="516" width="20" height="20" rx="3" fill="#5634c4" stroke="none">
+<title>Step 22 dev-python-dap-console with step 21 feat/comment-hunk: 8 files in conflict
+book/src/SUMMARY.md
+book/src/keymap.md
+helix-term/src/keymap/default.rs
+helix-term/src/ui/editor.rs
+helix-term/src/ui/statusline.rs
+helix-term/tests/integration.rs
+helix-view/src/document.rs
+helix-view/src/editor.rs</title>
+</rect>
+<rect x="734" y="490" width="28" height="28" rx="3" fill="#1b1922" stroke="none">
+</rect>
+<rect x="736" y="492" width="24" height="24" rx="3" fill="#ffffff" stroke="none">
+</rect>
+<rect x="738" y="494" width="20" height="20" rx="3" fill="#33198a" stroke="none">
+</rect>
+<path d="M16 554H804" stroke="#e3e0ea"/>
+<text x="16" y="590" font-size="24" fill="#1b1922" text-anchor="start" font-weight="700">17 files in conflict</text>
+<text x="16" y="616" font-size="13" fill="#4c4957" text-anchor="start" font-weight="400" class="mono">Step 21 feat/comment-hunk with step 20 dev-3-way-diff-second-attempt</text>
+<text x="16" y="642" font-size="12" fill="#4c4957" text-anchor="start" font-weight="400" class="mono">book/src/diff-and-merge.md</text>
+<text x="16" y="662" font-size="12" fill="#4c4957" text-anchor="start" font-weight="400" class="mono">book/src/generated/static-cmd.md</text>
+<text x="16" y="682" font-size="12" fill="#4c4957" text-anchor="start" font-weight="400" class="mono">book/src/pickers.md</text>
+<text x="16" y="702" font-size="12" fill="#4c4957" text-anchor="start" font-weight="400" class="mono">helix-term/src/commands.rs</text>
+<text x="16" y="722" font-size="12" fill="#4c4957" text-anchor="start" font-weight="400" class="mono">helix-term/src/commands/diff.rs</text>
+<text x="16" y="742" font-size="12" fill="#4c4957" text-anchor="start" font-weight="400" class="mono">helix-term/src/commands/typed.rs</text>
+<text x="16" y="762" font-size="12" fill="#4c4957" text-anchor="start" font-weight="400" class="mono">helix-term/src/ui/diff.rs</text>
+<text x="16" y="782" font-size="12" fill="#4c4957" text-anchor="start" font-weight="400" class="mono">helix-term/src/ui/editor.rs</text>
+<text x="16" y="802" font-size="12" fill="#4c4957" text-anchor="start" font-weight="400" class="mono">helix-term/tests/test/diff_merge.rs</text>
+<text x="416" y="642" font-size="12" fill="#4c4957" text-anchor="start" font-weight="400" class="mono">helix-vcs/src/git.rs</text>
+<text x="416" y="662" font-size="12" fill="#4c4957" text-anchor="start" font-weight="400" class="mono">helix-vcs/src/git/test.rs</text>
+<text x="416" y="682" font-size="12" fill="#4c4957" text-anchor="start" font-weight="400" class="mono">helix-vcs/src/lib.rs</text>
+<text x="416" y="702" font-size="12" fill="#4c4957" text-anchor="start" font-weight="400" class="mono">helix-view/src/annotations/diff.rs</text>
+<text x="416" y="722" font-size="12" fill="#4c4957" text-anchor="start" font-weight="400" class="mono">helix-view/src/document.rs</text>
+<text x="416" y="742" font-size="12" fill="#4c4957" text-anchor="start" font-weight="400" class="mono">helix-view/src/editor.rs</text>
+<text x="416" y="762" font-size="12" fill="#4c4957" text-anchor="start" font-weight="400" class="mono">helix-view/src/gutter.rs</text>
+<text x="416" y="782" font-size="12" fill="#4c4957" text-anchor="start" font-weight="400" class="mono">helix-view/src/view.rs</text>
+</svg>

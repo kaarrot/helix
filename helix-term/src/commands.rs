@@ -2471,10 +2471,16 @@ enum SearchPhase {
 /// by an earlier phase is recorded as the next phase's `skip` so the later walk
 /// does not revisit it. With no current file (e.g. a scratch buffer) this is
 /// just a plain walk of the workspace root.
+///
+/// The directory phase only runs when that directory lies inside the search
+/// root. For a file opened from elsewhere, such as `~/.bashrc`, it would walk
+/// a tree the search was never meant to cover, and before the root at that.
+/// Such a file is still searched itself, first.
 fn global_search_phases(current_file: Option<PathBuf>, search_root: PathBuf) -> Vec<SearchPhase> {
     let sibling_dir = current_file
         .as_ref()
         .and_then(|path| path.parent())
+        .filter(|dir| dir.starts_with(&search_root))
         .map(PathBuf::from);
 
     let mut phases = Vec::new();
@@ -7101,6 +7107,48 @@ mod tests {
                 SearchPhase::Walk {
                     root: PathBuf::from("/project"),
                     skip: Some(PathBuf::from("/project")),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn global_search_phases_stay_inside_the_root_for_a_file_outside_it() {
+        // A file opened from outside the workspace is searched itself, but its
+        // directory is not walked: that would search all of `/home/user`.
+        let phases = global_search_phases(
+            Some(PathBuf::from("/home/user/.bashrc")),
+            PathBuf::from("/home/user/project"),
+        );
+
+        assert_eq!(
+            phases,
+            vec![
+                SearchPhase::File(PathBuf::from("/home/user/.bashrc")),
+                SearchPhase::Walk {
+                    root: PathBuf::from("/home/user/project"),
+                    skip: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn global_search_phases_skip_a_directory_that_contains_the_root() {
+        // Searching from `src/pkg` with a file open from `src`: walking `src`
+        // first would cover its other subdirectories, outside the search root.
+        let phases = global_search_phases(
+            Some(PathBuf::from("/project/src/lib.rs")),
+            PathBuf::from("/project/src/pkg"),
+        );
+
+        assert_eq!(
+            phases,
+            vec![
+                SearchPhase::File(PathBuf::from("/project/src/lib.rs")),
+                SearchPhase::Walk {
+                    root: PathBuf::from("/project/src/pkg"),
+                    skip: None,
                 },
             ]
         );

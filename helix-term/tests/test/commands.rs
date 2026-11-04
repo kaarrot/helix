@@ -736,6 +736,43 @@ async fn test_insert_stream_commands_and_aliases() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_insert_stream_cancel_kills_the_commands_children() -> anyhow::Result<()> {
+    let _lock = Arc::clone(&STREAM_TEST_LOCK).lock_owned().await;
+    let pid_file = helpers::temp_file_with_contents("")?;
+    let mut app = AppBuilder::new().build()?;
+
+    // The shell forks `sleep` rather than exec-ing it, so killing only the
+    // shell would leave `sleep` running after the cancel.
+    send_key_sequence(
+        &mut app,
+        &format!(
+            ":insert-stream-output sleep 30 & echo $! <gt> {}; printf ready; wait<ret>",
+            pid_file.path().display()
+        ),
+    )
+    .await?;
+    wait_for_condition(&mut app, "command started", |app| {
+        doc!(app.editor).text().to_string().contains("ready")
+    })
+    .await?;
+
+    let pid: libc::pid_t = std::fs::read_to_string(pid_file.path())?.trim().parse()?;
+    // SAFETY: signal 0 only checks that the process exists.
+    let running = move || unsafe { libc::kill(pid, 0) } == 0;
+    assert!(running(), "sleep should run until the stream is cancelled");
+
+    send_key_sequence(&mut app, ":cancel-stream<ret>").await?;
+    wait_for_condition(&mut app, "sleep killed along with the stream", |_| {
+        !running()
+    })
+    .await?;
+
+    close_app(&mut app).await?;
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn test_insert_stream_output_reuses_last_stream_buffer() -> anyhow::Result<()> {
     let _lock = Arc::clone(&STREAM_TEST_LOCK).lock_owned().await;

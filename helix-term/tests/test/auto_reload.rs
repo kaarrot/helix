@@ -49,6 +49,37 @@ fn overwrite_until_newer(
     bail!("external file write did not produce a newer mtime")
 }
 
+/// Runs the event loop until `condition` holds or five seconds pass, with no
+/// input and no idle timeouts: an editor nobody is typing into. (Under the
+/// `integration` feature the loop re-arms the idle timer after every event,
+/// which a real editor only does on input.)
+async fn run_until(
+    app: &mut Application,
+    description: &str,
+    condition: impl Fn(&Application) -> bool,
+) -> anyhow::Result<()> {
+    let (_input_tx, input_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut input = tokio_stream::wrappers::UnboundedReceiverStream::new(input_rx);
+    for _ in 0..25 {
+        if condition(app) {
+            return Ok(());
+        }
+        app.editor.clear_idle_timer();
+        let _ = tokio::time::timeout(
+            Duration::from_millis(200),
+            app.event_loop_until_idle(&mut input),
+        )
+        .await;
+    }
+    if condition(app) {
+        return Ok(());
+    }
+    bail!(
+        "timed out waiting for {description}; status: {:?}",
+        app.editor.get_status()
+    )
+}
+
 async fn close_app(app: &mut Application) -> anyhow::Result<()> {
     let errs = app.close().await;
     if !errs.is_empty() {
@@ -132,6 +163,57 @@ async fn auto_reload_ignores_nonexistent_mapped_path() -> anyhow::Result<()> {
     app.handle_idle_timeout().await;
 
     assert!(!app.editor.is_err(), "error: {:?}", app.editor.get_status());
+
+    close_app(&mut app).await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn auto_reload_notices_a_change_made_while_idle() -> anyhow::Result<()> {
+    let mut file = temp_file_with_contents("before\n")?;
+    let mut app = AppBuilder::new()
+        .with_config(config_with_auto_reload(true))
+        .with_file(file.path(), None)
+        .build()?;
+
+    // The pause after the last keypress has passed before the file changes,
+    // and no key follows it.
+    app.handle_idle_timeout().await;
+    overwrite_until_newer(&app, &mut file, "after\n")?;
+
+    run_until(&mut app, "the reload", |app| current_text(app) == "after\n").await?;
+    assert!(!app.editor.is_err(), "error: {:?}", app.editor.get_status());
+
+    close_app(&mut app).await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn auto_reload_warns_about_a_change_made_while_idle() -> anyhow::Result<()> {
+    let mut file = temp_file_with_contents("before\n")?;
+    let mut app = AppBuilder::new()
+        .with_config(config_with_auto_reload(true))
+        .with_file(file.path(), None)
+        .build()?;
+
+    {
+        let (view, doc) = current!(app.editor);
+        let selection = doc.selection(view.id).clone();
+        let transaction = Transaction::change_by_selection(doc.text(), &selection, |_| {
+            (0, 0, Some("local ".into()))
+        });
+        doc.apply(&transaction, view.id);
+    }
+    app.handle_idle_timeout().await;
+    let warned = |app: &Application| {
+        app.editor.get_status().is_some_and(|(status, severity)| {
+            *severity == Severity::Warning && status.contains(":reload")
+        })
+    };
+    assert!(!warned(&app), "nothing has changed on disk yet");
+
+    overwrite_until_newer(&app, &mut file, "after\n")?;
+
+    run_until(&mut app, "the warning", warned).await?;
+    assert_eq!("local before\n", current_text(&app));
 
     close_app(&mut app).await
 }

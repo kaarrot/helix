@@ -6927,6 +6927,23 @@ async fn stream_error(message: String) {
     job::dispatch(move |editor, _compositor| editor.set_error(message)).await;
 }
 
+/// Kills a stream command together with everything it started.
+///
+/// The shell runs the command in a process group of its own, and the whole
+/// group is killed: killing only the shell would leave a cancelled `make` or
+/// test run going in the background.
+async fn kill_stream_command(child: &mut tokio::process::Child) {
+    #[cfg(unix)]
+    if let Some(pid) = child.id() {
+        // SAFETY: a plain syscall. The child hasn't been reaped yet, so its pid
+        // is still the id of the group that `process_group(0)` made it lead.
+        unsafe {
+            libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+        }
+    }
+    let _ = child.kill().await;
+}
+
 /// Runs one command to completion, streaming its output into the session's
 /// buffer from `from`, and returns the position the next command continues at.
 async fn run_stream_command(
@@ -6960,6 +6977,9 @@ async fn run_stream_command(
         // This makes Python programs stream output line-by-line instead of
         // buffering until the internal buffer (typically 4-8KB) is full.
         .env("PYTHONUNBUFFERED", "1");
+    // A group of its own lets cancelling reach everything the command starts.
+    #[cfg(unix)]
+    process.process_group(0);
 
     let mut child = match process.spawn() {
         Ok(child) => child,
@@ -6972,7 +6992,7 @@ async fn run_stream_command(
     let (cancel_tx, mut cancel_rx) = oneshot::channel::<()>();
     if !install_stream_cancel(target.generation, cancel_tx) {
         // The session was cancelled while this command was starting.
-        let _ = child.kill().await;
+        kill_stream_command(&mut child).await;
         return from;
     }
 
@@ -7006,7 +7026,7 @@ async fn run_stream_command(
             }
             _ = &mut cancel_rx => {
                 cancelled = true;
-                let _ = child.kill().await;
+                kill_stream_command(&mut child).await;
                 break;
             }
             bytes_read = stdout.read(&mut stdout_buffer), if !stdout_closed => {

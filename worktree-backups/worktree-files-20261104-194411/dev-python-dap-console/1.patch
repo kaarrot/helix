@@ -1,0 +1,350 @@
+Subject: [PATCH] feat(dap): session badge on the status line, a quieter frame
+ line, and gF
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Follow-up to the debug console after using it: it was not clear whether a
+session was attached, stepping sometimes lost the current line, and there was
+no quick way to look at a caller from a backtrace.
+
+Stepping lost the current line
+- Thread events made the thread they named the selected one. A program that
+  starts or ends a thread while being stepped (hython has plenty) took the
+  selection away from the stopped thread: stepping over `t.start()` left the
+  source view where it was and dropped the line highlight, and the next `n`
+  stepped the new thread into `genericpath.py`. Thread events no longer select
+  a thread; a selected thread that exits is unselected.
+- The first stop after attaching did not move to its line: the session was made
+  active only after selecting the stopped thread, which is looked up in the
+  active session. It is now made active first, and already on `initialized`,
+  so the session is shown, and `Space G h` can pause it, before it first stops.
+- `j` stops the selected thread again without resuming it, which used to be
+  ignored; the view now follows it there.
+- `n`, `s`, `o`, `c` mark the thread running when the request is sent rather
+  than when the adapter answers. An answer handled after the next stop would
+  otherwise clear the frame that stop selected. On a refused step the thread is
+  selected again.
+
+The current line
+- The frame line was highlighted on the same line number of every buffer on
+  screen, the console included; it is now drawn only in the frame's own file.
+- `▶` in the gutter shows in every view of that file, not only a focused one,
+  so the source view beside the console has it too.
+- A `ui.highlight.frameline` background far from the editor's, like the dark
+  red zed_onelight inherits, is toned down to a tint of it (`#e6ced0` for
+  `#97202a` there), and drawn without the theme's foreground, so the code on
+  the line keeps its syntax colours. Quiet colours and terminal palette colours
+  are used as the theme has them.
+
+Status line
+- New `debug-session` element, by default right after `mode`: while a session
+  runs it reads e.g. `DEBUG hython-bin pid 1234 · stopped` or
+  `DEBUG port 5678 · running`, in `ui.statusline.debug`, else on the theme's
+  `error` colour. A configured `left` list needs it added.
+- What the session debugs is named when it starts: the process attached to by
+  PID with its name, the program launched, or the debug server dialled.
+
+gF: show a file:line beside
+- New `peek_file_line`, on `gF`: shows the `file:line` under the cursor in the
+  view beside -- from the console, the source view -- reusing it rather than
+  splitting again, and keeps focus. It reads `file:line[:col]`, pdb's
+  `file(line)` and a traceback's `File "file", line N`, preferring the one
+  under the cursor, and skips files that do not exist. The line is marked with
+  `ui.highlight` until that view's cursor leaves it. The next step, jump or
+  frame change takes the source view back to the current frame.
+- `Editor::dap_source_view` now also leaves out the focused view, so `gF` works
+  from any buffer.
+
+Docs: debugger.md (status line, current line, `gF`), editor.md (the element),
+themes.md (`ui.statusline.debug`, the toned-down line), keymap.md and the
+regenerated command list.
+
+Tests: unit tests for the location parser, the tint and the session name; an
+integration test for `gF` from the console. Checked by hand against debugpy in
+tmux, before and after, including a script that starts a thread mid-step.
+---
+ book/src/debugger.md                   |  16 ++
+ book/src/editor.md                     |   3 +-
+ book/src/generated/static-cmd.md       |   1 +
+ book/src/keymap.md                     |   1 +
+ book/src/themes.md                     |  10 +-
+ helix-dap/src/client.rs                |   4 +
+ helix-term/src/commands.rs             | 198 +++++++++++++++++++++++++
+ helix-term/src/commands/dap.rs         |  93 ++++++++++--
+ helix-term/src/keymap/default.rs       |   1 +
+ helix-term/src/ui/editor.rs            | 102 +++++++++++--
+ helix-term/src/ui/statusline.rs        |  44 +++++-
+ helix-term/tests/test/dap_console.rs   |  58 ++++++++
+ helix-view/src/editor.rs               |  31 ++++
+ helix-view/src/gutter.rs               |  22 +--
+ helix-view/src/handlers/dap.rs         |  49 ++++--
+ helix-view/src/handlers/dap_console.rs |  13 +-
+ 16 files changed, 588 insertions(+), 58 deletions(-)
+
+diff --git a/book/src/debugger.md b/book/src/debugger.md
+index 3a461c93..51c9adfc 100644
+--- a/book/src/debugger.md
++++ b/book/src/debugger.md
+@@ -32,6 +32,14 @@ ### Starting a session
+ 
+ Template names containing spaces need quoting, e.g. `:debug-start "Attach to PID" 12345`.
+ 
++While a session runs, the status line says so beside the mode, in red: what is
++being debugged and whether it is stopped, e.g. `DEBUG hython-bin pid 1234 ·
++stopped`, `DEBUG port 5678 · running`. That is the `debug-session` element of
++[`[editor.statusline]`](./editor.md#editorstatusline-section), there by default; a
++configured `left` list needs it added. When execution stops, the line it stopped
++on gets `▶` in the gutter and a tint of the theme's `ui.highlight.frameline`, in
++every view of its file, and the view showing it scrolls there.
++
+ ### Breakpoints
+ 
+ | Key      | Description                                        | Command                 |
+@@ -140,6 +148,7 @@ ### Debug console
+ | `Esc`                                       | Normal mode inside the console, to move around the output     |
+ | `Esc` in normal mode                        | Back to the source, in the debug menu; the console stays open |
+ | `Ctrl-d`                                    | Close the console, back to the source in the debug menu. It takes the place of half-page down and delete-forward here |
++| `gF` in normal mode                         | Show the `file:line` under the cursor in the source view, staying in the console |
+ 
+ Typing always happens on the input line: entering insert mode anywhere in the
+ transcript, or typing after scrolling up, moves the cursor to the end of the
+@@ -152,6 +161,13 @@ ### Debug console
+ An empty line only repeats what the console itself last ran, never an entry of
+ the history, which is shared with the eval prompt and kept between sessions.
+ 
++`gF` previews a place the transcript names — a frame of `w`, a line of a
++traceback, a breakpoint of `b` — in the source view above the console, with the
++line marked, without moving focus or opening another split. It reads
++`file:line`, pdb's `file(line)` and a traceback's `File "file", line N`. The next
++step, jump or frame change takes the source view back to the current frame.
++`gF` works the same in any buffer, showing the place in the view beside it.
++
+ The console is never counted as unsaved, so it does not hold up `:q`, and it
+ survives having another file opened in its window; `Ctrl-d` brings it back with
+ its transcript.
+diff --git a/book/src/editor.md b/book/src/editor.md
+index 92e21f9c..60f20039 100644
+--- a/book/src/editor.md
++++ b/book/src/editor.md
+@@ -115,7 +115,7 @@ ### `[editor.statusline]` Section
+ 
+ | Key           | Description | Default |
+ | ---           | ---         | ---     |
+-| `left`        | A list of elements aligned to the left of the statusline | `["mode", "spinner", "file-name", "read-only-indicator", "file-modification-indicator"]` |
++| `left`        | A list of elements aligned to the left of the statusline | `["mode", "debug-session", "spinner", "file-name", "read-only-indicator", "file-modification-indicator"]` |
+ | `center`      | A list of elements aligned to the middle of the statusline | `[]` |
+ | `right`       | A list of elements aligned to the right of the statusline | `["diagnostics", "selections", "register", "position", "file-encoding"]` |
+ | `separator`   | The character used to separate elements in the statusline | `"│"` |
+@@ -130,6 +130,7 @@ ### `[editor.statusline]` Section
+ | Key    | Description |
+ | ------ | ----------- |
+ | `mode` | The current editor mode (`mode.normal`/`mode.insert`/`mode.select`) |
++| `debug-session` | While a [debug session](./debugger.md) runs: what it debugs and whether it is stopped, e.g. `DEBUG hython-bin pid 1234 · stopped` |
+ | `spinner` | A progress spinner indicating LSP activity |
+ | `file-name` | The path/name of the opened file |
+ | `file-absolute-path` | The absolute path/name of the opened file |
+diff --git a/book/src/generated/static-cmd.md b/book/src/generated/static-cmd.md
+index f2a306e7..01be2e30 100644
+--- a/book/src/generated/static-cmd.md
++++ b/book/src/generated/static-cmd.md
+@@ -137,6 +137,7 @@
+ | `goto_file` | Goto files/URLs in selections | normal: `` gf ``, select: `` gf `` |
+ | `goto_file_hsplit` | Goto files in selections (hsplit) | normal: `` <C-w>f ``, `` <space>wf ``, select: `` <C-w>f ``, `` <space>wf `` |
+ | `goto_file_vsplit` | Goto files in selections (vsplit) | normal: `` <C-w>F ``, `` <space>wF ``, select: `` <C-w>F ``, `` <space>wF `` |
++| `peek_file_line` | Show file:line under cursor in the split beside | normal: `` gF ``, select: `` gF `` |
+ | `goto_reference` | Goto references | normal: `` gr ``, select: `` gr `` |
+ | `goto_window_top` | Goto window top | normal: `` gt ``, select: `` gt `` |
+ | `goto_window_center` | Goto window center | normal: `` gc ``, select: `` gc `` |
+diff --git a/book/src/keymap.md b/book/src/keymap.md
+index 3a933685..0420c327 100644
+--- a/book/src/keymap.md
++++ b/book/src/keymap.md
+@@ -220,6 +220,7 @@ #### Goto mode
+ | <code>&#124;</code>     | Go to the start of line        | `goto_column`              |
+ | `e`   | Go to the end of the file                        | `goto_last_line`           |
+ | `f`   | Go to files in the selections                    | `goto_file`                |
++| `F`   | Show the `file:line` under the cursor in the split beside, staying here | `peek_file_line` |
+ | `h`   | Go to the start of the line                      | `goto_line_start`          |
+ | `l`   | Go to the end of the line                        | `goto_line_end`            |
+ | `s`   | Go to first non-whitespace character of the line | `goto_first_nonwhitespace` |
+diff --git a/book/src/themes.md b/book/src/themes.md
+index 353a4684..aefbdfd1 100644
+--- a/book/src/themes.md
++++ b/book/src/themes.md
+@@ -315,6 +315,7 @@ #### Interface
+ | `ui.statusline.insert`            | Statusline mode during insert mode ([only if `editor.color-modes` is enabled][editor-section]) |
+ | `ui.statusline.select`            | Statusline mode during select mode ([only if `editor.color-modes` is enabled][editor-section]) |
+ | `ui.statusline.separator`         | Separator character in statusline                                                              |
++| `ui.statusline.debug`             | Statusline `debug-session` element; the theme's `error` colour as background if unset         |
+ | `ui.bufferline`                   | Style for the buffer line                                                                      |
+ | `ui.bufferline.active`            | Style for the active buffer in buffer line                                                     |
+ | `ui.bufferline.background`        | Style for bufferline background                                                                |
+@@ -343,7 +344,7 @@ #### Interface
+ | `ui.menu.scroll`                  | `fg` sets thumb color, `bg` sets track color of scrollbar                                      |
+ | `ui.selection`                    | For selections in the editing area                                                             |
+ | `ui.selection.primary`            |                                                                                                |
+-| `ui.highlight`                    | Highlighted lines in the picker preview                                                        |
++| `ui.highlight`                    | Highlighted lines in the picker preview, and the line `gF` showed in another split             |
+ | `ui.highlight.frameline`          | Line at which debugging execution is paused at                                                 |
+ | `ui.cursorline.primary`           | The line of the primary cursor ([if cursorline is enabled][editor-section])                    |
+ | `ui.cursorline.secondary`         | The lines of any other cursors ([if cursorline is enabled][editor-section])                    |
+@@ -362,4 +363,11 @@ #### Interface
+ | `diagnostic.deprecated`           | Diagnostics with deprecated tag (editing area)                                                 |
+ | `tabstop`                         | Snippet placeholder                                                                            |
+ 
++The debugger's line, `ui.highlight.frameline`, and the line `gF` marks with
++`ui.highlight` are toned down when their background is far from that of
++`ui.background`, so the code on them stays readable: the background becomes a
++tint of the theme's colour, and the scope's foreground is dropped so the text
++keeps its syntax colours. This takes RGB colours for both backgrounds; terminal
++palette colours are used as the theme has them.
++
+ [editor-section]: ./configuration.md#editor-section
+diff --git a/helix-dap/src/client.rs b/helix-dap/src/client.rs
+index 17b19a7e..f68ff1d6 100644
+--- a/helix-dap/src/client.rs
++++ b/helix-dap/src/client.rs
+@@ -46,6 +46,9 @@ pub struct Client {
+     pub quirks: DebuggerQuirks,
+     /// The config which was used to start this debugger.
+     pub config: Option<DebugAdapterConfig>,
++    /// What the session debugs, as the status line names it: the process attached
++    /// to, the address of a debug server, or the program launched.
++    pub target: Option<String>,
+ }
+ 
+ impl Client {
+@@ -101,6 +104,7 @@ pub fn streams(
+             active_frame: None,
+             quirks: DebuggerQuirks::default(),
+             config: None,
++            target: None,
+         };
+ 
+         tokio::spawn(Self::recv(id, server_rx, client_tx));
+diff --git a/helix-term/src/commands.rs b/helix-term/src/commands.rs
+index ce4899dd..8a59505b 100644
+--- a/helix-term/src/commands.rs
++++ b/helix-term/src/commands.rs
+@@ -440,6 +440,7 @@ pub fn doc(&self) -> &str {
+         goto_file, "Goto files/URLs in selections",
+         goto_file_hsplit, "Goto files in selections (hsplit)",
+         goto_file_vsplit, "Goto files in selections (vsplit)",
++        peek_file_line, "Show file:line under cursor in the split beside",
+         goto_reference, "Goto references",
+         goto_window_top, "Goto window top",
+         goto_window_center, "Goto window center",
+@@ -1330,6 +1331,125 @@ fn goto_file_vsplit(cx: &mut Context) {
+     goto_file_impl(cx, Action::VerticalSplit);
+ }
+ 
++/// Shows the `file:line` under the cursor -- a traceback's, `w`'s or a
++/// compiler's -- in the view beside this one, reusing it rather than splitting
++/// again, and stays here. The line is marked there until that view's cursor
++/// leaves it. From the debug console this is the source view, which the next
++/// stop takes back to the current frame.
++fn peek_file_line(cx: &mut Context) {
++    let (view, doc) = current_ref!(cx.editor);
++    let text = doc.text().slice(..);
++    let cursor = doc.selection(view.id).primary().cursor(text);
++    let line_idx = text.char_to_line(cursor);
++    let line_start = text.line_to_char(line_idx);
++    let line = String::from(text.line(line_idx));
++    let column = text.slice(line_start..cursor).len_bytes();
++
++    let Some((path, line)) = file_line_at(&line, column) else {
++        cx.editor.set_error("No file:line under the cursor");
++        return;
++    };
++    let view_id = match helix_view::handlers::dap::show_beside(cx.editor, &path) {
++        Ok(view_id) => view_id,
++        Err(err) => {
++            cx.editor
++                .set_error(format!("Unable to open {}: {err}", path.display()));
++            return;
++        }
++    };
++
++    let view = view!(cx.editor, view_id);
++    let doc_id = view.doc;
++    let doc = doc_mut!(cx.editor, &doc_id);
++    let text = doc.text().slice(..);
++    let line = line.min(text.len_lines().saturating_sub(1));
++    let start = text.line_to_char(line);
++    let pos = start + text.line(line).first_non_whitespace_char().unwrap_or(0);
++    doc.set_selection(view_id, Selection::point(pos));
++    align_view(doc, view, Align::Center);
++    cx.editor.peek = Some((view_id, doc_id, line));
++}
++
++/// The existing file and line (0-based) referred to on `text`, a line: the
++/// reference under byte `column`, else the first one.
++fn file_line_at(text: &str, column: usize) -> Option<(PathBuf, usize)> {
++    let references: Vec<_> = file_line_references(text)
++        .into_iter()
++        .map(|(range, path, line)| (range, path::canonicalize(path), line))
++        .filter(|(_, path, _)| path.is_file())
++        .collect();
++    let (_, path, line) = references
++        .iter()
++        .find(|(range, ..)| range.contains(&column))
++        .or(references.first())?;
++    Some((path.clone(), line.saturating_sub(1)))
++}
++
++/// The places in files `text` names the way debuggers and compilers print them,
++/// with their byte ranges, in order: `file:line`, with or without a column after;
++/// pdb's `file(line)`; and a Python traceback's `File "file", line N`. Lines are
++/// 1-based, as printed. Whether the files exist is not checked.
++fn file_line_references(text: &str) -> Vec<(std::ops::Range<usize>, &str, usize)> {
++    let digits = |s: &str| -> Option<(usize, usize)> {
++        let len = s.bytes().take_while(u8::is_ascii_digit).count();
++        Some((s[..len].parse().ok()?, len))
++    };
++    let mut references = Vec::new();
++
++    // The traceback's path is quoted and may hold spaces, so it is found whole.
++    const FILE: &str = "File \"";
++    const LINE: &str = "\", line ";
++    let mut from = 0;
++    while let Some(found) = text[from..].find(FILE) {
++        let start = from + found;
++        let path_start = start + FILE.len();
++        from = path_start;
++        let Some(path_len) = text[path_start..].find('"') else {
++            break;
++        };
++        let path_end = path_start + path_len;
++        let reference = text[path_end..]
++            .strip_prefix(LINE)
++            .and_then(digits)
++            .filter(|_| path_len > 0);
++        if let Some((line, len)) = reference {
++            let end = path_end + LINE.len() + len;
++            references.push((start..end, &text[path_start..path_end], line));
++        }
++    }
++
++    // The others sit in one word, which may be wrapped in quotes or brackets.
++    let mut word_start = None;
++    for (i, c) in text.char_indices().chain([(text.len(), ' ')]) {
++        match (word_start, c.is_whitespace()) {
++            (None, false) => word_start = Some(i),
++            (Some(start), true) => {
++                word_start = None;
++                let word = &text[start..i];
++                let trimmed = word.trim_start_matches(['"', '\'', '(', '[', '<']);
++                let pdb = trimmed.find('(').and_then(|open| {
++                    let (line, len) = digits(&trimmed[open + 1..])?;
++                    let close = open + 1 + len;
++                    trimmed[close..].starts_with(')').then_some((open, line))
++                });
++                let colon = || {
++                    trimmed.match_indices(':').find_map(|(colon, _)| {
++                        let (line, _) = digits(&trimmed[colon + 1..])?;
++                        Some((colon, line))
++                    })
++                };
++                if let Some((path_len, line)) = pdb.or_else(colon).filter(|(len, _)| *len > 0) {
+

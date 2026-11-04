@@ -1,0 +1,285 @@
+
++        assert_eq!(Some(line), editor.peeked_line(view, doc));
++    };
++    shows_line(editor, 299);
++
++    // The next one reuses the same split.
++    let editor = session.keys("jgF").await?;
++    assert_eq!(console_view, editor.tree.focus);
++    assert_eq!(2, editor.tree.views().count());
++    shows_line(editor, 19);
++
++    // Nothing to show on the input line.
++    let editor = session.keys("jgF").await?;
++    assert_eq!(2, editor.tree.views().count());
++    assert_eq!(console_view, editor.tree.focus);
++
++    session.quit().await
++}
+diff --git a/helix-view/src/editor.rs b/helix-view/src/editor.rs
+index 26d1e7d4..e12b1b97 100644
+--- a/helix-view/src/editor.rs
++++ b/helix-view/src/editor.rs
+@@ -578,6 +578,7 @@ fn default() -> Self {
+         Self {
+             left: vec![
+                 E::Mode,
++                E::DebugSession,
+                 E::Spinner,
+                 E::FileName,
+                 E::ReadOnlyIndicator,
+@@ -623,6 +624,9 @@ pub enum StatusLineElement {
+     /// The editor mode (Normal, Insert, Visual/Selection)
+     Mode,
+ 
++    /// While a debug session runs: what it debugs, and whether it is stopped
++    DebugSession,
++
+     /// The LSP activity spinner
+     Spinner,
+ 
+@@ -1209,6 +1213,9 @@ pub struct Editor {
+     /// The debug console: the buffer evaluate results, program output and stops are
+     /// written to, and whose last line takes console input.
+     pub dap_console: crate::handlers::dap_console::DapConsole,
++    /// The line (0-based) `peek_file_line` last showed in another view, marked
++    /// there until that view's cursor leaves it.
++    pub peek: Option<(ViewId, DocumentId, usize)>,
+     pub autoinfo: Option<Info>,
+ 
+     pub config: Arc<dyn DynAccess<Config>>,
+@@ -1349,6 +1356,7 @@ pub fn new(
+             status_msg: None,
+             dap_eval_result: None,
+             dap_console: Default::default(),
++            peek: None,
+             autoinfo: None,
+             idle_timer: Box::pin(sleep(conf.idle_timeout)),
+             redraw_timer: Box::pin(sleep(Duration::MAX)),
+@@ -2350,6 +2358,29 @@ pub fn current_stack_frame(&self) -> Option<&dap::StackFrame> {
+         self.debug_adapters.current_stack_frame()
+     }
+ 
++    /// The line (0-based) execution is stopped on in the current frame, when `doc`
++    /// is that frame's file.
++    pub fn dap_frame_line(&self, doc: &Document) -> Option<usize> {
++        let frame = self.current_stack_frame()?;
++        let path = frame.source.as_ref()?.path.as_ref()?;
++        // Documents are kept by canonical path; the adapter's may not be one.
++        let in_doc = doc
++            .path()
++            .is_some_and(|doc_path| helix_stdx::path::canonicalize(path) == *doc_path);
++        in_doc.then(|| frame.line.saturating_sub(1))
++    }
++
++    /// The line `peek_file_line` showed in `view`, while its cursor is still on it.
++    pub fn peeked_line(&self, view: &View, doc: &Document) -> Option<usize> {
++        let (view_id, doc_id, line) = self.peek?;
++        if view_id != view.id || doc_id != doc.id() {
++            return None;
++        }
++        let text = doc.text().slice(..);
++        let cursor_line = doc.selection(view.id).primary().cursor_line(text);
++        (cursor_line == line).then_some(line)
++    }
++
+     /// Returns the id of a view that this doc contains a selection for,
+     /// making sure it is synced with the current changes
+     /// if possible or there are no selections returns current_view
+diff --git a/helix-view/src/gutter.rs b/helix-view/src/gutter.rs
+index 7506e515..3ca19370 100644
+--- a/helix-view/src/gutter.rs
++++ b/helix-view/src/gutter.rs
+@@ -271,31 +271,19 @@ pub fn breakpoints<'doc>(
+     )
+ }
+ 
++/// Marks the line execution is stopped on, in every view of its file: the one
++/// beside the debug console shows it while the console keeps focus.
+ fn execution_pause_indicator<'doc>(
+     editor: &'doc Editor,
+     doc: &'doc Document,
+     theme: &Theme,
+-    is_focused: bool,
+ ) -> GutterFn<'doc> {
+     let style = theme.get("ui.debug.active");
+-    let current_stack_frame = editor.current_stack_frame();
+-    let frame_line = current_stack_frame.map(|frame| frame.line - 1);
+-    let frame_source_path = current_stack_frame.map(|frame| {
+-        frame
+-            .source
+-            .as_ref()
+-            .and_then(|source| source.path.as_ref())
+-    });
+-    let should_display_for_current_doc =
+-        doc.path().is_some() && frame_source_path.unwrap_or(None) == doc.path();
++    let frame_line = editor.dap_frame_line(doc);
+ 
+     Box::new(
+         move |line: usize, _selected: bool, first_visual_line: bool, out: &mut String| {
+-            if !first_visual_line
+-                || !is_focused
+-                || line != frame_line?
+-                || !should_display_for_current_doc
+-            {
++            if !first_visual_line || line != frame_line? {
+                 return None;
+             }
+ 
+@@ -315,7 +303,7 @@ pub fn diagnostics_or_breakpoints<'doc>(
+ ) -> GutterFn<'doc> {
+     let mut diagnostics = diagnostic(editor, doc, view, theme, is_focused);
+     let mut breakpoints = breakpoints(editor, doc, view, theme, is_focused);
+-    let mut execution_pause_indicator = execution_pause_indicator(editor, doc, theme, is_focused);
++    let mut execution_pause_indicator = execution_pause_indicator(editor, doc, theme);
+ 
+     Box::new(move |line, selected, first_visual_line: bool, out| {
+         execution_pause_indicator(line, selected, first_visual_line, out)
+diff --git a/helix-view/src/handlers/dap.rs b/helix-view/src/handlers/dap.rs
+index 51bca8a4..b79d2373 100644
+--- a/helix-view/src/handlers/dap.rs
++++ b/helix-view/src/handlers/dap.rs
+@@ -32,10 +32,18 @@ pub fn dap_pos_to_pos(doc: &helix_core::Rope, line: usize, column: usize) -> Opt
+     Some(pos)
+ }
+ 
++/// Makes `thread_id` the selected thread and shows its innermost frame. Unless
++/// `force`d, a thread stopping while another one is selected leaves the selection
++/// alone. The selected thread stopping again -- after a `goto`, which never
++/// resumes it -- shows where it is now.
+ pub async fn select_thread_id(editor: &mut Editor, thread_id: ThreadId, force: bool) {
+     let debugger = debugger!(editor);
+ 
+-    if !force && debugger.thread_id.is_some() {
++    if !force
++        && debugger
++            .thread_id
++            .is_some_and(|selected| selected != thread_id)
++    {
+         return;
+     }
+ 
+@@ -77,7 +85,7 @@ pub fn jump_to_stack_frame(editor: &mut Editor, frame: &helix_dap::StackFrame) {
+     // Stepping from the debug console shows the source beside it rather than in
+     // its place, and leaves the console focused for the next command.
+     let shown = if editor.is_dap_console_focused() {
+-        show_beside_console(editor, &path)
++        show_beside(editor, &path)
+     } else {
+         editor
+             .open(&path, Action::Replace)
+@@ -106,14 +114,15 @@ pub fn jump_to_stack_frame(editor: &mut Editor, frame: &helix_dap::StackFrame) {
+     align_view(doc, view, Align::Center);
+ }
+ 
+-/// Opens `path` in the view the console reserves for source (see
+-/// `Editor::dap_source_view`) without taking focus from the console, splitting one
+-/// off when the console is alone on screen. Returns that view.
+-fn show_beside_console(
++/// Opens `path` in the view beside the focused one -- for the console, the one it
++/// reserves for source, see `Editor::dap_source_view` -- without taking focus or
++/// leaving the mode, splitting one off above when there is no other. Returns that
++/// view.
++pub fn show_beside(
+     editor: &mut Editor,
+     path: &std::path::Path,
+ ) -> Result<ViewId, DocumentOpenError> {
+-    let console_view = editor.tree.focus;
++    let focused_view = editor.tree.focus;
+     let mode = editor.mode;
+     // Loading neither moves focus nor leaves insert mode.
+     let doc_id = editor.open(path, Action::Load)?;
+@@ -126,11 +135,11 @@ fn show_beside_console(
+     }
+ 
+     // Splitting and refocusing both drop back to normal mode on the way; the
+-    // console was focused throughout as far as the user is concerned.
++    // focused view kept focus throughout as far as the user is concerned.
+     editor.switch(doc_id, Action::HorizontalSplit);
+     editor.swap_split_in_direction(Direction::Up);
+     let view_id = editor.tree.focus;
+-    editor.focus(console_view);
++    editor.focus(focused_view);
+     editor.mode = mode;
+     Ok(view_id)
+ }
+@@ -225,6 +234,9 @@ pub async fn handle_debugger_message(
+                         all_threads_stopped,
+                         ..
+                     }) => {
++                        // Before selecting the thread, which is done in the active
++                        // session -- on the first stop this one may not be it yet.
++                        self.debug_adapters.set_active_client(id);
+                         let debugger = match self.debug_adapters.get_client_mut(id) {
+                             Some(debugger) => debugger,
+                             None => return false,
+@@ -266,7 +278,6 @@ pub async fn handle_debugger_message(
+                         }
+ 
+                         self.set_status(status);
+-                        self.debug_adapters.set_active_client(id);
+ 
+                         self.dap_console_flush_output();
+                         self.dap_console_print_location();
+@@ -291,8 +302,19 @@ pub async fn handle_debugger_message(
+                             None => return false,
+                         };
+ 
+-                        debugger.thread_id = Some(thread.thread_id);
+-                        // set the stack frame for the thread
++                        // The selected thread is the stopped one being looked at. A
++                        // thread the program starts meanwhile is running, so it has
++                        // no frame to show nor any to step, and taking it over the
++                        // selection would make the next stop of the selected thread
++                        // look like someone else's.
++                        if thread.reason == "exited" {
++                            debugger.thread_states.remove(&thread.thread_id);
++                            debugger.stack_frames.remove(&thread.thread_id);
++                            if debugger.thread_id == Some(thread.thread_id) {
++                                debugger.thread_id = None;
++                                debugger.active_frame = None;
++                            }
++                        }
+                     }
+                     Event::Breakpoint(events::BreakpointBody { reason, breakpoint }) => {
+                         match &reason[..] {
+@@ -378,6 +400,9 @@ pub async fn handle_debugger_message(
+                     }
+                     Event::Initialized(_) => {
+                         self.set_status("Debugger initialized...");
++                        // The session is live from here, not only once it first
++                        // stops: it shows on the status line, and can be paused.
++                        self.debug_adapters.set_active_client(id);
+                         let debugger = match self.debug_adapters.get_client_mut(id) {
+                             Some(debugger) => debugger,
+                             None => return false,
+diff --git a/helix-view/src/handlers/dap_console.rs b/helix-view/src/handlers/dap_console.rs
+index 97f9a05c..bc912ac6 100644
+--- a/helix-view/src/handlers/dap_console.rs
++++ b/helix-view/src/handlers/dap_console.rs
+@@ -175,14 +175,17 @@ pub fn dap_frame_view(&self) -> Option<ViewId> {
+         self.dap_source_view(path.as_deref())
+     }
+ 
+-    /// The view to show `path` in without touching the console: one already showing
+-    /// it, else the split above the focused view, else any view but the console's.
++    /// The view to show `path` in without touching the focused view or the
++    /// console: one already showing it, else the split above the focused view, else
++    /// any other.
+     pub fn dap_source_view(&self, path: Option<&Path>) -> Option<ViewId> {
+         let console = self.dap_console_doc();
+         let is_source = |view_id: ViewId| {
+-            self.tree
+-                .try_get(view_id)
+-                .is_some_and(|view| Some(view.doc) != console)
++            view_id != self.tree.focus
++                && self
++                    .tree
++                    .try_get(view_id)
++                    .is_some_and(|view| Some(view.doc) != console)
+         };
+         let path = path.map(helix_stdx::path::canonicalize);
+ 
+-- 
+2.47.3
+

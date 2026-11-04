@@ -1,0 +1,78 @@
+{
+  "backup_branch": "backup/worktree-files-20261104-194411",
+  "worktrees": [
+    {
+      "path": "/home/kuba/SRC/helix/.worktrees/dev-3-way-diff-second-attempt",
+      "branch": "dev-3-way-diff-second-attempt",
+      "head": "537b09de3e49f91bd6f96605ae4c7df2db84c554",
+      "files": [
+        {
+          "path": "reports/Helix diff workflow UX evaluation.md",
+          "sha256": "4f4db118088f93bf8ce3d3e6c3cac444025aae0e0381c1f9bac2febd7df45a80"
+        },
+        {
+          "path": "research_notes/Helix diff workflow UX evaluation/diff_viewing_and_lifecycle.md",
+          "sha256": "fb0e31a99063cb8fcc9c0d62d5bbb19da4944420457e9956028ff6938e449682"
+        },
+        {
+          "path": "research_notes/Helix diff workflow UX evaluation/entry_points_and_discoverability.md",
+          "sha256": "862e4f6589dd636dc231edd769d6cb8fac1f0839350696ce631109eba73b0c73"
+        },
+        {
+          "path": "research_notes/Helix diff workflow UX evaluation/external_benchmark.md",
+          "sha256": "6203e415a719281e25f2908227eaf6f9a92fdaf04b0bba362c72a16abde23738"
+        },
+        {
+          "path": "research_notes/Helix diff workflow UX evaluation/hands_on_observations.md",
+          "sha256": "17765f4a251a72dd4492add02ddfa38fd4fe4e88c350b1ccf4545e452b42ce83"
+        },
+        {
+          "path": "research_notes/Helix diff workflow UX evaluation/three_way_merge.md",
+          "sha256": "c96ef18e2fd498a0a4607d0a326bcade6d758d4116097a1966d07fae79691263"
+        }
+      ]
+    },
+    {
+      "path": "/home/kuba/SRC/helix/.worktrees/dev-insert-stream-command",
+      "branch": "dev-insert-stream-command",
+      "head": "706e7bf8834170ea6172d863629c38d036dc4f4a",
+      "files": []
+    },
+    {
+      "path": "/home/kuba/SRC/helix/.worktrees/dev-python-dap",
+      "branch": "dev-python-dap",
+      "head": "cd18f89aa342f722a8bb69bc6533b32dabc20a7c",
+      "files": [
+        {
+          "path": "1.patch",
+          "sha256": "3c6595207bbf79f218e98b3cb6827f545872111efdff6035fe24aa1ec958703b"
+        }
+      ]
+    },
+    {
+      "path": "/home/kuba/SRC/helix/.worktrees/dev-python-dap-console",
+      "branch": "dev-python-dap-console",
+      "head": "76978e47aa07687aaeac73be798652af7271d0db",
+      "files": [
+        {
+          "path": "1.patch",
+          "sha256": "c76f8cec998a9370c01941c2b25b3471dc793c9defcefc7361edd3fb73854ca0"
+        },
+        {
+          "path": "2.patch",
+          "sha256": "5bbad4b609425a8df060ace2eeefa249b8876084ee92c8a6709ec0797b684aa4"
+        },
+        {
+          "path": "3.patch",
+          "sha256": "f51d48d8e3e5a7b37d9990d9851a388e0378498946908efa8ffd28417515a25c"
+        }
+      ]
+    },
+    {
+      "path": "/home/kuba/SRC/helix/.worktrees/feat-comment-hunk",
+      "branch": "feat/comment-hunk",
+      "head": "da1ae6688e3136f11acaba586878de0f6ac786e7",
+      "files": []
+    }
+  ]
+}

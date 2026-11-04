@@ -723,6 +723,32 @@ async fn test_read_file() -> anyhow::Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn test_startup_config_warnings_show_in_the_status_line() -> anyhow::Result<()> {
+    use helix_term::config::{Config, ConfigLoadError};
+
+    let (_, warnings) = Config::load_with_warnings(
+        Ok("[editor]\nline-numbr = \"relative\"\n".to_owned()),
+        Err(ConfigLoadError::default()),
+    )
+    .expect("a misspelled key is a warning, not an error");
+    assert_eq!(warnings.len(), 1);
+
+    let mut app = AppBuilder::new().build()?;
+    app.show_config_warnings(&warnings);
+
+    let (status, severity) = app.editor.get_status().expect("a status message");
+    assert_eq!(*severity, helix_core::diagnostic::Severity::Warning);
+    assert!(
+        status.starts_with("Config loaded with 1 warning: ") && status.contains("line-numbr"),
+        "{status}"
+    );
+
+    let errs = app.close().await;
+    assert!(errs.is_empty(), "{errs:?}");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn surround_delete() -> anyhow::Result<()> {
     // Test `surround_delete` when head < anchor
     test(("(#[|  ]#)", "mdm", "#[|  ]#")).await?;

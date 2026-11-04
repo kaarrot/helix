@@ -848,7 +848,8 @@ async fn global_search_with_multibyte_chars() -> anyhow::Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_copy_path_command() -> anyhow::Result<()> {
     let file = tempfile::NamedTempFile::new()?;
-    let expected = file.path().to_string_lossy().into_owned();
+    // Empty tempfile: cursor is on line 1, so the copied path is `path:1`.
+    let expected = format!("{}:1", file.path().to_string_lossy());
     // Exercise the saved clipboard register without depending on a desktop
     // clipboard service being available in the test environment.
     let mut config = test_config();
@@ -856,7 +857,7 @@ async fn test_copy_path_command() -> anyhow::Result<()> {
     let builder = || AppBuilder::new().with_config(config.clone());
 
     // The default, an explicit `absolute`, and `url` outside a diff pane all
-    // copy the absolute path: there is no commit to link to.
+    // copy the absolute path plus cursor line: there is no commit to link to.
     for command in [
         ":copy-path<ret>",
         ":copy-path absolute<ret>",
@@ -884,6 +885,29 @@ async fn test_copy_path_command() -> anyhow::Result<()> {
         .await?;
     }
 
+    // Cursor on a later line is included as `:line` (Helix `path:line` syntax).
+    let file = helpers::temp_file_with_contents("one\ntwo\nthree\nfour\n")?;
+    let expected = format!("{}:3", file.path().to_string_lossy());
+    test_key_sequence(
+        &mut builder().with_file(file.path(), None).build()?,
+        Some("2j:copy-path<ret>"),
+        Some(&move |app: &Application| {
+            let copied = app
+                .editor
+                .registers
+                .first('+', &app.editor)
+                .unwrap()
+                .into_owned();
+            assert_eq!(expected, copied);
+            assert_eq!(
+                format!("Copied path to clipboard: {}", expected),
+                app.editor.get_status().unwrap().0.as_ref()
+            );
+        }),
+        false,
+    )
+    .await?;
+
     test_key_sequence(
         &mut builder().build()?,
         Some(":copy-path<ret>"),
@@ -902,7 +926,7 @@ async fn test_copy_path_command() -> anyhow::Result<()> {
         Some(":copy-path relative<ret>"),
         Some(&|app| {
             assert_eq!(
-                "'copy-path': Unknown argument 'relative', expected 'url'",
+                "'copy-path': Unknown argument 'relative', expected 'absolute' or 'url'",
                 app.editor.get_status().unwrap().0
             );
         }),

@@ -65,6 +65,9 @@ pub const MIN_AREA_WIDTH_FOR_SIDE_BY_SIDE: u16 = 100;
 /// 1 content row. `overlaid()` also keeps 2 rows for the statusline, so a
 /// 12-row terminal is the practical floor.
 pub const MIN_AREA_HEIGHT_FOR_VERTICAL_PREVIEW: u16 = 10;
+/// Fewest list rows the stacked layout has to leave. Below this, an area wide
+/// enough for a preview beside the list gets one there instead.
+pub const MIN_LIST_ROWS_FOR_VERTICAL_PREVIEW: u16 = 5;
 /// Biggest file size to preview in bytes
 pub const MAX_FILE_SIZE_FOR_PREVIEW: u64 = 10 * 1024 * 1024;
 
@@ -334,6 +337,19 @@ fn mtime_order<T: 'static + Send + Sync>(
         std::cmp::Reverse(mtime)
     });
     order
+}
+
+/// Whether the preview goes under the list rather than beside it.
+///
+/// Narrow and tall areas stack, which halves the list's height. On a short,
+/// wide area that would leave the list a row or two (two at 100x16), so when
+/// the area is also wide enough for a preview beside the list, it goes there,
+/// as it does on master. Areas too narrow for that still stack.
+fn stacks_preview(area: Rect, header_height: u16) -> bool {
+    let narrow = area.height > area.width || area.width < MIN_AREA_WIDTH_FOR_SIDE_BY_SIDE;
+    let stacked_list_rows = (area.height / 2).saturating_sub(4 + header_height);
+    let starved = stacked_list_rows < MIN_LIST_ROWS_FOR_VERTICAL_PREVIEW;
+    narrow && !(starved && area.width > MIN_AREA_WIDTH_FOR_PREVIEW)
 }
 
 impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
@@ -679,7 +695,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
     }
 
     pub fn is_vertical(&self, area: Rect) -> bool {
-        area.height > area.width || area.width < MIN_AREA_WIDTH_FOR_SIDE_BY_SIDE
+        stacks_preview(area, self.header_height())
     }
 
     fn should_render_preview(&self, area: Rect) -> bool {
@@ -1687,6 +1703,59 @@ mod tests {
             "wide screens should keep a side-by-side preview, x={x} overlay={overlay:?}\n{}",
             lines.join("\n")
         );
+    }
+
+    #[test]
+    fn short_wide_picker_puts_preview_beside_the_list() {
+        // Stacked, a 100x16 terminal left the list two rows.
+        let (lines, overlay) = render_preview_picker(100, 16);
+        let (x, _) = marker_pos(&lines, PREVIEW_MARKER).unwrap_or_else(|| {
+            panic!(
+                "preview body missing on 100x16 picker:\n{}",
+                lines.join("\n")
+            )
+        });
+        assert!(
+            x >= overlay.x as usize + overlay.width as usize / 2,
+            "a short, wide screen should put the preview on the right, x={x} overlay={overlay:?}\n{}",
+            lines.join("\n")
+        );
+    }
+
+    #[test]
+    fn narrow_picker_with_room_for_the_list_stacks() {
+        let (lines, overlay) = render_preview_picker(90, 30);
+        let (_, y) = marker_pos(&lines, PREVIEW_MARKER).unwrap_or_else(|| {
+            panic!(
+                "preview body missing on 90x30 picker:\n{}",
+                lines.join("\n")
+            )
+        });
+        assert!(
+            y >= overlay.y as usize + overlay.height as usize / 2,
+            "a narrow screen with room for the list should stack, y={y} overlay={overlay:?}\n{}",
+            lines.join("\n")
+        );
+    }
+
+    #[test]
+    fn stacking_needs_room_for_the_list_unless_the_area_is_narrow() {
+        // (width, height) of the picker's own area, no column header.
+        for (width, height, stacks) in [
+            (90, 12, false), // 100x16 terminal: stacking left the list two rows
+            (90, 18, true),  // five list rows when stacked
+            (99, 17, false),
+            (40, 16, true), // too narrow for a preview beside the list
+            (40, 9, true),  // stacks, though `should_render_preview` hides it
+            (80, 98, true), // portrait
+            (108, 34, false),
+        ] {
+            assert_eq!(
+                stacks_preview(Rect::new(0, 0, width, height), 0),
+                stacks,
+                "{width}x{height}"
+            );
+        }
     }
 
     #[test]

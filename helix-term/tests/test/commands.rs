@@ -851,8 +851,8 @@ async fn test_copy_path_command() -> anyhow::Result<()> {
     // Empty tempfile: cursor is on line 1, so the copied path is `path:1`.
     let expected = format!("{}:1", file.path().to_string_lossy());
 
-    // The default, an explicit `absolute`, and `url` outside a git repository
-    // all copy the absolute path plus cursor line: there is no commit to link to.
+    // The default, an explicit `absolute`, and `url` outside a diff pane all
+    // copy the absolute path plus cursor line: there is no commit to link to.
     for command in [
         ":copy-path<ret>",
         ":copy-path absolute<ret>",
@@ -921,7 +921,7 @@ async fn test_copy_path_command() -> anyhow::Result<()> {
         Some(":copy-path relative<ret>"),
         Some(&|app| {
             assert_eq!(
-                "'copy-path': Unknown argument 'relative', expected 'url'",
+                "'copy-path': Unknown argument 'relative', expected 'absolute' or 'url'",
                 app.editor.get_status().unwrap().0
             );
         }),

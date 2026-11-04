@@ -310,8 +310,8 @@ Search specific options.
 
 Overrides for the links `:copy-path url` builds. `:copy-path url` looks up the
 remote this repository tracks (the checked-out branch's remote, else `origin`),
-resolves HEAD to a full commit hash, and renders a URL to the file at that
-commit with the cursor's line anchored.
+resolves the pane's revision to a full commit hash, and renders a URL to the
+file at that commit with the cursor's line anchored.
 
 The URL shape is chosen from the remote's host — GitHub, GitLab, Bitbucket,
 Gitea/Forgejo/Codeberg and Azure DevOps are recognized — and unrecognized

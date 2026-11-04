@@ -580,47 +580,6 @@ fn cursor_line_number(editor: &Editor) -> usize {
     text.char_to_line(cursor.min(text.len_chars())) + 1
 }
 
-/// The 1-based, inclusive line span covered by the primary selection.
-#[cfg(feature = "git")]
-fn selected_line_span(editor: &Editor) -> (usize, usize) {
-    let (view, doc) = current_ref!(editor);
-    let text = doc.text().slice(..);
-    let range = doc.selection(view.id).primary();
-    let start = text.char_to_line(range.from().min(text.len_chars()));
-    // `to()` is exclusive, so a selection ending at a line start would
-    // otherwise report the following line.
-    let end_char = if range.to() > range.from() {
-        range.to() - 1
-    } else {
-        range.to()
-    };
-    let end = text.char_to_line(end_char.min(text.len_chars()));
-    (start + 1, end + 1)
-}
-
-/// Build a permalink to `path` at `rev` using the host's URL shape, or the
-/// `[editor.git-remote]` overrides. Returns `None` when git support is off.
-#[cfg(feature = "git")]
-fn file_url_at_revision(
-    editor: &Editor,
-    path: &std::path::Path,
-    rev: &str,
-) -> anyhow::Result<String> {
-    let link = helix_vcs::git::file_web_link(path, rev)?;
-    let base = helix_vcs::web_url::web_base(&link.remote_url)
-        .ok_or_else(|| anyhow::anyhow!("git remote '{}' has no web address", link.remote_url))?;
-    let template = editor.config().git_remote.template_for_host(&base.host);
-    Ok(helix_vcs::web_url::render(
-        &template,
-        &helix_vcs::web_url::WebUrlFields {
-            base: &base,
-            commit: &link.commit,
-            path: &link.path,
-        },
-        Some(selected_line_span(editor)),
-    ))
-}
-
 fn copy_path_to_clipboard(
     cx: &mut compositor::Context,
     args: Args,
@@ -630,48 +589,34 @@ fn copy_path_to_clipboard(
         return Ok(());
     }
 
-    let as_url = match args.first() {
-        None | Some("absolute") => false,
-        Some("url") => true,
-        Some(arg) => anyhow::bail!("Unknown argument '{arg}', expected 'url'"),
-    };
+    // `url` links to the file at the commit a pane shows. A buffer of the
+    // working tree shows none, so there it copies the same `path:line`.
+    if let Some(arg) = args
+        .first()
+        .filter(|arg| !matches!(*arg, "absolute" | "url"))
+    {
+        anyhow::bail!("Unknown argument '{arg}', expected 'absolute' or 'url'");
+    }
 
     let path = doc!(cx.editor)
         .path()
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("No file path available (scratch buffer)"))?;
 
-    // Filesystem copies include the cursor line (`path:line`) so Helix can
-    // reopen at that location. `:copy-path url` links to HEAD and already
-    // appends a forge line fragment; if there is no web remote, fall back to
-    // the same `path:line`.
-    let path_with_line = format!(
+    // Copies include the cursor line (`path:line`) so Helix can reopen at that
+    // location.
+    let copied = format!(
         "{}:{}",
         path.to_string_lossy(),
         cursor_line_number(cx.editor)
     );
-    let (copied, what) = if as_url {
-        #[cfg(feature = "git")]
-        {
-            match file_url_at_revision(cx.editor, &path, "HEAD") {
-                Ok(url) => (url, "URL"),
-                Err(_) => (path_with_line, "path"),
-            }
-        }
-        #[cfg(not(feature = "git"))]
-        {
-            (path_with_line, "path")
-        }
-    } else {
-        (path_with_line, "path")
-    };
 
     cx.editor
         .registers
         .write('+', vec![copied.clone()])
         .map_err(|err| anyhow::anyhow!("Failed to copy to clipboard: {}", err))?;
     cx.editor
-        .set_status(format!("Copied {what} to clipboard: {copied}"));
+        .set_status(format!("Copied path to clipboard: {copied}"));
 
     Ok(())
 }
@@ -3046,7 +2991,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     TypableCommand {
         name: "copy-path",
         aliases: &["cp"],
-        doc: "Copy the current file's absolute path and cursor line (`path:line`) to the system clipboard. Use ':copy-path url' to copy a link to the file at HEAD on the git remote instead.",
+        doc: "Copy the current file's absolute path and cursor line (`path:line`) to the system clipboard. In a pane showing a commit, ':copy-path url' copies a link to the file at that commit instead.",
         fun: copy_path_to_clipboard,
         completer: CommandCompleter::positional(&[completers::copy_path_kind]),
         signature: Signature {

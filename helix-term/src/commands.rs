@@ -1330,49 +1330,82 @@ fn goto_file_vsplit(cx: &mut Context) {
 #[derive(Debug)]
 struct GotoFileTarget {
     path: String,
-    line: Option<NonZeroUsize>,
+    line: Option<LineSuffix>,
 }
 
-fn split_path_line_suffix(input: &str) -> (&str, Option<NonZeroUsize>) {
-    let Some((path, line)) = input.rsplit_once(':') else {
+/// The `:line` or `:line:column` after a path, as compilers, linters and test
+/// runners print it. Both count from 1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LineSuffix {
+    line: NonZeroUsize,
+    column: Option<NonZeroUsize>,
+}
+
+/// Splits a `:line` or `:line:column` suffix off `input`.
+fn split_path_line_suffix(input: &str) -> (&str, Option<LineSuffix>) {
+    let Some((rest, last)) = split_number_suffix(input) else {
         return (input, None);
     };
 
-    if path.is_empty() || line.is_empty() || !line.bytes().all(|byte| byte.is_ascii_digit()) {
-        return (input, None);
-    }
-
-    match line.parse::<usize>().ok().and_then(NonZeroUsize::new) {
-        Some(line) => (path, Some(line)),
-        None => (input, None),
+    match split_number_suffix(rest) {
+        Some((path, line)) => (
+            path,
+            Some(LineSuffix {
+                line,
+                column: Some(last),
+            }),
+        ),
+        None => (
+            rest,
+            Some(LineSuffix {
+                line: last,
+                column: None,
+            }),
+        ),
     }
 }
 
-fn path_line_suffix_end(source: RopeSlice<'_>, path_end: usize) -> Option<(usize, NonZeroUsize)> {
-    let mut chars = source.byte_slice(path_end..).chars();
+/// Splits `input` at its last `:` when a positive number follows it.
+fn split_number_suffix(input: &str) -> Option<(&str, NonZeroUsize)> {
+    let (head, number) = input.rsplit_once(':')?;
+    if head.is_empty() || number.is_empty() || !number.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+
+    let number = number.parse::<usize>().ok().and_then(NonZeroUsize::new)?;
+    Some((head, number))
+}
+
+/// Reads a `:line` or `:line:column` suffix that starts at byte `path_end`,
+/// returning the byte it ends at.
+fn path_line_suffix_end(source: RopeSlice<'_>, path_end: usize) -> Option<(usize, LineSuffix)> {
+    let (end, line) = number_suffix_end(source, path_end)?;
+    let (end, column) = match number_suffix_end(source, end) {
+        Some((end, column)) => (end, Some(column)),
+        None => (end, None),
+    };
+
+    Some((end, LineSuffix { line, column }))
+}
+
+/// Reads a `:` and a positive number from byte `start` on, returning the byte
+/// after the number.
+fn number_suffix_end(source: RopeSlice<'_>, start: usize) -> Option<(usize, NonZeroUsize)> {
+    let mut chars = source.byte_slice(start..).chars();
     if chars.next() != Some(':') {
         return None;
     }
 
-    let mut line = String::new();
-    let mut suffix_len = 1;
-    for ch in chars {
-        if !ch.is_ascii_digit() {
-            break;
-        }
-
-        line.push(ch);
-        suffix_len += ch.len_utf8();
-    }
-
-    if line.is_empty() {
+    let digits: String = chars.take_while(char::is_ascii_digit).collect();
+    if digits.is_empty() {
         return None;
     }
 
-    line.parse::<usize>()
+    digits
+        .parse::<usize>()
         .ok()
         .and_then(NonZeroUsize::new)
-        .map(|line| (path_end + suffix_len, line))
+        .map(|number| (start + 1 + digits.len(), number))
 }
 
 fn goto_file_target_from_selection(selection: &str) -> Option<GotoFileTarget> {
@@ -1390,7 +1423,7 @@ fn goto_file_target_from_selection(selection: &str) -> Option<GotoFileTarget> {
 fn select_line_in_opened_file(
     editor: &mut Editor,
     doc_id: DocumentId,
-    line: NonZeroUsize,
+    suffix: LineSuffix,
     action: Action,
 ) {
     let view = view_mut!(editor);
@@ -1402,8 +1435,15 @@ fn select_line_in_opened_file(
     } else {
         text.len_lines() - 1
     };
-    let line_idx = std::cmp::min(line.get() - 1, max_line);
-    let pos = text.line_to_char(line_idx);
+    let line_idx = std::cmp::min(suffix.line.get() - 1, max_line);
+    let line_start = text.line_to_char(line_idx);
+    // Columns are counted the way `goto_column` counts them, and stop at the
+    // end of the line.
+    let pos = match suffix.column {
+        Some(column) => graphemes::nth_next_grapheme_boundary(text, line_start, column.get() - 1)
+            .min(line_end_char_index(&text, line_idx)),
+        None => line_start,
+    };
 
     doc.set_selection(view.id, Selection::point(pos));
     if action.align_view(view, doc.id()) {
@@ -1440,7 +1480,7 @@ fn goto_file_impl(cx: &mut Context, action: Action) {
             .take_while(|range| search_start + range.start <= pos + 1)
             .find_map(|range| {
                 let (target_end, line) = path_line_suffix_end(search_range, range.end)
-                    .map_or((range.end, None), |(end, line)| (end, Some(line)));
+                    .map_or((range.end, None), |(end, suffix)| (end, Some(suffix)));
 
                 (pos <= search_start + target_end).then(|| GotoFileTarget {
                     path: Cow::from(search_range.byte_slice(range)).into_owned(),

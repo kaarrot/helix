@@ -248,6 +248,53 @@ async fn test_goto_file_impl() -> anyhow::Result<()> {
     )
     .await?;
 
+    fn assert_current_file_column(app: &Application, expected_line: usize, expected_column: usize) {
+        let (view, doc) = helix_view::current_ref!(app.editor);
+        let text = doc.text().slice(..);
+        let cursor = doc.selection(view.id).primary().cursor(text);
+        let line = text.char_to_line(cursor);
+        assert_eq!(
+            (expected_line - 1, expected_column - 1),
+            (line, cursor - text.line_to_char(line))
+        );
+    }
+
+    // Line and column suffix in selection: the path isn't `target.txt:3`
+    test_key_sequence(
+        &mut AppBuilder::new().with_file(&source_path, None).build()?,
+        Some("itarget.txt:3:4<esc>%gf"),
+        Some(&|app| {
+            assert_current_file_line(app, "target.txt", 3);
+            assert_current_file_column(app, 3, 4);
+        }),
+        false,
+    )
+    .await?;
+
+    // Line and column suffix with cursor on the column
+    test_key_sequence(
+        &mut AppBuilder::new().with_file(&source_path, None).build()?,
+        Some("itarget.txt:2:2<esc>hgf"),
+        Some(&|app| {
+            assert_current_file_line(app, "target.txt", 2);
+            assert_current_file_column(app, 2, 2);
+        }),
+        false,
+    )
+    .await?;
+
+    // A column past the end of the line stops at the line's end
+    test_key_sequence(
+        &mut AppBuilder::new().with_file(&source_path, None).build()?,
+        Some("itarget.txt:1:99<esc>%gf"),
+        Some(&|app| {
+            assert_current_file_line(app, "target.txt", 1);
+            assert_current_file_column(app, 1, 4);
+        }),
+        false,
+    )
+    .await?;
+
     Ok(())
 }
 

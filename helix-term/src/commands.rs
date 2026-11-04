@@ -6638,6 +6638,45 @@ mod stream_tests {
         assert_eq!(doc, Rope::from("abc界"));
         assert_eq!(next_pos, 4);
     }
+
+    #[test]
+    fn stream_decoder_keeps_a_character_split_across_reads() {
+        // The case seen in the wild: 1023 ASCII bytes and then `é`, read
+        // 1024 bytes at a time, splits the `é`.
+        let output = format!("{}é", "a".repeat(1023));
+        let (first, second) = output.as_bytes().split_at(1024);
+
+        let mut decoder = super::StreamDecoder::default();
+        let mut text = decoder.decode(first);
+        assert_eq!(text, "a".repeat(1023));
+        text.push_str(&decoder.decode(second));
+        text.push_str(&decoder.finish());
+        assert_eq!(text, output);
+    }
+
+    #[test]
+    fn stream_decoder_handles_a_character_split_byte_by_byte() {
+        let mut decoder = super::StreamDecoder::default();
+        let mut text = String::new();
+        for byte in "x界🦀y".as_bytes() {
+            text.push_str(&decoder.decode(std::slice::from_ref(byte)));
+        }
+        text.push_str(&decoder.finish());
+        assert_eq!(text, "x界🦀y");
+    }
+
+    #[test]
+    fn stream_decoder_still_replaces_invalid_bytes() {
+        let mut decoder = super::StreamDecoder::default();
+        // A stray continuation byte can't start a character, so it is
+        // replaced straight away rather than held back.
+        assert_eq!(decoder.decode(b"a\x80b"), "a\u{FFFD}b");
+        // A truncated character is held until the pipe closes, and is invalid
+        // then.
+        assert_eq!(decoder.decode(b"c\xE7\x95"), "c");
+        assert_eq!(decoder.finish(), "\u{FFFD}");
+        assert_eq!(decoder.finish(), "");
+    }
 }
 
 /// Cancels the running command and drops everything queued behind it, so one
@@ -6944,6 +6983,61 @@ async fn kill_stream_command(child: &mut tokio::process::Child) {
     let _ = child.kill().await;
 }
 
+/// Decodes one output pipe of a stream command as the bytes arrive.
+///
+/// A read can end partway through a multi-byte character. Those bytes wait for
+/// the next read instead of each half turning into U+FFFD.
+#[derive(Default)]
+struct StreamDecoder {
+    pending: Vec<u8>,
+}
+
+impl StreamDecoder {
+    /// Returns the text `bytes` complete, keeping back a character that is
+    /// still missing bytes. Bytes that can never be valid UTF-8 still become
+    /// U+FFFD, as with `String::from_utf8_lossy`.
+    fn decode(&mut self, bytes: &[u8]) -> String {
+        self.pending.extend_from_slice(bytes);
+        let mut text = String::new();
+        let mut rest = self.pending.as_slice();
+        loop {
+            match std::str::from_utf8(rest) {
+                Ok(valid) => {
+                    text.push_str(valid);
+                    rest = &[];
+                    break;
+                }
+                Err(err) => {
+                    let (valid, after) = rest.split_at(err.valid_up_to());
+                    text.push_str(&String::from_utf8_lossy(valid));
+                    match err.error_len() {
+                        Some(len) => {
+                            text.push(char::REPLACEMENT_CHARACTER);
+                            rest = &after[len..];
+                        }
+                        // The input ends inside a character: keep it for later.
+                        None => {
+                            rest = after;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        let kept = rest.len();
+        self.pending.drain(..self.pending.len() - kept);
+        text
+    }
+
+    /// Returns what is left once the pipe has closed. A character still
+    /// incomplete by then is invalid.
+    fn finish(&mut self) -> String {
+        let text = String::from_utf8_lossy(&self.pending).into_owned();
+        self.pending.clear();
+        text
+    }
+}
+
 /// Runs one command to completion, streaming its output into the session's
 /// buffer from `from`, and returns the position the next command continues at.
 async fn run_stream_command(
@@ -7004,6 +7098,8 @@ async fn run_stream_command(
     // commands that use printf or don't flush lines.
     let mut stdout_buffer = vec![0u8; 1024];
     let mut stderr_buffer = vec![0u8; 1024];
+    let mut stdout_decoder = StreamDecoder::default();
+    let mut stderr_decoder = StreamDecoder::default();
 
     // The command line heads its own output.
     let mut pos = insert_stream_command_line(target, from, &display_cmd).await;
@@ -7033,13 +7129,19 @@ async fn run_stream_command(
                 match bytes_read {
                     Ok(0) => {
                         stdout_closed = true;
+                        let rest = stdout_decoder.finish();
+                        if !rest.is_empty() {
+                            pos = insert_stream_chunk(target, pos, Tendril::from(rest)).await;
+                        }
                         if stderr_closed {
                             break;
                         }
                     }
                     Ok(n) => {
-                        let chunk = String::from_utf8_lossy(&stdout_buffer[..n]);
-                        pos = insert_stream_chunk(target, pos, Tendril::from(chunk.as_ref())).await;
+                        let chunk = stdout_decoder.decode(&stdout_buffer[..n]);
+                        if !chunk.is_empty() {
+                            pos = insert_stream_chunk(target, pos, Tendril::from(chunk)).await;
+                        }
                     }
                     Err(err) => {
                         failure = Some(format!("Error reading stdout: {}", err));
@@ -7051,13 +7153,19 @@ async fn run_stream_command(
                 match bytes_read {
                     Ok(0) => {
                         stderr_closed = true;
+                        let rest = stderr_decoder.finish();
+                        if !rest.is_empty() {
+                            pos = insert_stream_chunk(target, pos, Tendril::from(rest)).await;
+                        }
                         if stdout_closed {
                             break;
                         }
                     }
                     Ok(n) => {
-                        let chunk = String::from_utf8_lossy(&stderr_buffer[..n]);
-                        pos = insert_stream_chunk(target, pos, Tendril::from(chunk.as_ref())).await;
+                        let chunk = stderr_decoder.decode(&stderr_buffer[..n]);
+                        if !chunk.is_empty() {
+                            pos = insert_stream_chunk(target, pos, Tendril::from(chunk)).await;
+                        }
                     }
                     Err(err) => {
                         failure = Some(format!("Error reading stderr: {}", err));

@@ -640,6 +640,42 @@ async fn test_insert_stream_cancel_kills_the_commands_children() -> anyhow::Resu
     Ok(())
 }
 
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_insert_stream_output_keeps_characters_split_across_reads() -> anyhow::Result<()> {
+    let _lock = Arc::clone(&STREAM_TEST_LOCK).lock_owned().await;
+    // Output is read 1024 bytes at a time, so 1023 ASCII bytes put the `é`
+    // across the boundary. `cat` writes it all at once, in a single read.
+    let output = format!("{}é", "a".repeat(1023));
+    let file = helpers::temp_file_with_contents(&output)?;
+    let mut app = AppBuilder::new().build()?;
+
+    send_key_sequence(
+        &mut app,
+        &format!(":insert-stream-output cat {}<ret>", file.path().display()),
+    )
+    .await?;
+    wait_for_condition(&mut app, "stream completed", |app| {
+        app.editor
+            .get_status()
+            .is_some_and(|(status, _)| status.as_ref() == "Stream completed in '[scratch]'")
+    })
+    .await?;
+
+    let text = doc!(app.editor).text().to_string();
+    assert!(
+        text.contains(&output) && !text.contains(char::REPLACEMENT_CHARACTER),
+        "streamed output should keep the split character intact, but it ends {:?}",
+        text.char_indices()
+            .rev()
+            .nth(15)
+            .map_or(text.as_str(), |(i, _)| &text[i..])
+    );
+
+    close_app(&mut app).await?;
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn test_insert_stream_output_reuses_last_stream_buffer() -> anyhow::Result<()> {
     let _lock = Arc::clone(&STREAM_TEST_LOCK).lock_owned().await;

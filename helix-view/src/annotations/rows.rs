@@ -225,6 +225,7 @@ impl VirtualRowPlanBuilder {
     ///
     /// Padding goes below a hunk rather than above it: a replacement pairs its
     /// lines off from the top, and the rows it is short of are its last ones.
+    #[allow(clippy::too_many_arguments)]
     pub fn add_wrapped_diff_spacers(
         &mut self,
         diff_handle: &DiffHandle,
@@ -232,12 +233,21 @@ impl VirtualRowPlanBuilder {
         format: &TextFormat,
         peer_format: &TextFormat,
         visible: Range<usize>,
+        annotations: &TextAnnotations,
+        peer_annotations: &TextAnnotations,
     ) {
         let diff = diff_handle.load();
         let peer = diff.diff_base();
         let mut padding = BTreeMap::<usize, usize>::new();
 
-        for line in visible.clone() {
+        let mut line = visible.start;
+        while line < visible.end {
+            if let Some(fold) =
+                helix_core::fold::fold_at(annotations.folds(), text.line_to_char(line))
+            {
+                line = text.char_to_line(fold.end);
+                continue;
+            }
             let mut peer_line = Some(line);
             for index in 0..diff.len() {
                 let hunk = diff.nth_hunk(index);
@@ -256,12 +266,13 @@ impl VirtualRowPlanBuilder {
                 );
             }
             if let Some(peer_line) = peer_line.filter(|&line| line < peer.len_lines()) {
-                let deficit = line_height(peer, peer_line, peer_format)
-                    .saturating_sub(line_height(text, line, format));
+                let deficit = line_height(peer, peer_line, peer_format, peer_annotations)
+                    .saturating_sub(line_height(text, line, format, annotations));
                 if deficit > 0 {
                     *padding.entry(line).or_default() += deficit;
                 }
             }
+            line += 1;
         }
 
         for index in 0..diff.len() {
@@ -274,10 +285,21 @@ impl VirtualRowPlanBuilder {
             let emit_after = (hunk.after.end as usize).saturating_sub(1);
             *padding.entry(emit_after).or_default() += if visible.contains(&emit_after) {
                 (missing..before_end)
-                    .map(|line| line_height(peer, line, peer_format))
+                    .map(|line| line_height(peer, line, peer_format, peer_annotations))
                     .sum()
             } else {
-                before_end - missing
+                let hidden: usize = peer_annotations
+                    .folds()
+                    .iter()
+                    .map(|fold| {
+                        let lines = fold.lines(peer.slice(..));
+                        lines
+                            .end
+                            .min(before_end)
+                            .saturating_sub(lines.start.max(missing))
+                    })
+                    .sum();
+                (before_end - missing).saturating_sub(hidden)
             };
         }
 
@@ -294,6 +316,17 @@ impl VirtualRowPlanBuilder {
             return;
         }
         self.by_line.entry(doc_line).or_default().extend(rows);
+    }
+
+    /// Hidden lines cannot own screen rows. Their comments return when the
+    /// fold is opened, while the visible header keeps its own rows.
+    pub fn retain_visible_rows(&mut self, text: &Rope, folds: &[helix_core::fold::Fold]) {
+        if !folds.is_empty() {
+            self.by_line.retain(|&line, _| {
+                line < text.len_lines()
+                    && helix_core::fold::fold_at(folds, text.line_to_char(line)).is_none()
+            });
+        }
     }
 
     pub fn build(self) -> VirtualRowPlan {
@@ -351,15 +384,22 @@ impl LineAnnotation for VirtualRowLines {
     }
 }
 
-fn line_height(text: &Rope, line: usize, format: &TextFormat) -> usize {
+fn line_height(
+    text: &Rope,
+    line: usize,
+    format: &TextFormat,
+    annotations: &TextAnnotations,
+) -> usize {
+    if helix_core::fold::fold_at(annotations.folds(), text.line_to_char(line)).is_some() {
+        return 0;
+    }
     if !format.soft_wrap {
         return 1;
     }
-    let annotations = TextAnnotations::default();
     DocumentFormatter::new_at_prev_checkpoint(
         text.slice(..),
         format,
-        &annotations,
+        annotations,
         text.line_to_char(line),
     )
     .take_while(|grapheme| grapheme.line_idx == line)
@@ -489,6 +529,72 @@ mod test {
     }
 
     #[test]
+    fn regression_folded_lines_have_no_height_or_virtual_rows() {
+        use helix_core::{fold::Fold, text_annotations::InlineAnnotation};
+        let text = Rope::from("header\nhidden\ntail\n");
+        let folds = [Fold::new(text.slice(..), 0, 1).unwrap()];
+        let placeholders = [InlineAnnotation::new(6, " folded block")];
+        let mut annotations = TextAnnotations::default();
+        annotations
+            .set_folds(&folds)
+            .add_inline_annotations(&placeholders, None);
+        let format = TextFormat {
+            soft_wrap: true,
+            viewport_width: 10,
+            ..TextFormat::default()
+        };
+        assert_eq!(line_height(&text, 1, &format, &annotations), 0);
+        assert!(line_height(&text, 0, &format, &annotations) > 1);
+        let mut builder = VirtualRowPlanBuilder::new();
+        builder.add_comment_rows(0, vec![VirtualRow::Composing]);
+        builder.add_comment_rows(1, vec![VirtualRow::Composing, VirtualRow::Spacer]);
+        builder.add_comment_rows(2, vec![VirtualRow::Composing]);
+        builder.retain_visible_rows(&text, &folds);
+        let plan = builder.build();
+        assert_eq!(plan.rows_at(0).len(), 1);
+        assert!(plan.rows_at(1).is_empty());
+        assert_eq!(plan.rows_at(2).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn regression_wrapped_spacers_measure_fold_placeholders_below_the_header() {
+        use helix_core::{fold::Fold, text_annotations::InlineAnnotation};
+        let before = Rope::from("head\nhidden\na long line that wraps below the fold\ntail\n");
+        let after = Rope::from("head\nhidden\nshort\ntail\n");
+        let handle = settled_diff(&before, &after).await;
+        let folds = [Fold::new(after.slice(..), 0, 1).unwrap()];
+        let placeholders = [InlineAnnotation::new(4, " folded block")];
+        let mut annotations = TextAnnotations::default();
+        annotations
+            .set_folds(&folds)
+            .add_inline_annotations(&placeholders, None);
+        let format = TextFormat {
+            soft_wrap: true,
+            viewport_width: 12,
+            ..TextFormat::default()
+        };
+        let mut builder = VirtualRowPlanBuilder::new();
+        builder.add_wrapped_diff_spacers(
+            &handle,
+            &after,
+            &format,
+            &format,
+            0..4,
+            &annotations,
+            &annotations,
+        );
+        builder.retain_visible_rows(&after, &folds);
+        let plan = builder.build();
+        assert!(plan.rows_at(1).is_empty());
+        assert_eq!(
+            plan.rows_at(2).len(),
+            line_height(&before, 2, &format, &annotations)
+                - line_height(&after, 2, &format, &annotations)
+        );
+        assert!(!plan.rows_at(2).is_empty());
+    }
+
+    #[test]
     fn wrap_breaks_on_words() {
         assert_eq!(
             wrap_text("the quick brown fox jumps", 10),
@@ -566,7 +672,15 @@ mod test {
         reverse.invert();
         let tail_row = |diff: &DiffHandle, text: &Rope, format: &TextFormat, peer: &TextFormat| {
             let mut builder = VirtualRowPlanBuilder::new();
-            builder.add_wrapped_diff_spacers(diff, text, format, peer, 0..text.len_lines());
+            builder.add_wrapped_diff_spacers(
+                diff,
+                text,
+                format,
+                peer,
+                0..text.len_lines(),
+                &TextAnnotations::default(),
+                &TextAnnotations::default(),
+            );
             let mut annotations = TextAnnotations::default();
             annotations
                 .add_line_annotation(Box::new(VirtualRowLines::new(Rc::new(builder.build()))));
@@ -595,7 +709,15 @@ mod test {
             ..TextFormat::default()
         };
         let mut builder = VirtualRowPlanBuilder::new();
-        builder.add_wrapped_diff_spacers(&handle, &after, &format, &format, 1..2);
+        builder.add_wrapped_diff_spacers(
+            &handle,
+            &after,
+            &format,
+            &format,
+            1..2,
+            &TextAnnotations::default(),
+            &TextAnnotations::default(),
+        );
         assert_eq!(builder.build().rows_at(0), vec![VirtualRow::Spacer; 2]);
     }
 

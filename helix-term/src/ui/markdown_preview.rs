@@ -698,8 +698,15 @@ impl Component for MarkdownPreview {
                 let Some((start, end)) = self.selected_cols(line) else {
                     continue;
                 };
-                let width = end.saturating_sub(start).min(inner.width.saturating_sub(start));
-                let area = Rect::new(inner.x + start, inner.y + (row - self.scroll) as u16, width, 1);
+                let width = end
+                    .saturating_sub(start)
+                    .min(inner.width.saturating_sub(start));
+                let area = Rect::new(
+                    inner.x + start,
+                    inner.y + (row - self.scroll) as u16,
+                    width,
+                    1,
+                );
                 surface.set_style(area, selection_style);
             }
         }
@@ -770,10 +777,12 @@ fn goto_source_line(
     if editor.document(doc_id).is_none() || !editor.tree.contains(view_id) {
         return;
     }
-    {
-        let view = editor.tree.get_mut(view_id);
-        if view.doc != doc_id {
-            view.doc = doc_id;
+    if editor.tree.get(view_id).doc != doc_id {
+        let previous_focus = editor.tree.focus;
+        editor.tree.focus = view_id;
+        editor.switch(doc_id, Action::Replace);
+        if editor.tree.contains(previous_focus) {
+            editor.tree.focus = previous_focus;
         }
     }
     let Some(doc) = editor.documents.get_mut(&doc_id) else {
@@ -806,15 +815,26 @@ fn goto_source_line(
 }
 
 /// Open a markdown link destination. Returns `true` when the editor navigated.
+fn external_url(dest: &str) -> Option<Url> {
+    let url = Url::parse(dest).ok()?;
+    (dest.contains("://") || matches!(url.scheme(), "mailto" | "tel")).then_some(url)
+}
+
 fn open_link(compositor: &mut Compositor, cx: &mut Context, dest: &str, base_dir: &Path) -> bool {
     let dest = dest.trim();
     if dest.is_empty() {
         return false;
     }
 
-    if let Ok(url) = Url::parse(dest) {
+    if let Some(url) = external_url(dest) {
         if url.scheme() == "file" {
-            return open_path_in_editor(compositor, cx, &PathBuf::from(url.path()));
+            return match url.to_file_path() {
+                Ok(path) => open_path_in_editor(compositor, cx, &path),
+                Err(()) => {
+                    cx.editor.set_error("Invalid file URL");
+                    false
+                }
+            };
         }
         cx.jobs.callback(crate::open_external_url_callback(url));
         return false;
@@ -829,14 +849,19 @@ fn open_link(compositor: &mut Compositor, cx: &mut Context, dest: &str, base_dir
 }
 
 fn open_path_in_editor(compositor: &mut Compositor, cx: &mut Context, path: &Path) -> bool {
+    let (path, position) = crate::args::parse_file(&path.to_string_lossy());
     if path.is_dir() {
         let picker = file_picker(cx.editor, path.to_path_buf());
         compositor.push(Box::new(overlaid(picker)));
         true
-    } else if let Err(err) = cx.editor.open(path, Action::Replace) {
+    } else if let Err(err) = cx.editor.open(&path, Action::Replace) {
         cx.editor.set_error(format!("Open file failed: {err:?}"));
         false
     } else {
+        let (view, doc) = helix_view::current!(cx.editor);
+        let pos = helix_core::pos_at_coords(doc.text().slice(..), position, true);
+        doc.set_selection(view.id, Selection::point(pos));
+        align_view(doc, view, Align::Center);
         true
     }
 }
@@ -845,6 +870,88 @@ fn open_path_in_editor(compositor: &mut Compositor, cx: &mut Context, path: &Pat
 mod tests {
     use super::*;
     use helix_view::keyboard::KeyModifiers;
+
+    #[test]
+    fn regression_local_paths_are_not_external_urls() {
+        for path in [
+            "foo.rs:42",
+            "C:/path/file.md",
+            "C:\\path\\file.md",
+            "file.rs:3:2",
+        ] {
+            assert!(external_url(path).is_none(), "{path}");
+        }
+        for url in [
+            "https://example.com",
+            "file:///tmp/file.md",
+            "mailto:user@example.com",
+        ] {
+            assert!(external_url(url).is_some(), "{url}");
+        }
+    }
+
+    #[cfg(feature = "integration")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn regression_returning_to_source_records_the_document_we_left() -> anyhow::Result<()> {
+        let source = tempfile::NamedTempFile::new()?;
+        let other = tempfile::NamedTempFile::new()?;
+        std::fs::write(source.path(), "one\ntwo\n")?;
+        std::fs::write(other.path(), "other\n")?;
+        let mut app = crate::application::Application::new(
+            crate::args::Args::default(),
+            crate::config::Config::default(),
+            helix_core::syntax::Loader::default(),
+        )?;
+        let source_id = app.editor.open(source.path(), Action::Replace)?;
+        let other_id = app.editor.open(other.path(), Action::Replace)?;
+        let view_id = app.editor.tree.focus;
+        goto_source_line(&mut app.editor, view_id, source_id, 1, false);
+        let (view, doc) = helix_view::current!(app.editor);
+        let jump = view
+            .jumps
+            .backward(view.id, doc, 1)
+            .expect("jump back to previous buffer");
+        assert_eq!(jump.0, other_id);
+        app.close().await;
+        Ok(())
+    }
+
+    #[cfg(feature = "integration")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn regression_opening_a_link_honors_its_line_and_column() -> anyhow::Result<()> {
+        assert!(external_url("file.rs:3:2").is_none());
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("file.rs");
+        std::fs::write(&path, "one\ntwo\nthree\n")?;
+        let mut app = crate::application::Application::new(
+            crate::args::Args::default(),
+            crate::config::Config::default(),
+            helix_core::syntax::Loader::default(),
+        )?;
+        let mut jobs = crate::job::Jobs::new();
+        let mut compositor = Compositor::new(Rect::new(0, 0, 120, 40));
+        let mut cx = Context {
+            editor: &mut app.editor,
+            jobs: &mut jobs,
+            scroll: None,
+        };
+        assert!(open_link(
+            &mut compositor,
+            &mut cx,
+            "file.rs:3:2",
+            dir.path()
+        ));
+        let (view, doc) = helix_view::current_ref!(app.editor);
+        assert_eq!(doc.path(), Some(&helix_stdx::path::canonicalize(&path)));
+        assert_eq!(
+            doc.selection(view.id)
+                .primary()
+                .cursor(doc.text().slice(..)),
+            9
+        );
+        app.close().await;
+        Ok(())
+    }
 
     fn test_preview(total_lines: usize, height: u16) -> MarkdownPreview {
         let mut preview = MarkdownPreview::new(
@@ -956,10 +1063,7 @@ mod tests {
         press.dragged = true;
         let anchor = press.at;
         preview.selection = Some((anchor, head));
-        assert_eq!(
-            preview.selection_text().as_deref(),
-            Some("st line\nsecond")
-        );
+        assert_eq!(preview.selection_text().as_deref(), Some("st line\nsecond"));
     }
 
     #[test]
@@ -1085,4 +1189,3 @@ mod tests {
         assert_eq!(preview.scroll, 2);
     }
 }
-

@@ -178,6 +178,17 @@ pub trait LineAnnotation {
         line_end_visual_pos: Position,
         doc_line: usize,
     ) -> Position;
+
+    /// Called at a soft wrap within a document line. Annotations anchored
+    /// below whole document lines can defer their rows until the line ends.
+    fn insert_virtual_lines_on_soft_wrap(
+        &mut self,
+        char_idx: usize,
+        visual_pos: Position,
+        doc_line: usize,
+    ) -> Position {
+        self.insert_virtual_lines(char_idx, visual_pos, doc_line)
+    }
 }
 
 #[derive(Debug)]
@@ -481,12 +492,41 @@ impl<'a> TextAnnotations<'a> {
         line_end_visual_pos: Position,
         doc_line: usize,
     ) -> usize {
+        self.virtual_lines_at_impl(char_idx, line_end_visual_pos, doc_line, false)
+    }
+
+    pub(crate) fn virtual_lines_at_soft_wrap(
+        &self,
+        char_idx: usize,
+        visual_pos: Position,
+        doc_line: usize,
+    ) -> usize {
+        self.virtual_lines_at_impl(char_idx, visual_pos, doc_line, true)
+    }
+
+    fn virtual_lines_at_impl(
+        &self,
+        char_idx: usize,
+        line_end_visual_pos: Position,
+        doc_line: usize,
+        soft_wrap: bool,
+    ) -> usize {
         let mut virt_off = Position::new(0, 0);
         for (_, layer) in &self.line_annotations {
             virt_off += unsafe {
-                layer
-                    .get()
-                    .insert_virtual_lines(char_idx, line_end_visual_pos + virt_off, doc_line)
+                if soft_wrap {
+                    layer.get().insert_virtual_lines_on_soft_wrap(
+                        char_idx,
+                        line_end_visual_pos + virt_off,
+                        doc_line,
+                    )
+                } else {
+                    layer.get().insert_virtual_lines(
+                        char_idx,
+                        line_end_visual_pos + virt_off,
+                        doc_line,
+                    )
+                }
             };
         }
         virt_off.row

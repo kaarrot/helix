@@ -319,6 +319,10 @@ impl VirtualRowLines {
 }
 
 impl LineAnnotation for VirtualRowLines {
+    fn insert_virtual_lines_on_soft_wrap(&mut self, _: usize, _: Position, _: usize) -> Position {
+        Position::default()
+    }
+
     fn reset_pos(&mut self, _char_idx: usize) -> usize {
         self.last_emitted_doc_line.set(None);
         usize::MAX
@@ -330,9 +334,9 @@ impl LineAnnotation for VirtualRowLines {
         _line_end_visual_pos: Position,
         doc_line: usize,
     ) -> Position {
-        // Called at the end of every visual line, so a soft-wrapped document
-        // line asks several times. Emit on the first ask only; the painting
-        // decoration's `first_visual_line` guard is the other half of this.
+        // Whole-line rows belong after the final wrapped row. Soft wraps use
+        // the separate hook above, so checkpoints within a long line cannot
+        // cause these rows to be reserved again.
         if self.last_emitted_doc_line.get() == Some(doc_line) {
             return Position::default();
         }
@@ -406,6 +410,83 @@ pub fn wrap_text(text: &str, width: usize) -> Vec<String> {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn regression_long_line_checkpoints_do_not_duplicate_virtual_rows() {
+        use helix_core::doc_formatter::{DocumentFormatter, TextFormat};
+        use helix_core::text_annotations::TextAnnotations;
+        use helix_core::Rope;
+        let text = Rope::from(format!("{}\ntail\n", "x".repeat(10_000)));
+        let format = TextFormat {
+            soft_wrap: true,
+            viewport_width: 32,
+            ..TextFormat::default()
+        };
+        let mut builder = VirtualRowPlanBuilder::new();
+        builder.add_comment_rows(0, vec![VirtualRow::Spacer; 3]);
+        let mut annotations = TextAnnotations::default();
+        annotations.add_line_annotation(Box::new(VirtualRowLines::new(Rc::new(builder.build()))));
+        for anchor in [0, 5_000, 9_000] {
+            let graphemes: Vec<_> = DocumentFormatter::new_at_prev_checkpoint(
+                text.slice(..),
+                &format,
+                &annotations,
+                anchor,
+            )
+            .collect();
+            let mut rows: Vec<_> = graphemes
+                .iter()
+                .filter(|g| g.line_idx == 0)
+                .map(|g| g.visual_pos.row)
+                .collect();
+            rows.dedup();
+            assert_eq!(rows, (0..rows.len()).collect::<Vec<_>>());
+            assert_eq!(
+                graphemes
+                    .iter()
+                    .find(|g| g.line_idx == 1)
+                    .unwrap()
+                    .visual_pos
+                    .row,
+                rows.len() + 3
+            );
+        }
+    }
+
+    #[test]
+    fn regression_virtual_rows_follow_the_last_wrapped_row() {
+        use helix_core::doc_formatter::{DocumentFormatter, TextFormat};
+        use helix_core::text_annotations::TextAnnotations;
+        let text = helix_core::Rope::from("one two three four five six\ntail\n");
+        let format = TextFormat {
+            soft_wrap: true,
+            viewport_width: 8,
+            ..TextFormat::default()
+        };
+        let mut builder = VirtualRowPlanBuilder::new();
+        builder.add_comment_rows(0, vec![VirtualRow::Spacer; 3]);
+        let mut annotations = TextAnnotations::default();
+        annotations.add_line_annotation(Box::new(VirtualRowLines::new(Rc::new(builder.build()))));
+        let formatted: Vec<_> =
+            DocumentFormatter::new_at_prev_checkpoint(text.slice(..), &format, &annotations, 0)
+                .collect();
+        let mut rows: Vec<_> = formatted
+            .iter()
+            .filter(|g| g.line_idx == 0)
+            .map(|g| g.visual_pos.row)
+            .collect();
+        rows.dedup();
+        assert_eq!(rows, (0..rows.len()).collect::<Vec<_>>());
+        assert_eq!(
+            formatted
+                .iter()
+                .find(|g| g.line_idx == 1)
+                .unwrap()
+                .visual_pos
+                .row,
+            rows.len() + 3
+        );
+    }
 
     #[test]
     fn wrap_breaks_on_words() {

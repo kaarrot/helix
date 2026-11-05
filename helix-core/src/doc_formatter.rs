@@ -590,9 +590,11 @@ impl<'t> DocumentFormatter<'t> {
         };
 
         if advance_row {
-            let virtual_lines =
-                self.annotations
-                    .virtual_lines_at(self.char_pos, self.visual_pos, self.line_pos);
+            let virtual_lines = self.annotations.virtual_lines_at_soft_wrap(
+                self.char_pos,
+                self.visual_pos,
+                self.line_pos,
+            );
             self.visual_pos.row += 1 + virtual_lines;
         }
         self.visual_pos.col = indent_carry_over as usize;

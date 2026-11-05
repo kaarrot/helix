@@ -203,7 +203,7 @@ impl Decoration for VirtualRowDecoration {
         pos: LinePos,
         virt_off: Position,
     ) -> Position {
-        if !pos.first_visual_line {
+        if !pos.last_visual_line {
             return Position::default();
         }
         let rows = self.plan.rows_at(pos.doc_line);

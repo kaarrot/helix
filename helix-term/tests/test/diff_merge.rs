@@ -127,6 +127,40 @@ fn conflicted_repo() -> anyhow::Result<GitRepoFixture> {
     Ok(repo)
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn regression_opening_a_diff_replaces_the_merge_session() -> anyhow::Result<()> {
+    let repo = conflicted_repo()?;
+    let _cwd = CwdGuard::enter(repo.path()).await?;
+    for split in [true, false] {
+        for target in [None, Some("feature")] {
+            let file = repo.file("conflict.txt");
+            let mut app = AppBuilder::new().with_file(&file, None).build()?;
+            app.editor.open_merge_view(&file)?;
+            assert_eq!(app.editor.diff.merge_views.len(), 3);
+            match target {
+                None => app.editor.open_diff_view(&file, "HEAD", Some(split))?,
+                Some(target) => {
+                    app.editor
+                        .open_diff_view_range(&file, "HEAD", Some(target), Some(split))?
+                }
+            }
+            assert!(
+                app.editor.diff.merge_views.is_empty(),
+                "split={split}, target={target:?}"
+            );
+            let count = if split { 2 } else { 1 };
+            assert_eq!(app.editor.tree.views().count(), count);
+            assert_eq!(app.editor.diff.views.len(), count);
+            for (view, _) in app.editor.tree.views() {
+                assert!(app.editor.document(view.doc).is_some());
+            }
+            app.editor.close_diff_view(app.editor.tree.focus);
+            AppTestHarness::new().close(&mut app).await?;
+        }
+    }
+    Ok(())
+}
+
 async fn check_merge_result_close(command: &str) -> anyhow::Result<()> {
     let repo = conflicted_repo()?;
     let _cwd = CwdGuard::enter(repo.path()).await?;

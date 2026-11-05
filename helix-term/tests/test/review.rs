@@ -1,6 +1,36 @@
 use helix_term::application::Application;
 use helix_view::review::{ReviewRev, ThreadId};
 
+#[tokio::test(flavor = "multi_thread")]
+async fn regression_switching_conversations_clears_a_save_block() -> anyhow::Result<()> {
+    let repo = GitRepoFixture::new()?;
+    repo.write_file("file.txt", "one\n")?;
+    repo.commit_all("initial")?;
+    let _cwd = CwdGuard::enter(repo.path()).await?;
+    let mut app = AppBuilder::new()
+        .with_file(repo.file("file.txt"), None)
+        .build()?;
+    let mut harness = AppTestHarness::new();
+    for claimed in [false, true] {
+        if claimed {
+            assert!(
+                harness
+                    .send_keys(&mut app, ":review-session broken<ret>")
+                    .await?
+            );
+        }
+        app.editor.diff.reviews.save_blocked = true;
+        assert!(
+            harness
+                .send_keys(&mut app, ":review-session clean<ret>")
+                .await?
+        );
+        assert!(!app.editor.diff.reviews.save_blocked);
+    }
+    harness.close(&mut app).await?;
+    Ok(())
+}
+
 use super::*;
 
 fn thread_count(app: &Application) -> usize {

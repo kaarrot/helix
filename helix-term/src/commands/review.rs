@@ -331,6 +331,18 @@ impl CommentInput {
         self.lines.join("\n")
     }
 
+    fn cursor_position(&self) -> Option<helix_core::Position> {
+        use helix_core::unicode::width::UnicodeWidthStr;
+        if self.area.width == 0 || self.area.height == 0 {
+            return None;
+        }
+        let prefix: String = self.lines.get(self.row)?.chars().take(self.col).collect();
+        Some(helix_core::Position::new(
+            (self.area.y as usize + 1 + self.row).min(self.area.bottom() as usize - 1),
+            (self.area.x as usize + 1 + prefix.width()).min(self.area.right() as usize - 1),
+        ))
+    }
+
     fn insert(&mut self, c: char) {
         let line = &mut self.lines[self.row];
         let at = line
@@ -590,10 +602,7 @@ impl crate::compositor::Component for CommentInput {
     ) {
         // Against where it was actually drawn, not the viewport it was offered.
         (
-            Some(helix_core::Position::new(
-                self.area.y as usize + 1 + self.row,
-                self.area.x as usize + 1 + self.col,
-            )),
+            self.cursor_position(),
             helix_view::graphics::CursorKind::Block,
         )
     }
@@ -2827,6 +2836,21 @@ mod test {
 
     use super::comment_box_ctrl_s;
     use helix_view::input::{KeyCode, KeyEvent, KeyModifiers};
+
+    #[test]
+    fn regression_comment_cursor_uses_display_columns_and_stays_inside_its_box() {
+        use helix_core::Position;
+        use helix_view::graphics::Rect;
+        for (text, width) in [("界a", 3), ("e\u{301}", 1), ("🙂", 2)] {
+            let mut input = super::CommentInput::new("comment".into(), None, text, |_, _, _| {});
+            input.area = Rect::new(10, 5, 20, 4);
+            assert_eq!(input.cursor_position(), Some(Position::new(6, 11 + width)));
+            input.area = Rect::new(10, 5, 2, 1);
+            assert_eq!(input.cursor_position(), Some(Position::new(5, 11)));
+            input.area = Rect::default();
+            assert_eq!(input.cursor_position(), None);
+        }
+    }
 
     fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
         KeyEvent { code, modifiers }

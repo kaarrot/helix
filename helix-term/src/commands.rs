@@ -3199,7 +3199,7 @@ fn global_search(cx: &mut Context) {
             // Walks `walk_root` in parallel, optionally pruning `skip` — a path
             // already covered by an earlier phase — to avoid duplicate results.
             let run_walk = |walk_root: &Path, skip: Option<&Path>| {
-                let Some(mut walker) =
+                let Some(walker) =
                     global_search_walk(walk_root, &search_root, skip, &config.file_picker_config)
                 else {
                     return;
@@ -8392,11 +8392,19 @@ mod tests {
             std::fs::write(root.join(path), "needle").unwrap();
         }
         let current = root.join("deep/nested/current.txt");
-        let mut files = scoped_files(root, &current, Some(1));
-        files.sort();
-        let mut expected = vec![current, root.join("root.txt")];
-        expected.sort();
-        assert_eq!(files, expected);
+        for (depth, additional) in [
+            (0, vec![]),
+            (1, vec!["root.txt"]),
+            (2, vec!["root.txt", "deep/peer.txt"]),
+            (3, vec!["root.txt", "deep/peer.txt", "deep/nested/peer.txt"]),
+        ] {
+            let mut files = scoped_files(root, &current, Some(depth));
+            files.sort();
+            let mut expected = vec![current.clone()];
+            expected.extend(additional.into_iter().map(|path| root.join(path)));
+            expected.sort();
+            assert_eq!(files, expected, "max_depth={depth}");
+        }
     }
 
     #[cfg(unix)]

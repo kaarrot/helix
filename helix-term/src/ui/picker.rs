@@ -1260,6 +1260,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
                 area.height,
                 area.width,
                 offset.horizontal_offset,
+                &[],
                 &loader,
             );
             let mut overlay_highlights = Vec::new();

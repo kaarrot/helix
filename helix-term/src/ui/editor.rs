@@ -197,16 +197,14 @@ impl EditorView {
             decorations.add_decoration(Self::line_decoration(inner, line, style));
         }
 
-        // Folds put more document lines on screen than there are rows, and all of
-        // them need highlights.
-        let text_lines = view.estimate_doc_lines_in_view(doc);
-        let text_height = u16::try_from(text_lines).unwrap_or(u16::MAX);
+        let text_height = inner.height;
         let syntax_highlighter = Self::doc_syntax_highlighter(
             doc,
             view_offset.anchor,
             text_height,
             inner.width,
             view_offset.horizontal_offset,
+            doc.folds(view.id),
             &loader,
         );
         let mut overlays = Vec::new();
@@ -231,6 +229,7 @@ impl EditorView {
                 text_height,
                 inner.width,
                 view_offset.horizontal_offset,
+                doc.folds(view.id),
                 theme,
                 &loader,
             ) {
@@ -406,6 +405,7 @@ impl EditorView {
         width: u16,
         horizontal_offset: usize,
         text_fmt: &TextFormat,
+        folds: &[helix_core::fold::Fold],
     ) -> std::ops::Range<usize> {
         // The renderer formats from the start of the anchor's block, so highlights have to
         // be available from there -- not merely from the anchor.
@@ -415,7 +415,11 @@ impl EditorView {
         // Calculate viewport byte ranges:
         // Saturating subs to make it inclusive zero indexing.
         let last_line = text.len_lines().saturating_sub(1);
-        let last_visible_line = (row + height as usize).saturating_sub(1).min(last_line);
+        let doc_lines = helix_core::fold::lines_for_rows(folds, text, row, height as usize);
+        let last_visible_line = row
+            .saturating_add(doc_lines)
+            .saturating_sub(1)
+            .min(last_line);
         let start = text.char_to_byte(start_char);
 
         // With soft wrap off the renderer walks each line up to the clip column, so the
@@ -424,9 +428,20 @@ impl EditorView {
             .saturating_mul(height as usize)
             .saturating_mul(Self::MAX_CHARS_PER_COLUMN)
             .saturating_add(anchor - start_char);
-        let end_char = start_char
+        let mut end_char = start_char
             .saturating_add(visible_chars)
             .min(text.len_chars());
+        let line_end = text.line_to_char(last_visible_line + 1);
+        // Concealed characters consume no screen columns. Add them back to
+        // the budget so highlights extend through every visible line below.
+        for fold in folds.iter().filter(|fold| fold.end > start_char) {
+            if fold.start > end_char || fold.start >= line_end {
+                break;
+            }
+            end_char = end_char
+                .saturating_add(fold.end - fold.start.max(start_char))
+                .min(text.len_chars());
+        }
         let end = text
             .line_to_byte(last_visible_line + 1)
             .min(text.char_to_byte(end_char));
@@ -443,13 +458,21 @@ impl EditorView {
         height: u16,
         width: u16,
         horizontal_offset: usize,
+        folds: &[helix_core::fold::Fold],
         loader: &'editor syntax::Loader,
     ) -> Option<syntax::Highlighter<'editor>> {
         let syntax = doc.syntax()?;
         let text = doc.text().slice(..);
         let text_fmt = doc.text_format(width, None);
-        let range =
-            Self::viewport_byte_range(text, anchor, height, width, horizontal_offset, &text_fmt);
+        let range = Self::viewport_byte_range(
+            text,
+            anchor,
+            height,
+            width,
+            horizontal_offset,
+            &text_fmt,
+            folds,
+        );
         let range = range.start as u32..range.end as u32;
 
         let highlighter = syntax.highlighter(text, loader, range);
@@ -467,8 +490,15 @@ impl EditorView {
         let text = doc.text().slice(..);
         let text_fmt = doc.text_format(width, None);
 
-        let mut range =
-            Self::viewport_byte_range(text, anchor, height, width, horizontal_offset, &text_fmt);
+        let mut range = Self::viewport_byte_range(
+            text,
+            anchor,
+            height,
+            width,
+            horizontal_offset,
+            &text_fmt,
+            text_annotations.folds(),
+        );
         range = text.byte_to_char(range.start)..text.byte_to_char(range.end);
 
         text_annotations.collect_overlay_highlights(range)
@@ -480,14 +510,22 @@ impl EditorView {
         height: u16,
         width: u16,
         horizontal_offset: usize,
+        folds: &[helix_core::fold::Fold],
         theme: &Theme,
         loader: &syntax::Loader,
     ) -> Option<OverlayHighlights> {
         let syntax = doc.syntax()?;
         let text = doc.text().slice(..);
         let text_fmt = doc.text_format(width, None);
-        let visible_range =
-            Self::viewport_byte_range(text, anchor, height, width, horizontal_offset, &text_fmt);
+        let visible_range = Self::viewport_byte_range(
+            text,
+            anchor,
+            height,
+            width,
+            horizontal_offset,
+            &text_fmt,
+            folds,
+        );
         let start = syntax::child_for_byte_range(
             &syntax.tree().root_node(),
             visible_range.start as u32..visible_range.end as u32,
@@ -2711,6 +2749,35 @@ fn tint(color: [u8; 3], base: [u8; 3]) -> Option<[u8; 3]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn regression_highlights_extend_below_a_large_fold() {
+        let text = helix_core::Rope::from(format!("header\n{}\nvisible\n", "x".repeat(200_000)));
+        let fold = helix_core::fold::Fold::new(text.slice(..), 0, 1).unwrap();
+        let range = EditorView::viewport_byte_range(
+            text.slice(..),
+            0,
+            3,
+            20,
+            0,
+            &TextFormat::default(),
+            &[fold],
+        );
+        assert_eq!(range.end, text.len_bytes());
+        let plain = EditorView::viewport_byte_range(
+            text.slice(..),
+            0,
+            3,
+            20,
+            0,
+            &TextFormat::default(),
+            &[],
+        );
+        assert!(
+            plain.end < 2000,
+            "unfolded long lines keep their rendering budget"
+        );
+    }
 
     fn distance(a: [u8; 3], b: [u8; 3]) -> f32 {
         (0..3)

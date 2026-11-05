@@ -839,11 +839,15 @@ impl View {
             ) {
                 let format = doc.text_format(self.inner_width(doc), None);
                 let peer_format = other_doc.text_format(other_view.inner_width(other_doc), None);
-                if format.soft_wrap || peer_format.soft_wrap {
+                if format.soft_wrap
+                    || peer_format.soft_wrap
+                    || !doc.folds(self.id).is_empty()
+                    || !other_doc.folds(other_view_id).is_empty()
+                {
                     // Only measure lines that can appear in this viewport.
                     // Counting the whole file on every render makes wrapped
-                    // large diffs slow. Every line takes a row at least, so
-                    // this reaches past a large vertical offset too.
+                    // large diffs slow. Include the document lines hidden by
+                    // folds so visible lines below them are measured too.
                     let text = doc.text();
                     let offset = doc.view_offset(self.id);
                     let first = text
@@ -851,7 +855,7 @@ impl View {
                         .saturating_sub(1);
                     let end = first
                         .saturating_add(offset.vertical_offset)
-                        .saturating_add(self.inner_height())
+                        .saturating_add(self.estimate_doc_lines_in_view(doc))
                         .saturating_add(3)
                         .min(text.len_lines());
                     builder.add_wrapped_diff_spacers(
@@ -860,6 +864,8 @@ impl View {
                         &format,
                         &peer_format,
                         first..end,
+                        &self.text_annotations(doc, None),
+                        &other_view.text_annotations(other_doc, None),
                     );
                 } else {
                     builder.add_diff_spacers(diff_handle);
@@ -930,6 +936,7 @@ impl View {
             }
         }
 
+        builder.retain_visible_rows(doc.text(), doc.folds(self.id));
         let plan = builder.build();
         (!plan.is_empty()).then(|| std::rc::Rc::new(plan))
     }

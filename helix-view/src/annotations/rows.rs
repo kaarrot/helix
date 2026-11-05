@@ -505,7 +505,12 @@ mod test {
         };
         let mut builder = VirtualRowPlanBuilder::new();
         builder.add_comment_rows(0, vec![VirtualRow::Spacer; 3]);
+        let inline = [helix_core::text_annotations::InlineAnnotation::new(
+            1,
+            "inline\nannotation",
+        )];
         let mut annotations = TextAnnotations::default();
+        annotations.add_inline_annotations(&inline, None);
         annotations.add_line_annotation(Box::new(VirtualRowLines::new(Rc::new(builder.build()))));
         let formatted: Vec<_> =
             DocumentFormatter::new_at_prev_checkpoint(text.slice(..), &format, &annotations, 0)

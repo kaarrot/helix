@@ -914,9 +914,16 @@ impl<'t> Iterator for DocumentFormatter<'t> {
         if grapheme.raw == Grapheme::Newline {
             // move to end of newline char
             self.visual_pos.col += 1;
-            let virtual_lines =
+            let virtual_lines = if grapheme.is_virtual() {
+                self.annotations.virtual_lines_at_soft_wrap(
+                    self.char_pos,
+                    self.visual_pos,
+                    self.line_pos,
+                )
+            } else {
                 self.annotations
-                    .virtual_lines_at(self.char_pos, self.visual_pos, self.line_pos);
+                    .virtual_lines_at(self.char_pos, self.visual_pos, self.line_pos)
+            };
             self.visual_pos.row += 1 + virtual_lines;
             self.visual_pos.col = 0;
             if !grapheme.is_virtual() {

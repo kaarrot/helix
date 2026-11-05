@@ -197,6 +197,7 @@ impl EditorView {
             decorations.add_decoration(Self::line_decoration(inner, line, style));
         }
 
+        let text_lines = view.estimate_doc_lines_in_view(doc);
         let text_height = inner.height;
         let syntax_highlighter = Self::doc_syntax_highlighter(
             doc,

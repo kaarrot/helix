@@ -16,11 +16,104 @@ use tui::buffer::Buffer as Surface;
 
 use crate::ui::text_decorations::DecorationManager;
 
+#[cfg(test)]
+mod virtual_row_tests {
+    use super::*;
+    use helix_view::annotations::rows::{
+        Attention, CommentRowKind, RowMark, VirtualRow, VirtualRowLines, VirtualRowPlanBuilder,
+    };
+    use std::{cell::RefCell, rc::Rc, sync::Arc};
+
+    #[tokio::test]
+    async fn regression_scrolled_wrapped_comments_do_not_cover_document_text() {
+        let text = helix_core::Rope::from(format!("{}\ntail\n", "word ".repeat(8)));
+        let doc = Document::from(
+            text.clone(),
+            None,
+            Arc::new(arc_swap::ArcSwap::from_pointee(
+                helix_view::editor::Config::default(),
+            )),
+            Arc::new(arc_swap::ArcSwap::from_pointee(
+                helix_core::syntax::Loader::default(),
+            )),
+        );
+        for soft_wrap in [false, true] {
+            let format = TextFormat {
+                soft_wrap,
+                viewport_width: 12,
+                ..TextFormat::default()
+            };
+            let plain = TextAnnotations::default();
+            let tail_row =
+                DocumentFormatter::new_at_prev_checkpoint(text.slice(..), &format, &plain, 0)
+                    .find(|g| g.line_idx == 1)
+                    .unwrap()
+                    .visual_pos
+                    .row;
+            for offset in 0..=tail_row.min(2) {
+                let mut builder = VirtualRowPlanBuilder::new();
+                builder.add_comment_rows(
+                    0,
+                    vec![VirtualRow::Comment {
+                        thread: helix_view::review::ThreadId(1),
+                        kind: CommentRowKind::User,
+                        text: "review".into(),
+                        spans: Vec::new(),
+                        attention: Attention::Idle,
+                        mark: RowMark::None,
+                        body: Some(0),
+                    }],
+                );
+                let plan = Rc::new(builder.build());
+                let mut annotations = TextAnnotations::default();
+                annotations.add_line_annotation(Box::new(VirtualRowLines::new(plan.clone())));
+                let theme = &helix_view::theme::DEFAULT_THEME;
+                let hits = Rc::new(RefCell::new(Vec::new()));
+                let mut decorations = DecorationManager::default();
+                decorations.add_decoration(crate::ui::diff::VirtualRowDecoration::new(
+                    plan,
+                    theme,
+                    helix_view::ViewId::default(),
+                    hits.clone(),
+                ));
+                let area = Rect::new(0, 0, 12, 12);
+                let mut surface = Surface::empty(area);
+                let mut renderer =
+                    TextRenderer::new(&mut surface, &doc, theme, Position::new(offset, 0), area);
+                render_text(
+                    &mut renderer,
+                    text.slice(..),
+                    0,
+                    &format,
+                    &annotations,
+                    None,
+                    Vec::new(),
+                    theme,
+                    decorations,
+                );
+                assert_eq!(hits.borrow()[0].row as usize, tail_row - offset);
+                let tail = (0..4)
+                    .map(|x| {
+                        surface
+                            .get(x, (tail_row + 1 - offset) as u16)
+                            .unwrap()
+                            .symbol
+                            .as_str()
+                    })
+                    .collect::<String>();
+                assert_eq!(tail, "tail");
+            }
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
 pub struct LinePos {
     /// Indicates whether the given visual line
     /// is the first visual line of the given document line
     pub first_visual_line: bool,
+    /// Whether this visual row ends the document line (including EOF).
+    pub last_visual_line: bool,
     /// The line index of the document line that contains the given visual line
     pub doc_line: usize,
     /// Vertical offset from the top of the inner view area
@@ -83,6 +176,7 @@ pub fn render_text(
 
     let mut last_line_pos = LinePos {
         first_visual_line: false,
+        last_visual_line: false,
         doc_line: usize::MAX,
         visual_line: u16::MAX,
     };
@@ -106,6 +200,12 @@ pub fn render_text(
             reached_view_top = true;
         }
 
+        // Looking at the next row also handles renderers that skip a clipped
+        // line's tail without yielding its newline.
+        if grapheme.visual_pos.row as u16 != last_line_pos.visual_line {
+            last_line_pos.last_visual_line = grapheme.line_idx != last_line_pos.doc_line;
+        }
+
         // if the end of the viewport is reached stop rendering
         if grapheme.visual_pos.row as u16 >= renderer.viewport.height + renderer.offset.row as u16 {
             break;
@@ -125,11 +225,15 @@ pub fn render_text(
             }
             last_line_pos = LinePos {
                 first_visual_line: grapheme.line_idx != last_line_pos.doc_line,
+                last_visual_line: false,
                 doc_line: grapheme.line_idx,
                 visual_line: grapheme.visual_pos.row as u16,
             };
             decorations.decorate_line(renderer, last_line_pos);
         }
+
+        last_line_pos.last_visual_line = !grapheme.is_virtual()
+            && (grapheme.raw == Grapheme::Newline || grapheme.source.is_eof());
 
         // acquire the correct grapheme style
         while grapheme.char_idx >= syntax_highlighter.pos {

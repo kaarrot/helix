@@ -1125,9 +1125,9 @@ impl Document {
             }
         };
 
-        if pgp_save.is_none() && pgp::is_new_file_path(&path) && !path.exists() {
+        if pgp_save.is_none() && pgp::is_new_file_path(&path) {
             bail!(
-                "won't write plain text to a new encrypted file; open {} to set its passphrase",
+                "won't write plain text to an encrypted file; open {} to set its passphrase",
                 path.display()
             );
         }
@@ -1888,10 +1888,9 @@ impl Document {
         view_id: ViewId,
         emit_lsp_notification: bool,
     ) -> bool {
-        // Only git-revision panes refuse edits. A file the user can't write
-        // stays editable like upstream and fails at `:w`, which also keeps
-        // `:reload` working on it.
-        if self.is_virtual_base && !transaction.changes().is_empty() {
+        // Git revisions and locked encrypted buffers refuse edits. A file
+        // the user cannot write stays editable and reports its error at :w.
+        if (self.is_virtual_base || self.is_pgp_locked()) && !transaction.changes().is_empty() {
             return false;
         }
 
@@ -2135,6 +2134,10 @@ impl Document {
             self.old_state = None;
             self.history.set(History::default());
             self.reset_modified();
+            if self.language.is_none() {
+                let loader = self.syn_loader.load();
+                self.detect_language(&loader);
+            }
             self.detect_indent_and_line_ending();
         }
         self.detect_readonly();
@@ -3166,6 +3169,75 @@ mod test {
         );
         assert!(doc.save(Some(dir.path().join("fresh.gpg")), false).is_err());
         assert!(!dir.path().join("fresh.gpg").exists());
+    }
+
+    #[cfg(feature = "pgp")]
+    #[tokio::test]
+    async fn regression_plaintext_cannot_overwrite_an_encrypted_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("existing.gpg");
+        let contents = include_bytes!("../tests/pgp/hello.txt.asc");
+        std::fs::write(&path, contents).unwrap();
+        let mut doc = open(&dir.path().join("plain.txt")).unwrap();
+        let result = match doc.save(Some(path.clone()), true) {
+            Ok(save) => save.await.map(|_| ()),
+            Err(err) => Err(err),
+        };
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), contents);
+    }
+
+    #[cfg(feature = "pgp")]
+    #[test]
+    fn regression_locked_documents_reject_transactions() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut doc = open(&dir.path().join("new.gpg")).unwrap();
+        let view = ViewId::default();
+        doc.ensure_view_init(view);
+        let version = doc.version();
+        let transaction = Transaction::insert(doc.text(), &Selection::point(0), "secret".into());
+        assert!(!doc.apply(&transaction, view));
+        assert!(!doc.apply_temporary(&transaction, view));
+        assert_eq!(doc.version(), version);
+        assert!(!doc.is_modified());
+    }
+
+    #[cfg(feature = "pgp")]
+    #[tokio::test]
+    async fn regression_unlock_detects_the_decrypted_shebang() {
+        use crate::pgp::{encrypt, Passphrase};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("script.gpg");
+        let passphrase = Passphrase::new("test");
+        std::fs::write(
+            &path,
+            encrypt(
+                b"#!/usr/bin/python\nprint(1)\n",
+                &passphrase,
+                false,
+                "script",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let loader = syntax::Loader::new(
+            helix_loader::config::default_lang_config()
+                .try_into()
+                .unwrap(),
+        )
+        .unwrap();
+        let mut doc = Document::open(
+            &path,
+            None,
+            false,
+            Arc::new(ArcSwap::from_pointee(Config::default())),
+            Arc::new(ArcSwap::from_pointee(loader)),
+        )
+        .unwrap();
+        doc.ensure_view_init(ViewId::default());
+        assert!(doc.language.is_none());
+        doc.pgp_unlock(passphrase).unwrap();
+        assert_eq!(doc.language_name(), Some("python"));
     }
 
     #[test]

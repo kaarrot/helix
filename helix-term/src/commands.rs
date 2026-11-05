@@ -7271,6 +7271,14 @@ fn cancel_stream_command(cx: &mut compositor::Context) {
     }
 }
 
+fn is_stream_output_buffer(doc: &Document) -> bool {
+    doc.path().is_none()
+        && !doc.readonly
+        && !doc.is_transcript
+        && !doc.is_virtual_base
+        && !doc.is_pgp_locked()
+}
+
 /// Picks the buffer a new stream session writes to.
 ///
 /// Output never goes into a file. Started from a file buffer, a session
@@ -7278,12 +7286,13 @@ fn cancel_stream_command(cx: &mut compositor::Context) {
 /// for its output when there is none, so the first `::` from a file lands in
 /// the same kind of place as every later one. A fresh scratch buffer (`:new`)
 /// takes the output in place.
+
 fn prepare_stream_output_buffer(cx: &mut compositor::Context) {
     let (current_doc_id, current_is_output_buffer, current_len_chars) = {
         let (_, doc) = current!(cx.editor);
         (
             doc.id(),
-            doc.path().is_none() && !doc.readonly,
+            is_stream_output_buffer(doc),
             doc.text().len_chars(),
         )
     };
@@ -7291,7 +7300,7 @@ fn prepare_stream_output_buffer(cx: &mut compositor::Context) {
     let last_doc_id = last_doc_id.filter(|doc_id| {
         cx.editor
             .document(*doc_id)
-            .is_some_and(|doc| doc.path().is_none() && !doc.readonly)
+            .is_some_and(is_stream_output_buffer)
     });
 
     match last_doc_id {

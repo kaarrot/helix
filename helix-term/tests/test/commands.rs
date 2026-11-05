@@ -18,6 +18,64 @@ static STREAM_TEST_LOCK: Lazy<Arc<tokio::sync::Mutex<()>>> =
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
+async fn regression_stream_output_preserves_transcript_and_virtual_buffers() -> anyhow::Result<()> {
+    let _lock = Arc::clone(&STREAM_TEST_LOCK).lock_owned().await;
+    for transcript in [true, false] {
+        let mut app = AppBuilder::new()
+            .with_input_text("#[|]#original\n")
+            .build()?;
+        let original = doc!(app.editor).id();
+        let doc = app.editor.document_mut(original).unwrap();
+        doc.is_transcript = transcript;
+        doc.is_virtual_base = !transcript;
+        send_key_sequence(&mut app, ":insert-stream-output printf finished<ret>").await?;
+        wait_for_condition(&mut app, "stream in its own scratch buffer", |app| {
+            app.editor
+                .get_status()
+                .is_some_and(|(s, _)| s.starts_with("Stream completed"))
+        })
+        .await?;
+        assert_ne!(doc!(app.editor).id(), original);
+        assert_eq!(
+            app.editor.document(original).unwrap().text().to_string(),
+            "original\n"
+        );
+        close_app(&mut app).await?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn regression_stream_output_revalidates_a_remembered_transcript() -> anyhow::Result<()> {
+    let _lock = Arc::clone(&STREAM_TEST_LOCK).lock_owned().await;
+    let mut app = AppBuilder::new().build()?;
+    send_key_sequence(&mut app, ":insert-stream-output printf first<ret>").await?;
+    wait_for_condition(&mut app, "first stream completed", |app| {
+        app.editor
+            .get_status()
+            .is_some_and(|(s, _)| s.starts_with("Stream completed"))
+    })
+    .await?;
+    let original = doc!(app.editor).id();
+    let text = doc!(app.editor).text().clone();
+    app.editor.document_mut(original).unwrap().is_transcript = true;
+    app.editor.new_file(Action::Replace);
+    send_key_sequence(&mut app, "ix<esc>:insert-stream-output printf second<ret>").await?;
+    wait_for_condition(&mut app, "second stream completed", |app| {
+        app.editor
+            .get_status()
+            .is_some_and(|(s, _)| s.starts_with("Stream completed"))
+    })
+    .await?;
+    assert_ne!(doc!(app.editor).id(), original);
+    assert_eq!(app.editor.document(original).unwrap().text(), &text);
+    close_app(&mut app).await?;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_insert_stream_output_survives_closing_its_original_view() -> anyhow::Result<()> {
     let _lock = Arc::clone(&STREAM_TEST_LOCK).lock_owned().await;
     let mut app = AppBuilder::new().build()?;

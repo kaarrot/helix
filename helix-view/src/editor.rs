@@ -3720,6 +3720,9 @@ impl Editor {
         let focused_view = self.tree.focus;
         let previous_view = self.tree.get(focused_view).clone();
         self.forget_suspended_diffs(focused_view);
+        if self.diff.merge_views.contains_key(&focused_view) {
+            self.close_merge_session_leaving_view(focused_view, &[base_doc_id, working_doc_id]);
+        }
         if self.diff.views.contains_key(&focused_view) {
             self.detach_diff_for_replacement(focused_view);
         }
@@ -4299,6 +4302,12 @@ impl Editor {
                 let focused_view = self.tree.focus;
                 let previous_view = self.tree.get(focused_view).clone();
                 self.forget_suspended_diffs(focused_view);
+                if self.diff.merge_views.contains_key(&focused_view) {
+                    self.close_merge_session_leaving_view(
+                        focused_view,
+                        &[base_doc_id, target_doc_id],
+                    );
+                }
                 if self.diff.views.contains_key(&focused_view) {
                     self.detach_diff_for_replacement(focused_view);
                 }

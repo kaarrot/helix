@@ -54,10 +54,14 @@ pub struct ConflictScan {
 /// block must never become an apparently resolved file, or a smaller block
 /// whose acceptance silently discards content.
 pub fn scan_conflicts(text: &Rope) -> ConflictScan {
-    scan_conflicts_with_size(text, 7)
+    scan_conflicts_impl(text, None)
 }
 
 pub fn scan_conflicts_with_size(text: &Rope, marker_size: usize) -> ConflictScan {
+    scan_conflicts_impl(text, Some(marker_size))
+}
+
+fn scan_conflicts_impl(text: &Rope, marker_size: Option<usize>) -> ConflictScan {
     let mut scan = ConflictScan::default();
     let mut start: Option<(usize, usize)> = None;
     let mut state = 0;
@@ -68,6 +72,12 @@ pub fn scan_conflicts_with_size(text: &Rope, marker_size: usize) -> ConflictScan
         let Some((kind, width)) = marker(s, marker_size) else {
             continue;
         };
+        // A divider without an open conflict is ordinary text, for example a
+        // Markdown heading underline. Labelled orphan markers still signal
+        // damaged conflict syntax and must block destructive merge commands.
+        if kind == '=' && start.is_none() {
+            continue;
+        }
         scan.marker_lines += 1;
         if start.is_some_and(|(_, expected)| width != expected) {
             scan.malformed = true;
@@ -99,13 +109,20 @@ pub fn scan_conflicts_with_size(text: &Rope, marker_size: usize) -> ConflictScan
     scan
 }
 
-fn marker(line: &str, marker_size: usize) -> Option<(char, usize)> {
+fn marker(line: &str, marker_size: Option<usize>) -> Option<(char, usize)> {
     let kind = line.chars().next()?;
     if !matches!(kind, '<' | '|' | '=' | '>') {
         return None;
     }
     let width = line.bytes().take_while(|&b| b == kind as u8).count();
-    (width >= 7 || width == marker_size).then_some((kind, width))
+    let valid_width = marker_size.map_or(width >= 7, |size| width == size);
+    let suffix = &line[width..];
+    let valid_suffix = if kind == '=' {
+        suffix.is_empty()
+    } else {
+        suffix.is_empty() || suffix.starts_with([' ', '\t'])
+    };
+    (valid_width && valid_suffix).then_some((kind, width))
 }
 
 pub fn find_conflicts(text: &Rope) -> Vec<ConflictRegion> {
@@ -138,7 +155,7 @@ pub fn extract_sides(
         }
         let s: String = line.chars().collect();
         let s_trim = s.trim_end_matches(['\n', '\r']);
-        let kind = marker(s_trim, region.marker_size).map(|(kind, _)| kind);
+        let kind = marker(s_trim, Some(region.marker_size)).map(|(kind, _)| kind);
         if i == region.start_line && kind == Some('<') {
             state = 1;
             continue;
@@ -186,6 +203,34 @@ pub fn extract_sides(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn regression_ordinary_banners_are_not_conflicts() {
+        for input in [
+            "Heading\n=======\n",
+            "================================\n",
+            "<<<<<<<operator\n",
+            ">>>>>>>shift\n",
+            "=======suffix\n",
+        ] {
+            let scan = scan_conflicts(&Rope::from(input));
+            assert!(!scan.malformed, "{input:?}");
+            assert_eq!(scan.marker_lines, 0, "{input:?}");
+        }
+        let text =
+            Rope::from("Heading\n=======\n<<<<<<< ours\nours\n=======\ntheirs\n>>>>>>> theirs\n");
+        let scan = scan_conflicts(&text);
+        assert!(!scan.malformed);
+        assert_eq!(scan.regions.len(), 1);
+        assert_eq!(extract_sides(&text, &scan.regions[0]).unwrap().0, "ours\n");
+    }
+
+    #[test]
+    fn regression_known_marker_width_is_exact() {
+        let text = Rope::from("<<<<<<<<< ours\nours\n=========\ntheirs\n>>>>>>>>> theirs\n");
+        assert!(scan_conflicts_with_size(&text, 7).regions.is_empty());
+        assert_eq!(scan_conflicts_with_size(&text, 9).regions.len(), 1);
+    }
 
     const START_MARKER: &str = "<<<<<<<";
     const BASE_MARKER: &str = "|||||||";

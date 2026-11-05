@@ -3010,6 +3010,45 @@ fn global_search_phases(current_file: Option<PathBuf>, search_root: PathBuf) -> 
     phases
 }
 
+fn global_search_walk(
+    walk_root: &Path,
+    search_root: &Path,
+    skip: Option<&Path>,
+    config: &helix_view::editor::FilePickerConfig,
+) -> Option<WalkBuilder> {
+    let depth = walk_root
+        .strip_prefix(search_root)
+        .ok()?
+        .components()
+        .count();
+    let max_depth = match config.max_depth {
+        Some(max) => Some(max.checked_sub(depth)?),
+        None => None,
+    };
+    let absolute_root = search_root
+        .canonicalize()
+        .unwrap_or_else(|_| search_root.to_path_buf());
+    let skip = skip.map(Path::to_path_buf);
+    let dedup_symlinks = config.deduplicate_links;
+    let mut walker = WalkBuilder::new(walk_root);
+    walker
+        .hidden(config.hidden)
+        .parents(config.parents)
+        .ignore(config.ignore)
+        .follow_links(config.follow_symlinks)
+        .git_ignore(config.git_ignore)
+        .git_global(config.git_global)
+        .git_exclude(config.git_exclude)
+        .max_depth(max_depth)
+        .filter_entry(move |entry| {
+            skip.as_deref() != Some(entry.path())
+                && filter_picker_entry(entry, &absolute_root, dedup_symlinks)
+        })
+        .add_custom_ignore_filename(helix_loader::config_dir().join("ignore"))
+        .add_custom_ignore_filename(".helix/ignore");
+    Some(walker)
+}
+
 fn global_search(cx: &mut Context) {
     #[derive(Debug)]
     struct FileResult {
@@ -3143,7 +3182,6 @@ fn global_search(cx: &mut Context) {
             }
         };
 
-        let dedup_symlinks = config.file_picker_config.deduplicate_links;
         let search_root = config.search_root.clone();
         let current_file = config.current_file.clone();
 
@@ -3161,70 +3199,45 @@ fn global_search(cx: &mut Context) {
             // Walks `walk_root` in parallel, optionally pruning `skip` — a path
             // already covered by an earlier phase — to avoid duplicate results.
             let run_walk = |walk_root: &Path, skip: Option<&Path>| {
-                let absolute_root = walk_root
-                    .canonicalize()
-                    .unwrap_or_else(|_| walk_root.to_path_buf());
-                let skip = skip.map(|p| p.to_path_buf());
-                WalkBuilder::new(walk_root)
-                    .hidden(config.file_picker_config.hidden)
-                    .parents(config.file_picker_config.parents)
-                    .ignore(config.file_picker_config.ignore)
-                    .follow_links(config.file_picker_config.follow_symlinks)
-                    .git_ignore(config.file_picker_config.git_ignore)
-                    .git_global(config.file_picker_config.git_global)
-                    .git_exclude(config.file_picker_config.git_exclude)
-                    .max_depth(config.file_picker_config.max_depth)
-                    .filter_entry(move |entry| {
-                        // Prune a path already searched by an earlier phase.
-                        // Returning `false` for a directory prunes its whole
-                        // subtree.
-                        if skip.as_deref() == Some(entry.path()) {
-                            return false;
+                let Some(mut walker) =
+                    global_search_walk(walk_root, &search_root, skip, &config.file_picker_config)
+                else {
+                    return;
+                };
+                walker.build_parallel().run(|| {
+                    let mut searcher = searcher.clone();
+                    let matcher = matcher.clone();
+                    let injector = injector.clone();
+                    let documents = &documents;
+                    let stopped = stopped.clone();
+                    Box::new(move |entry: Result<DirEntry, ignore::Error>| -> WalkState {
+                        let entry = match entry {
+                            Ok(entry) => entry,
+                            Err(_) => return WalkState::Continue,
+                        };
+
+                        match entry.file_type() {
+                            Some(entry) if entry.is_file() => {}
+                            // skip everything else
+                            _ => return WalkState::Continue,
+                        };
+
+                        if search_entry(entry.path(), &mut searcher, &matcher, documents, &injector)
+                        {
+                            stopped.store(true, Ordering::Relaxed);
+                            WalkState::Quit
+                        } else {
+                            WalkState::Continue
                         }
-                        filter_picker_entry(entry, &absolute_root, dedup_symlinks)
                     })
-                    .add_custom_ignore_filename(helix_loader::config_dir().join("ignore"))
-                    .add_custom_ignore_filename(".helix/ignore")
-                    .build_parallel()
-                    .run(|| {
-                        let mut searcher = searcher.clone();
-                        let matcher = matcher.clone();
-                        let injector = injector.clone();
-                        let documents = &documents;
-                        let stopped = stopped.clone();
-                        Box::new(move |entry: Result<DirEntry, ignore::Error>| -> WalkState {
-                            let entry = match entry {
-                                Ok(entry) => entry,
-                                Err(_) => return WalkState::Continue,
-                            };
-
-                            match entry.file_type() {
-                                Some(entry) if entry.is_file() => {}
-                                // skip everything else
-                                _ => return WalkState::Continue,
-                            };
-
-                            if search_entry(
-                                entry.path(),
-                                &mut searcher,
-                                &matcher,
-                                documents,
-                                &injector,
-                            ) {
-                                stopped.store(true, Ordering::Relaxed);
-                                WalkState::Quit
-                            } else {
-                                WalkState::Continue
-                            }
-                        })
-                    });
+                });
             };
 
             // Search each phase in order — the current file (directly, so the
             // edited buffer is always covered), then its directory, then the
             // workspace root — so matches nearest the current file are injected,
             // and therefore shown, first.
-            for phase in global_search_phases(current_file, search_root) {
+            for phase in global_search_phases(current_file, search_root.clone()) {
                 match phase {
                     SearchPhase::File(file) => {
                         let mut searcher = searcher.clone();
@@ -8329,7 +8342,80 @@ fn lsp_or_syntax_workspace_symbol_picker(cx: &mut Context) {
 
 #[cfg(test)]
 mod tests {
-    use super::{global_search_phases, SearchPhase};
+    use super::{global_search_phases, global_search_walk, SearchPhase};
+
+    fn scoped_files(
+        root: &std::path::Path,
+        current: &std::path::Path,
+        depth: Option<usize>,
+    ) -> Vec<std::path::PathBuf> {
+        let config = helix_view::editor::FilePickerConfig {
+            max_depth: depth,
+            ..Default::default()
+        };
+        let mut files = Vec::new();
+        for phase in global_search_phases(Some(current.to_owned()), root.to_owned()) {
+            match phase {
+                SearchPhase::File(file) => files.push(file),
+                SearchPhase::Walk {
+                    root: walk_root,
+                    skip,
+                } => {
+                    if let Some(walk) =
+                        global_search_walk(&walk_root, root, skip.as_deref(), &config)
+                    {
+                        files.extend(
+                            walk.build()
+                                .filter_map(Result::ok)
+                                .filter(|e| e.file_type().is_some_and(|t| t.is_file()))
+                                .map(|e| e.into_path()),
+                        );
+                    }
+                }
+            }
+        }
+        files
+    }
+
+    #[test]
+    fn regression_search_depth_is_relative_to_the_overall_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("deep/nested/child")).unwrap();
+        for path in [
+            "root.txt",
+            "deep/peer.txt",
+            "deep/nested/current.txt",
+            "deep/nested/peer.txt",
+            "deep/nested/child/hidden.txt",
+        ] {
+            std::fs::write(root.join(path), "needle").unwrap();
+        }
+        let current = root.join("deep/nested/current.txt");
+        let mut files = scoped_files(root, &current, Some(1));
+        files.sort();
+        let mut expected = vec![current, root.join("root.txt")];
+        expected.sort();
+        assert_eq!(files, expected);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn regression_search_deduplicates_links_into_an_ancestor_phase() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir(root.join("near")).unwrap();
+        let current = root.join("near/current.txt");
+        let target = root.join("target.txt");
+        std::fs::write(&current, "needle").unwrap();
+        std::fs::write(&target, "needle").unwrap();
+        std::os::unix::fs::symlink(&target, root.join("near/alias.txt")).unwrap();
+        let files = scoped_files(root, &current, None);
+        assert_eq!(files.len(), 2, "{files:?}");
+        assert!(files.contains(&current));
+        assert!(files.contains(&target));
+    }
+
     use std::path::PathBuf;
 
     #[test]

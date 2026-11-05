@@ -119,6 +119,45 @@ fn missing_file() {
 }
 
 #[test]
+fn regression_diff_in_a_deleted_directory() {
+    let repo = empty_git_repo();
+    write_repo_file(repo.path(), "gone/nested/file.txt", "base\n");
+    create_commit(repo.path(), true);
+    let file = repo.path().join("gone/nested/file.txt");
+    fs::remove_dir_all(repo.path().join("gone")).unwrap();
+    assert_eq!(git::get_diff_base(&file).unwrap(), b"base\n");
+    assert_eq!(
+        git::get_diff_base_from_ref(&file, "HEAD").unwrap(),
+        b"base\n"
+    );
+    assert_eq!(git::get_repo_dir(&file).unwrap(), repo.path());
+    exec_git_cmd(
+        "remote add origin https://example.com/repo.git",
+        repo.path(),
+    );
+    assert_eq!(
+        git::file_web_link(&file, "HEAD").unwrap().path,
+        "gone/nested/file.txt"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn regression_missing_path_preserves_symlink_ancestor() {
+    let repo = empty_git_repo();
+    write_repo_file(repo.path(), "gone/file.txt", "base\n");
+    create_commit(repo.path(), true);
+    fs::remove_dir_all(repo.path().join("gone")).unwrap();
+    let alias_dir = tempfile::tempdir().unwrap();
+    let alias = alias_dir.path().join("alias");
+    std::os::unix::fs::symlink(repo.path(), &alias).unwrap();
+    assert_eq!(
+        git::get_diff_base(&alias.join("gone/file.txt")).unwrap(),
+        b"base\n"
+    );
+}
+
+#[test]
 fn unmodified_file() {
     let temp_git = empty_git_repo();
     let file = temp_git.path().join("file.txt");

@@ -24,19 +24,23 @@ mod test;
 
 #[inline]
 fn get_repo_dir(file: &Path) -> Result<&Path> {
-    file.parent().context("file has no parent directory")
+    file.parent()
+        .context("file has no parent directory")?
+        .ancestors()
+        .find(|path| path.is_dir())
+        .context("file has no existing ancestor directory")
 }
 
 /// Resolve a file path, handling the case where the file doesn't exist yet
-/// (e.g. a deleted file being diffed). Falls back to resolving the parent directory.
+/// (e.g. a deleted file being diffed). Resolve the nearest existing directory,
+/// preserving the missing suffix even when several directories are gone.
 fn resolve_file_path(file: &Path) -> Result<PathBuf> {
     if file.exists() {
         gix::path::realpath(file).context("resolve symlinks")
     } else {
-        let parent = get_repo_dir(file)?;
-        let parent = gix::path::realpath(parent).context("resolve symlinks for parent")?;
-        let file_name = file.file_name().context("file has no file name")?;
-        Ok(parent.join(file_name))
+        let ancestor = get_repo_dir(file)?;
+        let resolved = gix::path::realpath(ancestor).context("resolve symlinks for ancestor")?;
+        Ok(resolved.join(file.strip_prefix(ancestor)?))
     }
 }
 

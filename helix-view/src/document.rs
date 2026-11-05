@@ -2138,6 +2138,10 @@ impl Document {
             self.detect_indent_and_line_ending();
         }
         self.detect_readonly();
+        let views: Vec<_> = self.view_data.keys().copied().collect();
+        for view in views {
+            self.fold_closed_blocks(view);
+        }
         Ok(())
     }
 
@@ -3193,6 +3197,36 @@ mod test {
         doc.set_language_by_language_id("markdown", &loader)
             .unwrap();
         assert!(doc.folds(view).is_empty());
+    }
+
+    #[cfg(feature = "pgp")]
+    #[tokio::test]
+    async fn regression_unlock_initializes_closed_blocks_in_existing_views() {
+        use crate::pgp::{encrypt, Passphrase};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notes.md.gpg");
+        let passphrase = Passphrase::new("test");
+        let contents = b"# title\n\n```rust\nfn a() {}\nfn b() {}\n```\n";
+        std::fs::write(
+            &path,
+            encrypt(contents, &passphrase, false, "notes.md").unwrap(),
+        )
+        .unwrap();
+        let mut doc = Document::open(
+            &path,
+            None,
+            false,
+            Arc::new(ArcSwap::from_pointee(Config::default())),
+            Arc::new(ArcSwap::from_pointee(
+                helix_core::config::default_lang_loader(),
+            )),
+        )
+        .unwrap();
+        let view = ViewId::default();
+        doc.ensure_view_init(view);
+        assert!(doc.folds(view).is_empty());
+        doc.pgp_unlock(passphrase).unwrap();
+        assert_eq!(doc.folds(view).len(), 1);
     }
 
     #[test]

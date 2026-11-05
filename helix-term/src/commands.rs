@@ -6716,20 +6716,28 @@ fn cancel_stream_command(cx: &mut compositor::Context) {
 /// the same kind of place as every later one. A fresh scratch buffer (`:new`)
 /// takes the output in place.
 fn prepare_stream_output_buffer(cx: &mut compositor::Context) {
-    let (current_doc_id, current_is_file_buffer, current_len_chars) = {
+    let (current_doc_id, current_is_output_buffer, current_len_chars) = {
         let (_, doc) = current!(cx.editor);
-        (doc.id(), doc.path().is_some(), doc.text().len_chars())
+        (
+            doc.id(),
+            doc.path().is_none() && !doc.readonly,
+            doc.text().len_chars(),
+        )
     };
     let last_doc_id = *LAST_STREAM_DOC_ID.lock().unwrap();
-    let last_doc_id = last_doc_id.filter(|doc_id| cx.editor.document(*doc_id).is_some());
+    let last_doc_id = last_doc_id.filter(|doc_id| {
+        cx.editor
+            .document(*doc_id)
+            .is_some_and(|doc| doc.path().is_none() && !doc.readonly)
+    });
 
     match last_doc_id {
         Some(doc_id) if doc_id == current_doc_id => {}
         // Preserve existing behavior for a fresh scratch buffer (`:new`) where
         // users expect the first stream to start in the current buffer.
-        Some(_) if !current_is_file_buffer && current_len_chars <= 1 => return,
+        Some(_) if current_is_output_buffer && current_len_chars <= 1 => return,
         Some(doc_id) => cx.editor.switch(doc_id, Action::Replace),
-        None if current_is_file_buffer => {
+        None if !current_is_output_buffer => {
             cx.editor.new_file(Action::Replace);
             return;
         }
@@ -6920,10 +6928,12 @@ async fn insert_stream_command_line(target: &StreamTarget, pos: usize, display_c
     let (tx, rx) = oneshot::channel();
 
     job::dispatch(move |editor, _compositor| {
+        let view_id = stream_edit_view(editor, doc_id, view_id);
         let Some(doc) = editor.document_mut(doc_id) else {
             let _ = tx.send(pos);
             return;
         };
+        doc.ensure_view_init(view_id);
 
         let text = doc.text();
         let insert_pos = pos.min(text.len_chars());
@@ -6936,7 +6946,9 @@ async fn insert_stream_command_line(target: &StreamTarget, pos: usize, display_c
 
         let (transaction, next_pos) = stream_insert_transaction(text, insert_pos, header);
         doc.apply(&transaction, view_id);
-        editor.ensure_cursor_in_view(view_id);
+        if editor.tree.get(view_id).doc == doc_id {
+            editor.ensure_cursor_in_view(view_id);
+        }
         let _ = tx.send(next_pos);
     })
     .await;
@@ -6951,14 +6963,18 @@ async fn insert_stream_chunk(target: &StreamTarget, pos: usize, text: Tendril) -
     let (tx, rx) = oneshot::channel();
 
     job::dispatch(move |editor, _compositor| {
+        let view_id = stream_edit_view(editor, doc_id, view_id);
         let Some(doc) = editor.document_mut(doc_id) else {
             let _ = tx.send(pos);
             return;
         };
+        doc.ensure_view_init(view_id);
 
         let (transaction, next_pos) = stream_insert_transaction(doc.text(), pos, text);
         doc.apply(&transaction, view_id);
-        editor.ensure_cursor_in_view(view_id);
+        if editor.tree.get(view_id).doc == doc_id {
+            editor.ensure_cursor_in_view(view_id);
+        }
         let _ = tx.send(next_pos);
     })
     .await;
@@ -7204,6 +7220,25 @@ async fn run_stream_command(
     pos
 }
 
+// A closed split cannot own selections or receive document-change events.
+// Prefer a view showing the output; otherwise use a live view's cached state
+// for the hidden buffer, without moving that view's cursor or viewport.
+fn stream_edit_view(editor: &Editor, doc_id: DocumentId, preferred: ViewId) -> ViewId {
+    editor
+        .tree
+        .try_get(preferred)
+        .filter(|view| view.doc == doc_id)
+        .map(|view| view.id)
+        .or_else(|| {
+            editor
+                .tree
+                .traverse()
+                .find(|(_, view)| view.doc == doc_id)
+                .map(|(_, view)| view.id)
+        })
+        .unwrap_or(editor.tree.focus)
+}
+
 /// Leaves the cursor after the command's output and reports how it ended.
 async fn finish_stream_command(target: &StreamTarget, pos: usize, outcome: Result<(), String>) {
     let pending = pending_stream_commands(target.generation);
@@ -7211,10 +7246,13 @@ async fn finish_stream_command(target: &StreamTarget, pos: usize, outcome: Resul
     let (doc_id, view_id) = (target.doc_id, target.view_id);
 
     job::dispatch(move |editor, _compositor| {
-        if let Some(doc) = editor.document_mut(doc_id) {
-            let cursor = pos.min(doc.text().len_chars());
-            doc.set_selection(view_id, Selection::point(cursor));
-            editor.ensure_cursor_in_view(view_id);
+        let view_id = stream_edit_view(editor, doc_id, view_id);
+        if editor.tree.get(view_id).doc == doc_id {
+            if let Some(doc) = editor.document_mut(doc_id) {
+                let cursor = pos.min(doc.text().len_chars());
+                doc.set_selection(view_id, Selection::point(cursor));
+                editor.ensure_cursor_in_view(view_id);
+            }
         }
 
         match outcome {

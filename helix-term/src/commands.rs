@@ -7513,7 +7513,10 @@ async fn insert_stream_command_line(target: &StreamTarget, pos: usize, display_c
     let (tx, rx) = oneshot::channel();
 
     job::dispatch(move |editor, _compositor| {
-        let view_id = stream_edit_view(editor, doc_id, view_id);
+        let Some(view_id) = stream_edit_view(editor, doc_id, view_id) else {
+            let _ = tx.send(pos);
+            return;
+        };
         let Some(doc) = editor.document_mut(doc_id) else {
             let _ = tx.send(pos);
             return;
@@ -7548,7 +7551,10 @@ async fn insert_stream_chunk(target: &StreamTarget, pos: usize, text: Tendril) -
     let (tx, rx) = oneshot::channel();
 
     job::dispatch(move |editor, _compositor| {
-        let view_id = stream_edit_view(editor, doc_id, view_id);
+        let Some(view_id) = stream_edit_view(editor, doc_id, view_id) else {
+            let _ = tx.send(pos);
+            return;
+        };
         let Some(doc) = editor.document_mut(doc_id) else {
             let _ = tx.send(pos);
             return;
@@ -7808,7 +7814,7 @@ async fn run_stream_command(
 // A closed split cannot own selections or receive document-change events.
 // Prefer a view showing the output; otherwise use a live view's cached state
 // for the hidden buffer, without moving that view's cursor or viewport.
-fn stream_edit_view(editor: &Editor, doc_id: DocumentId, preferred: ViewId) -> ViewId {
+fn stream_edit_view(editor: &Editor, doc_id: DocumentId, preferred: ViewId) -> Option<ViewId> {
     editor
         .tree
         .try_get(preferred)
@@ -7821,7 +7827,7 @@ fn stream_edit_view(editor: &Editor, doc_id: DocumentId, preferred: ViewId) -> V
                 .find(|(_, view)| view.doc == doc_id)
                 .map(|(_, view)| view.id)
         })
-        .unwrap_or(editor.tree.focus)
+        .or_else(|| editor.tree.try_get(editor.tree.focus).map(|view| view.id))
 }
 
 /// Leaves the cursor after the command's output and reports how it ended.
@@ -7831,8 +7837,9 @@ async fn finish_stream_command(target: &StreamTarget, pos: usize, outcome: Resul
     let (doc_id, view_id) = (target.doc_id, target.view_id);
 
     job::dispatch(move |editor, _compositor| {
-        let view_id = stream_edit_view(editor, doc_id, view_id);
-        if editor.tree.get(view_id).doc == doc_id {
+        if let Some(view_id) = stream_edit_view(editor, doc_id, view_id)
+            .filter(|&view_id| editor.tree.get(view_id).doc == doc_id)
+        {
             if let Some(doc) = editor.document_mut(doc_id) {
                 let cursor = pos.min(doc.text().len_chars());
                 doc.set_selection(view_id, Selection::point(cursor));

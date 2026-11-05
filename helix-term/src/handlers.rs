@@ -25,10 +25,11 @@ mod signature_help;
 mod snippet;
 
 pub fn setup(config: Arc<ArcSwap<Config>>) -> Handlers {
-    // Event IDs are process-global and panic on a second register. Tests that
-    // build more than one `Editor` (statusline harnesses, for example) would
-    // otherwise crash; production still only calls `setup` once.
-    static EVENTS: std::sync::Once = std::sync::Once::new();
+    // Match the registry's lifetime: process-wide normally, per Tokio runtime
+    // in integration tests. Multiple editors in one registry share its guard.
+    helix_event::runtime_local! {
+        static EVENTS: std::sync::Once = std::sync::Once::new();
+    }
     EVENTS.call_once(events::register);
 
     let event_tx = completion::CompletionHandler::new(config).spawn();
@@ -60,4 +61,29 @@ pub fn setup(config: Arc<ArcSwap<Config>>) -> Handlers {
     #[cfg(feature = "pgp")]
     pgp::register_hooks(&handlers);
     handlers
+}
+
+#[cfg(all(test, feature = "integration"))]
+mod tests {
+    #[test]
+    fn regression_applications_register_events_in_each_runtime() {
+        for _ in 0..2 {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let mut config = crate::config::Config::default();
+                config.editor.lsp.enable = false;
+                let mut app = crate::application::Application::new(
+                    crate::args::Args::default(),
+                    config,
+                    helix_core::syntax::Loader::default(),
+                )
+                .unwrap();
+                assert!(app.close().await.is_empty());
+            });
+        }
+    }
 }

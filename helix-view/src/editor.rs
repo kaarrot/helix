@@ -3983,6 +3983,8 @@ impl Editor {
         if self.diff.session.is_none() {
             // Only shown, never claimed: there is nothing to save.
             self.remove_review_threads(&leaving);
+            self.diff.reviews.save_blocked = false;
+            self.diff.reviews.load_error = None;
             return leaving.len();
         }
 
@@ -4004,6 +4006,8 @@ impl Editor {
             crate::review::session::release(&session);
         }
         self.remove_review_threads(&leaving);
+        self.diff.reviews.save_blocked = false;
+        self.diff.reviews.load_error = None;
         leaving.len()
     }
 

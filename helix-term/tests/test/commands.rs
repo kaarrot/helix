@@ -17,6 +17,112 @@ static STREAM_TEST_LOCK: Lazy<Arc<tokio::sync::Mutex<()>>> =
     Lazy::new(|| Arc::new(tokio::sync::Mutex::new(())));
 
 #[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_insert_stream_output_survives_closing_its_original_view() -> anyhow::Result<()> {
+    let _lock = Arc::clone(&STREAM_TEST_LOCK).lock_owned().await;
+    let mut app = AppBuilder::new().build()?;
+    send_key_sequence(
+        &mut app,
+        ":insert-stream-output sleep 2; printf finished<ret>",
+    )
+    .await?;
+    let output = doc!(app.editor).id();
+    let original = app.editor.tree.focus;
+    app.editor.switch(output, Action::VerticalSplit);
+    app.editor.close(original);
+    wait_for_condition(
+        &mut app,
+        "stream completion after closing its view",
+        |app| {
+            app.editor
+                .get_status()
+                .is_some_and(|(s, _)| s.starts_with("Stream completed"))
+        },
+    )
+    .await?;
+    let doc = app.editor.document(output).unwrap();
+    assert!(doc.text().to_string().contains("printf finished\nfinished"));
+    assert!(!doc.selections().contains_key(&original));
+    close_app(&mut app).await?;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_insert_stream_output_does_not_reuse_a_saved_output_buffer() -> anyhow::Result<()> {
+    let _lock = Arc::clone(&STREAM_TEST_LOCK).lock_owned().await;
+    let mut app = AppBuilder::new().build()?;
+    send_key_sequence(&mut app, ":insert-stream-output printf first<ret>").await?;
+    wait_for_condition(&mut app, "first stream completed", |app| {
+        app.editor
+            .get_status()
+            .is_some_and(|(s, _)| s.starts_with("Stream completed"))
+    })
+    .await?;
+    let saved_id = doc!(app.editor).id();
+    let saved_text = doc!(app.editor).text().clone();
+    let file = helpers::temp_file_with_contents("")?;
+    app.editor
+        .document_mut(saved_id)
+        .unwrap()
+        .set_path(Some(file.path()));
+    app.editor.new_file(Action::Replace);
+    send_key_sequence(&mut app, "ix<esc>:insert-stream-output printf second<ret>").await?;
+    wait_for_condition(&mut app, "second stream completed", |app| {
+        doc!(app.editor).text().to_string().contains("second\n")
+            && app
+                .editor
+                .get_status()
+                .is_some_and(|(s, _)| s.starts_with("Stream completed"))
+    })
+    .await?;
+    assert_ne!(doc!(app.editor).id(), saved_id);
+    assert_eq!(app.editor.document(saved_id).unwrap().text(), &saved_text);
+    close_app(&mut app).await?;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_insert_stream_output_preserves_an_unrelated_viewport() -> anyhow::Result<()> {
+    let _lock = Arc::clone(&STREAM_TEST_LOCK).lock_owned().await;
+    let file = helpers::temp_file_with_contents(&"line\n".repeat(200))?;
+    let mut app = AppBuilder::new().with_file(file.path(), None).build()?;
+    let other = doc!(app.editor).id();
+    send_key_sequence(
+        &mut app,
+        ":insert-stream-output sleep 2; printf finished<ret>",
+    )
+    .await?;
+    let output = doc!(app.editor).id();
+    app.editor.switch(other, Action::Replace);
+    let view = app.editor.tree.focus;
+    let doc = app.editor.document_mut(other).unwrap();
+    doc.set_selection(view, Selection::point(900));
+    doc.set_view_offset(view, helix_view::view::ViewPosition::default());
+    let offset = doc.view_offset(view);
+    wait_for_condition(&mut app, "background stream completed", |app| {
+        app.editor
+            .get_status()
+            .is_some_and(|(s, _)| s.starts_with("Stream completed"))
+    })
+    .await?;
+    assert_eq!(
+        app.editor.document(other).unwrap().view_offset(view),
+        offset
+    );
+    assert!(app
+        .editor
+        .document(output)
+        .unwrap()
+        .text()
+        .to_string()
+        .contains("printf finished\nfinished"));
+    close_app(&mut app).await?;
+    Ok(())
+}
+
+#[cfg(unix)]
 async fn assert_stream_output_contains(
     input: &str,
     keys: &str,
@@ -579,8 +685,7 @@ async fn test_insert_stream_output_cursor_does_not_append_arg() -> anyhow::Resul
 
     // A normal-mode cursor covers one grapheme; it must not be passed as an
     // argument the way a real selection is.
-    let text =
-        assert_stream_output_contains("#[a|]#bc\n", ":: printf '[%%s]'<ret>", "[]").await?;
+    let text = assert_stream_output_contains("#[a|]#bc\n", ":: printf '[%%s]'<ret>", "[]").await?;
     assert!(
         !text.contains("[a]"),
         "the character under the cursor should not be appended as a shell argument: {text:?}"

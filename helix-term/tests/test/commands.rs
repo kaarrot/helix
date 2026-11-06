@@ -17,32 +17,47 @@ static STREAM_TEST_LOCK: Lazy<Arc<tokio::sync::Mutex<()>>> =
     Lazy::new(|| Arc::new(tokio::sync::Mutex::new(())));
 
 #[cfg(unix)]
-#[tokio::test(flavor = "multi_thread")]
-async fn regression_stream_output_preserves_transcript_and_virtual_buffers() -> anyhow::Result<()> {
+async fn assert_stream_output_preserves_special_buffer(transcript: bool) -> anyhow::Result<()> {
     let _lock = Arc::clone(&STREAM_TEST_LOCK).lock_owned().await;
-    for transcript in [true, false] {
-        let mut app = AppBuilder::new()
-            .with_input_text("#[|]#original\n")
-            .build()?;
-        let original = doc!(app.editor).id();
-        let doc = app.editor.document_mut(original).unwrap();
-        doc.is_transcript = transcript;
-        doc.is_virtual_base = !transcript;
-        send_key_sequence(&mut app, ":insert-stream-output printf finished<ret>").await?;
-        wait_for_condition(&mut app, "stream in its own scratch buffer", |app| {
-            app.editor
-                .get_status()
-                .is_some_and(|(s, _)| s.starts_with("Stream completed"))
-        })
-        .await?;
-        assert_ne!(doc!(app.editor).id(), original);
-        assert_eq!(
-            app.editor.document(original).unwrap().text().to_string(),
-            "original\n"
-        );
-        close_app(&mut app).await?;
-    }
+    let mut app = AppBuilder::new()
+        .with_input_text("#[|]#original\n")
+        .build()?;
+    let original = doc!(app.editor).id();
+    let doc = app.editor.document_mut(original).unwrap();
+    doc.is_transcript = transcript;
+    doc.is_virtual_base = !transcript;
+    send_key_sequence(&mut app, ":insert-stream-output printf finished<ret>").await?;
+    wait_for_condition(&mut app, "stream in its own scratch buffer", |app| {
+        app.editor
+            .get_status()
+            .is_some_and(|(s, _)| s.starts_with("Stream completed"))
+    })
+    .await?;
+    assert_ne!(doc!(app.editor).id(), original);
+    assert!(doc!(app.editor)
+        .text()
+        .to_string()
+        .contains("printf finished\nfinished"));
+    assert_eq!(
+        app.editor.document(original).unwrap().text().to_string(),
+        "original\n"
+    );
+    close_app(&mut app).await?;
     Ok(())
+}
+
+// The job queue belongs to one Tokio runtime and application, so each case
+// needs its own test runtime instead of opening two applications in one test.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn regression_stream_output_preserves_transcript_buffer() -> anyhow::Result<()> {
+    assert_stream_output_preserves_special_buffer(true).await
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn regression_stream_output_preserves_virtual_buffer() -> anyhow::Result<()> {
+    assert_stream_output_preserves_special_buffer(false).await
 }
 
 #[cfg(unix)]

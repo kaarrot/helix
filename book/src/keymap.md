@@ -260,6 +260,7 @@ Jumps to various locations.
 | `j`   | Move down textual (instead of visual) line       | `move_line_down`           |
 | `k`   | Move up textual (instead of visual) line         | `move_line_up`             |
 | `w`   | Show labels at each word and select the word that belongs to the entered labels | `goto_word` |
+| `v`   | Restore the previous selection and enter select mode | `restore_selection` |
 
 #### Match mode
 
@@ -699,6 +700,12 @@ Select mode echoes Normal mode, but changes any movements to extend
 selections rather than replace them. Goto motions are also changed to
 extend, so that `vgl`, for example, extends the selection to the end of
 the line.
+
+Press `gv` to restore the previous selection and enter select mode. This also
+works after collapsing a selection with `;` or moving away in normal mode.
+All selection ranges, their direction, and the primary selection are preserved.
+The saved selection follows edits and is kept separately for each buffer and
+view. In select mode, `gv` exchanges the current and previous selections.
 
 Search is also affected. By default, `n` and `N` will remove the current
 selection and select the next instance of the search term. Toggling this

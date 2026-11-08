@@ -3010,8 +3010,13 @@ impl Editor {
             return;
         }
 
+        let was_select = self.mode == Mode::Select;
         self.mode = Mode::Normal;
         let (view, doc) = current!(self);
+
+        if was_select {
+            doc.save_previous_selection(view.id);
+        }
 
         try_restore_indent(doc, view);
 

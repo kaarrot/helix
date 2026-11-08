@@ -9,6 +9,7 @@ use super::*;
 
 mod insert;
 mod movement;
+mod restore_selection;
 mod reverse_selection_contents;
 mod rotate_selection_contents;
 mod write;

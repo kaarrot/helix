@@ -168,6 +168,7 @@ pub struct Document {
     pub(crate) id: DocumentId,
     text: Rope,
     selections: HashMap<ViewId, Selection>,
+    previous_selections: HashMap<ViewId, Selection>,
     view_data: HashMap<ViewId, ViewData>,
     pub active_snippet: Option<ActiveSnippet>,
 
@@ -801,6 +802,7 @@ impl Document {
             has_bom,
             text,
             selections: HashMap::default(),
+            previous_selections: HashMap::default(),
             inlay_hints: HashMap::default(),
             inlay_hints_oudated: false,
             view_data: Default::default(),
@@ -1653,6 +1655,16 @@ impl Document {
         })
     }
 
+    /// Remember the current selection so it can be restored after moving away.
+    pub fn save_previous_selection(&mut self, view_id: ViewId) {
+        self.previous_selections
+            .insert(view_id, self.selection(view_id).clone());
+    }
+
+    pub fn previous_selection(&self, view_id: ViewId) -> Option<&Selection> {
+        self.previous_selections.get(&view_id)
+    }
+
     /// Find the origin selection of the text in a document, i.e. where
     /// a single cursor would go if it were on the first grapheme. If
     /// the text is empty, returns (0, 0).
@@ -1695,6 +1707,7 @@ impl Document {
     pub fn remove_view(&mut self, view_id: ViewId) {
         self.view_diffs.remove(&view_id);
         self.selections.remove(&view_id);
+        self.previous_selections.remove(&view_id);
         self.inlay_hints.remove(&view_id);
         self.jump_labels.remove(&view_id);
         self.folds.remove(&view_id);
@@ -1732,7 +1745,11 @@ impl Document {
         self.modified_since_accessed = true;
         self.version += 1;
 
-        for selection in self.selections.values_mut() {
+        for selection in self
+            .selections
+            .values_mut()
+            .chain(self.previous_selections.values_mut())
+        {
             *selection = selection
                 .clone()
                 // Map through changes

@@ -364,6 +364,24 @@ macro_rules! static_commands {
 
 impl MappableCommand {
     pub fn execute(&self, cx: &mut Context) {
+        // Normal mode can hold an extended selection too (for example after `x`).
+        // Remember it before another command moves away or collapses it, while
+        // ordinary cursor movement must leave the saved selection intact.
+        if cx.editor.mode == Mode::Normal
+            && self.name() != "restore_selection"
+            && !cx.editor.tree.is_empty()
+        {
+            let (view, doc) = current!(cx.editor);
+            let text = doc.text().slice(..);
+            if doc
+                .selection(view.id)
+                .iter()
+                .any(|range| !range.is_empty() && !range.is_single_grapheme(text))
+            {
+                doc.save_previous_selection(view.id);
+            }
+        }
+
         // A code command returns the keys to the buffer. In particular, focus
         // must not silently return when a later motion revisits the anchor.
         let keeps_review = matches!(self, Self::Macro { .. })
@@ -592,6 +610,7 @@ impl MappableCommand {
         normal_mode, "Enter normal mode",
         select_mode, "Enter selection extend mode",
         exit_select_mode, "Exit selection mode",
+        restore_selection, "Restore previous selection and enter select mode",
         goto_definition, "Goto definition",
         goto_declaration, "Goto declaration",
         add_newline_above, "Add newline above",
@@ -3605,11 +3624,18 @@ fn change_selection_noyank(cx: &mut Context) {
 fn collapse_selection(cx: &mut Context) {
     let (view, doc) = current!(cx.editor);
     let text = doc.text().slice(..);
+    let was_extended = doc
+        .selection(view.id)
+        .iter()
+        .any(|range| !range.is_empty() && !range.is_single_grapheme(text));
 
     let selection = doc.selection(view.id).clone().transform(|range| {
         let pos = range.cursor(text);
         Range::new(pos, pos)
     });
+    if was_extended {
+        doc.save_previous_selection(view.id);
+    }
     doc.set_selection(view.id, selection);
 }
 
@@ -3639,6 +3665,10 @@ fn enter_insert_mode(cx: &mut Context) {
         cx.editor
             .set_error("This revision is read-only; switch to the working or result pane to edit");
         return;
+    }
+    if cx.editor.mode == Mode::Select {
+        let (view, doc) = current!(cx.editor);
+        doc.save_previous_selection(view.id);
     }
     cx.editor.mode = Mode::Insert;
 }
@@ -4494,8 +4524,24 @@ fn select_mode(cx: &mut Context) {
 
 fn exit_select_mode(cx: &mut Context) {
     if cx.editor.mode == Mode::Select {
+        let (view, doc) = current!(cx.editor);
+        doc.save_previous_selection(view.id);
         cx.editor.mode = Mode::Normal;
     }
+}
+
+fn restore_selection(cx: &mut Context) {
+    let swap = cx.editor.mode == Mode::Select;
+    let (view, doc) = current!(cx.editor);
+    let Some(selection) = doc.previous_selection(view.id).cloned() else {
+        cx.editor.set_error("No previous selection");
+        return;
+    };
+    if swap {
+        doc.save_previous_selection(view.id);
+    }
+    doc.set_selection(view.id, selection);
+    cx.editor.mode = Mode::Select;
 }
 
 fn goto_first_diag(cx: &mut Context) {
@@ -5875,6 +5921,10 @@ fn keep_primary_selection(cx: &mut Context) {
     let (view, doc) = current!(cx.editor);
     // TODO: handle count
 
+    // Keep an extended selection saved by `;` when dropping its extra cursors.
+    if doc.selection(view.id).len() > 1 && doc.previous_selection(view.id).is_none() {
+        doc.save_previous_selection(view.id);
+    }
     let range = doc.selection(view.id).primary();
     doc.set_selection(view.id, Selection::single(range.anchor, range.head));
 }

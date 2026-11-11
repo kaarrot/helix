@@ -70,6 +70,19 @@
 | `editor-config` | Whether to read settings from [EditorConfig](https://editorconfig.org) files | `true` |
 | `rainbow-brackets` | Whether to render rainbow colors for matching brackets. Requires tree-sitter `rainbows.scm` queries for the language. | `false` |
 | `kitty-keyboard-protocol` | Whether to enable Kitty Keyboard Protocol. Can be `enabled`, `disabled` or `auto` | `"auto"` |
+| `review-agent` | Default agent for answering review comments: `claude`, `grok`, `agy`, or `codex` | `"claude"` |
+
+To choose a default agent for review comments, add this to `config.toml`:
+
+```toml
+[editor]
+review-agent = "codex"
+```
+
+Use `:review-session grok` to override the agent for the current editor session.
+Changing `review-agent` with `:config-reload` or `:set-option review-agent agy`
+applies the new choice to subsequent sends. Reloading an unchanged value or
+changing unrelated settings preserves the session override.
 
 ### `[editor.clipboard-provider]` Section
 

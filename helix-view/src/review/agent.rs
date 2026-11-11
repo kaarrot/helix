@@ -6,14 +6,17 @@
 //! touching the store, the rendering or the keymap.
 
 use super::ThreadId;
+use serde::{Deserialize, Serialize};
 use std::fmt;
 
 /// Which child answers review comments.
 ///
-/// Chosen with `:review-session [claude|grok|agy|codex]`, not config. The CLIs take
-/// the prompt differently, so the editor picks the spawn path from this. Each
-/// comment is its own conversation either way.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// Defaults to `editor.review-agent`, with an override available through
+/// `:review-session [claude|grok|agy|codex]`. The CLIs take the prompt differently,
+/// so the editor picks the spawn path from this. Each comment is its own
+/// conversation either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum ReviewAgentKind {
     #[default]
     Claude,

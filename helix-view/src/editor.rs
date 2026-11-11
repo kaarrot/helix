@@ -378,6 +378,8 @@ pub struct Config {
     pub lsp: LspConfig,
     #[serde(default)]
     pub diff: DiffConfig,
+    /// Default agent for answering review comments. Defaults to Claude.
+    pub review_agent: crate::review::agent::ReviewAgentKind,
     /// Overrides for how `:copy-path url` builds links to the git remote.
     #[serde(default)]
     pub git_remote: GitRemoteConfig,
@@ -1149,6 +1151,7 @@ impl Default for Config {
             search: SearchConfig::default(),
             lsp: LspConfig::default(),
             diff: DiffConfig::default(),
+            review_agent: crate::review::agent::ReviewAgentKind::default(),
             git_remote: GitRemoteConfig::default(),
             terminal: get_terminal_provider(),
             rulers: Vec::new(),
@@ -1471,7 +1474,7 @@ impl Editor {
         // HAXX: offset the render area height by 1 to account for prompt/commandline
         area.height -= 1;
 
-        Self {
+        let mut editor = Self {
             mode: Mode::Normal,
             tree: Tree::new(area),
             next_document_id: DocumentId::default(),
@@ -1513,7 +1516,9 @@ impl Editor {
             handlers,
             mouse_down_range: None,
             cursor_cache: CursorCache::default(),
-        }
+        };
+        editor.set_review_agent(conf.review_agent);
+        editor
     }
 
     pub fn popup_border(&self) -> bool {
@@ -1552,6 +1557,10 @@ impl Editor {
     /// relevant members.
     pub fn refresh_config(&mut self, old_config: &Config) {
         let config = self.config();
+        // Preserve a :review-session override through unrelated config updates.
+        if config.review_agent != old_config.review_agent {
+            self.set_review_agent(config.review_agent);
+        }
         self.auto_pairs = (&config.auto_pairs).into();
         self.reset_idle_timer();
         self._refresh();

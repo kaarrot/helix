@@ -504,6 +504,40 @@ mod tests {
     }
 
     #[test]
+    fn parsing_review_agent_config() {
+        use helix_view::review::agent::ReviewAgentKind;
+
+        assert_eq!(
+            Config::load_test("").editor.review_agent,
+            ReviewAgentKind::Claude
+        );
+        for (name, agent) in [
+            ("claude", ReviewAgentKind::Claude),
+            ("grok", ReviewAgentKind::Grok),
+            ("agy", ReviewAgentKind::Agy),
+            ("codex", ReviewAgentKind::Codex),
+        ] {
+            let (config, warnings) =
+                Config::load_test_with_warnings(&format!("[editor]\nreview-agent = \"{name}\""));
+            assert!(warnings.is_empty(), "{warnings:?}");
+            assert_eq!(config.editor.review_agent, agent);
+        }
+    }
+
+    #[test]
+    fn invalid_review_agent_config_warns_without_discarding_valid_settings() {
+        use helix_view::review::agent::ReviewAgentKind;
+
+        let (config, warnings) = Config::load_test_with_warnings(
+            "[editor]\nreview-agent = \"unknown\"\ncursorline = true",
+        );
+        assert_eq!(config.editor.review_agent, ReviewAgentKind::Claude);
+        assert!(config.editor.cursorline);
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].path, "editor.review-agent");
+    }
+
+    #[test]
     fn parsing_git_remote_config() {
         let config = Config::load_test(
             r##"

@@ -1150,6 +1150,50 @@ async fn switching_review_sessions_isolates_their_stores() -> anyhow::Result<()>
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn review_agent_config_sets_the_default_and_allows_session_overrides() -> anyhow::Result<()> {
+    use helix_view::review::agent::ReviewAgentKind;
+
+    let mut config = test_config();
+    config.editor.review_agent = ReviewAgentKind::Codex;
+    let mut app = AppBuilder::new().with_config(config).build()?;
+    let mut harness = AppTestHarness::new();
+
+    assert_eq!(app.editor.diff.agent_kind, ReviewAgentKind::Codex);
+    assert!(app.editor.diff.agent.is_none());
+    assert!(harness.send_keys(&mut app, ":review-session<ret>").await?);
+    assert!(app.editor.get_status().unwrap().0.contains("agent codex"));
+
+    assert!(
+        harness
+            .send_keys(&mut app, ":review-session grok<ret>")
+            .await?
+    );
+    assert_eq!(app.editor.diff.agent_kind, ReviewAgentKind::Grok);
+    assert_eq!(app.editor.config().review_agent, ReviewAgentKind::Codex);
+
+    app.editor.diff.agent = Some(Box::new(FakeAgent::default()));
+    assert!(
+        harness
+            .send_keys(&mut app, ":set-option cursorline true<ret>")
+            .await?
+    );
+    assert_eq!(app.editor.diff.agent_kind, ReviewAgentKind::Grok);
+    assert!(app.editor.diff.agent.is_some());
+
+    assert!(
+        harness
+            .send_keys(&mut app, ":set-option review-agent agy<ret>")
+            .await?
+    );
+    assert_eq!(app.editor.config().review_agent, ReviewAgentKind::Agy);
+    assert_eq!(app.editor.diff.agent_kind, ReviewAgentKind::Agy);
+    assert!(app.editor.diff.agent.is_none());
+
+    harness.close(&mut app).await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn review_session_picks_the_agent_without_renaming() -> anyhow::Result<()> {
     use helix_view::review::agent::ReviewAgentKind;
 

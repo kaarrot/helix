@@ -245,14 +245,15 @@ Accessed by typing `m` in [normal mode](#normal-mode).
 
 Please refer to the relevant sections for detailed explanations about [surround](./surround.md) and [textobjects](./textobjects.md).
 
-| Key              | Description                                     | Command                    |
-| -----            | -----------                                     | -------                    |
-| `m`              | Goto matching bracket (**TS**)                  | `match_brackets`           |
-| `s` `<char>`     | Surround current selection with `<char>`        | `surround_add`             |
-| `r` `<from><to>` | Replace surround character `<from>` with `<to>` | `surround_replace`         |
-| `d` `<char>`     | Delete surround character `<char>`              | `surround_delete`          |
-| `a` `<object>`   | Select around textobject                        | `select_textobject_around` |
-| `i` `<object>`   | Select inside textobject                        | `select_textobject_inner`  |
+| Key                   | Description                                                | Command                            |
+| --------------------- | ---------------------------------------------------------- | ---------------------------------- |
+| `m`                   | Goto matching bracket (**TS**)                             | `match_brackets`                   |
+| `s` `<delimiter><ret>` | Surround current selection with a delimiter                | `surround_add`                     |
+| `r` `<from><to>`       | Replace surround character `<from>` with `<to>`             | `surround_replace`                 |
+| `d` `<char>`           | Delete surround character `<char>`                         | `surround_delete`                  |
+| `a` `<object>`         | Select around textobject                                   | `select_textobject_around`          |
+| `i` `<object>`         | Select inside textobject                                   | `select_textobject_inner`           |
+| `I` `<object>`         | Select inside textobject, allowing space pairs across lines | `select_textobject_inner_multiline` |
 
 TODO: Mappings for selecting syntax nodes (a superset of `[`).
 

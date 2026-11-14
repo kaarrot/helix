@@ -4,11 +4,11 @@ use ropey::RopeSlice;
 
 use crate::chars::{categorize_char, char_is_whitespace, CharCategory};
 use crate::graphemes::{next_grapheme_boundary, prev_grapheme_boundary};
-use crate::line_ending::rope_is_line_ending;
+use crate::line_ending::{line_end_char_index, rope_is_line_ending};
 use crate::movement::Direction;
 use crate::syntax;
 use crate::Range;
-use crate::{surround, Syntax};
+use crate::{search, surround, Syntax};
 
 fn find_word_boundary(slice: RopeSlice, mut pos: usize, direction: Direction, long: bool) -> usize {
     use CharCategory::{Eol, Whitespace};
@@ -195,6 +195,26 @@ pub fn textobject_paragraph(
     let anchor = slice.line_to_char(line_back);
     let head = slice.line_to_char(line);
     Range::new(anchor, head)
+}
+
+/// Select between spaces on the cursor's line, using line boundaries when a
+/// surrounding space is missing. The line ending is never included.
+pub fn textobject_space(slice: RopeSlice, range: Range, count: usize) -> Range {
+    let pos = range.cursor(slice);
+    // As with other symmetric pairs, a cursor on the delimiter is ambiguous.
+    if slice.get_char(pos) == Some(' ') {
+        return range;
+    }
+
+    let line = slice.char_to_line(pos);
+    let start = slice.line_to_char(line);
+    let end = line_end_char_index(&slice, line);
+    let text = slice.slice(start..end);
+    let pos = pos.min(end) - start;
+
+    let from = search::find_nth_prev(text, ' ', pos, count).map_or(start, |p| start + p + 1);
+    let to = search::find_nth_next(text, ' ', pos, count).map_or(end, |p| start + p);
+    Range::new(from, to).with_direction(range.direction())
 }
 
 pub fn textobject_pair_surround(
@@ -494,6 +514,42 @@ mod test {
                 .transform(|r| textobject_paragraph(text.slice(..), r, TextObject::Around, 1));
             let actual = crate::test::plain(s.as_ref(), &selection);
             assert_eq!(actual, expected, "\nbefore: `{:?}`", before);
+        }
+    }
+
+    #[test]
+    fn test_textobject_space() {
+        let cases = [
+            (
+                "left word\nhe#[l|]#lo\nnext word\n",
+                1,
+                "left word\n#[hello|]#\nnext word\n",
+            ),
+            ("he#[l|]#lo world\n", 1, "#[hello|]# world\n"),
+            ("hello wo#[r|]#ld\n", 1, "hello #[world|]#\n"),
+            ("a b#[c|]#d e\n", 1, "a #[bcd|]# e\n"),
+            ("a b#[c|]#d e\n", 2, "#[a bcd e|]#\n"),
+            ("he#[|l]#lo\n", 1, "#[|hello]#\n"),
+            ("ca#[f|]#é\r\n", 1, "#[café|]#\r\n"),
+            ("hello#[\r\n|]#", 1, "#[hello|]#\r\n"),
+            ("hello#[\n|]#", 1, "#[hello|]#\n"),
+            ("he#[l|]#lo", 1, "#[hello|]#"),
+            ("#[x|]#", 1, "#[x|]#"),
+            ("#[|]#", 1, "#[|]#"),
+            ("hello\n#[|]#", 1, "hello\n#[|]#"),
+            ("#[\n|]#next", 1, "#[|]#\nnext"),
+            ("a#[ |]#b\n", 1, "a#[ |]#b\n"),
+        ];
+        for (input, count, expected) in cases {
+            let (text, selection) = crate::test::print(input);
+            let text = Rope::from(text);
+            let selection =
+                selection.transform(|range| textobject_space(text.slice(..), range, count));
+            assert_eq!(
+                crate::test::plain(text, &selection),
+                expected,
+                "input: {input:?}, count: {count}"
+            );
         }
     }
 

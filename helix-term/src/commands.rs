@@ -566,6 +566,7 @@ impl MappableCommand {
         surround_delete, "Surround delete",
         select_textobject_around, "Select around object",
         select_textobject_inner, "Select inside object",
+        select_textobject_inner_multiline, "Select inside object, allowing space pairs across lines",
         goto_next_function, "Goto next function",
         goto_prev_function, "Goto previous function",
         goto_next_class, "Goto next type definition",
@@ -5992,14 +5993,18 @@ fn goto_prev_entry(cx: &mut Context) {
 }
 
 fn select_textobject_around(cx: &mut Context) {
-    select_textobject(cx, textobject::TextObject::Around);
+    select_textobject(cx, textobject::TextObject::Around, true);
 }
 
 fn select_textobject_inner(cx: &mut Context) {
-    select_textobject(cx, textobject::TextObject::Inside);
+    select_textobject(cx, textobject::TextObject::Inside, false);
 }
 
-fn select_textobject(cx: &mut Context, objtype: textobject::TextObject) {
+fn select_textobject_inner_multiline(cx: &mut Context) {
+    select_textobject(cx, textobject::TextObject::Inside, true);
+}
+
+fn select_textobject(cx: &mut Context, objtype: textobject::TextObject, multiline_space: bool) {
     let count = cx.count();
 
     cx.on_next_key(move |cx, event| {
@@ -6060,6 +6065,7 @@ fn select_textobject(cx: &mut Context, objtype: textobject::TextObject) {
                             count,
                         ),
                         'g' => textobject_change(range),
+                        ' ' if !multiline_space => textobject::textobject_space(text, range, count),
                         // TODO: cancel new ranges if inconsistent surround matches across lines
                         ch if !ch.is_ascii_alphanumeric() => textobject::textobject_pair_surround(
                             doc.syntax(),
@@ -6079,6 +6085,7 @@ fn select_textobject(cx: &mut Context, objtype: textobject::TextObject) {
     });
 
     let title = match objtype {
+        textobject::TextObject::Inside if multiline_space => "Match inside (across lines)",
         textobject::TextObject::Inside => "Match inside",
         textobject::TextObject::Around => "Match around",
         _ => return,
@@ -6096,6 +6103,14 @@ fn select_textobject(cx: &mut Context, objtype: textobject::TextObject) {
         ("m", "Closest surrounding pair (tree-sitter)"),
         ("g", "Change"),
         ("x", "(X)HTML element (tree-sitter)"),
+        (
+            "space",
+            if multiline_space {
+                "Spaces (across lines)"
+            } else {
+                "Spaces (current line)"
+            },
+        ),
         (" ", "... or any character acting as a pair"),
     ];
 
@@ -6112,54 +6127,81 @@ static SURROUND_HELP_TEXT: [(&str, &str); 6] = [
 ];
 
 fn surround_add(cx: &mut Context) {
-    cx.on_next_key(move |cx, event| {
-        cx.editor.autoinfo = None;
-        let (view, doc) = current!(cx.editor);
-        // surround_len is the number of new characters being added.
-        let (open, close, surround_len) = match event.char() {
-            Some(ch) => {
-                let (o, c) = match_brackets::get_pair(ch);
-                let mut open = Tendril::new();
-                open.push(o);
-                let mut close = Tendril::new();
-                close.push(c);
-                (open, close, 2)
+    cx.editor.autoinfo = None;
+    ui::prompt(
+        cx,
+        "surround (\\n = newline): ".into(),
+        None,
+        ui::completers::none,
+        |cx, input, event| {
+            if event != PromptEvent::Validate || input.is_empty() {
+                return;
             }
-            None if event.code == KeyCode::Enter => (
-                doc.line_ending.as_str().into(),
-                doc.line_ending.as_str().into(),
-                2 * doc.line_ending.len_chars(),
-            ),
-            None => return,
-        };
+            let scrolloff = cx.editor.config().scrolloff;
+            let (view, doc) = current!(cx.editor);
+            let (open, close) = surround_delimiters(input, doc.line_ending);
+            let surround_len = open.chars().count() + close.chars().count();
 
-        let selection = doc.selection(view.id);
-        let mut changes = Vec::with_capacity(selection.len() * 2);
-        let mut ranges = SmallVec::with_capacity(selection.len());
-        let mut offs = 0;
+            let selection = doc.selection(view.id);
+            let mut changes = Vec::with_capacity(selection.len() * 2);
+            let mut ranges = SmallVec::with_capacity(selection.len());
+            let mut offs = 0;
 
-        for range in selection.iter() {
-            changes.push((range.from(), range.from(), Some(open.clone())));
-            changes.push((range.to(), range.to(), Some(close.clone())));
+            for range in selection.iter() {
+                changes.push((range.from(), range.from(), Some(open.clone())));
+                changes.push((range.to(), range.to(), Some(close.clone())));
 
-            ranges.push(
-                Range::new(offs + range.from(), offs + range.to() + surround_len)
-                    .with_direction(range.direction()),
-            );
+                ranges.push(
+                    Range::new(offs + range.from(), offs + range.to() + surround_len)
+                        .with_direction(range.direction()),
+                );
 
-            offs += surround_len;
+                offs += surround_len;
+            }
+
+            let transaction = Transaction::change(doc.text(), changes.into_iter())
+                .with_selection(Selection::new(ranges, selection.primary_index()));
+            doc.apply(&transaction, view.id);
+            doc.append_changes_to_history(view);
+            if cx.editor.mode == Mode::Select {
+                cx.editor.mode = Mode::Normal;
+            }
+            view.ensure_cursor_in_view(doc, scrolloff);
+        },
+    );
+}
+
+fn surround_delimiters(input: &str, line_ending: LineEnding) -> (Tendril, Tendril) {
+    let mut delimiter = String::new();
+    let mut chars = input.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match (ch, chars.peek()) {
+            ('\\', Some('n')) => {
+                chars.next();
+                delimiter.push_str(line_ending.as_str());
+            }
+            ('\\', Some('\\')) => {
+                chars.next();
+                delimiter.push('\\');
+            }
+            _ => delimiter.push(ch),
         }
+    }
 
-        let transaction = Transaction::change(doc.text(), changes.into_iter())
-            .with_selection(Selection::new(ranges, selection.primary_index()));
-        doc.apply(&transaction, view.id);
-        exit_select_mode(cx);
-    });
-
-    cx.editor.autoinfo = Some(Info::new(
-        "Surround selections with",
-        &SURROUND_HELP_TEXT[1..],
-    ));
+    // Preserve bracket pairing for a single character or repetitions of it.
+    // Other strings are literal delimiters, used unchanged on both sides.
+    let mut chars = delimiter.chars();
+    if let Some(ch) = chars.next() {
+        if chars.all(|c| c == ch) {
+            let (open, close) = match_brackets::get_pair(ch);
+            let len = delimiter.chars().count();
+            return (
+                open.to_string().repeat(len).into(),
+                close.to_string().repeat(len).into(),
+            );
+        }
+    }
+    (delimiter.as_str().into(), delimiter.into())
 }
 
 fn surround_replace(cx: &mut Context) {

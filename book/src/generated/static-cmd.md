@@ -263,6 +263,7 @@
 | `surround_delete` | Surround delete | normal: `` md ``, select: `` md `` |
 | `select_textobject_around` | Select around object | normal: `` ma ``, select: `` ma `` |
 | `select_textobject_inner` | Select inside object | normal: `` mi ``, select: `` mi `` |
+| `select_textobject_inner_multiline` | Select inside object, allowing space pairs across lines | normal: `` mI ``, select: `` mI `` |
 | `goto_next_function` | Goto next function | normal: `` ]f ``, select: `` ]f `` |
 | `goto_prev_function` | Goto previous function | normal: `` [f ``, select: `` [f `` |
 | `goto_next_class` | Goto next type definition | normal: `` ]t ``, select: `` ]t `` |

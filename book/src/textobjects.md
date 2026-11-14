@@ -10,6 +10,7 @@ function or block of code.
 
 - `ma` - Select around the object (`va` in Vim, `<alt-a>` in Kakoune)
 - `mi` - Select inside the object (`vi` in Vim, `<alt-i>` in Kakoune)
+- `mI` - Select inside the object, allowing surrounding spaces across lines
 
 | Key after `mi` or `ma` | Textobject selected      |
 | ---                    | ---                      |
@@ -25,6 +26,18 @@ function or block of code.
 | `T`                    | Test                     |
 | `g`                    | Change                   |
 | `x`                    | (X)HTML element          |
+
+`mi<Space>` selects between spaces on the cursor's current line. When a space
+is missing on either side, the start or end of that line acts as the boundary.
+The line ending is excluded, so a line with no spaces selects only its text.
+On an empty line, the cursor stays on that line.
+Counts select farther spaces but never leave the current line. A cursor on a
+space keeps its existing selection, as with other symmetric delimiters.
+
+`mI<Space>` preserves the previous behavior: it searches for surrounding spaces
+across line breaks and selects everything between them. Other text objects
+behave the same with `mi` and `mI`, including matching quotes and brackets
+across lines. `ma<Space>` also keeps its existing behavior across lines.
 
 > 💡 `f`, `t`, etc. need a tree-sitter grammar active for the current
 document and a special tree-sitter query file to work properly. [Only

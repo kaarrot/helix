@@ -28,4 +28,5 @@ mod test {
     mod movement;
     mod review;
     mod splits;
+    mod surround;
 }

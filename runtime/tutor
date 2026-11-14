@@ -1283,14 +1283,17 @@ letters! that is not good grammar. you can fix this.
   * i) select the "select all of this" line segment (for example,
  move in normal mode the cursor to the start of select, then enter
  selection mode with v , then select the 4 next words with 4e ),
-  * ii) press ms( or ms) to surround the selection with a pair of
- parentheses.
+  * ii) press ms( or ms), then Enter, to surround the selection
+ with a pair of parentheses.
 
  --> so, select all of this, and surround it with ()
 
- You can do the same with other delimiters: for example, ms' on
- WORD below to surround it with a pair of ''. You can try also
- with adding a surrounding pair of "", or {}, or [].
+ You can do the same with other delimiters: for example, ms' then
+ Enter on WORD below to surround it with a pair of ''. You can also
+ try adding a surrounding pair of "", or {}, or [].
+
+ Type more than one delimiter before Enter to add several at once:
+ ms''' then Enter surrounds the selection with triple single quotes.
 
  --> surround this WORD !
 
@@ -1355,7 +1358,7 @@ letters! that is not good grammar. you can fix this.
   (i.e. select the content and the delimiters) with ma( and
   similar
   * delete surrounding delimiters with md( and similar
-  * add surrounding delimiters around the selection with ms(
+  * add surrounding delimiters around the selection with ms( then Enter
   * replace a pair of delimiters surrounding your selection with
   mr([ to replace for example surrounding () with []
 

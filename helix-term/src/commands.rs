@@ -368,15 +368,16 @@ impl MappableCommand {
         // Remember it before another command moves away or collapses it, while
         // ordinary cursor movement must leave the saved selection intact.
         if cx.editor.mode == Mode::Normal
-            && self.name() != "restore_selection"
+            && !matches!(self.name(), "restore_selection" | "keep_primary_selection")
             && !cx.editor.tree.is_empty()
         {
             let (view, doc) = current!(cx.editor);
             let text = doc.text().slice(..);
-            if doc
-                .selection(view.id)
-                .iter()
-                .any(|range| !range.is_empty() && !range.is_single_grapheme(text))
+            let selection = doc.selection(view.id);
+            if selection.len() > 1
+                || selection
+                    .iter()
+                    .any(|range| !range.is_empty() && !range.is_single_grapheme(text))
             {
                 doc.save_previous_selection(view.id);
             }

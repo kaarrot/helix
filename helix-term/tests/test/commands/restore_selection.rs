@@ -121,6 +121,27 @@ async fn restore_selection_preserves_multiple_cursors() -> anyhow::Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn restore_selection_records_multiple_single_grapheme_ranges_before_motion(
+) -> anyhow::Result<()> {
+    // Regression: `%s^[ac]<ret>jgv` should restore the two 1-char matches
+    // instead of the earlier whole-file `%` selection.
+    assert_restored(
+        "#[a|]# first\nb second\nc third\nd fourth\ne fifth\n",
+        "%s^[ac]<ret>jgv",
+        "#[a|]# first\nb second\n#(c|)# third\nd fourth\ne fifth\n",
+    )
+    .await?;
+
+    // Fresh session: `Cjgv` should restore the two cursors created by `C`.
+    assert_restored(
+        "#[a|]# first\nb second\nc third\n",
+        "Cjgv",
+        "#(a|)# first\n#[b|]# second\nc third\n",
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn restore_selection_without_saved_selection() -> anyhow::Result<()> {
     let mut app = AppBuilder::new().with_input_text("#[a|]#bc\n").build()?;
     test_key_sequence(

@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use crate::compositor::{Callback, Component, Compositor, Context, Event, EventResult};
 use crate::ui::{file_picker, overlay::overlaid, Markdown, MarkdownLink};
-use crate::{ctrl, key};
+use crate::{ctrl, key, shift};
 
 use helix_core::line_ending::line_end_char_index;
 use helix_core::unicode::segmentation::UnicodeSegmentation;
@@ -82,6 +82,8 @@ pub struct MarkdownPreview {
     /// Text selection as (anchor, head); either may come first on screen. The
     /// cell under `head` is part of the selection.
     selection: Option<(Pos, Pos)>,
+    /// Index among links on `cursor_line` chosen via Tab / Shift-Tab.
+    selected_link: usize,
     cache: Option<PreviewCache>,
 }
 
@@ -133,6 +135,7 @@ impl MarkdownPreview {
             side_by_side: false,
             press: None,
             selection: None,
+            selected_link: 0,
             cache: None,
         }
     }
@@ -208,6 +211,9 @@ impl MarkdownPreview {
         };
 
         let new_line = (current_line as isize + delta).clamp(0, max_line as isize) as usize;
+        if new_line != self.cursor_line {
+            self.selected_link = 0;
+        }
         self.cursor_line = new_line;
         self.selection = None;
 
@@ -264,17 +270,72 @@ impl MarkdownPreview {
         }
     }
 
-    fn follow_link_at(&self, rendered_line: usize, col: Option<u16>) -> Option<EventResult> {
-        let link = self.links.iter().find(|link| {
-            if link.line != rendered_line {
-                return false;
+    fn links_on_line(&self, rendered_line: usize) -> Vec<&MarkdownLink> {
+        self.links
+            .iter()
+            .filter(|link| link.line == rendered_line)
+            .collect()
+    }
+
+    fn jump_to_rendered_line(&mut self, rendered_line: usize) {
+        if self.total_lines == 0 {
+            return;
+        }
+        let target = rendered_line.min(self.total_lines.saturating_sub(1));
+        if target != self.cursor_line {
+            self.selected_link = 0;
+        }
+        self.cursor_line = target;
+        self.selection = None;
+        let height = self.area.height.max(1) as usize;
+        let line_start = self.row_starts.get(target).copied().unwrap_or(0);
+        let max_scroll = self.total_rows().saturating_sub(height);
+        self.scroll = line_start.saturating_sub(TOP_MARGIN).min(max_scroll);
+    }
+
+    fn follow_link_at(&mut self, rendered_line: usize, col: Option<u16>) -> Option<EventResult> {
+        let link = match col {
+            Some(c) => self.links.iter().find(|link| {
+                link.line == rendered_line && c >= link.start_col && c < link.end_col
+            })?,
+            None => {
+                let on_line = self.links_on_line(rendered_line);
+                if on_line.is_empty() {
+                    return None;
+                }
+                let idx = self.selected_link.min(on_line.len() - 1);
+                on_line[idx]
             }
-            match col {
-                Some(c) => c >= link.start_col && c < link.end_col,
-                None => true,
-            }
-        })?;
+        };
         let dest = link.dest.clone();
+        if let Some(fragment) = dest.trim().strip_prefix('#') {
+            let fragment = fragment.to_string();
+            let view = self.source_view;
+            let doc_id = self.source_doc;
+            return Some(EventResult::Consumed(Some(Box::new(
+                move |compositor: &mut Compositor, cx: &mut Context| {
+                    if fragment.is_empty() {
+                        cx.editor.set_error("Empty heading link");
+                        return;
+                    }
+                    let target_line = cx.editor.document(doc_id).and_then(|doc| {
+                        find_heading_line(&doc.text().to_string(), &fragment)
+                    });
+                    let Some(src_line) = target_line else {
+                        cx.editor
+                            .set_error(format!("Heading not found: #{fragment}"));
+                        return;
+                    };
+                    goto_source_line(cx.editor, view, doc_id, src_line, false);
+                    if let Some(preview) = compositor.find_id::<MarkdownPreview>(Self::ID) {
+                        preview.last_source_line = Some(src_line);
+                        if let Some(rendered) = preview.rendered_line_for_source(src_line) {
+                            preview.jump_to_rendered_line(rendered);
+                        }
+                    }
+                },
+            ))));
+        }
         let base_dir = self.base_dir.clone();
         Some(EventResult::Consumed(Some(Box::new(
             move |compositor: &mut Compositor, cx: &mut Context| {
@@ -425,6 +486,20 @@ impl MarkdownPreview {
                     return self
                         .follow_link_at(self.cursor_line, None)
                         .unwrap_or(EventResult::Ignored(None));
+                }
+                key!(Tab) => {
+                    let count = self.links_on_line(self.cursor_line).len();
+                    if count > 1 {
+                        self.selected_link = (self.selected_link + 1) % count;
+                        return EventResult::Consumed(None);
+                    }
+                }
+                shift!(Tab) => {
+                    let count = self.links_on_line(self.cursor_line).len();
+                    if count > 1 {
+                        self.selected_link = (self.selected_link + count - 1) % count;
+                        return EventResult::Consumed(None);
+                    }
                 }
                 key!('y') => {
                     if self.copy(cx.editor) {
@@ -713,6 +788,27 @@ impl Component for MarkdownPreview {
             let row = inner.y + (visible_start - self.scroll) as u16;
             let height = (visible_end - visible_start) as u16;
             surface.set_style(Rect::new(inner.x, row, inner.width, height), cursor_style);
+
+            // When multiple links share the cursor line, highlight the active
+            // keyboard target so Tab / Shift-Tab selection is visible.
+            let links_on_cursor = self.links_on_line(self.cursor_line);
+            if links_on_cursor.len() > 1 {
+                let idx = self.selected_link.min(links_on_cursor.len() - 1);
+                let active = links_on_cursor[idx];
+                let start = active.start_col.min(inner.width);
+                let end = active.end_col.min(inner.width);
+                if start < end {
+                    let link_hl = distinct_style(
+                        &cx.editor.theme,
+                        &["ui.selection", "ui.menu.selected"],
+                        &[popup_bg, cursor_style.bg],
+                    );
+                    surface.set_style(
+                        Rect::new(inner.x + start, row, end - start, 1),
+                        link_hl,
+                    );
+                }
+            }
         }
 
         // Drawn over the cursor line, so a selection that covers it still reads
@@ -851,16 +947,106 @@ fn external_url(dest: &str) -> Option<Url> {
     (dest.contains("://") || matches!(url.scheme(), "mailto" | "tel")).then_some(url)
 }
 
+fn percent_decode(input: &str) -> String {
+    fn hex_val(b: u8) -> Option<u8> {
+        match b {
+            b'0'..=b'9' => Some(b - b'0'),
+            b'a'..=b'f' => Some(b - b'a' + 10),
+            b'A'..=b'F' => Some(b - b'A' + 10),
+            _ => None,
+        }
+    }
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
+                out.push((hi << 4) | lo);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8(out).unwrap_or_else(|_| input.to_string())
+}
+
+fn heading_slug(text: &str) -> String {
+    let mut slug = String::new();
+    for ch in text.trim().chars() {
+        if ch.is_alphanumeric() {
+            for lower in ch.to_lowercase() {
+                slug.push(lower);
+            }
+        } else if ch == ' ' || ch == '-' {
+            slug.push('-');
+        } else if ch == '_' {
+            slug.push('_');
+        }
+    }
+    slug
+}
+
+/// Find the 0-based source line of an ATX Markdown heading matching `fragment`
+/// using GitHub-style slug rules (including `-1`, `-2` duplicate suffixes).
+fn find_heading_line(markdown: &str, fragment: &str) -> Option<usize> {
+    let target = percent_decode(fragment.trim()).to_lowercase();
+    if target.is_empty() {
+        return None;
+    }
+    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut in_fence: Option<(char, usize)> = None;
+    for (line_idx, raw_line) in markdown.lines().enumerate() {
+        let trimmed = raw_line.trim_start();
+        if let Some((fence_ch, fence_len)) = in_fence {
+            let count = trimmed.chars().take_while(|&c| c == fence_ch).count();
+            if count >= fence_len && trimmed[count..].trim().is_empty() {
+                in_fence = None;
+            }
+            continue;
+        }
+        if let Some(first) = trimmed.chars().next().filter(|&c| c == '`' || c == '~') {
+            let count = trimmed.chars().take_while(|&c| c == first).count();
+            if count >= 3 {
+                in_fence = Some((first, count));
+                continue;
+            }
+        }
+        let hashes = trimmed.bytes().take_while(|&b| b == b'#').count();
+        if (1..=6).contains(&hashes) {
+            let rest = &trimmed[hashes..];
+            if rest.is_empty() || rest.starts_with([' ', '\t']) {
+                let title = rest.trim().trim_end_matches('#').trim();
+                let base_slug = heading_slug(title);
+                let count = counts.entry(base_slug.clone()).or_insert(0);
+                let slug = if *count == 0 {
+                    base_slug
+                } else {
+                    format!("{base_slug}-{}", *count)
+                };
+                *count += 1;
+                if slug == target {
+                    return Some(line_idx);
+                }
+            }
+        }
+    }
+    None
+}
+
 fn open_link(compositor: &mut Compositor, cx: &mut Context, dest: &str, base_dir: &Path) -> bool {
     let dest = dest.trim();
     if dest.is_empty() {
+        cx.editor.set_error("Empty link destination");
         return false;
     }
 
     if let Some(url) = external_url(dest) {
         if url.scheme() == "file" {
             return match url.to_file_path() {
-                Ok(path) => open_path_in_editor(compositor, cx, &path),
+                Ok(path) => open_path_in_editor(compositor, cx, &path, None),
                 Err(()) => {
                     cx.editor.set_error("Invalid file URL");
                     false
@@ -871,15 +1057,31 @@ fn open_link(compositor: &mut Compositor, cx: &mut Context, dest: &str, base_dir
         return false;
     }
 
-    let path = dest.split('#').next().unwrap_or(dest);
-    if path.is_empty() {
+    let (raw_path, fragment) = match dest.split_once('#') {
+        Some((p, f)) => (p, Some(f)),
+        None => (dest, None),
+    };
+    if raw_path.is_empty() {
+        cx.editor.set_error(format!("Cannot follow link: {dest}"));
         return false;
     }
-    let expanded = path::expand(path);
-    open_path_in_editor(compositor, cx, &base_dir.join(expanded))
+    let decoded = percent_decode(raw_path);
+    let decoded_path = base_dir.join(path::expand(&decoded));
+    let raw_joined = base_dir.join(path::expand(raw_path));
+    let target_path = if decoded != raw_path && (decoded_path.exists() || !raw_joined.exists()) {
+        decoded_path
+    } else {
+        raw_joined
+    };
+    open_path_in_editor(compositor, cx, &target_path, fragment)
 }
 
-fn open_path_in_editor(compositor: &mut Compositor, cx: &mut Context, path: &Path) -> bool {
+fn open_path_in_editor(
+    compositor: &mut Compositor,
+    cx: &mut Context,
+    path: &Path,
+    fragment: Option<&str>,
+) -> bool {
     let (path, position) = crate::args::parse_file(&path.to_string_lossy());
     if path.is_dir() {
         let picker = file_picker(cx.editor, path.to_path_buf());
@@ -889,10 +1091,29 @@ fn open_path_in_editor(compositor: &mut Compositor, cx: &mut Context, path: &Pat
         cx.editor.set_error(format!("Open file failed: {err:?}"));
         false
     } else {
+        let mut missing_fragment = None;
         let (view, doc) = helix_view::current!(cx.editor);
-        let pos = helix_core::pos_at_coords(doc.text().slice(..), position, true);
+        let pos = if position == helix_core::Position::new(0, 0) {
+            if let Some(fragment) = fragment.filter(|f| !f.is_empty()) {
+                match find_heading_line(&doc.text().to_string(), fragment) {
+                    Some(line) => doc.text().line_to_char(line),
+                    None => {
+                        missing_fragment = Some(fragment);
+                        0
+                    }
+                }
+            } else {
+                0
+            }
+        } else {
+            helix_core::pos_at_coords(doc.text().slice(..), position, true)
+        };
         doc.set_selection(view.id, Selection::point(pos));
         align_view(doc, view, Align::Center);
+        if let Some(fragment) = missing_fragment {
+            cx.editor
+                .set_warning(format!("Heading not found: #{fragment}"));
+        }
         true
     }
 }
@@ -1291,6 +1512,81 @@ mod tests {
         assert!(preview.cache.is_none());
         assert_eq!(preview.total_lines, 0);
 
+        app.close().await;
+        Ok(())
+    }
+
+    #[test]
+    fn percent_decode_and_heading_slug_lookup() {
+        assert_eq!(percent_decode("sub%20dir/target.md"), "sub dir/target.md");
+        assert_eq!(percent_decode("plain.md"), "plain.md");
+
+        let md = "# Intro\n\n```md\n## A Heading\n```\n\n## A Heading\n\n### A Heading\n";
+        assert_eq!(find_heading_line(md, "intro"), Some(0));
+        assert_eq!(find_heading_line(md, "a-heading"), Some(6));
+        assert_eq!(find_heading_line(md, "a-heading-1"), Some(8));
+        assert_eq!(find_heading_line(md, "missing"), None);
+    }
+
+    #[test]
+    fn tab_cycles_among_multiple_links_on_cursor_line() {
+        let mut preview = test_preview(3, 10);
+        preview.links = vec![
+            MarkdownLink {
+                line: 0,
+                dest: "first.md".into(),
+                start_col: 0,
+                end_col: 5,
+            },
+            MarkdownLink {
+                line: 0,
+                dest: "second.md".into(),
+                start_col: 8,
+                end_col: 14,
+            },
+        ];
+        assert_eq!(preview.selected_link, 0);
+        assert_eq!(preview.links_on_line(0).len(), 2);
+        preview.selected_link = (preview.selected_link + 1) % 2;
+        assert_eq!(preview.selected_link, 1);
+        preview.move_cursor(1);
+        assert_eq!(preview.selected_link, 0);
+    }
+
+    #[cfg(feature = "integration")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn regression_percent_encoded_local_link_opens_existing_file() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let sub = dir.path().join("sub dir");
+        std::fs::create_dir(&sub)?;
+        let target = sub.join("target.md");
+        std::fs::write(&target, "# Target\n\n## Section Two\nbody\n")?;
+
+        let mut app = crate::application::Application::new(
+            crate::args::Args::default(),
+            crate::config::Config::default(),
+            helix_core::syntax::Loader::default(),
+        )?;
+        let mut jobs = crate::job::Jobs::new();
+        let mut compositor = Compositor::new(Rect::new(0, 0, 120, 40));
+        let mut cx = Context {
+            editor: &mut app.editor,
+            jobs: &mut jobs,
+            scroll: None,
+        };
+        assert!(open_link(
+            &mut compositor,
+            &mut cx,
+            "sub%20dir/target.md#section-two",
+            dir.path()
+        ));
+        let (view, doc) = helix_view::current_ref!(app.editor);
+        assert_eq!(doc.path(), Some(&helix_stdx::path::canonicalize(&target)));
+        let line = doc
+            .selection(view.id)
+            .primary()
+            .cursor_line(doc.text().slice(..));
+        assert_eq!(line, 2);
         app.close().await;
         Ok(())
     }

@@ -410,7 +410,10 @@ pub fn get_merge_versions(file: &Path) -> Result<(Vec<u8>, Vec<u8>)> {
 }
 
 pub fn for_each_changed_file(cwd: &Path, f: impl Fn(Result<FileChange>) -> bool) -> Result<()> {
-    status(&open_repo(cwd)?.to_thread_local(), UntrackedFiles::Files, f)
+    let repo = open_repo(cwd)?.to_thread_local();
+    let head_tree_id = repo.head_tree_id_or_empty()?;
+    let base_tree = repo.find_tree(head_tree_id)?;
+    status(&repo, &base_tree, UntrackedFiles::Files, f)
 }
 
 /// Resolve the old name only for a selected new file. This avoids hashing
@@ -515,13 +518,13 @@ fn for_each_change_impl(
         None => {
             let base_tree = resolve_tree(&repo, base_ref)?;
             if repo.head()?.is_unborn() {
-                return status(&repo, untracked, f);
+                return status(&repo, &base_tree, untracked, f);
             }
             let head_commit = repo.head_commit()?;
             let head_tree = head_commit.tree()?;
 
             if base_tree.id == head_tree.id {
-                return status(&repo, untracked, f);
+                return status(&repo, &base_tree, untracked, f);
             }
 
             let work_dir = repo
@@ -529,6 +532,7 @@ fn for_each_change_impl(
                 .ok_or_else(|| anyhow::anyhow!("working tree not found"))?
                 .to_path_buf();
 
+            let (mut pipeline, _) = repo.filter_pipeline(None)?;
             let mut seen = std::collections::HashSet::new();
             let mut cancelled = false;
 
@@ -567,10 +571,26 @@ fn for_each_change_impl(
                         }
                     };
                     if let Some(change_item) = file_change {
-                        seen.insert(change_item.path().to_path_buf());
-                        if !f(Ok(change_item)) {
-                            cancelled = true;
-                            return Ok(gix::object::tree::diff::Action::Cancel);
+                        match emit_worktree_change(
+                            &repo,
+                            &work_dir,
+                            &mut pipeline,
+                            &base_tree,
+                            &mut seen,
+                            change_item,
+                            &f,
+                        ) {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                cancelled = true;
+                                return Ok(gix::object::tree::diff::Action::Cancel);
+                            }
+                            Err(err) => {
+                                if !f(Err(err)) {
+                                    cancelled = true;
+                                    return Ok(gix::object::tree::diff::Action::Cancel);
+                                }
+                            }
                         }
                     }
                     Ok(gix::object::tree::diff::Action::Continue)
@@ -578,7 +598,7 @@ fn for_each_change_impl(
             )?;
 
             if !cancelled {
-                status(&repo, untracked, |change| match &change {
+                status(&repo, &base_tree, untracked, |change| match &change {
                     Ok(fc)
                         if seen.contains(fc.path())
                             && !matches!(fc, FileChange::Conflict { .. }) =>
@@ -656,11 +676,31 @@ fn for_each_change_impl(
 /// repository is skipped rather than listed as one `nested/` entry, since the
 /// picker opens files. Submodules are skipped too, as git does.
 pub fn for_each_untracked_file(cwd: &Path, f: impl Fn(FileChange) + Sync) -> Result<()> {
+    for_each_untracked_file_impl(cwd, None, f)
+}
+
+/// Like [`for_each_untracked_file`], excluding paths that exist in `base_ref`
+/// because [`for_each_tracked_change`] already evaluates them against disk.
+pub fn for_each_untracked_file_against_ref(
+    cwd: &Path,
+    base_ref: &str,
+    f: impl Fn(FileChange) + Sync,
+) -> Result<()> {
+    for_each_untracked_file_impl(cwd, Some(base_ref), f)
+}
+
+fn for_each_untracked_file_impl(
+    cwd: &Path,
+    base_ref: Option<&str>,
+    f: impl Fn(FileChange) + Sync,
+) -> Result<()> {
     let repo = open_repo(cwd)?.to_thread_local();
     let work_dir = repo
         .workdir()
         .ok_or_else(|| anyhow::anyhow!("working tree not found"))?
         .to_path_buf();
+
+    let base_tree = base_ref.map(|r| resolve_tree(&repo, r)).transpose()?;
 
     // Absolute paths of every entry in the index — everything git already
     // tracks (including staged-but-uncommitted files, which are not untracked).
@@ -701,24 +741,61 @@ pub fn for_each_untracked_file(cwd: &Path, f: impl Fn(FileChange) + Sync) -> Res
         .threads(0) // 0 = pick a sensible default based on CPUs
         .build_parallel();
 
-    walker.run(|| {
-        Box::new(|result| {
-            if let Ok(entry) = result {
-                // Regular files and symlinks; git lists an untracked symlink as
-                // its own entry. Sockets and FIFOs are skipped, as git does.
-                if entry
-                    .file_type()
-                    .is_some_and(|ft| ft.is_file() || ft.is_symlink())
-                {
-                    let path = entry.into_path();
-                    if !tracked.contains(&path) {
-                        f(FileChange::Untracked { path });
+    if let Some(base_tree) = base_tree {
+        let candidates = std::sync::Mutex::new(Vec::new());
+        walker.run(|| {
+            Box::new(|result| {
+                if let Ok(entry) = result {
+                    // Regular files and symlinks; git lists an untracked symlink as
+                    // its own entry. Sockets and FIFOs are skipped, as git does.
+                    if entry
+                        .file_type()
+                        .is_some_and(|ft| ft.is_file() || ft.is_symlink())
+                    {
+                        let path = entry.into_path();
+                        if !tracked.contains(&path) {
+                            candidates.lock().unwrap().push(path);
+                        }
                     }
                 }
+                ignore::WalkState::Continue
+            })
+        });
+        for path in candidates.into_inner().unwrap() {
+            let in_base = path
+                .strip_prefix(&work_dir)
+                .ok()
+                .and_then(|rel| base_tree.lookup_entry_by_path(rel).ok().flatten())
+                .is_some_and(|entry| {
+                    matches!(
+                        entry.mode().kind(),
+                        EntryKind::Blob | EntryKind::BlobExecutable | EntryKind::Link
+                    )
+                });
+            if !in_base {
+                f(FileChange::Untracked { path });
             }
-            ignore::WalkState::Continue
-        })
-    });
+        }
+    } else {
+        walker.run(|| {
+            Box::new(|result| {
+                if let Ok(entry) = result {
+                    // Regular files and symlinks; git lists an untracked symlink as
+                    // its own entry. Sockets and FIFOs are skipped, as git does.
+                    if entry
+                        .file_type()
+                        .is_some_and(|ft| ft.is_file() || ft.is_symlink())
+                    {
+                        let path = entry.into_path();
+                        if !tracked.contains(&path) {
+                            f(FileChange::Untracked { path });
+                        }
+                    }
+                }
+                ignore::WalkState::Continue
+            })
+        });
+    }
 
     Ok(())
 }
@@ -907,6 +984,189 @@ fn is_file_mode(mode: gix::index::entry::Mode) -> bool {
         .is_some_and(|mode| mode.is_blob_or_symlink())
 }
 
+fn path_is_file_or_symlink(path: &Path) -> bool {
+    std::fs::symlink_metadata(path)
+        .is_ok_and(|meta| meta.file_type().is_file() || meta.file_type().is_symlink())
+}
+
+fn tree_file_entry<'a>(
+    tree: &Tree<'a>,
+    work_dir: &Path,
+    path: &Path,
+) -> Result<Option<gix::object::tree::Entry<'a>>> {
+    let Ok(rel_path) = path.strip_prefix(work_dir) else {
+        return Ok(None);
+    };
+    Ok(tree
+        .lookup_entry_by_path(rel_path)?
+        .filter(|entry| {
+            matches!(
+                entry.mode().kind(),
+                EntryKind::Blob | EntryKind::BlobExecutable | EntryKind::Link
+            )
+        }))
+}
+
+fn blob_worktree_bytes(
+    repo: &Repository,
+    work_dir: &Path,
+    pipeline: &mut gix::filter::Pipeline<'_>,
+    path: &Path,
+    oid: ObjectId,
+) -> Result<Vec<u8>> {
+    let data = repo.find_object(oid)?.detach().data;
+    let rela_path = path.strip_prefix(work_dir)?;
+    let rela_path = gix::path::try_into_bstr(rela_path)?;
+    let mut worktree_outcome =
+        pipeline.convert_to_worktree(&data, rela_path.as_ref(), Delay::Forbid)?;
+    let mut buf = Vec::with_capacity(data.len());
+    worktree_outcome.read_to_end(&mut buf)?;
+    Ok(buf)
+}
+
+enum BaseDiskComparison {
+    Unchanged,
+    Deleted,
+    PresentDiffers { in_base: bool },
+}
+
+fn compare_base_tree_with_worktree(
+    repo: &Repository,
+    work_dir: &Path,
+    pipeline: &mut gix::filter::Pipeline<'_>,
+    base_tree: &Tree<'_>,
+    path: &Path,
+) -> Result<BaseDiskComparison> {
+    let base_entry = tree_file_entry(base_tree, work_dir, path)?;
+    let disk_meta = match std::fs::symlink_metadata(path) {
+        Ok(meta) => Some(meta),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(_) => {
+            return Ok(BaseDiskComparison::PresentDiffers {
+                in_base: base_entry.is_some(),
+            });
+        }
+    };
+    let disk_exists = disk_meta
+        .as_ref()
+        .is_some_and(|meta| meta.file_type().is_file() || meta.file_type().is_symlink());
+
+    match (base_entry, disk_exists) {
+        (None, false) => Ok(BaseDiskComparison::Unchanged),
+        (None, true) => Ok(BaseDiskComparison::PresentDiffers { in_base: false }),
+        (Some(_), false) => Ok(BaseDiskComparison::Deleted),
+        (Some(entry), true) => {
+            let equal = if entry.mode().kind() == EntryKind::Link {
+                let target = match std::fs::read_link(path) {
+                    Ok(target) => target,
+                    Err(_) => return Ok(BaseDiskComparison::PresentDiffers { in_base: true }),
+                };
+                let target_bytes = gix::path::into_bstr(target);
+                let base_bytes = entry.object()?.detach().data;
+                target_bytes.as_ref() == base_bytes.as_slice()
+            } else {
+                let disk_bytes = match std::fs::read(path) {
+                    Ok(bytes) => bytes,
+                    Err(_) => return Ok(BaseDiskComparison::PresentDiffers { in_base: true }),
+                };
+                let base_bytes =
+                    blob_worktree_bytes(repo, work_dir, pipeline, path, entry.object_id())?;
+                disk_bytes == base_bytes
+            };
+            if equal {
+                Ok(BaseDiskComparison::Unchanged)
+            } else {
+                Ok(BaseDiskComparison::PresentDiffers { in_base: true })
+            }
+        }
+    }
+}
+
+fn resolve_simple_worktree_change(
+    repo: &Repository,
+    work_dir: &Path,
+    pipeline: &mut gix::filter::Pipeline<'_>,
+    base_tree: &Tree<'_>,
+    change: FileChange,
+) -> Result<Option<FileChange>> {
+    if matches!(change, FileChange::Conflict { .. }) {
+        return Ok(Some(change));
+    }
+    let path = change.path();
+    match compare_base_tree_with_worktree(repo, work_dir, pipeline, base_tree, path)? {
+        BaseDiskComparison::Unchanged => Ok(None),
+        BaseDiskComparison::Deleted => Ok(Some(FileChange::Deleted {
+            path: path.to_path_buf(),
+        })),
+        BaseDiskComparison::PresentDiffers { in_base } => {
+            if matches!(change, FileChange::Untracked { .. }) && !in_base {
+                Ok(Some(change))
+            } else {
+                Ok(Some(FileChange::Modified {
+                    path: path.to_path_buf(),
+                }))
+            }
+        }
+    }
+}
+
+fn emit_worktree_change(
+    repo: &Repository,
+    work_dir: &Path,
+    pipeline: &mut gix::filter::Pipeline<'_>,
+    base_tree: &Tree<'_>,
+    seen: &mut std::collections::HashSet<PathBuf>,
+    change: FileChange,
+    f: &impl Fn(Result<FileChange>) -> bool,
+) -> Result<bool> {
+    if let FileChange::Renamed { from_path, to_path } = change {
+        let from_in_base = tree_file_entry(base_tree, work_dir, &from_path)?.is_some();
+        let to_exists = path_is_file_or_symlink(&to_path);
+        let from_exists = path_is_file_or_symlink(&from_path);
+        if from_in_base && to_exists && !from_exists {
+            seen.insert(from_path.clone());
+            seen.insert(to_path.clone());
+            return Ok(f(Ok(FileChange::Renamed { from_path, to_path })));
+        }
+        if seen.insert(to_path.clone()) {
+            if let Some(resolved) = resolve_simple_worktree_change(
+                repo,
+                work_dir,
+                pipeline,
+                base_tree,
+                FileChange::Modified { path: to_path },
+            )? {
+                if !f(Ok(resolved)) {
+                    return Ok(false);
+                }
+            }
+        }
+        if seen.insert(from_path.clone()) {
+            if let Some(resolved) = resolve_simple_worktree_change(
+                repo,
+                work_dir,
+                pipeline,
+                base_tree,
+                FileChange::Modified { path: from_path },
+            )? {
+                if !f(Ok(resolved)) {
+                    return Ok(false);
+                }
+            }
+        }
+        return Ok(true);
+    }
+
+    let is_conflict = matches!(change, FileChange::Conflict { .. });
+    if !seen.insert(change.path().to_path_buf()) && !is_conflict {
+        return Ok(true);
+    }
+    match resolve_simple_worktree_change(repo, work_dir, pipeline, base_tree, change)? {
+        Some(resolved) => Ok(f(Ok(resolved))),
+        None => Ok(true),
+    }
+}
+
 /// Emulates the result of running `git status` from the command line.
 ///
 /// `untracked` selects how new files are reported. Callers that enumerate
@@ -916,6 +1176,7 @@ fn is_file_mode(mode: gix::index::entry::Mode) -> bool {
 /// modification passes.
 fn status(
     repo: &Repository,
+    base_tree: &Tree<'_>,
     untracked: UntrackedFiles,
     f: impl Fn(Result<FileChange>) -> bool,
 ) -> Result<()> {
@@ -965,10 +1226,7 @@ fn status(
     // costs no extra filesystem I/O: it reads objects, never the worktree.
     let status_iter = status_platform.into_iter(empty_patterns)?;
 
-    // A file can be reported by both halves (staged, then modified again). Emit
-    // it once. Ordering between the halves is explicitly undefined under
-    // `parallel`, so which half labels it is not guaranteed; every label here
-    // means "changed", and the picker keys on the path.
+    let (mut pipeline, _) = repo.filter_pipeline(None)?;
     let mut seen = std::collections::HashSet::new();
 
     for item in status_iter {
@@ -1058,12 +1316,15 @@ fn status(
         } else {
             change
         };
-        if !seen.insert(change.path().to_path_buf())
-            && !matches!(change, FileChange::Renamed { .. })
-        {
-            continue;
-        }
-        if !f(Ok(change)) {
+        if !emit_worktree_change(
+            repo,
+            &work_dir,
+            &mut pipeline,
+            base_tree,
+            &mut seen,
+            change,
+            &f,
+        )? {
             break;
         }
     }

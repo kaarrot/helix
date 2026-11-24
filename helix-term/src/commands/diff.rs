@@ -65,7 +65,7 @@ fn scan_changed_files(
     // Untracked files only exist when comparing against the working tree.
     if target_ref.is_none() {
         let untracked = std::sync::Mutex::new(Vec::new());
-        git::for_each_untracked_file(cwd, |change| {
+        git::for_each_untracked_file_against_ref(cwd, base_ref, |change| {
             untracked.lock().unwrap().push(change);
         })?;
         let mut untracked = untracked.into_inner().unwrap();

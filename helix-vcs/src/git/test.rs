@@ -1178,3 +1178,61 @@ fn selected_unstaged_rename_resolves_its_base_without_a_full_untracked_scan() {
         Some(repo.path().join("old.txt"))
     );
 }
+
+#[test]
+fn for_each_changed_file_omits_reverted_historical_and_staged_files() {
+    let repo = empty_git_repo();
+    write_repo_file(repo.path(), "file.txt", "base content\n");
+    create_commit_with_message(repo.path(), "base");
+    write_repo_file(repo.path(), "file.txt", "historical content\n");
+    create_commit_with_message(repo.path(), "second");
+
+    // Restoring the base commit's content on disk leaves no effective diff against HEAD^.
+    write_repo_file(repo.path(), "file.txt", "base content\n");
+    let tracked_vs_parent = RefCell::new(Vec::new());
+    git::for_each_tracked_change(repo.path(), "HEAD^", None, |c| {
+        tracked_vs_parent.borrow_mut().push(c.unwrap());
+        true
+    })
+    .unwrap();
+    assert!(tracked_vs_parent.borrow().is_empty(), "{:?}", tracked_vs_parent.borrow());
+
+    let all_vs_parent = RefCell::new(Vec::new());
+    git::for_each_changed_file_between_refs(repo.path(), "HEAD^", None, |c| {
+        all_vs_parent.borrow_mut().push(c.unwrap());
+        true
+    })
+    .unwrap();
+    assert!(all_vs_parent.borrow().is_empty(), "{:?}", all_vs_parent.borrow());
+
+    // Staging a change and restoring HEAD's content on disk leaves no effective diff against HEAD.
+    write_repo_file(repo.path(), "file.txt", "staged content\n");
+    exec_git_cmd("add file.txt", repo.path());
+    write_repo_file(repo.path(), "file.txt", "historical content\n");
+
+    let tracked_vs_head = RefCell::new(Vec::new());
+    git::for_each_tracked_change(repo.path(), "HEAD", None, |c| {
+        tracked_vs_head.borrow_mut().push(c.unwrap());
+        true
+    })
+    .unwrap();
+    assert!(tracked_vs_head.borrow().is_empty(), "{:?}", tracked_vs_head.borrow());
+
+    let all_vs_head = RefCell::new(Vec::new());
+    git::for_each_changed_file(repo.path(), |c| {
+        all_vs_head.borrow_mut().push(c.unwrap());
+        true
+    })
+    .unwrap();
+    assert!(all_vs_head.borrow().is_empty(), "{:?}", all_vs_head.borrow());
+
+    // Staged deletion with identical content recreated on disk is also excluded from untracked-against-ref.
+    exec_git_cmd("rm -f file.txt", repo.path());
+    write_repo_file(repo.path(), "file.txt", "base content\n");
+    let untracked_vs_parent = std::sync::Mutex::new(Vec::new());
+    git::for_each_untracked_file_against_ref(repo.path(), "HEAD^", |c| {
+        untracked_vs_parent.lock().unwrap().push(c);
+    })
+    .unwrap();
+    assert!(untracked_vs_parent.lock().unwrap().is_empty());
+}

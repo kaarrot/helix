@@ -1336,6 +1336,8 @@ pub struct MergeViewState {
     pub ours_view_id: ViewId,
     pub theirs_view_id: ViewId,
     pub result_view_id: ViewId,
+    /// Canonical path of the conflicted file when `:merge` opened.
+    pub result_path: PathBuf,
     pub sync_scroll: bool,
     pub fingerprint: String,
     pub stale: bool,
@@ -1349,6 +1351,9 @@ pub struct MergeViewState {
     pub ours_deleted: bool,
     pub theirs_deleted: bool,
     pub delete_result: bool,
+    /// `Document::version()` when deletion was accepted, so undoing or editing
+    /// the result buffer clears the pending deletion state immediately.
+    pub delete_doc_version: Option<i32>,
     pub result_on_disk: Option<Arc<[u8]>>,
     pub review_range: Option<DiffRange>,
     /// Tracks the last accept so a follow-up accept (e.g. ours → theirs)
@@ -1374,6 +1379,12 @@ impl MergeViewState {
             || id == self.theirs_view_id
             || id == self.result_view_id
             || self.base_view_id == Some(id)
+    }
+
+    pub fn is_delete_pending(&self, doc: &Document) -> bool {
+        self.delete_result
+            && self.delete_doc_version == Some(doc.version())
+            && doc.text().len_chars() == 0
     }
 }
 
@@ -4039,6 +4050,10 @@ impl Editor {
                 ours_view_id,
                 theirs_view_id,
                 result_view_id,
+                result_path: self.documents[&result_doc_id]
+                    .path()
+                    .cloned()
+                    .unwrap_or_else(|| path.clone()),
                 sync_scroll: true,
                 fingerprint: inputs.fingerprint,
                 stale: false,
@@ -4052,6 +4067,7 @@ impl Editor {
                 ours_deleted,
                 theirs_deleted,
                 delete_result: false,
+                delete_doc_version: None,
                 result_on_disk,
                 review_range: None,
                 last_resolution: None,
@@ -4182,11 +4198,34 @@ impl Editor {
         Ok(())
     }
 
+    /// Look up the active merge session associated with `view_id`, including any
+    /// duplicate pane displaying the session's `result_doc_id`.
+    pub fn merge_state_for_view(&self, view_id: ViewId) -> Option<&MergeViewState> {
+        if let Some(state) = self.diff.merge_views.get(&view_id) {
+            return Some(state);
+        }
+        let doc_id = self.tree.try_get(view_id)?.doc;
+        self.diff
+            .merge_views
+            .values()
+            .find(|state| state.result_doc_id == doc_id)
+    }
+
     /// Reject side operations once an external Git operation replaced the
-    /// stages the user is looking at. Result edits remain untouched.
+    /// stages the user is looking at, or if the result view switched documents
+    /// or was saved under another path. Result edits remain untouched.
     pub fn ensure_merge_inputs_current(&mut self, view_id: ViewId) -> anyhow::Result<()> {
         #[cfg(feature = "git")]
-        if let Some(state) = self.diff.merge_views.get(&view_id).cloned() {
+        if let Some(state) = self.merge_state_for_view(view_id).cloned() {
+            if view_id == state.result_view_id
+                && self
+                    .tree
+                    .try_get(view_id)
+                    .is_some_and(|view| view.doc != state.result_doc_id)
+            {
+                self.close_merge_view(view_id);
+                anyhow::bail!("Merge view is no longer showing the conflicted file");
+            }
             anyhow::ensure!(
                 !state.finished,
                 "This conflict resolution is already staged"
@@ -4194,7 +4233,13 @@ impl Editor {
             let path = self.documents[&state.result_doc_id]
                 .path()
                 .ok_or_else(|| anyhow!("Merge result has no file path"))?;
-            let current = helix_vcs::git::merge_fingerprint(path)?;
+            if path != &state.result_path {
+                self.close_merge_view(state.result_view_id);
+                anyhow::bail!(
+                    "Merge result was saved to a different path; reopen :merge on the conflicted file"
+                );
+            }
+            let current = helix_vcs::git::merge_fingerprint(&state.result_path)?;
             if current != state.fingerprint {
                 for entry in self
                     .diff
@@ -4299,7 +4344,7 @@ impl Editor {
                 "staged".to_string()
             } else if scan.malformed {
                 "malformed markers".to_string()
-            } else if state.delete_result {
+            } else if state.is_delete_pending(&self.documents[&state.result_doc_id]) {
                 "delete pending".to_string()
             } else if state.whole_file {
                 "file conflict".to_string()

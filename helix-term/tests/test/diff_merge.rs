@@ -3557,3 +3557,140 @@ async fn sticky_merge_menu_can_switch_sides_and_leave_for_undo() -> anyhow::Resu
     harness.close(&mut app).await?;
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn jumplist_detaches_merge_view_instead_of_staging_hidden_file() -> anyhow::Result<()> {
+    let repo = GitRepoFixture::new()?;
+    repo.write_file("a.txt", "base\n")?;
+    repo.write_file("b.txt", "other unconflicted file\n")?;
+    repo.commit_all("base")?;
+    repo.checkout_new_branch("side")?;
+    repo.write_file("a.txt", "incoming\n")?;
+    repo.commit_all("side")?;
+    repo.checkout("main")?;
+    repo.write_file("a.txt", "ours\n")?;
+    repo.commit_all("main")?;
+    repo.merge_expect_conflict("side")?;
+
+    let _cwd = CwdGuard::enter(repo.path()).await?;
+    let mut app = AppBuilder::new()
+        .with_file(repo.file("b.txt"), None)
+        .build()?;
+    let mut harness = AppTestHarness::new();
+    assert!(harness.send_keys(&mut app, ":open a.txt<ret>:merge<ret>").await?);
+    assert!(!app.editor.diff.merge_views.is_empty());
+
+    // Ctrl-o jumps back to b.txt and must detach the merge session.
+    assert!(harness.send_keys(&mut app, "<C-o>").await?);
+    assert!(app.editor.diff.merge_views.is_empty());
+    assert_current_doc_path(&app, &repo.file("b.txt"));
+
+    // Attempting to finish from b.txt must not stage a.txt.
+    assert!(harness.send_keys(&mut app, "<space>mf").await?);
+    assert!(helix_vcs::git::is_conflicted(&repo.file("a.txt"))?);
+    harness.close(&mut app).await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn duplicate_merge_result_pane_respects_deletion_and_stale_index() -> anyhow::Result<()> {
+    use std::io::Write;
+
+    // 1. Modify/delete conflict: duplicate pane must remove & stage deletion, not empty file.
+    let repo = GitRepoFixture::new()?;
+    repo.write_file("file.txt", "base\n")?;
+    repo.commit_all("base")?;
+    repo.checkout_new_branch("side")?;
+    repo.git(&["rm", "-q", "file.txt"])?;
+    repo.commit_all("side")?;
+    repo.checkout("main")?;
+    repo.write_file("file.txt", "ours\n")?;
+    repo.commit_all("main")?;
+    repo.merge_expect_conflict("side")?;
+
+    let _cwd = CwdGuard::enter(repo.path()).await?;
+    let mut app = AppBuilder::new()
+        .with_file(repo.file("file.txt"), None)
+        .build()?;
+    let mut harness = AppTestHarness::new();
+    assert!(harness.send_keys(&mut app, ":merge<ret><space>mt").await?);
+    // Undoing restores text and clears pending deletion status.
+    assert!(harness.send_keys(&mut app, "u").await?);
+    assert!(!app
+        .editor
+        .comparison_label(app.editor.tree.focus)
+        .contains("delete pending"));
+    // Re-accept deletion, duplicate pane with C-w v, and finish from duplicate.
+    assert!(harness.send_keys(&mut app, "<space>mt<C-w>v<space>mf").await?);
+    assert!(
+        !repo.file("file.txt").exists(),
+        "duplicate pane must delete file"
+    );
+    assert!(!helix_vcs::git::is_conflicted(&repo.file("file.txt"))?);
+    assert!(!harness.send_keys(&mut app, ":qa!<ret>").await?);
+    app.close().await;
+    drop(_cwd);
+
+    // 2. Duplicate pane must also reject stale index stages.
+    let repo2 = conflicted_repo()?;
+    let _cwd2 = CwdGuard::enter(repo2.path()).await?;
+    let mut app2 = AppBuilder::new()
+        .with_file(repo2.file("conflict.txt"), None)
+        .build()?;
+    let mut harness2 = AppTestHarness::new();
+    assert!(harness2.send_keys(&mut app2, ":merge<ret><space>mt").await?);
+    let mut blob = std::process::Command::new("git")
+        .current_dir(repo2.path())
+        .args(["hash-object", "-w", "--stdin"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()?;
+    blob.stdin.as_mut().unwrap().write_all(b"replacement\n")?;
+    let out = blob.wait_with_output()?;
+    let oid = String::from_utf8(out.stdout)?.trim().to_string();
+    let mut upd = std::process::Command::new("git")
+        .current_dir(repo2.path())
+        .args(["update-index", "--index-info"])
+        .stdin(std::process::Stdio::piped())
+        .spawn()?;
+    upd.stdin
+        .as_mut()
+        .unwrap()
+        .write_all(format!("100644 {oid} 3\tconflict.txt\n").as_bytes())?;
+    assert!(upd.wait()?.success());
+
+    assert!(harness2.send_keys(&mut app2, "<C-w>v<space>mf").await?);
+    assert!(app2.editor.is_err());
+    assert!(helix_vcs::git::is_conflicted(&repo2.file("conflict.txt"))?);
+    // Single :qa! exits merge view in one invocation.
+    assert!(!harness2.send_keys(&mut app2, ":qa!<ret>").await?);
+    app2.close().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn accept_base_with_shared_adjacent_edits_stages_correct_base_line() -> anyhow::Result<()> {
+    let repo = GitRepoFixture::new()?;
+    repo.git(&["config", "merge.conflictStyle", "merge"])?;
+    repo.write_file("conflict.txt", "top\nAAAA\nBBBB\nCCCC\nbottom\n")?;
+    repo.commit_all("base")?;
+    repo.checkout_new_branch("side")?;
+    repo.write_file("conflict.txt", "top\ndddd\nffff\ngggg\nbottom\n")?;
+    repo.commit_all("side")?;
+    repo.checkout("main")?;
+    repo.write_file("conflict.txt", "top\ndddd\neeee\ngggg\nbottom\n")?;
+    repo.commit_all("main")?;
+    repo.merge_expect_conflict("side")?;
+
+    let _cwd = CwdGuard::enter(repo.path()).await?;
+    let mut app = AppBuilder::new()
+        .with_file(repo.file("conflict.txt"), None)
+        .build()?;
+    let mut harness = AppTestHarness::new();
+    assert!(harness.send_keys(&mut app, ":merge<ret><space>ma<space>mf").await?);
+    assert_eq!(current_doc_text(&app), "top\ndddd\nBBBB\ngggg\nbottom\n");
+    assert!(!helix_vcs::git::is_conflicted(&repo.file("conflict.txt"))?);
+    assert!(harness.send_keys(&mut app, "<space>mq").await?);
+    harness.close(&mut app).await?;
+    Ok(())
+}

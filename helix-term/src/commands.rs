@@ -4746,13 +4746,20 @@ fn paste_impl(
     // multi-selection yank can be pasted back in full from a single cursor.
     let spillover: Option<Tendril> = if mapped.len() > selection.len() {
         let mut out = Tendril::new();
+        let mut prev_has_line_ending = mapped
+            .get(primary_index)
+            .is_some_and(|v| get_line_ending_of_str(v).is_some());
         for value in &mapped[selection.len()..] {
-            // `linewise` values already carry a trailing line ending; charwise ones
-            // need an explicit break so each entry lands on its own line.
-            if !linewise {
+            // Insert a line break whenever the preceding entry did not already end
+            // with one, so mixed linewise/charwise yanks never glue entries together.
+            if !prev_has_line_ending {
                 out.push_str(doc.line_ending.as_str());
             }
             out.push_str(value);
+            prev_has_line_ending = get_line_ending_of_str(value).is_some();
+        }
+        if linewise && !prev_has_line_ending {
+            out.push_str(doc.line_ending.as_str());
         }
         Some(out)
     } else {

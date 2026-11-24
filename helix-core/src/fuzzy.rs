@@ -76,33 +76,61 @@ pub fn fuzzy_match_with_typos<T: AsRef<str>>(
 
     let max_distance = max_typo_distance(pattern);
     let ignore_case = pattern.chars().all(|c| !c.is_uppercase());
+    let query_chars = fold_chars(pattern, ignore_case);
+    let query_folded: String = query_chars.iter().collect();
     let mut buf = Vec::new();
-    let mut fuzzy = Vec::new();
+    let mut direct_fuzzy = Vec::new();
+    let mut exact_typos = Vec::new();
+    let mut gapped_fuzzy = Vec::new();
     let mut typos = Vec::new();
 
     for item in items {
         let text = item.as_ref();
+        let candidate_chars = fold_chars(text, ignore_case);
+        let candidate_folded: String = candidate_chars.iter().collect();
         if let Some(score) = atom.score(Utf32Str::new(text, &mut buf), &mut matcher) {
-            fuzzy.push((item, score));
+            if candidate_folded.contains(&query_folded) {
+                direct_fuzzy.push((item, score));
+            } else {
+                gapped_fuzzy.push((item, score));
+            }
         } else if max_distance > 0 {
-            if let Some(distance) = typo_distance(pattern, text, max_distance, ignore_case) {
+            // A one-edit match to the entire command name (e.g. `wriet` -> `write`)
+            // is a stronger signal than a gapped subsequence across a longer command
+            // (e.g. `wriet` inside `write-quit`).
+            if bounded_damerau_levenshtein(&query_chars, &candidate_chars, 1) == Some(1) {
+                exact_typos.push(item);
+            } else if let Some(distance) = typo_distance(pattern, text, max_distance, ignore_case) {
                 typos.push((item, distance));
             }
         }
     }
 
-    fuzzy.sort_by_key(|(_, score)| Reverse(*score));
+    direct_fuzzy.sort_by_key(|(_, score)| Reverse(*score));
+    exact_typos.sort_by(|a, b| {
+        a.as_ref()
+            .len()
+            .cmp(&b.as_ref().len())
+            .then_with(|| a.as_ref().cmp(b.as_ref()))
+    });
+    gapped_fuzzy.sort_by_key(|(_, score)| Reverse(*score));
     typos.sort_by(|a, b| {
         a.1.cmp(&b.1)
             .then_with(|| a.0.as_ref().len().cmp(&b.0.as_ref().len()))
             .then_with(|| a.0.as_ref().cmp(b.0.as_ref()))
     });
-    fuzzy.extend(
+    direct_fuzzy.extend(
+        exact_typos
+            .into_iter()
+            .map(|item| (item, u16::from(max_distance))),
+    );
+    direct_fuzzy.extend(gapped_fuzzy);
+    direct_fuzzy.extend(
         typos
             .into_iter()
             .map(|(item, distance)| (item, u16::from(max_distance.saturating_sub(distance)))),
     );
-    fuzzy
+    direct_fuzzy
 }
 
 fn max_typo_distance(pattern: &str) -> u8 {
@@ -248,6 +276,12 @@ mod tests {
         let matched = names("wirte");
         assert_eq!(matched[0], "write");
         assert!(matched.contains(&"write-quit"));
+
+        // `wriet` is also a gapped subsequence of `write-quit`, but `write` is
+        // a one-transposition match to the entire command name.
+        let matched = names("wriet");
+        assert_eq!(matched[0], "write", "{matched:?}");
+        assert!(matched.contains(&"write-quit"), "{matched:?}");
     }
 
     #[test]

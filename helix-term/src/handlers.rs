@@ -50,6 +50,7 @@ pub fn setup(config: Arc<ArcSwap<Config>>) -> Handlers {
     diagnostics::register_hooks(&handlers);
     snippet::register_hooks(&handlers);
     document_colors::register_hooks(&handlers);
+    crate::commands::register_stream_hooks();
     prompt::register_hooks(&handlers);
     handlers
 }

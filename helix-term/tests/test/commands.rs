@@ -619,6 +619,29 @@ async fn test_multi_selection_paste_spillover() -> anyhow::Result<()> {
     ))
     .await?;
 
+    // Mixed linewise + charwise yanks still put every surplus entry on its own line.
+    test((
+        indoc! {"\
+            #[a|]#a first
+            bb second
+            cc third
+            dd fourth
+            ee fifth
+            "},
+        "%s(aa first\\n|bb|cc)<ret>y,ge;p",
+        indoc! {"\
+            aa first
+            bb second
+            cc third
+            dd fourth
+            ee fifth
+            #[aa first
+            bb
+            cc
+            |]#"},
+    ))
+    .await?;
+
     Ok(())
 }
 

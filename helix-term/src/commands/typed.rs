@@ -2392,6 +2392,10 @@ fn toggle_option(
             );
             Value::Bool(!value)
         }
+        Value::Object(ref map) if key == "cursorline" && args.len() == 1 => {
+            let any_enabled = map.values().any(|v| v.as_bool() == Some(true));
+            Value::Bool(!any_enabled)
+        }
         Value::String(ref value) => {
             ensure!(
                 args.len() == 2,

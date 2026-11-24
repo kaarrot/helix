@@ -96,24 +96,24 @@
 <title>Step 6 feat/scroll-redraw with step 5 feat/key-bindings-description: 0 files in conflict</title>
 </rect>
 <text x="16" y="200" font-size="12" fill="#6c687a" text-anchor="start" font-weight="400" class="mono">7</text>
-<text x="46" y="200" font-size="12" fill="#4c4957" text-anchor="start" font-weight="400" class="mono">improve-long-lines</text>
+<text x="46" y="200" font-size="12" fill="#4c4957" text-anchor="start" font-weight="400" class="mono">feat/improve-long-lines</text>
 <rect x="320" y="186" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
-<title>Step 7 improve-long-lines with step 1 feat/recoverable-config: 0 files in conflict</title>
+<title>Step 7 feat/improve-long-lines with step 1 feat/recoverable-config: 0 files in conflict</title>
 </rect>
 <rect x="342" y="186" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
-<title>Step 7 improve-long-lines with step 2 feat/yank-multi-selection: 0 files in conflict</title>
+<title>Step 7 feat/improve-long-lines with step 2 feat/yank-multi-selection: 0 files in conflict</title>
 </rect>
 <rect x="364" y="186" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
-<title>Step 7 improve-long-lines with step 3 feat/balanced-tripple-quotes: 0 files in conflict</title>
+<title>Step 7 feat/improve-long-lines with step 3 feat/balanced-tripple-quotes: 0 files in conflict</title>
 </rect>
 <rect x="386" y="186" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
-<title>Step 7 improve-long-lines with step 4 feat/fuzzy-commands: 0 files in conflict</title>
+<title>Step 7 feat/improve-long-lines with step 4 feat/fuzzy-commands: 0 files in conflict</title>
 </rect>
 <rect x="408" y="186" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
-<title>Step 7 improve-long-lines with step 5 feat/key-bindings-description: 0 files in conflict</title>
+<title>Step 7 feat/improve-long-lines with step 5 feat/key-bindings-description: 0 files in conflict</title>
 </rect>
 <rect x="430" y="186" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
-<title>Step 7 improve-long-lines with step 6 feat/scroll-redraw: 0 files in conflict</title>
+<title>Step 7 feat/improve-long-lines with step 6 feat/scroll-redraw: 0 files in conflict</title>
 </rect>
 <text x="16" y="222" font-size="12" fill="#6c687a" text-anchor="start" font-weight="400" class="mono">8</text>
 <text x="46" y="222" font-size="12" fill="#4c4957" text-anchor="start" font-weight="400" class="mono">feat/scoped-file-open</text>
@@ -136,7 +136,7 @@
 <title>Step 8 feat/scoped-file-open with step 6 feat/scroll-redraw: 0 files in conflict</title>
 </rect>
 <rect x="452" y="208" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
-<title>Step 8 feat/scoped-file-open with step 7 improve-long-lines: 0 files in conflict</title>
+<title>Step 8 feat/scoped-file-open with step 7 feat/improve-long-lines: 0 files in conflict</title>
 </rect>
 <text x="16" y="244" font-size="12" fill="#6c687a" text-anchor="start" font-weight="400" class="mono">9</text>
 <text x="46" y="244" font-size="12" fill="#4c4957" text-anchor="start" font-weight="400" class="mono">feat/markdown-preview-v2</text>
@@ -159,7 +159,7 @@
 <title>Step 9 feat/markdown-preview-v2 with step 6 feat/scroll-redraw: 0 files in conflict</title>
 </rect>
 <rect x="452" y="230" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
-<title>Step 9 feat/markdown-preview-v2 with step 7 improve-long-lines: 0 files in conflict</title>
+<title>Step 9 feat/markdown-preview-v2 with step 7 feat/improve-long-lines: 0 files in conflict</title>
 </rect>
 <rect x="474" y="230" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
 <title>Step 9 feat/markdown-preview-v2 with step 8 feat/scoped-file-open: 0 files in conflict</title>
@@ -185,7 +185,7 @@
 <title>Step 10 feat/theme-remove-modifier with step 6 feat/scroll-redraw: 0 files in conflict</title>
 </rect>
 <rect x="452" y="252" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
-<title>Step 10 feat/theme-remove-modifier with step 7 improve-long-lines: 0 files in conflict</title>
+<title>Step 10 feat/theme-remove-modifier with step 7 feat/improve-long-lines: 0 files in conflict</title>
 </rect>
 <rect x="474" y="252" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
 <title>Step 10 feat/theme-remove-modifier with step 8 feat/scoped-file-open: 0 files in conflict</title>
@@ -214,7 +214,7 @@
 <title>Step 11 feat/pgp with step 6 feat/scroll-redraw: 0 files in conflict</title>
 </rect>
 <rect x="452" y="274" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
-<title>Step 11 feat/pgp with step 7 improve-long-lines: 0 files in conflict</title>
+<title>Step 11 feat/pgp with step 7 feat/improve-long-lines: 0 files in conflict</title>
 </rect>
 <rect x="474" y="274" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
 <title>Step 11 feat/pgp with step 8 feat/scoped-file-open: 0 files in conflict</title>
@@ -246,7 +246,7 @@
 <title>Step 12 feat/scoped-search with step 6 feat/scroll-redraw: 0 files in conflict</title>
 </rect>
 <rect x="452" y="296" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
-<title>Step 12 feat/scoped-search with step 7 improve-long-lines: 0 files in conflict</title>
+<title>Step 12 feat/scoped-search with step 7 feat/improve-long-lines: 0 files in conflict</title>
 </rect>
 <rect x="474" y="296" width="20" height="20" rx="3" fill="#a998ee" stroke="none">
 <title>Step 12 feat/scoped-search with step 8 feat/scoped-file-open: 1 file in conflict
@@ -282,7 +282,7 @@ helix-term/src/keymap.rs</title>
 <title>Step 13 feat/vertical-preview with step 6 feat/scroll-redraw: 0 files in conflict</title>
 </rect>
 <rect x="452" y="318" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
-<title>Step 13 feat/vertical-preview with step 7 improve-long-lines: 0 files in conflict</title>
+<title>Step 13 feat/vertical-preview with step 7 feat/improve-long-lines: 0 files in conflict</title>
 </rect>
 <rect x="474" y="318" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
 <title>Step 13 feat/vertical-preview with step 8 feat/scoped-file-open: 0 files in conflict</title>
@@ -336,7 +336,7 @@ helix-term/src/config.rs
 helix-term/src/main.rs</title>
 </rect>
 <rect x="452" y="340" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
-<title>Step 14 feat/per-mode-cursorline with step 7 improve-long-lines: 0 files in conflict</title>
+<title>Step 14 feat/per-mode-cursorline with step 7 feat/improve-long-lines: 0 files in conflict</title>
 </rect>
 <rect x="474" y="340" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
 <title>Step 14 feat/per-mode-cursorline with step 8 feat/scoped-file-open: 0 files in conflict</title>
@@ -385,7 +385,7 @@ helix-term/src/config.rs</title>
 helix-term/src/config.rs</title>
 </rect>
 <rect x="452" y="362" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
-<title>Step 15 feat/buffer-reload-on-change with step 7 improve-long-lines: 0 files in conflict</title>
+<title>Step 15 feat/buffer-reload-on-change with step 7 feat/improve-long-lines: 0 files in conflict</title>
 </rect>
 <rect x="474" y="362" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
 <title>Step 15 feat/buffer-reload-on-change with step 8 feat/scoped-file-open: 0 files in conflict</title>
@@ -436,7 +436,7 @@ helix-term/src/config.rs</title>
 helix-term/src/config.rs</title>
 </rect>
 <rect x="452" y="384" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
-<title>Step 16 feat/statusline-completion with step 7 improve-long-lines: 0 files in conflict</title>
+<title>Step 16 feat/statusline-completion with step 7 feat/improve-long-lines: 0 files in conflict</title>
 </rect>
 <rect x="474" y="384" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
 <title>Step 16 feat/statusline-completion with step 8 feat/scoped-file-open: 0 files in conflict</title>
@@ -487,7 +487,7 @@ helix-term/src/config.rs</title>
 <title>Step 17 dev-insert-stream-command with step 6 feat/scroll-redraw: 0 files in conflict</title>
 </rect>
 <rect x="452" y="406" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
-<title>Step 17 dev-insert-stream-command with step 7 improve-long-lines: 0 files in conflict</title>
+<title>Step 17 dev-insert-stream-command with step 7 feat/improve-long-lines: 0 files in conflict</title>
 </rect>
 <rect x="474" y="406" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
 <title>Step 17 dev-insert-stream-command with step 8 feat/scoped-file-open: 0 files in conflict</title>
@@ -541,7 +541,7 @@ helix-term/tests/test/helpers.rs</title>
 <title>Step 18 feat/buffer-file-path with step 6 feat/scroll-redraw: 0 files in conflict</title>
 </rect>
 <rect x="452" y="428" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
-<title>Step 18 feat/buffer-file-path with step 7 improve-long-lines: 0 files in conflict</title>
+<title>Step 18 feat/buffer-file-path with step 7 feat/improve-long-lines: 0 files in conflict</title>
 </rect>
 <rect x="474" y="428" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
 <title>Step 18 feat/buffer-file-path with step 8 feat/scoped-file-open: 0 files in conflict</title>
@@ -599,7 +599,7 @@ helix-term/src/ui/statusline.rs</title>
 helix-term/src/ui/picker.rs</title>
 </rect>
 <rect x="452" y="450" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
-<title>Step 19 dev-timestamp-sort-file-picker with step 7 improve-long-lines: 0 files in conflict</title>
+<title>Step 19 dev-timestamp-sort-file-picker with step 7 feat/improve-long-lines: 0 files in conflict</title>
 </rect>
 <rect x="474" y="450" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
 <title>Step 19 dev-timestamp-sort-file-picker with step 8 feat/scoped-file-open: 0 files in conflict</title>
@@ -656,7 +656,7 @@ helix-term/src/ui/picker.rs</title>
 <title>Step 20 dev-3-way-diff-second-attempt with step 6 feat/scroll-redraw: 0 files in conflict</title>
 </rect>
 <rect x="452" y="472" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
-<title>Step 20 dev-3-way-diff-second-attempt with step 7 improve-long-lines: 0 files in conflict</title>
+<title>Step 20 dev-3-way-diff-second-attempt with step 7 feat/improve-long-lines: 0 files in conflict</title>
 </rect>
 <rect x="474" y="472" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
 <title>Step 20 dev-3-way-diff-second-attempt with step 8 feat/scoped-file-open: 0 files in conflict</title>
@@ -744,7 +744,7 @@ helix-term/src/config.rs</title>
 helix-term/src/config.rs</title>
 </rect>
 <rect x="452" y="494" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
-<title>Step 21 feat/comment-hunk with step 7 improve-long-lines: 0 files in conflict</title>
+<title>Step 21 feat/comment-hunk with step 7 feat/improve-long-lines: 0 files in conflict</title>
 </rect>
 <rect x="474" y="494" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
 <title>Step 21 feat/comment-hunk with step 8 feat/scoped-file-open: 0 files in conflict</title>
@@ -855,7 +855,7 @@ helix-view/src/view.rs</title>
 <title>Step 22 dev-python-dap-console with step 6 feat/scroll-redraw: 0 files in conflict</title>
 </rect>
 <rect x="452" y="516" width="20" height="20" rx="3" fill="#ffffff" stroke="#e3e0ea">
-<title>Step 22 dev-python-dap-console with step 7 improve-long-lines: 0 files in conflict</title>
+<title>Step 22 dev-python-dap-console with step 7 feat/improve-long-lines: 0 files in conflict</title>
 </rect>
 <rect x="474" y="516" width="20" height="20" rx="3" fill="#a998ee" stroke="none">
 <title>Step 22 dev-python-dap-console with step 8 feat/scoped-file-open: 1 file in conflict

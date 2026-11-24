@@ -45,7 +45,7 @@ Resolve and check each step before moving to the next.
 | 4 | Find command completions despite typos. | `feat/fuzzy-commands` | 0 (clean) |
 | 5 | Describe key bindings with comments in the configuration. | `feat/key-bindings-description` | 0 (clean) |
 | 6 | Synchronized redraws and smoother scrolling. | `feat/scroll-redraw` | 0 (clean) |
-| 7 | Responsive navigation on long, soft-wrapped lines. | `improve-long-lines` | 0 (clean) |
+| 7 | Responsive navigation on long, soft-wrapped lines. | `feat/improve-long-lines` | 0 (clean) |
 | 8 | Open nearby files and jump or peek at path:line:column locations. | `feat/scoped-file-open` | 0 (clean) |
 | 9 | Preview Markdown inside the editor, fullscreen or in a split. | `feat/markdown-preview-v2` | 0 (clean) |
 | 10 | Remove inherited theme modifiers with a leading minus. | `feat/theme-remove-modifier` | 0 (clean) |

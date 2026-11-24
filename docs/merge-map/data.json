@@ -11,7 +11,7 @@
     "feat/fuzzy-commands",
     "feat/key-bindings-description",
     "feat/scroll-redraw",
-    "improve-long-lines",
+    "feat/improve-long-lines",
     "feat/scoped-file-open",
     "feat/markdown-preview-v2",
     "feat/theme-remove-modifier",

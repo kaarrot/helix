@@ -158,6 +158,116 @@ async fn test_insert_stream_output_does_not_reuse_a_saved_output_buffer() -> any
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
+async fn regression_queued_stream_uses_submission_cwd() -> anyhow::Result<()> {
+    let _lock = Arc::clone(&STREAM_TEST_LOCK).lock_owned().await;
+    let dir = tempfile::tempdir()?;
+    let one = dir.path().join("one");
+    let two = dir.path().join("two");
+    std::fs::create_dir(&one)?;
+    std::fs::create_dir(&two)?;
+    std::fs::write(one.join("target.txt"), "one original\n")?;
+    std::fs::write(two.join("target.txt"), "two original\n")?;
+    let _cwd = CwdGuard::enter(&one).await?;
+
+    let mut app = AppBuilder::new().build()?;
+    send_key_sequence(
+        &mut app,
+        ":insert-stream-output echo ready; sleep 2<ret>",
+    )
+    .await?;
+    wait_for_condition(&mut app, "first stream printed ready", |app| {
+        doc!(app.editor).text().to_string().contains("ready\n")
+    })
+    .await?;
+    send_key_sequence(
+        &mut app,
+        &format!(
+            ":insert-stream-output printf updated <gt> target.txt; echo QUEUED_DONE<ret>:cd {}<ret>",
+            two.display()
+        ),
+    )
+    .await?;
+    wait_for_condition(&mut app, "queued stream finished", |app| {
+        doc!(app.editor).text().to_string().contains("QUEUED_DONE\n")
+    })
+    .await?;
+
+    assert_eq!(std::fs::read_to_string(one.join("target.txt"))?, "updated");
+    assert_eq!(
+        std::fs::read_to_string(two.join("target.txt"))?,
+        "two original\n"
+    );
+    close_app(&mut app).await?;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn regression_cancel_stream_kills_child_after_pipe_eof() -> anyhow::Result<()> {
+    let _lock = Arc::clone(&STREAM_TEST_LOCK).lock_owned().await;
+    let dir = tempfile::tempdir()?;
+    let marker = dir.path().join("cancelled.txt");
+    let _cwd = CwdGuard::enter(dir.path()).await?;
+
+    let mut app = AppBuilder::new().build()?;
+    send_key_sequence(
+        &mut app,
+        ":insert-stream-output echo ready; exec <gt>/dev/null 2<gt>&1; sleep 2; printf after-cancel <gt> cancelled.txt<ret>",
+    )
+    .await?;
+    wait_for_condition(&mut app, "stream printed ready", |app| {
+        doc!(app.editor).text().to_string().contains("ready\n")
+    })
+    .await?;
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    send_key_sequence(&mut app, ":cancel-stream<ret>").await?;
+    tokio::time::sleep(std::time::Duration::from_millis(2200)).await;
+
+    assert!(!marker.exists(), "cancelled stream must not write delayed file");
+    assert!(
+        app.editor
+            .get_status()
+            .is_some_and(|(s, _)| s.starts_with("Stream cancelled")),
+        "status should remain cancelled, got {:?}",
+        app.editor.get_status()
+    );
+    close_app(&mut app).await?;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn regression_late_stream_output_maps_through_user_edits() -> anyhow::Result<()> {
+    let _lock = Arc::clone(&STREAM_TEST_LOCK).lock_owned().await;
+    let mut app = AppBuilder::new().build()?;
+    send_key_sequence(
+        &mut app,
+        ":insert-stream-output echo FIRST; sleep 1; echo SECOND<ret>",
+    )
+    .await?;
+    wait_for_condition(&mut app, "stream printed FIRST", |app| {
+        doc!(app.editor).text().to_string().contains("FIRST\n")
+    })
+    .await?;
+    // Insert a prefix line at the top of the buffer while the command is sleeping.
+    send_key_sequence(&mut app, "ggOPREFIX<esc>").await?;
+    wait_for_condition(&mut app, "stream printed SECOND", |app| {
+        doc!(app.editor).text().to_string().contains("SECOND\n")
+    })
+    .await?;
+
+    let text = doc!(app.editor).text().to_string();
+    assert!(
+        text.starts_with("PREFIX\n")
+            && text.contains("echo FIRST; sleep 1; echo SECOND\nFIRST\nSECOND\n"),
+        "expected intact header and output, got: {text:?}"
+    );
+    close_app(&mut app).await?;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_insert_stream_output_preserves_an_unrelated_viewport() -> anyhow::Result<()> {
     let _lock = Arc::clone(&STREAM_TEST_LOCK).lock_owned().await;
     let file = helpers::temp_file_with_contents(&"line\n".repeat(200))?;

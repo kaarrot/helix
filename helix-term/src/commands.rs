@@ -110,6 +110,8 @@ struct StreamCommand {
     cmd: String,
     /// What the buffer and the status messages show.
     display_cmd: String,
+    /// Working directory captured when the command was submitted.
+    cwd: PathBuf,
 }
 
 /// The buffer a stream session writes to.
@@ -131,6 +133,25 @@ struct StreamSession {
     /// Cancels the running command's child process; `None` until it spawns.
     cancel_tx: Option<oneshot::Sender<()>>,
     queue: VecDeque<StreamCommand>,
+    /// Current insertion char offset in `target.doc_id`, mapped through user edits.
+    pos: usize,
+    /// Suppresses self-remapping while a stream chunk applies its own transaction.
+    applying_chunk: bool,
+}
+
+/// Keep the active stream's insertion position aligned across user edits.
+pub fn register_stream_hooks() {
+    use helix_view::events::DocumentDidChange;
+    helix_event::register_hook!(move |event: &mut DocumentDidChange<'_>| {
+        if let Ok(mut guard) = STREAM_SESSION.lock() {
+            if let Some(session) = guard.as_mut() {
+                if session.target.doc_id == event.doc.id() && !session.applying_chunk {
+                    session.pos = event.changes.map_pos(session.pos, helix_core::Assoc::After);
+                }
+            }
+        }
+        Ok(())
+    });
 }
 
 static STREAM_SESSION: Lazy<Mutex<Option<StreamSession>>> = Lazy::new(|| Mutex::new(None));
@@ -7501,7 +7522,12 @@ fn prepare_stream_output_buffer(cx: &mut compositor::Context) {
 /// without remapping it through the other's edits, the second would splice its
 /// output into the middle of the first's.
 fn queue_stream_command(cx: &mut compositor::Context, cmd: String, display_cmd: String) {
-    match enqueue_stream_command(StreamCommand { cmd, display_cmd }) {
+    let cwd = helix_stdx::env::current_working_dir();
+    match enqueue_stream_command(StreamCommand {
+        cmd,
+        display_cmd,
+        cwd,
+    }) {
         Ok(status) => cx.editor.set_status(status),
         Err(command) => {
             prepare_stream_output_buffer(cx);
@@ -7560,6 +7586,11 @@ fn start_stream_session(cx: &mut compositor::Context, command: StreamCommand) {
         buffer_name,
     };
 
+    let initial_pos = doc
+        .selections()
+        .get(&view_id)
+        .map_or(0, |selection| selection.primary().from());
+
     // Register the session synchronously, before the task starts: a second
     // `:insert-stream-output` has to find it and queue up rather than race a
     // second stream into the same buffer.
@@ -7567,6 +7598,8 @@ fn start_stream_session(cx: &mut compositor::Context, command: StreamCommand) {
         target: target.clone(),
         cancel_tx: None,
         queue: VecDeque::from([command]),
+        pos: initial_pos,
+        applying_chunk: false,
     });
     *LAST_STREAM_DOC_ID.lock().unwrap() = Some(doc_id);
 
@@ -7581,6 +7614,7 @@ fn start_stream_session(cx: &mut compositor::Context, command: StreamCommand) {
         let _spinner_guard = StreamSpinnerGuard::start(target.generation, target.doc_id);
 
         let mut pos = stream_start_position(target.doc_id, target.view_id).await;
+        set_stream_session_pos(target.generation, pos);
         while let Some(command) = next_stream_command(target.generation) {
             pos = run_stream_command(&shell, command, &target, pos).await;
         }
@@ -7658,28 +7692,76 @@ fn end_stream_session(generation: u64) {
     }
 }
 
+fn stream_session_pos(generation: u64, fallback: usize) -> usize {
+    STREAM_SESSION
+        .lock()
+        .unwrap()
+        .as_ref()
+        .filter(|session| session.target.generation == generation)
+        .map_or(fallback, |session| session.pos)
+}
+
+fn set_stream_session_pos(generation: u64, pos: usize) {
+    if let Some(session) = STREAM_SESSION
+        .lock()
+        .unwrap()
+        .as_mut()
+        .filter(|session| session.target.generation == generation)
+    {
+        session.pos = pos;
+    }
+}
+
+fn apply_stream_transaction(
+    generation: u64,
+    doc: &mut Document,
+    transaction: &Transaction,
+    view_id: ViewId,
+    next_pos: usize,
+) {
+    if let Some(session) = STREAM_SESSION
+        .lock()
+        .unwrap()
+        .as_mut()
+        .filter(|session| session.target.generation == generation)
+    {
+        session.applying_chunk = true;
+    }
+    doc.apply(transaction, view_id);
+    if let Some(session) = STREAM_SESSION
+        .lock()
+        .unwrap()
+        .as_mut()
+        .filter(|session| session.target.generation == generation)
+    {
+        session.applying_chunk = false;
+        session.pos = next_pos;
+    }
+}
+
 /// Inserts the command line that heads a command's output, breaking the line
 /// first when the buffer doesn't already sit at the start of one. Commands that
 /// end without a trailing newline are common (`printf`), and without this the
 /// next command in the queue would run into the previous one's output.
 async fn insert_stream_command_line(target: &StreamTarget, pos: usize, display_cmd: &str) -> usize {
-    let (doc_id, view_id) = (target.doc_id, target.view_id);
+    let (generation, doc_id, view_id) = (target.generation, target.doc_id, target.view_id);
     let display_cmd = display_cmd.to_string();
     let (tx, rx) = oneshot::channel();
 
     job::dispatch(move |editor, _compositor| {
+        let current_pos = stream_session_pos(generation, pos);
         let Some(view_id) = stream_edit_view(editor, doc_id, view_id) else {
-            let _ = tx.send(pos);
+            let _ = tx.send(current_pos);
             return;
         };
         let Some(doc) = editor.document_mut(doc_id) else {
-            let _ = tx.send(pos);
+            let _ = tx.send(current_pos);
             return;
         };
         doc.ensure_view_init(view_id);
 
         let text = doc.text();
-        let insert_pos = pos.min(text.len_chars());
+        let insert_pos = current_pos.min(text.len_chars());
         let line_break = if insert_pos > 0 && text.char(insert_pos - 1) != '\n' {
             "\n"
         } else {
@@ -7688,7 +7770,7 @@ async fn insert_stream_command_line(target: &StreamTarget, pos: usize, display_c
         let header = Tendril::from(format!("{}{}\n", line_break, display_cmd));
 
         let (transaction, next_pos) = stream_insert_transaction(text, insert_pos, header);
-        doc.apply(&transaction, view_id);
+        apply_stream_transaction(generation, doc, &transaction, view_id, next_pos);
         if editor.tree.get(view_id).doc == doc_id {
             editor.ensure_cursor_in_view(view_id);
         }
@@ -7702,22 +7784,23 @@ async fn insert_stream_command_line(target: &StreamTarget, pos: usize, display_c
 /// Inserts `text` into the session's buffer at `pos` and returns the position
 /// to continue from, as computed by the editor after the insert landed.
 async fn insert_stream_chunk(target: &StreamTarget, pos: usize, text: Tendril) -> usize {
-    let (doc_id, view_id) = (target.doc_id, target.view_id);
+    let (generation, doc_id, view_id) = (target.generation, target.doc_id, target.view_id);
     let (tx, rx) = oneshot::channel();
 
     job::dispatch(move |editor, _compositor| {
+        let current_pos = stream_session_pos(generation, pos);
         let Some(view_id) = stream_edit_view(editor, doc_id, view_id) else {
-            let _ = tx.send(pos);
+            let _ = tx.send(current_pos);
             return;
         };
         let Some(doc) = editor.document_mut(doc_id) else {
-            let _ = tx.send(pos);
+            let _ = tx.send(current_pos);
             return;
         };
         doc.ensure_view_init(view_id);
 
-        let (transaction, next_pos) = stream_insert_transaction(doc.text(), pos, text);
-        doc.apply(&transaction, view_id);
+        let (transaction, next_pos) = stream_insert_transaction(doc.text(), current_pos, text);
+        apply_stream_transaction(generation, doc, &transaction, view_id, next_pos);
         if editor.tree.get(view_id).doc == doc_id {
             editor.ensure_cursor_in_view(view_id);
         }
@@ -7820,7 +7903,11 @@ async fn run_stream_command(
     use tokio::io::AsyncReadExt;
     use tokio::process::Command;
 
-    let StreamCommand { cmd, display_cmd } = command;
+    let StreamCommand {
+        cmd,
+        display_cmd,
+        cwd,
+    } = command;
 
     stream_status(format!(
         "Running in '{}': {}",
@@ -7832,6 +7919,7 @@ async fn run_stream_command(
     process
         .args(&shell[1..])
         .arg(&cmd)
+        .current_dir(&cwd)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         // Nothing can answer a prompt, so hand the command EOF instead of
@@ -7946,7 +8034,18 @@ async fn run_stream_command(
         }
     }
 
-    let status = child.wait().await;
+    let status = if cancelled {
+        child.wait().await
+    } else {
+        tokio::select! {
+            status = child.wait() => status,
+            _ = &mut cancel_rx => {
+                cancelled = true;
+                kill_stream_command(&mut child).await;
+                child.wait().await
+            }
+        }
+    };
 
     if cancelled {
         return pos;
@@ -7989,14 +8088,15 @@ fn stream_edit_view(editor: &Editor, doc_id: DocumentId, preferred: ViewId) -> O
 async fn finish_stream_command(target: &StreamTarget, pos: usize, outcome: Result<(), String>) {
     let pending = pending_stream_commands(target.generation);
     let buffer_name = target.buffer_name.clone();
-    let (doc_id, view_id) = (target.doc_id, target.view_id);
+    let (generation, doc_id, view_id) = (target.generation, target.doc_id, target.view_id);
 
     job::dispatch(move |editor, _compositor| {
+        let current_pos = stream_session_pos(generation, pos);
         if let Some(view_id) = stream_edit_view(editor, doc_id, view_id)
             .filter(|&view_id| editor.tree.get(view_id).doc == doc_id)
         {
             if let Some(doc) = editor.document_mut(doc_id) {
-                let cursor = pos.min(doc.text().len_chars());
+                let cursor = current_pos.min(doc.text().len_chars());
                 doc.set_selection(view_id, Selection::point(cursor));
                 editor.ensure_cursor_in_view(view_id);
             }

@@ -672,6 +672,8 @@ impl ThemePalette {
                         for modifier in modifiers {
                             if modifier.as_str() == Some("underlined") {
                                 *style = style.underline_style(UnderlineStyle::Line);
+                            } else if modifier.as_str() == Some("-underlined") {
+                                *style = style.underline_style(UnderlineStyle::Reset);
                             } else if let Some(name) =
                                 modifier.as_str().and_then(|s| s.strip_prefix('-'))
                             {
@@ -806,6 +808,18 @@ mod tests {
         // drawn over bold text, it takes the bold off
         let over_bold = Style::default().add_modifier(Modifier::BOLD).patch(style);
         assert_eq!(over_bold.add_modifier, Modifier::ITALIC);
+
+        // `-underlined` clears inherited underline styling
+        let mut un_underlined = Style::default();
+        let table = toml::toml! { "markup.raw" = { modifiers = ["-underlined"] } };
+        for (_name, value) in table {
+            palette.parse_style(&mut un_underlined, value).unwrap();
+        }
+        assert_eq!(un_underlined.underline_style, Some(UnderlineStyle::Reset));
+        let over_underlined = Style::default()
+            .underline_style(UnderlineStyle::Line)
+            .patch(un_underlined);
+        assert_eq!(over_underlined.underline_style, Some(UnderlineStyle::Reset));
 
         let table = toml::toml! { "markup.raw" = { modifiers = ["-loud"] } };
         for (_name, value) in table {

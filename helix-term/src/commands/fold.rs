@@ -82,13 +82,21 @@ pub fn unfold_all(cx: &mut Context) {
     doc.set_folds(view.id, Vec::new());
 }
 
-/// Moves every cursor that a fold hides to the start of the fold's header line.
-/// Otherwise the next redraw would open the fold right back up.
+/// Moves every selection that a fold hides or reaches into to the start of the
+/// fold's header line. Otherwise the next redraw would open the fold right back
+/// up, or an edit like `d` could delete hidden lines.
 fn move_selection_out_of_folds(doc: &mut Document, view_id: ViewId) {
     let text = doc.text().slice(..);
     let folds = doc.folds(view_id);
     let selection = doc.selection(view_id).clone().transform(|range| {
-        match fold::fold_at(folds, range.cursor(text)) {
+        let hidden = fold::fold_at(folds, range.cursor(text)).or_else(|| {
+            let from = range.from();
+            let to = range.to();
+            folds
+                .iter()
+                .find(|fold| from < fold.end && fold.start < to)
+        });
+        match hidden {
             Some(fold) => Range::point(text.line_to_char(fold.header_line(text))),
             None => range,
         }

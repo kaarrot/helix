@@ -195,3 +195,79 @@ async fn test_changes_in_splits_apply_to_all_views() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+#[cfg(not(windows))]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_coalesced_click_and_enter_cancels_prompt() -> anyhow::Result<()> {
+    use helix_view::input::parse_macro;
+    use termina::event::{
+        Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, Modifiers, MouseButton, MouseEvent,
+        MouseEventKind,
+    };
+    use tokio_stream::wrappers::UnboundedReceiverStream;
+
+    let file_a = tempfile::NamedTempFile::new()?;
+    let file_b = tempfile::NamedTempFile::new()?;
+    std::fs::write(file_a.path(), "alpha\n")?;
+    std::fs::write(file_b.path(), "bravo\n")?;
+
+    let mut app = helpers::AppBuilder::new()
+        .with_file(file_a.path(), None)
+        .build()?;
+
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut rx_stream = UnboundedReceiverStream::new(rx);
+
+    let setup = format!(
+        ":vsplit {}<ret>A UNSAVED<esc><C-w>h:buffer-close!",
+        file_b.path().to_string_lossy()
+    );
+    for key_event in parse_macro(&setup)? {
+        tx.send(Ok(Event::Key(KeyEvent::from(key_event))))?;
+    }
+    assert!(app.event_loop_until_idle(&mut rx_stream).await);
+    assert_eq!(2, app.editor.tree.views().count());
+
+    let right_view_area = app
+        .editor
+        .tree
+        .views()
+        .find(|(view, _)| {
+            app.editor
+                .document(view.doc)
+                .and_then(|doc| doc.path())
+                .is_some_and(|p| p == &path::normalize(file_b.path()))
+        })
+        .map(|(view, _)| view.area)
+        .expect("right split showing B.txt");
+
+    // Enqueue click on B.txt and Enter together so both arrive in one coalesced batch.
+    tx.send(Ok(Event::Mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: right_view_area.x + 1,
+        row: right_view_area.y + 1,
+        modifiers: Modifiers::NONE,
+    })))?;
+    tx.send(Ok(Event::Key(KeyEvent {
+        code: KeyCode::Enter,
+        modifiers: Modifiers::NONE,
+        kind: KeyEventKind::Press,
+        state: KeyEventState::NONE,
+    })))?;
+
+    assert!(app.event_loop_until_idle(&mut rx_stream).await);
+
+    // Focus moved to B.txt, and the pending `:buffer-close!` prompt from A.txt
+    // was dismissed before Enter could discard B.txt's unsaved edit.
+    assert_eq!(2, app.editor.tree.views().count());
+    let doc_b = app
+        .editor
+        .documents()
+        .find(|doc| doc.path().is_some_and(|p| p == &path::normalize(file_b.path())))
+        .expect("B.txt should still be open");
+    assert_eq!("bravo UNSAVED\n", doc_b.text().to_string());
+    assert!(doc_b.is_modified());
+
+    app.close().await;
+    Ok(())
+}

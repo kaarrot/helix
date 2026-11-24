@@ -780,6 +780,16 @@ impl Application {
     /// `EventStream`. The stream's helper thread holds the reader mutex in a
     /// blocking poll, so a zero-timeout `poll_next` often reports "empty" even
     /// when more keys are already parsed or sitting in the PTY.
+    fn drain_job_callbacks(&mut self) -> bool {
+        let mut handled = false;
+        while let Ok(callback) = self.jobs.callbacks.try_recv() {
+            self.jobs
+                .handle_callback(&mut self.editor, &mut self.compositor, Ok(Some(callback)));
+            handled = true;
+        }
+        handled
+    }
+
     async fn handle_terminal_events_batch<S>(
         &mut self,
         first: std::io::Result<TerminalEvent>,
@@ -791,11 +801,13 @@ impl Application {
         loop {
             let mut batched = 1usize;
             let mut need_redraw = self.handle_terminal_events(event);
+            need_redraw |= self.drain_job_callbacks();
             while !self.editor.should_close() {
                 let Some(next) = self.take_available_event(input_stream).await else {
                     break;
                 };
                 need_redraw |= self.handle_terminal_events(next);
+                need_redraw |= self.drain_job_callbacks();
                 batched += 1;
             }
             if batched > 1 {

@@ -6409,6 +6409,11 @@ fn show_jump(cx: &mut Context, from_doc: DocumentId, doc_id: DocumentId, selecti
     if cx.editor.leaves_diff(view_id, doc_id) {
         cx.editor.suspend_diff_view(view_id);
     }
+    if cx.editor.diff.merge_views.get(&view_id).is_some_and(|state| {
+        view_id == state.result_view_id && doc_id != state.result_doc_id
+    }) {
+        cx.editor.close_merge_view(view_id);
+    }
 
     view_mut!(cx.editor).doc = doc_id;
     let (view, doc) = current!(cx.editor); // refetch doc

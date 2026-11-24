@@ -1116,9 +1116,12 @@ fn quit_all_impl(cx: &mut compositor::Context, force: bool) -> anyhow::Result<()
         buffers_remaining_impl(cx.editor)?;
     }
 
-    // close all views
-    let views: Vec<_> = cx.editor.tree.views().map(|(view, _)| view.id).collect();
-    for view_id in views {
+    // close all views (loop because closing a diff/merge view tears down
+    // partner panes and intentionally keeps the last pane open on a single `:q`)
+    loop {
+        let Some(view_id) = cx.editor.tree.views().next().map(|(view, _)| view.id) else {
+            break;
+        };
         cx.editor.close(view_id);
     }
 

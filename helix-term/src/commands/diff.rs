@@ -633,10 +633,13 @@ pub fn merge_show_base(cx: &mut Context) {
 }
 
 /// The document/view merge commands should edit. Inside a merge session this
-/// is always RESULT, even when OURS/THEIRS is focused.
+/// is always RESULT, even when OURS/THEIRS or a duplicate RESULT pane is focused.
 fn merge_target(editor: &Editor) -> (ViewId, DocumentId) {
     let view_id = view!(editor).id;
-    if let Some(state) = editor.diff.merge_views.get(&view_id) {
+    if let Some(state) = editor.merge_state_for_view(view_id) {
+        if view_id == state.result_view_id && editor.tree.get(view_id).doc != state.result_doc_id {
+            return (view_id, doc!(editor).id());
+        }
         (state.result_view_id, state.result_doc_id)
     } else {
         (view_id, doc!(editor).id())
@@ -679,9 +682,7 @@ fn merge_accept_impl(cx: &mut Context, side: AcceptSide) {
     }
     if let Some(state) = cx
         .editor
-        .diff
-        .merge_views
-        .get(&current_view_id)
+        .merge_state_for_view(current_view_id)
         .cloned()
         .filter(|state| state.whole_file && scan.marker_lines == 0)
     {
@@ -708,6 +709,7 @@ fn merge_accept_impl(cx: &mut Context, side: AcceptSide) {
         }
         let view = cx.editor.tree.get_mut(target_view_id);
         doc.append_changes_to_history(view);
+        let delete_version = delete.then_some(doc.version());
         for entry in cx
             .editor
             .diff
@@ -716,6 +718,7 @@ fn merge_accept_impl(cx: &mut Context, side: AcceptSide) {
             .filter(|entry| entry.result_doc_id == target_doc_id)
         {
             entry.delete_result = delete;
+            entry.delete_doc_version = delete_version;
         }
         cx.editor.set_status(if delete {
             "Accepted deletion; f removes and stages this file"
@@ -726,9 +729,7 @@ fn merge_accept_impl(cx: &mut Context, side: AcceptSide) {
     }
     let prior = cx
         .editor
-        .diff
-        .merge_views
-        .get(&current_view_id)
+        .merge_state_for_view(current_view_id)
         .and_then(|s| s.last_resolution.clone());
 
     // 1. If we just resolved a conflict and the RESULT cursor is still inside
@@ -817,26 +818,15 @@ fn merge_accept_impl(cx: &mut Context, side: AcceptSide) {
         return;
     };
     let base = base.or_else(|| {
-        let state = cx.editor.diff.merge_views.get(&current_view_id)?;
+        let state = cx.editor.merge_state_for_view(current_view_id)?;
         let base = cx.editor.document(state.base_doc_id?)?.text();
-        // Map the complete current marker block back to the index base.
-        // Computing from the current rope also handles hand edits made after
-        // opening the view, without a second mutable conflict model.
-        let inverse = helix_core::diff::compare_ropes(&text, base);
-        let start = text.line_to_char(region.start_line);
-        let end = if region.end_line + 1 < text.len_lines() {
-            text.line_to_char(region.end_line + 1)
-        } else {
-            text.len_chars()
-        };
-        let start = inverse.changes().map_pos(start, helix_core::Assoc::Before);
-        let end = inverse.changes().map_pos(end, helix_core::Assoc::After);
-        Some(base.slice(start..end).to_string())
+        infer_conflict_base(&text, base, &region, &ours, &theirs)
     });
     let both = format!("{}{}", ours, theirs);
     let Some(replacement) = side.pick(&ours, base.as_deref(), &theirs, &both) else {
-        cx.editor
-            .set_error("No base version is available for this conflict");
+        cx.editor.set_error(
+            "Base cannot be inferred unambiguously from these markers; space m B shows the index base",
+        );
         return;
     };
 
@@ -874,6 +864,93 @@ fn merge_accept_impl(cx: &mut Context, side: AcceptSide) {
     );
     cx.editor
         .set_status(format!("Accepted {} version", side.label()));
+}
+
+/// Infer the base lines corresponding to `region` when conflict markers omit a
+/// `|||||||` base section (`merge.conflictStyle = merge`).
+///
+/// Uses a pure line-level diff against `base` (never char-level diffing, which
+/// can match stray newlines across unrelated lines) and only slices `base`
+/// across adjacent shared edits when the surrounding lines map 1-to-1.
+fn infer_conflict_base(
+    text: &helix_core::Rope,
+    base: &helix_core::Rope,
+    region: &helix_view::merge_view::ConflictRegion,
+    ours: &str,
+    theirs: &str,
+) -> Option<String> {
+    use similar::{DiffOp, TextDiff};
+
+    let text_str = text.to_string();
+    let base_str = base.to_string();
+    let text_lines: Vec<&str> = text_str.split_inclusive('\n').collect();
+    let base_lines: Vec<&str> = base_str.split_inclusive('\n').collect();
+
+    let conflict_start = region.start_line;
+    let conflict_end = (region.end_line + 1).min(text_lines.len());
+
+    let diff = TextDiff::from_slices(&text_lines, &base_lines);
+    let mut t_start = 0usize;
+    let mut b_start = 0usize;
+    let mut t_end = text_lines.len();
+    let mut b_end = base_lines.len();
+    let mut found_end = false;
+
+    for op in diff.ops() {
+        if let DiffOp::Equal {
+            old_index,
+            new_index,
+            len,
+        } = *op
+        {
+            let old_end = old_index + len;
+            if old_index <= conflict_start {
+                let clamped = conflict_start.min(old_end);
+                t_start = clamped;
+                b_start = new_index + (clamped - old_index);
+            }
+            if !found_end && old_end >= conflict_end {
+                let clamped = conflict_end.max(old_index);
+                t_end = clamped;
+                b_end = new_index + (clamped - old_index);
+                found_end = true;
+            }
+        }
+    }
+
+    if t_start > conflict_start || t_end < conflict_end || b_start > b_end {
+        return None;
+    }
+
+    let base_hunk = &base_lines[b_start..b_end];
+    let prefix_lines = conflict_start - t_start;
+    let suffix_lines = t_end - conflict_end;
+
+    // Unambiguous case: unchanged base context directly brackets the conflict.
+    if prefix_lines == 0 && suffix_lines == 0 {
+        return Some(base_hunk.concat());
+    }
+
+    // Adjacent shared edits merged into the same diff hunk: slice `base` only
+    // when the hunk matches a 1-to-1 line replacement around the conflict.
+    let count_lines = |s: &str| {
+        if s.is_empty() {
+            0
+        } else {
+            s.split_inclusive('\n').count()
+        }
+    };
+    let ours_lines = count_lines(ours);
+    let theirs_lines = count_lines(theirs);
+
+    if prefix_lines + suffix_lines <= base_hunk.len()
+        && (base_hunk.len() == prefix_lines + ours_lines + suffix_lines
+            || base_hunk.len() == prefix_lines + theirs_lines + suffix_lines)
+    {
+        return Some(base_hunk[prefix_lines..base_hunk.len() - suffix_lines].concat());
+    }
+
+    None
 }
 
 /// Update `last_resolution` on every MergeViewState entry tied to the given
@@ -1042,10 +1119,8 @@ pub fn merge_finish(cx: &mut Context) {
     }
     let deletion = cx
         .editor
-        .diff
-        .merge_views
-        .get(&view_id)
-        .filter(|state| state.delete_result)
+        .merge_state_for_view(view_id)
+        .filter(|state| state.is_delete_pending(&cx.editor.documents[&doc_id]))
         .cloned();
     if let Some(state) = &deletion {
         if cx.editor.documents[&doc_id].text().len_chars() != 0 {

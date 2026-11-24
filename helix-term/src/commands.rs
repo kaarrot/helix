@@ -2507,12 +2507,52 @@ fn global_search_phases(current_file: Option<PathBuf>, search_root: PathBuf) -> 
     phases
 }
 
+fn path_is_ignored_from_root(
+    walk_root: &Path,
+    search_root: &Path,
+    config: &helix_view::editor::FilePickerConfig,
+) -> bool {
+    let Ok(rel) = walk_root.strip_prefix(search_root) else {
+        return false;
+    };
+    let mut parent = search_root.to_path_buf();
+    for component in rel.components() {
+        let next = parent.join(component);
+        let mut walker = WalkBuilder::new(&parent);
+        walker
+            .hidden(config.hidden)
+            .parents(config.parents)
+            .ignore(config.ignore)
+            .follow_links(config.follow_symlinks)
+            .git_ignore(config.git_ignore)
+            .git_global(config.git_global)
+            .git_exclude(config.git_exclude)
+            .max_depth(Some(1))
+            .add_custom_ignore_filename(helix_loader::config_dir().join("ignore"))
+            .add_custom_ignore_filename(".helix/ignore");
+        let target = next.clone();
+        walker.filter_entry(move |entry| entry.depth() == 0 || entry.path() == target);
+        let allowed = walker
+            .build()
+            .filter_map(Result::ok)
+            .any(|entry| entry.depth() == 1 && entry.path() == next);
+        if !allowed {
+            return true;
+        }
+        parent = next;
+    }
+    false
+}
+
 fn global_search_walk(
     walk_root: &Path,
     search_root: &Path,
     skip: Option<&Path>,
     config: &helix_view::editor::FilePickerConfig,
 ) -> Option<WalkBuilder> {
+    if walk_root != search_root && path_is_ignored_from_root(walk_root, search_root, config) {
+        return None;
+    }
     let depth = walk_root
         .strip_prefix(search_root)
         .ok()?
@@ -7158,6 +7198,29 @@ mod tests {
         assert_eq!(files.len(), 2, "{files:?}");
         assert!(files.contains(&current));
         assert!(files.contains(&target));
+    }
+
+    #[test]
+    fn regression_search_skips_ignored_siblings_of_current_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir(root.join(".git")).unwrap();
+        std::fs::write(root.join(".gitignore"), "ignored/\n").unwrap();
+        std::fs::create_dir(root.join("ignored")).unwrap();
+        let active = root.join("ignored/active.txt");
+        let sibling = root.join("ignored/sibling.txt");
+        let tracked = root.join("tracked.txt");
+        std::fs::write(&active, "needle\n").unwrap();
+        std::fs::write(&sibling, "needle\n").unwrap();
+        std::fs::write(&tracked, "needle\n").unwrap();
+
+        let files = scoped_files(root, &active, None);
+        assert!(files.contains(&active), "current file is searched: {files:?}");
+        assert!(files.contains(&tracked), "tracked file is searched: {files:?}");
+        assert!(
+            !files.contains(&sibling),
+            "ignored sibling must not be walked: {files:?}"
+        );
     }
 
     use std::path::PathBuf;

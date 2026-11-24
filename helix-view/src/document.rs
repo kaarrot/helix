@@ -1127,9 +1127,15 @@ impl Document {
             }
         };
 
-        if pgp_save.is_none() && pgp::is_new_file_path(&path) {
+        if pgp_save.is_none() && (pgp::is_new_file_path(&path) || pgp::is_encrypted_file(&path)) {
             bail!(
                 "won't write plain text to an encrypted file; open {} to set its passphrase",
+                path.display()
+            );
+        }
+        if pgp_save.is_some() && !pgp::is_pgp_path(&path) {
+            bail!(
+                "won't write encrypted text to {}; use a .gpg, .pgp, or .asc extension",
                 path.display()
             );
         }
@@ -3206,6 +3212,57 @@ mod test {
         };
         assert!(result.is_err());
         assert_eq!(std::fs::read(&path).unwrap(), contents);
+    }
+
+    #[cfg(feature = "pgp")]
+    #[tokio::test]
+    async fn regression_plaintext_cannot_overwrite_an_encrypted_asc_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let encrypted = dir.path().join("ciphertext.asc");
+        let plain_asc = dir.path().join("plain.asc");
+        let contents = include_bytes!("../tests/pgp/hello.txt.asc");
+        std::fs::write(&encrypted, contents).unwrap();
+        std::fs::write(&plain_asc, b"ordinary ascii text\n").unwrap();
+
+        let mut doc = open(&dir.path().join("plain.txt")).unwrap();
+        let result = match doc.save(Some(encrypted.clone()), false) {
+            Ok(save) => save.await.map(|_| ()),
+            Err(err) => Err(err),
+        };
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&encrypted).unwrap(), contents);
+
+        // Plaintext `.asc` files remain writable.
+        doc.save(Some(plain_asc.clone()), true)
+            .unwrap()
+            .await
+            .unwrap();
+    }
+
+    #[cfg(feature = "pgp")]
+    #[tokio::test]
+    async fn regression_encrypted_save_as_requires_pgp_extension() {
+        use crate::pgp::Passphrase;
+
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("hello.txt.asc");
+        std::fs::write(&src, include_bytes!("../tests/pgp/hello.txt.asc")).unwrap();
+
+        let mut doc = open(&src).unwrap();
+        doc.ensure_view_init(ViewId::default());
+        doc.pgp_unlock(Passphrase::new("test123")).unwrap();
+
+        let bad_dst = dir.path().join("copy.txt");
+        assert!(doc.save(Some(bad_dst.clone()), false).is_err());
+        assert!(!bad_dst.exists());
+
+        let good_dst = dir.path().join("copy.asc");
+        doc.save(Some(good_dst.clone()), false)
+            .unwrap()
+            .await
+            .unwrap();
+        let reopened = open(&good_dst).unwrap();
+        assert!(reopened.is_pgp_locked());
     }
 
     #[cfg(feature = "pgp")]

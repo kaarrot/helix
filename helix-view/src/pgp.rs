@@ -53,6 +53,16 @@ pub fn is_new_file_path(path: &Path) -> bool {
     cfg!(feature = "pgp") && has_extension(path, &NEW_FILE_EXTENSIONS)
 }
 
+/// Whether `path` already exists on disk as an encrypted PGP message
+/// (symmetric or unsupported), even for extensions such as `.asc` that stay
+/// plain for new files.
+pub fn is_encrypted_file(path: &Path) -> bool {
+    is_pgp_path(path)
+        && std::fs::read(path)
+            .ok()
+            .is_some_and(|bytes| !matches!(inspect(&bytes), Contents::Plain))
+}
+
 /// `path` without its encryption extension, so `notes.md.gpg` is detected
 /// as Markdown.
 pub fn inner_path(path: &Path) -> PathBuf {

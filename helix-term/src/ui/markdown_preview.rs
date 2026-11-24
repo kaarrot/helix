@@ -88,6 +88,23 @@ pub struct MarkdownPreview {
 impl MarkdownPreview {
     pub const ID: &'static str = "markdown-preview";
 
+    /// Dismiss the preview whenever its source document closes so edits cannot
+    /// be hidden behind a stale fullscreen overlay.
+    pub fn register_hooks() {
+        use helix_view::events::DocumentDidClose;
+        helix_event::register_hook!(move |event: &mut DocumentDidClose<'_>| {
+            let doc_id = event.doc.id();
+            crate::job::dispatch_blocking(move |_, compositor| {
+                if compositor
+                    .find_id::<MarkdownPreview>(MarkdownPreview::ID)
+                    .is_some_and(|preview| preview.source_doc == doc_id)
+                {
+                    compositor.remove(MarkdownPreview::ID);
+                }
+            });
+            Ok(())
+        });
+    }
     pub fn new(
         source_view: ViewId,
         source_doc: DocumentId,
@@ -546,6 +563,11 @@ impl Component for MarkdownPreview {
     }
 
     fn cursor(&self, _area: Rect, _ctx: &Editor) -> (Option<Position>, CursorKind) {
+        // In side-by-side mode the source pane remains focused and editable, so
+        // fall through to EditorView's cursor instead of hiding it.
+        if self.side_by_side {
+            return (None, CursorKind::Hidden);
+        }
         // Must return Some so Compositor::cursor does not fall through to EditorView.
         let row_off = self
             .row_starts
@@ -584,17 +606,20 @@ impl Component for MarkdownPreview {
 
         let theme_name = cx.editor.theme.name().to_string();
         let syn_loader = cx.editor.syn_loader.clone();
-        let (contents, version, wrap_width, soft_wrap) = match cx.editor.document(self.source_doc) {
-            Some(doc) => {
-                let fmt = doc.text_format(inner.width, Some(&cx.editor.theme));
-                (
-                    doc.text().to_string(),
-                    doc.version(),
-                    fmt.viewport_width,
-                    fmt.soft_wrap,
-                )
-            }
-            None => (String::new(), 0, inner.width, false),
+        let Some((contents, version, wrap_width, soft_wrap)) =
+            cx.editor.document(self.source_doc).map(|doc| {
+                // Always wrap prose to the preview panel width: the preview has
+                // no horizontal scroll, so leaving soft wrap off would clip
+                // long paragraphs past the right edge.
+                (doc.text().to_string(), doc.version(), inner.width, true)
+            })
+        else {
+            self.cache = None;
+            self.total_lines = 0;
+            self.line_map.clear();
+            self.links.clear();
+            self.row_starts.clear();
+            return;
         };
 
         let cache_hit = self.cache.as_ref().is_some_and(|cache| {
@@ -1187,5 +1212,80 @@ mod tests {
         preview.move_cursor(-1);
         assert_eq!(preview.cursor_line, 7);
         assert_eq!(preview.scroll, 2);
+    }
+
+    #[cfg(feature = "integration")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn regression_preview_wraps_long_paragraphs_and_clears_when_source_closes(
+    ) -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let md_path = dir.path().join("a.md");
+        let txt_path = dir.path().join("b.txt");
+        std::fs::write(
+            &md_path,
+            "word1 word2 word3 word4 word5 word6 word7 word8 END_MARKER\n",
+        )?;
+        std::fs::write(&txt_path, "other\n")?;
+
+        let mut app = crate::application::Application::new(
+            crate::args::Args::default(),
+            crate::config::Config::default(),
+            helix_core::syntax::Loader::default(),
+        )?;
+        let md_id = app.editor.open(&md_path, Action::Replace)?;
+        let _txt_id = app.editor.open(&txt_path, Action::Load)?;
+        let view_id = app.editor.tree.focus;
+
+        let mut jobs = crate::job::Jobs::new();
+        let mut preview = MarkdownPreview::new(view_id, md_id, dir.path().to_path_buf(), false);
+        let mut surface = Surface::empty(Rect::new(0, 0, 40, 20));
+        let mut cx = Context {
+            editor: &mut app.editor,
+            jobs: &mut jobs,
+            scroll: None,
+        };
+        preview.render(Rect::new(0, 0, 40, 20), &mut surface, &mut cx);
+        // Fullscreen hides editor cursor; split mode lets editor cursor show.
+        assert!(preview.cursor(Rect::new(0, 0, 40, 20), &app.editor).0.is_some());
+        preview.side_by_side = true;
+        assert_eq!(
+            preview.cursor(Rect::new(0, 0, 120, 20), &app.editor),
+            (None, CursorKind::Hidden)
+        );
+        preview.side_by_side = false;
+
+        let rendered: String = preview
+            .cache
+            .as_ref()
+            .unwrap()
+            .text
+            .lines
+            .iter()
+            .map(|l| {
+                l.0.iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("END_MARKER"), "{rendered:?}");
+        assert!(
+            preview.total_lines > 1,
+            "long paragraph should wrap at 40 cols even with soft-wrap disabled"
+        );
+
+        // Closing the source document invalidates any cached version-0 render.
+        assert!(app.editor.close_document(md_id, true).is_ok());
+        let mut cx = Context {
+            editor: &mut app.editor,
+            jobs: &mut jobs,
+            scroll: None,
+        };
+        preview.render(Rect::new(0, 0, 40, 20), &mut surface, &mut cx);
+        assert!(preview.cache.is_none());
+        assert_eq!(preview.total_lines, 0);
+
+        app.close().await;
+        Ok(())
     }
 }

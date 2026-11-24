@@ -51,12 +51,12 @@ Resolve and check each step before moving to the next.
 | 10 | Remove inherited theme modifiers with a leading minus. | `feat/theme-remove-modifier` | 0 (clean) |
 | 11 | Edit passphrase-encrypted OpenPGP files. | `feat/pgp` | 0 (clean) |
 | 12 | Search the current file first, then nearby directories before the rest of the workspace. | `feat/scoped-search` | 1 |
-| 13 | Keep picker previews beside the list on wide screens. | `dev-vertical-preview` | 1 |
+| 13 | Keep picker previews beside the list on wide screens. | `feat/vertical-preview` | 1 |
 | 14 | Use different cursorline styles in normal, insert, and select modes. | `feat/per-mode-cursorline` | 3 |
 | 15 | Reload files changed on disk, including while the editor is idle. | `feat/buffer-reload-on-change` | 1 |
 | 16 | Show completion suggestions in the statusline with keyboard and mouse selection. | `feat/statusline-completion` | 2 |
 | 17 | Stream shell-command output into buffers, with queuing and cancellation. | `dev-insert-stream-command` | 4 |
-| 18 | Display and copy buffer paths and path:line locations. | `dev-buffer-file-path` | 3 |
+| 18 | Display and copy buffer paths and path:line locations. | `feat/buffer-file-path` | 3 |
 | 19 | Sort file-picker matches by modification time. | `dev-timestamp-sort-file-picker` | 1 |
 | 20 | Compare working files, commits, and bases; resolve three-way merges. | `dev-3-way-diff-second-attempt` | 15 |
 | 21 | Attach inline review discussions and coding-agent conversations to diff hunks. | `feat/comment-hunk` | 32 |

@@ -529,10 +529,10 @@ mod tests {
         use helix_view::review::agent::ReviewAgentKind;
 
         let (config, warnings) = Config::load_test_with_warnings(
-            "[editor]\nreview-agent = \"unknown\"\ncursorline = true",
+            "[editor]\nreview-agent = \"unknown\"\nauto-format = false",
         );
         assert_eq!(config.editor.review_agent, ReviewAgentKind::Claude);
-        assert!(config.editor.cursorline);
+        assert!(!config.editor.auto_format);
         assert_eq!(warnings.len(), 1);
         assert_eq!(warnings[0].path, "editor.review-agent");
     }

@@ -3877,3 +3877,44 @@ async fn accept_base_with_shared_adjacent_edits_stages_correct_base_line() -> an
     harness.close(&mut app).await?;
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn changed_file_navigation_skips_files_with_no_effective_diff() -> anyhow::Result<()> {
+    let repo = GitRepoFixture::new()?;
+    repo.write_file("same.txt", "base content\n")?;
+    repo.commit_all("base")?;
+    repo.write_file("same.txt", "historical content\n")?;
+    repo.commit_all("second")?;
+    repo.write_file("same.txt", "base content\n")?;
+
+    let _cwd = CwdGuard::enter(repo.path()).await?;
+    let mut app = AppBuilder::new()
+        .with_file(repo.file("same.txt"), None)
+        .build()?;
+    let mut harness = AppTestHarness::new();
+    assert!(harness.send_keys(&mut app, ":diff-commit HEAD^<ret>").await?);
+    assert!(harness.wait_for_idle(&mut app).await?);
+    assert!(harness.send_keys(&mut app, "]F").await?);
+    assert!(harness.wait_for_idle(&mut app).await?);
+    assert_eq!(
+        app.editor.get_status().map(|(msg, _)| msg.as_ref()),
+        Some("No changed files in this comparison")
+    );
+
+    // Against HEAD, staging a change and restoring HEAD text on disk also has no effective diff.
+    repo.write_file("same.txt", "staged content\n")?;
+    repo.git(&["add", "same.txt"])?;
+    repo.write_file("same.txt", "historical content\n")?;
+    assert!(harness.send_keys(&mut app, ":diff-commit HEAD<ret>").await?);
+    assert!(harness.wait_for_idle(&mut app).await?);
+    assert!(harness.send_keys(&mut app, "]F").await?);
+    assert!(harness.wait_for_idle(&mut app).await?);
+    assert_eq!(
+        app.editor.get_status().map(|(msg, _)| msg.as_ref()),
+        Some("No changed files in this comparison")
+    );
+
+    assert!(harness.send_keys(&mut app, "<space>mq").await?);
+    harness.close(&mut app).await?;
+    Ok(())
+}

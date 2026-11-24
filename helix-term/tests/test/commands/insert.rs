@@ -583,3 +583,29 @@ async fn test_jump_undo_redo() -> anyhow::Result<()> {
     .await?;
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn paste_linewise_after_closed_fold() -> anyhow::Result<()> {
+    test((
+        indoc! {"\
+            #[`|]#``python
+            x = 1
+            ```
+
+            Outside the fence.
+        "},
+        "v2jzf<esc>:5<ret>xyggp",
+        indoc! {"\
+            ```python
+            x = 1
+            ```
+            #[Outside the fence.
+            |]#
+
+            Outside the fence.
+        "},
+    ))
+    .await?;
+
+    Ok(())
+}

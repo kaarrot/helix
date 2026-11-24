@@ -5461,7 +5461,14 @@ fn paste_impl(
             (Paste::Before, true) => text.line_to_char(text.char_to_line(range.from())),
             // paste linewise after
             (Paste::After, true) => {
-                let line = range.line_range(text.slice(..)).1;
+                let mut line = range.line_range(text.slice(..)).1;
+                if let Some(fold) = doc
+                    .folds(view.id)
+                    .iter()
+                    .find(|fold| fold.header_line(text.slice(..)) == line)
+                {
+                    line = fold.lines(text.slice(..)).end - 1;
+                }
                 text.line_to_char((line + 1).min(text.len_lines()))
             }
             // paste insert

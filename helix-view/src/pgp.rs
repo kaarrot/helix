@@ -12,6 +12,7 @@
 //! All of it needs the `pgp` feature. Without it no path is taken for an
 //! encrypted file, and the editor never gets past the checks below.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -245,6 +246,8 @@ pub struct PgpState {
     pub passphrase: Option<Passphrase>,
     /// The file's bytes while the document is locked. `None` for a new file.
     pub(crate) ciphertext: Option<Vec<u8>>,
+    /// Requested jump coordinates recorded before decryption finishes.
+    pub(crate) pending_coords: HashMap<crate::ViewId, Vec<helix_core::Position>>,
 }
 
 impl PgpState {
@@ -257,6 +260,7 @@ impl PgpState {
             armored,
             passphrase: None,
             ciphertext: Some(ciphertext),
+            pending_coords: HashMap::new(),
         }
     }
 
@@ -267,6 +271,7 @@ impl PgpState {
             armored: false,
             passphrase: None,
             ciphertext: None,
+            pending_coords: HashMap::new(),
         }
     }
 

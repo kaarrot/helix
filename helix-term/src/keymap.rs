@@ -73,16 +73,28 @@ impl KeyTrieNode {
         if !other.name.is_empty() {
             self.name.clone_from(&other.name);
         }
-        self.docs.extend(std::mem::take(&mut other.docs));
+        let mut other_docs = std::mem::take(&mut other.docs);
         for (key, trie) in std::mem::take(&mut other.map) {
             if let Some(KeyTrie::Node(node)) = self.map.get_mut(&key) {
                 if let KeyTrie::Node(other_node) = trie {
                     node.merge(other_node);
+                    if let Some(doc) = other_docs.remove(&key) {
+                        self.docs.insert(key, doc);
+                    }
                     continue;
                 }
             }
             self.map.insert(key, trie);
+            match other_docs.remove(&key) {
+                Some(doc) => {
+                    self.docs.insert(key, doc);
+                }
+                None => {
+                    self.docs.remove(&key);
+                }
+            }
         }
+        self.docs.extend(other_docs);
         for &key in self.map.keys() {
             if !self.order.contains(&key) {
                 self.order.push(key);
@@ -653,5 +665,36 @@ mod tests {
         ));
 
         assert_eq!(toml::from_str(keys), Ok(expectation));
+    }
+
+    #[test]
+    fn replacing_a_binding_clears_its_inherited_doc() {
+        use crate::commands::MappableCommand;
+        use helix_view::input::{KeyCode, KeyEvent, KeyModifiers};
+
+        let key = KeyEvent {
+            code: KeyCode::Char('x'),
+            modifiers: KeyModifiers::NONE,
+        };
+        let mut base = KeyTrieNode::new(
+            "Normal",
+            hashmap! { key => KeyTrie::MappableCommand(MappableCommand::select_all) },
+            vec![key],
+        );
+        base.set_doc(key, "Global custom doc".into());
+
+        let override_layer = KeyTrieNode::new(
+            "",
+            hashmap! { key => KeyTrie::MappableCommand(MappableCommand::delete_selection) },
+            vec![key],
+        );
+        base.merge(override_layer);
+
+        let info = base.infobox();
+        assert!(
+            !info.text.contains("Global custom doc"),
+            "stale doc should be cleared: {}",
+            info.text
+        );
     }
 }

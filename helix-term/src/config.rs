@@ -505,6 +505,25 @@ fn descend<'a>(mut node: &'a mut KeyTrieNode, path: &[String]) -> Option<&'a mut
     Some(node)
 }
 
+fn strip_inline_comment(line: &str) -> &str {
+    let mut quote = None;
+    let mut escaped = false;
+    for (idx, ch) in line.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' if quote == Some('"') => escaped = true,
+            _ if Some(ch) == quote => quote = None,
+            '"' | '\'' if quote.is_none() => quote = Some(ch),
+            '#' if quote.is_none() => return line[..idx].trim_end(),
+            _ => {}
+        }
+    }
+    line
+}
+
 /// Collect `(path, description)` pairs out of the comments in a config file, for
 /// both table headers and keys. This is deliberately sloppier than a TOML parser:
 /// the parsed config is what decides which keys exist, so a path that comes out
@@ -522,7 +541,8 @@ fn keymap_comment_docs(file: &str) -> Vec<(Vec<String>, String)> {
             continue;
         }
 
-        if let Some(header) = line
+        let code = strip_inline_comment(line);
+        if let Some(header) = code
             .strip_prefix('[')
             .and_then(|line| line.strip_suffix(']'))
         {
@@ -530,8 +550,8 @@ fn keymap_comment_docs(file: &str) -> Vec<(Vec<String>, String)> {
             if !comments.is_empty() {
                 docs.push((table.clone(), comments.join(" ")));
             }
-        } else if !line.is_empty() && !comments.is_empty() {
-            let path = key_path(line);
+        } else if !code.is_empty() && !comments.is_empty() {
+            let path = key_path(code);
             if !path.is_empty() {
                 docs.push(([table.clone(), path].concat(), comments.join(" ")));
             }
@@ -792,6 +812,33 @@ mod tests {
             .infobox();
         assert_eq!(submenu.title, "Version control");
         assert_eq!(description(&submenu, "b"), "Blame the current line");
+    }
+
+    #[test]
+    fn comments_above_table_headers_with_inline_comments() {
+        let config = Config::load_test(
+            r#"
+            # Version control
+            [keys.normal.space.v] # submenu comment
+            # Blame the current line
+            b = ":sh git blame"
+
+            [editor] # plain table with inline comment
+            # Editor setting comment should not leak into keys.normal.space.v
+            mouse = true
+            "#,
+        );
+
+        let space = "space".parse::<KeyEvent>().unwrap();
+        let v = "v".parse::<KeyEvent>().unwrap();
+        let submenu = config.keys[&Mode::Normal]
+            .search(&[space, v])
+            .and_then(KeyTrie::node)
+            .unwrap()
+            .infobox();
+        assert_eq!(submenu.title, "Version control");
+        assert_eq!(description(&submenu, "b"), "Blame the current line");
+        assert!(!submenu.text.contains("Editor setting comment"));
     }
 
     #[test]

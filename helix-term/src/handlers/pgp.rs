@@ -91,9 +91,28 @@ fn unlock(editor: &mut Editor, compositor: &mut Compositor, doc_id: DocumentId) 
         .iter()
         .any(|passphrase| doc.pgp_unlock(passphrase.clone()).is_ok());
     if unlocked {
+        align_unlocked_views(editor, doc_id);
         editor.set_status(format!("Decrypted {name}"));
     } else {
         ask(compositor, doc_id, name, false);
+    }
+}
+
+fn align_unlocked_views(editor: &mut Editor, doc_id: DocumentId) {
+    let views: Vec<_> = editor
+        .tree
+        .views()
+        .filter(|(view, _)| view.doc == doc_id)
+        .map(|(view, _)| view.id)
+        .collect();
+    for view_id in views {
+        let Some(doc) = editor.documents.get_mut(&doc_id) else {
+            return;
+        };
+        if doc.selection(view_id).primary().from() > 0 {
+            let view = editor.tree.get(view_id);
+            helix_view::align_view(doc, view, helix_view::Align::Center);
+        }
     }
 }
 
@@ -130,6 +149,7 @@ fn ask(compositor: &mut Compositor, doc_id: DocumentId, name: String, wrong: boo
                 let passphrase = Passphrase::new(input);
                 match doc.pgp_unlock(passphrase.clone()) {
                     Ok(()) => {
+                        align_unlocked_views(cx.editor, doc_id);
                         cx.editor.pgp_passphrases.remember(passphrase);
                         cx.editor.set_status(format!("Decrypted {name}"));
                         next(cx);

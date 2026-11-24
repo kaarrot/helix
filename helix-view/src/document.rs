@@ -2130,9 +2130,11 @@ impl Document {
             }
             None => None,
         };
+        let mut pending_coords = std::collections::HashMap::new();
         if let Some(state) = &mut self.pgp {
             state.passphrase = Some(passphrase);
             state.ciphertext = None;
+            pending_coords = std::mem::take(&mut state.pending_coords);
         }
 
         if let Some((rope, encoding, has_bom)) = decoded {
@@ -2144,7 +2146,23 @@ impl Document {
                     let transaction = helix_core::diff::compare_ropes(self.text(), &rope);
                     self.apply(&transaction, view_id);
                     for view_id in view_ids {
-                        self.set_selection(view_id, Selection::point(0));
+                        let selection = pending_coords
+                            .remove(&view_id)
+                            .filter(|coords| !coords.is_empty())
+                            .map(|coords| {
+                                coords
+                                    .into_iter()
+                                    .map(|coords| {
+                                        helix_core::Range::point(helix_core::pos_at_coords(
+                                            self.text().slice(..),
+                                            coords,
+                                            true,
+                                        ))
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_else(|| Selection::point(0));
+                        self.set_selection(view_id, selection);
                     }
                 }
                 None => {
@@ -2169,6 +2187,16 @@ impl Document {
             self.fold_closed_blocks(view);
         }
         Ok(())
+    }
+
+    /// Records coordinates requested while the file is still PGP-locked so
+    /// [`Self::pgp_unlock`] can jump there once the plaintext is available.
+    pub fn set_pending_pgp_coords(&mut self, view_id: ViewId, coords: Vec<helix_core::Position>) {
+        if let Some(state) = self.pgp.as_mut().filter(|state| state.is_locked()) {
+            if !coords.is_empty() {
+                state.pending_coords.insert(view_id, coords);
+            }
+        }
     }
 
     /// If there are unsaved modifications.
@@ -3278,6 +3306,33 @@ mod test {
         assert!(!doc.apply_temporary(&transaction, view));
         assert_eq!(doc.version(), version);
         assert!(!doc.is_modified());
+    }
+
+    #[cfg(feature = "pgp")]
+    #[tokio::test]
+    async fn regression_unlock_applies_pending_coordinates() {
+        use crate::pgp::{encrypt, Passphrase};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notes.txt.gpg");
+        let passphrase = Passphrase::new("test");
+        std::fs::write(
+            &path,
+            encrypt(b"one\ntwo\n123456\n", &passphrase, false, "notes.txt").unwrap(),
+        )
+        .unwrap();
+
+        let mut doc = open(&path).unwrap();
+        let view = ViewId::default();
+        doc.ensure_view_init(view);
+        // Line 3, column 5 (0-based: row 2, col 4 -> '5' at char offset 12).
+        doc.set_pending_pgp_coords(view, vec![helix_core::Position::new(2, 4)]);
+        doc.pgp_unlock(passphrase).unwrap();
+
+        let pos = doc.selection(view).primary().cursor(doc.text().slice(..));
+        assert_eq!(
+            helix_core::coords_at_pos(doc.text().slice(..), pos),
+            helix_core::Position::new(2, 4)
+        );
     }
 
     #[cfg(feature = "pgp")]

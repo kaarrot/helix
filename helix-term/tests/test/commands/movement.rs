@@ -948,3 +948,25 @@ async fn match_bracket() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_fold_selection_collapses_backward_selection_out_of_fold() -> anyhow::Result<()> {
+    let input = indoc! {"\
+        #[o|]#ne
+        value = \"two\"
+        three
+        four
+    "};
+    let expected = indoc! {"\
+        #[n|]#e
+        value = \"two\"
+        three
+        four
+    "};
+
+    for keys in ["v2jzf<esc>d", "2jv2kzf<esc>d", "2jxv2kzf<esc>d"] {
+        test((input, keys, expected)).await?;
+    }
+
+    Ok(())
+}

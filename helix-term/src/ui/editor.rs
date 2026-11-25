@@ -1143,7 +1143,8 @@ impl EditorView {
     }
 
     fn sync_statusline_height(&self, editor: &mut Editor) {
-        let takeover = statusline::completions_take_over(editor, self.completion.as_ref());
+        let (_, doc) = current_ref!(editor);
+        let takeover = statusline::completions_take_over(editor, doc, self.completion.as_ref());
         let scrolloff = editor.config().scrolloff;
         let (view, doc) = current!(editor);
         let new_height = if takeover {
@@ -1160,8 +1161,10 @@ impl EditorView {
     }
 
     fn statusline_area(&self, editor: &Editor) -> Rect {
-        let view_area = current_ref!(editor).0.area;
-        let height = statusline::strip_height(editor, self.completion.as_ref(), view_area.height);
+        let (view, doc) = current_ref!(editor);
+        let view_area = view.area;
+        let height =
+            statusline::strip_height(editor, doc, self.completion.as_ref(), view_area.height);
         let height = height.min(view_area.height).max(1);
         view_area.clip_top(view_area.height.saturating_sub(height))
     }
@@ -1216,12 +1219,12 @@ impl EditorView {
     fn append_whitespace_after_statusline_completion(&self, editor: &mut Editor) {
         use helix_view::editor::CompletionDisplay;
         let config = editor.config();
+        let (view, doc) = current!(editor);
         if !config.completion_mouse_append_whitespace
-            || !matches!(config.completion_display, CompletionDisplay::Statusline)
+            || !matches!(doc.completion_display(), CompletionDisplay::Statusline)
         {
             return;
         }
-        let (view, doc) = current!(editor);
         if doc.active_snippet.is_some() {
             return;
         }
@@ -1300,7 +1303,8 @@ impl EditorView {
 
         match kind {
             MouseEventKind::Down(MouseButton::Left) => {
-                if statusline::completions_take_over(cxt.editor, self.completion.as_ref())
+                let (_, doc) = current_ref!(cxt.editor);
+                if statusline::completions_take_over(cxt.editor, doc, self.completion.as_ref())
                     && self.statusline_area_contains(cxt.editor, row, column)
                 {
                     if let Some(index) =
@@ -1365,8 +1369,9 @@ impl EditorView {
                     let diagnostic_click = editor.mode == Mode::Insert
                         && modifiers != KeyModifiers::ALT
                         && Self::cursor_overlaps_diagnostic(editor);
+                    let (_, doc) = current_ref!(editor);
                     let statusline_completion = matches!(
-                        config.completion_display,
+                        doc.completion_display(),
                         helix_view::editor::CompletionDisplay::Statusline
                     );
                     if diagnostic_click && (had_completion || statusline_completion) {
@@ -1883,10 +1888,8 @@ impl Component for EditorView {
 
         if let Some(completion) = self.completion.as_mut() {
             use helix_view::editor::CompletionDisplay;
-            if !matches!(
-                cx.editor.config().completion_display,
-                CompletionDisplay::Statusline
-            ) {
+            let (_, doc) = current_ref!(cx.editor);
+            if !matches!(doc.completion_display(), CompletionDisplay::Statusline) {
                 completion.render(area, surface, cx);
             }
         }

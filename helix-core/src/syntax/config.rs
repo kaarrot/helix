@@ -63,6 +63,8 @@ pub struct LanguageConfiguration {
     pub path_completion: Option<bool>,
     /// If set, overrides `editor.word-completion`.
     pub word_completion: Option<WordCompletion>,
+    /// If set, overrides `editor.completion-display`.
+    pub completion_display: Option<CompletionDisplay>,
 
     #[serde(default)]
     pub diagnostic_severity: Severity,
@@ -110,6 +112,20 @@ impl LanguageConfiguration {
         // This value must be set by `super::Loader::new`.
         self.language.unwrap()
     }
+}
+
+/// Where to render completion suggestions.
+#[derive(Debug, Default, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CompletionDisplay {
+    /// Render the vertical popup next to the cursor (current behavior).
+    #[default]
+    Popup,
+    /// Render suggestions only inside the statusline (requires
+    /// `completion-suggestions` to be in the statusline layout).
+    Statusline,
+    /// Render both the popup and the statusline suggestions.
+    Both,
 }
 
 #[derive(Debug, PartialEq, Eq, Hash)]

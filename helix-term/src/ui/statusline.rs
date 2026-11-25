@@ -821,10 +821,14 @@ where
 /// True when completion suggestions are currently being rendered in the statusline
 /// and are therefore allowed to hide path elements to free up space.
 fn suggestions_taking_over(context: &RenderContext) -> bool {
-    completions_take_over(context.editor, context.completion)
+    context.focused && completions_take_over(context.editor, context.doc, context.completion)
 }
 
-pub(crate) fn completions_take_over(editor: &Editor, completion: Option<&Completion>) -> bool {
+pub(crate) fn completions_take_over(
+    editor: &Editor,
+    doc: &Document,
+    completion: Option<&Completion>,
+) -> bool {
     use helix_view::editor::CompletionDisplay;
     if editor.mode() != Mode::Insert {
         return false;
@@ -835,7 +839,7 @@ pub(crate) fn completions_take_over(editor: &Editor, completion: Option<&Complet
     if completion.is_empty() {
         return false;
     }
-    if matches!(editor.config().completion_display, CompletionDisplay::Popup) {
+    if matches!(doc.completion_display(), CompletionDisplay::Popup) {
         return false;
     }
     let cfg = &editor.config().statusline;
@@ -848,10 +852,11 @@ pub(crate) fn completions_take_over(editor: &Editor, completion: Option<&Complet
 
 pub(crate) fn strip_height(
     editor: &Editor,
+    doc: &Document,
     completion: Option<&Completion>,
     view_height: u16,
 ) -> u16 {
-    if completions_take_over(editor, completion) {
+    if completions_take_over(editor, doc, completion) {
         COMPLETION_STRIP_HEIGHT.min(view_height).max(1)
     } else {
         1
@@ -910,13 +915,10 @@ fn completion_suggestion_spans<'a>(
 ) -> Vec<CompletionSuggestionSpan<'a>> {
     use helix_view::editor::CompletionDisplay;
 
-    if context.editor.mode() != Mode::Insert {
+    if !context.focused || context.editor.mode() != Mode::Insert {
         return Vec::new();
     }
-    if matches!(
-        context.editor.config().completion_display,
-        CompletionDisplay::Popup
-    ) {
+    if matches!(context.doc.completion_display(), CompletionDisplay::Popup) {
         return Vec::new();
     }
     let Some(completion) = context.completion else {
@@ -1078,7 +1080,7 @@ mod tests {
         width: u16,
     ) -> Vec<String> {
         let (view, doc) = current_ref!(editor);
-        let height = strip_height(editor, completion, view.area.height);
+        let height = strip_height(editor, doc, completion, view.area.height);
         let viewport = Rect::new(0, 0, width, height);
         let mut surface = Surface::empty(viewport);
         let spinners = ProgressSpinners::default();
@@ -1234,5 +1236,49 @@ mod tests {
             "mode indicator should be visible outside insert mode: {line:?}"
         );
         assert!(line.contains("1 sel"));
+
+        // Per-language override: markdown uses statusline while other languages keep default popup.
+        let lang_config: syntax::config::Configuration = toml::from_str(
+            r#"
+            [[language]]
+            name = "markdown"
+            scope = "source.md"
+            file-types = ["md"]
+            completion-display = "statusline"
+
+            [[language]]
+            name = "rust"
+            scope = "source.rust"
+            file-types = ["rs"]
+            "#,
+        )
+        .expect("language config should deserialize");
+        let loader = syntax::Loader::new(lang_config).expect("syntax loader should initialize");
+        harness.editor.syn_loader.store(Arc::new(loader));
+
+        harness.set_completion_display(CompletionDisplay::Popup);
+        harness.editor.mode = Mode::Insert;
+
+        {
+            let syn_loader = harness.editor.syn_loader.load();
+            let (_, doc) = current!(harness.editor);
+            doc.set_path(Some(Path::new("notes.md")));
+            doc.detect_language(&syn_loader);
+        }
+        let rows = render_statusline(&harness.editor, Some(&completion), 30);
+        assert_eq!(COMPLETION_STRIP_HEIGHT as usize, rows.len());
+        assert!(text_row(&rows).contains("alpha"));
+        assert!(!text_row(&rows).contains("notes.md"));
+
+        {
+            let syn_loader = harness.editor.syn_loader.load();
+            let (_, doc) = current!(harness.editor);
+            doc.set_path(Some(Path::new("src/main.rs")));
+            doc.detect_language(&syn_loader);
+        }
+        let rows = render_statusline(&harness.editor, Some(&completion), 40);
+        assert_eq!(1, rows.len());
+        assert!(text_row(&rows).contains("src/main.rs"));
+        assert!(!text_row(&rows).contains("alpha"));
     }
 }

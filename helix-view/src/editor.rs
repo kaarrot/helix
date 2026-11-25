@@ -1010,19 +1010,7 @@ mod tests {
     }
 }
 
-/// Where to render completion suggestions.
-#[derive(Debug, Default, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum CompletionDisplay {
-    /// Render the vertical popup next to the cursor (current behavior).
-    #[default]
-    Popup,
-    /// Render suggestions only inside the statusline (requires
-    /// `completion-suggestions` to be in the statusline layout).
-    Statusline,
-    /// Render both the popup and the statusline suggestions.
-    Both,
-}
+pub use helix_core::syntax::config::CompletionDisplay;
 
 /// bufferline render modes
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]

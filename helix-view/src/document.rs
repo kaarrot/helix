@@ -2300,6 +2300,12 @@ impl Document {
             .unwrap_or_else(|| self.config.load().path_completion)
     }
 
+    pub fn completion_display(&self) -> crate::editor::CompletionDisplay {
+        self.language_config()
+            .and_then(|lang_config| lang_config.completion_display)
+            .unwrap_or_else(|| self.config.load().completion_display)
+    }
+
     /// maintains the order as configured in the language_servers TOML array
     pub fn language_servers(&self) -> impl Iterator<Item = &helix_lsp::Client> {
         self.language_config().into_iter().flat_map(move |config| {

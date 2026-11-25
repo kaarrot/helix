@@ -184,8 +184,8 @@ While suggestions are active the strip grows to three rows so each candidate is
 easier to tap, and adjacent labels are packed with a single space of padding
 so as many as will fit remain readable.
 
-To enable it, set `completion-display` **and** add the element to the
-statusline layout:
+To enable it, set `completion-display` (globally in `config.toml` or per
+language in `languages.toml`) **and** add the element to the statusline layout:
 
 ```toml
 [editor]

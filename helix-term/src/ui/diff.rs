@@ -9,8 +9,16 @@ use helix_view::{
     review::MARKER,
     Document, Theme,
 };
-use similar::{Algorithm, ChangeTag, DiffOp, TextDiff};
-use std::{ops::Range, rc::Rc, time::Duration};
+use similar::{
+    algorithms::{diff_deadline, Capture, IdentifyDistinct, Replace},
+    get_diff_ratio, Algorithm, DiffOp, DiffableStr,
+};
+use std::{
+    hash::Hash,
+    ops::Range,
+    rc::Rc,
+    time::{Duration, Instant},
+};
 
 const MAX_INTRALINE_HUNK_LINES: usize = 40;
 const MAX_INTRALINE_HUNK_CHARS: usize = 8 * 1024;
@@ -22,6 +30,12 @@ const MIN_WORD_DIFF_RATIO: f32 = 0.45;
 const MIN_LINE_PAIR_RATIO: f32 = 0.50;
 const MAX_REPLACEMENT_HIGHLIGHT_DENSITY: f32 = 0.60;
 const INLINE_DIFF_TIMEOUT: Duration = Duration::from_millis(4);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IntralineSide {
+    Before,
+    After,
+}
 
 #[derive(Debug, PartialEq, Eq)]
 struct IntralineRange {
@@ -410,7 +424,13 @@ pub(super) fn char_diff_highlights_into(
             continue;
         };
 
-        for range in adaptive_intraline_ranges(&base_hunk, &doc_hunk) {
+        let (before_hunk, after_hunk, side) = if diff.is_inverted() {
+            (&doc_hunk, &base_hunk, IntralineSide::Before)
+        } else {
+            (&base_hunk, &doc_hunk, IntralineSide::After)
+        };
+
+        for range in adaptive_intraline_ranges(before_hunk, after_hunk, side) {
             let line_idx = start_line + range.line;
             if line_idx < first_visible_line
                 || line_idx >= last_visible_line
@@ -461,7 +481,46 @@ fn collect_hunk_text(
     Some(hunk)
 }
 
-fn adaptive_intraline_ranges(before: &str, after: &str) -> Vec<IntralineRange> {
+/// Diff two slices without `similar::algorithms::Compact`, which shifts
+/// `Insert` ops through following `Equal` runs and can split adjacent
+/// `Delete`/`Insert` replacements (e.g. highlighting the last `b` in
+/// `aaabbb` vs `aaacbb`).
+fn diff_slices_without_compact<T>(algorithm: Algorithm, old: &[T], new: &[T]) -> Vec<DiffOp>
+where
+    T: Eq + Hash + Ord,
+{
+    let deadline = Instant::now().checked_add(INLINE_DIFF_TIMEOUT);
+    let mut hook = Replace::new(Capture::new());
+    if old.len() > 100 || new.len() > 100 {
+        let ih = IdentifyDistinct::<u32>::new(old, 0..old.len(), new, 0..new.len());
+        let _ = diff_deadline(
+            algorithm,
+            &mut hook,
+            ih.old_lookup(),
+            ih.old_range(),
+            ih.new_lookup(),
+            ih.new_range(),
+            deadline,
+        );
+    } else {
+        let _ = diff_deadline(
+            algorithm,
+            &mut hook,
+            old,
+            0..old.len(),
+            new,
+            0..new.len(),
+            deadline,
+        );
+    }
+    hook.into_inner().into_ops()
+}
+
+fn adaptive_intraline_ranges(
+    before: &str,
+    after: &str,
+    side: IntralineSide,
+) -> Vec<IntralineRange> {
     let before_chars = before.chars().count();
     let after_chars = after.chars().count();
     if before_chars + after_chars > MAX_INTRALINE_HUNK_CHARS {
@@ -471,34 +530,46 @@ fn adaptive_intraline_ranges(before: &str, after: &str) -> Vec<IntralineRange> {
         return Vec::new();
     }
 
-    let mut config = TextDiff::configure();
-    config
-        .algorithm(Algorithm::Patience)
-        .timeout(INLINE_DIFF_TIMEOUT);
-    let line_diff = config.diff_lines(before, after);
+    let old_lines = before.tokenize_lines();
+    let new_lines = after.tokenize_lines();
 
-    if line_diff.old_slices().len() + line_diff.new_slices().len() > MAX_INTRALINE_HUNK_LINES {
+    if old_lines.len() + new_lines.len() > MAX_INTRALINE_HUNK_LINES {
         return Vec::new();
     }
 
+    let line_ops = diff_slices_without_compact(Algorithm::Patience, &old_lines, &new_lines);
+
     let mut ranges = Vec::new();
-    for op in line_diff.ops() {
-        match *op {
-            DiffOp::Equal { .. } | DiffOp::Delete { .. } => {}
+    for op in line_ops {
+        match op {
+            DiffOp::Equal { .. } => {}
+            DiffOp::Delete {
+                old_index, old_len, ..
+            } => {
+                if side == IntralineSide::Before {
+                    push_whole_line_ranges(&old_lines, old_index, old_len, &mut ranges);
+                }
+            }
             DiffOp::Insert {
                 new_index, new_len, ..
-            } => push_inserted_line_ranges(&line_diff, new_index, new_len, &mut ranges),
+            } => {
+                if side == IntralineSide::After {
+                    push_whole_line_ranges(&new_lines, new_index, new_len, &mut ranges);
+                }
+            }
             DiffOp::Replace {
                 old_index,
                 old_len,
                 new_index,
                 new_len,
             } => push_replacement_ranges(
-                &line_diff,
+                &old_lines,
+                &new_lines,
                 old_index,
                 old_len,
                 new_index,
                 new_len,
+                side,
                 &mut ranges,
             ),
         }
@@ -507,20 +578,20 @@ fn adaptive_intraline_ranges(before: &str, after: &str) -> Vec<IntralineRange> {
     ranges
 }
 
-fn push_inserted_line_ranges(
-    line_diff: &TextDiff<'_, '_, '_, str>,
-    new_index: usize,
-    new_len: usize,
+fn push_whole_line_ranges(
+    lines: &[&str],
+    start: usize,
+    len: usize,
     ranges: &mut Vec<IntralineRange>,
 ) {
-    for line in new_index..new_index + new_len {
-        push_inserted_line_range(line_diff.new_slices()[line], line, ranges);
+    for line in start..start + len {
+        push_whole_line_range(lines[line], line, ranges);
     }
 }
 
-fn push_inserted_line_range(after: &str, line: usize, ranges: &mut Vec<IntralineRange>) {
-    let line_chars = after.chars().count();
-    if line_chars == 0 || line_chars > MAX_INTRALINE_LINE_CHARS || after.trim().is_empty() {
+fn push_whole_line_range(text: &str, line: usize, ranges: &mut Vec<IntralineRange>) {
+    let line_chars = text.chars().count();
+    if line_chars == 0 || line_chars > MAX_INTRALINE_LINE_CHARS || text.trim().is_empty() {
         return;
     }
     ranges.push(IntralineRange {
@@ -529,21 +600,29 @@ fn push_inserted_line_range(after: &str, line: usize, ranges: &mut Vec<Intraline
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn push_replacement_ranges(
-    line_diff: &TextDiff<'_, '_, '_, str>,
+    old_lines: &[&str],
+    new_lines: &[&str],
     old_index: usize,
     old_len: usize,
     new_index: usize,
     new_len: usize,
+    side: IntralineSide,
     ranges: &mut Vec<IntralineRange>,
 ) {
     if old_len == new_len && old_len <= MAX_CHAR_DIFF_REPLACE_LINES {
         let ranges_start = ranges.len();
         for offset in 0..new_len {
+            let line = match side {
+                IntralineSide::Before => old_index + offset,
+                IntralineSide::After => new_index + offset,
+            };
             push_paired_line_ranges(
-                line_diff.old_slices()[old_index + offset],
-                line_diff.new_slices()[new_index + offset],
-                new_index + offset,
+                old_lines[old_index + offset],
+                new_lines[new_index + offset],
+                line,
+                side,
                 ranges,
             );
         }
@@ -553,24 +632,36 @@ fn push_replacement_ranges(
         }
     }
 
-    push_matched_replacement_ranges(line_diff, old_index, old_len, new_index, new_len, ranges);
+    push_matched_replacement_ranges(
+        old_lines,
+        new_lines,
+        old_index,
+        old_len,
+        new_index,
+        new_len,
+        side,
+        ranges,
+    );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn push_matched_replacement_ranges(
-    line_diff: &TextDiff<'_, '_, '_, str>,
+    old_lines: &[&str],
+    new_lines: &[&str],
     old_index: usize,
     old_len: usize,
     new_index: usize,
     new_len: usize,
+    side: IntralineSide,
     ranges: &mut Vec<IntralineRange>,
 ) {
     let mut used_old_lines = vec![false; old_len];
     let mut line_matches = vec![None; new_len];
 
     for new_offset in 0..new_len {
-        let after = line_diff.new_slices()[new_index + new_offset];
+        let after = new_lines[new_index + new_offset];
         let Some(old_offset) =
-            best_line_match(line_diff, old_index, old_len, after, &used_old_lines)
+            best_line_match(old_lines, old_index, old_len, after, &used_old_lines)
         else {
             continue;
         };
@@ -583,23 +674,50 @@ fn push_matched_replacement_ranges(
         return;
     }
 
-    for (new_offset, old_offset) in line_matches.into_iter().enumerate() {
-        let after = line_diff.new_slices()[new_index + new_offset];
-        if let Some(old_offset) = old_offset {
-            push_paired_line_ranges(
-                line_diff.old_slices()[old_index + old_offset],
-                after,
-                new_index + new_offset,
-                ranges,
-            );
-        } else {
-            push_inserted_line_range(after, new_index + new_offset, ranges);
+    match side {
+        IntralineSide::After => {
+            for (new_offset, old_offset) in line_matches.into_iter().enumerate() {
+                let after = new_lines[new_index + new_offset];
+                if let Some(old_offset) = old_offset {
+                    push_paired_line_ranges(
+                        old_lines[old_index + old_offset],
+                        after,
+                        new_index + new_offset,
+                        side,
+                        ranges,
+                    );
+                } else {
+                    push_whole_line_range(after, new_index + new_offset, ranges);
+                }
+            }
+        }
+        IntralineSide::Before => {
+            let mut old_to_new = vec![None; old_len];
+            for (new_offset, old_offset) in line_matches.into_iter().enumerate() {
+                if let Some(old_offset) = old_offset {
+                    old_to_new[old_offset] = Some(new_offset);
+                }
+            }
+            for (old_offset, new_offset) in old_to_new.into_iter().enumerate() {
+                let before = old_lines[old_index + old_offset];
+                if let Some(new_offset) = new_offset {
+                    push_paired_line_ranges(
+                        before,
+                        new_lines[new_index + new_offset],
+                        old_index + old_offset,
+                        side,
+                        ranges,
+                    );
+                } else {
+                    push_whole_line_range(before, old_index + old_offset, ranges);
+                }
+            }
         }
     }
 }
 
 fn best_line_match(
-    line_diff: &TextDiff<'_, '_, '_, str>,
+    old_lines: &[&str],
     old_index: usize,
     old_len: usize,
     after: &str,
@@ -611,7 +729,7 @@ fn best_line_match(
             continue;
         }
 
-        let ratio = line_similarity(line_diff.old_slices()[old_index + old_offset], after);
+        let ratio = line_similarity(old_lines[old_index + old_offset], after);
         if ratio >= MIN_LINE_PAIR_RATIO && best.is_none_or(|(_, best_ratio)| ratio > best_ratio) {
             best = Some((old_offset, ratio));
         }
@@ -621,33 +739,35 @@ fn best_line_match(
 }
 
 fn line_similarity(before: &str, after: &str) -> f32 {
-    let before_chars = before.chars().count();
-    let after_chars = after.chars().count();
-    if before_chars == 0 || after_chars == 0 {
+    let before_len = before.chars().count();
+    let after_len = after.chars().count();
+    if before_len == 0 || after_len == 0 {
         return 0.0;
     }
-    if before_chars > MAX_INTRALINE_LINE_CHARS
-        || after_chars > MAX_INTRALINE_LINE_CHARS
-        || !length_ratio_ok(before_chars, after_chars)
+    if before_len > MAX_INTRALINE_LINE_CHARS
+        || after_len > MAX_INTRALINE_LINE_CHARS
+        || !length_ratio_ok(before_len, after_len)
     {
         return 0.0;
     }
 
-    let mut config = TextDiff::configure();
-    config.timeout(INLINE_DIFF_TIMEOUT);
-    config.diff_chars(before, after).ratio()
+    let before_chars: Vec<char> = before.chars().collect();
+    let after_chars: Vec<char> = after.chars().collect();
+    let ops = diff_slices_without_compact(Algorithm::Myers, &before_chars, &after_chars);
+    get_diff_ratio(&ops, before_chars.len(), after_chars.len())
 }
 
 fn push_paired_line_ranges(
     before: &str,
     after: &str,
     line: usize,
+    side: IntralineSide,
     ranges: &mut Vec<IntralineRange>,
 ) {
     let ranges_start = ranges.len();
-    push_char_diff_line_ranges(before, after, line, ranges);
+    push_char_diff_line_ranges(before, after, line, side, ranges);
     if ranges.len() == ranges_start {
-        push_word_diff_line_ranges(before, after, line, ranges);
+        push_word_diff_line_ranges(before, after, line, side, ranges);
     }
 }
 
@@ -655,47 +775,63 @@ fn push_char_diff_line_ranges(
     before: &str,
     after: &str,
     line: usize,
+    side: IntralineSide,
     ranges: &mut Vec<IntralineRange>,
 ) {
-    let before_chars = before.chars().count();
-    let after_chars = after.chars().count();
-    if after_chars == 0
-        || before_chars > MAX_INTRALINE_LINE_CHARS
-        || after_chars > MAX_INTRALINE_LINE_CHARS
-        || (before_chars != 0 && !length_ratio_ok(before_chars, after_chars))
+    let before_len = before.chars().count();
+    let after_len = after.chars().count();
+    let target_len = match side {
+        IntralineSide::Before => before_len,
+        IntralineSide::After => after_len,
+    };
+    if target_len == 0
+        || before_len > MAX_INTRALINE_LINE_CHARS
+        || after_len > MAX_INTRALINE_LINE_CHARS
+        || (before_len != 0 && after_len != 0 && !length_ratio_ok(before_len, after_len))
     {
         return;
     }
 
-    let mut config = TextDiff::configure();
-    config.timeout(INLINE_DIFF_TIMEOUT);
-    let char_diff = config.diff_chars(before, after);
-    if char_diff.ratio() < MIN_CHAR_DIFF_RATIO {
+    let before_chars: Vec<char> = before.chars().collect();
+    let after_chars: Vec<char> = after.chars().collect();
+    let ops = diff_slices_without_compact(Algorithm::Myers, &before_chars, &after_chars);
+    if get_diff_ratio(&ops, before_chars.len(), after_chars.len()) < MIN_CHAR_DIFF_RATIO {
         return;
     }
 
     let ranges_start = ranges.len();
-    let mut after_idx = 0;
     let mut highlighted_chars = 0;
-    for change in char_diff.iter_all_changes() {
-        let char_count = change.value().chars().count();
-        match change.tag() {
-            ChangeTag::Equal => after_idx += char_count,
-            ChangeTag::Insert => {
-                if char_count != 0 {
-                    ranges.push(IntralineRange {
-                        line,
-                        chars: after_idx..after_idx + char_count,
-                    });
-                    highlighted_chars += char_count;
-                    after_idx += char_count;
+    for op in ops {
+        let changed = match (side, op) {
+            (
+                IntralineSide::Before,
+                DiffOp::Delete {
+                    old_index, old_len, ..
                 }
+                | DiffOp::Replace {
+                    old_index, old_len, ..
+                },
+            ) => Some(old_index..old_index + old_len),
+            (
+                IntralineSide::After,
+                DiffOp::Insert {
+                    new_index, new_len, ..
+                }
+                | DiffOp::Replace {
+                    new_index, new_len, ..
+                },
+            ) => Some(new_index..new_index + new_len),
+            _ => None,
+        };
+        if let Some(chars) = changed {
+            if !chars.is_empty() {
+                highlighted_chars += chars.len();
+                ranges.push(IntralineRange { line, chars });
             }
-            ChangeTag::Delete => {}
         }
     }
 
-    if highlighted_chars == 0 || too_dense(highlighted_chars, after_chars) {
+    if highlighted_chars == 0 || too_dense(highlighted_chars, target_len) {
         ranges.truncate(ranges_start);
     }
 }
@@ -704,49 +840,96 @@ fn push_word_diff_line_ranges(
     before: &str,
     after: &str,
     line: usize,
+    side: IntralineSide,
     ranges: &mut Vec<IntralineRange>,
 ) {
-    let before_chars = before.chars().count();
-    let after_chars = after.chars().count();
-    if after_chars == 0
-        || before_chars > MAX_INTRALINE_LINE_CHARS
-        || after_chars > MAX_INTRALINE_LINE_CHARS
-        || (before_chars != 0 && !length_ratio_ok(before_chars, after_chars))
+    let before_len = before.chars().count();
+    let after_len = after.chars().count();
+    let target_len = match side {
+        IntralineSide::Before => before_len,
+        IntralineSide::After => after_len,
+    };
+    if target_len == 0
+        || before_len > MAX_INTRALINE_LINE_CHARS
+        || after_len > MAX_INTRALINE_LINE_CHARS
+        || (before_len != 0 && after_len != 0 && !length_ratio_ok(before_len, after_len))
     {
         return;
     }
 
-    let mut config = TextDiff::configure();
-    config
-        .algorithm(Algorithm::Patience)
-        .timeout(INLINE_DIFF_TIMEOUT);
-    let word_diff = config.diff_words(before, after);
-    if word_diff.ratio() < MIN_WORD_DIFF_RATIO {
+    let before_words = before.tokenize_words();
+    let after_words = after.tokenize_words();
+    let ops = diff_slices_without_compact(Algorithm::Patience, &before_words, &after_words);
+    if get_diff_ratio(&ops, before_words.len(), after_words.len()) < MIN_WORD_DIFF_RATIO {
         return;
     }
 
     let ranges_start = ranges.len();
-    let mut after_idx = 0;
+    let mut char_idx = 0;
     let mut highlighted_chars = 0;
-    for change in word_diff.iter_all_changes() {
-        let char_count = change.value().chars().count();
-        match change.tag() {
-            ChangeTag::Equal => after_idx += char_count,
-            ChangeTag::Insert => {
+    for op in ops {
+        match (side, op) {
+            (IntralineSide::Before, DiffOp::Equal { old_index, len, .. }) => {
+                char_idx += before_words[old_index..old_index + len]
+                    .iter()
+                    .map(|word| word.chars().count())
+                    .sum::<usize>();
+            }
+            (
+                IntralineSide::Before,
+                DiffOp::Delete {
+                    old_index, old_len, ..
+                }
+                | DiffOp::Replace {
+                    old_index, old_len, ..
+                },
+            ) => {
+                let char_count: usize = before_words[old_index..old_index + old_len]
+                    .iter()
+                    .map(|word| word.chars().count())
+                    .sum();
                 if char_count != 0 {
                     ranges.push(IntralineRange {
                         line,
-                        chars: after_idx..after_idx + char_count,
+                        chars: char_idx..char_idx + char_count,
                     });
                     highlighted_chars += char_count;
-                    after_idx += char_count;
+                    char_idx += char_count;
                 }
             }
-            ChangeTag::Delete => {}
+            (IntralineSide::After, DiffOp::Equal { new_index, len, .. }) => {
+                char_idx += after_words[new_index..new_index + len]
+                    .iter()
+                    .map(|word| word.chars().count())
+                    .sum::<usize>();
+            }
+            (
+                IntralineSide::After,
+                DiffOp::Insert {
+                    new_index, new_len, ..
+                }
+                | DiffOp::Replace {
+                    new_index, new_len, ..
+                },
+            ) => {
+                let char_count: usize = after_words[new_index..new_index + new_len]
+                    .iter()
+                    .map(|word| word.chars().count())
+                    .sum();
+                if char_count != 0 {
+                    ranges.push(IntralineRange {
+                        line,
+                        chars: char_idx..char_idx + char_count,
+                    });
+                    highlighted_chars += char_count;
+                    char_idx += char_count;
+                }
+            }
+            _ => {}
         }
     }
 
-    if highlighted_chars == 0 || too_dense(highlighted_chars, after_chars) {
+    if highlighted_chars == 0 || too_dense(highlighted_chars, target_len) {
         ranges.truncate(ranges_start);
     }
 }
@@ -764,7 +947,7 @@ fn too_dense(highlighted_chars: usize, line_chars: usize) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{adaptive_intraline_ranges, IntralineRange};
+    use super::{adaptive_intraline_ranges, IntralineRange, IntralineSide};
 
     fn range(line: usize, chars: std::ops::Range<usize>) -> IntralineRange {
         IntralineRange { line, chars }
@@ -773,8 +956,82 @@ mod tests {
     #[test]
     fn small_one_line_edit_uses_character_ranges() {
         assert_eq!(
-            adaptive_intraline_ranges("let value = 1;\n", "let value = 2;\n"),
+            adaptive_intraline_ranges("let value = 1;\n", "let value = 2;\n", IntralineSide::After),
             vec![range(0, 12..13)]
+        );
+        assert_eq!(
+            adaptive_intraline_ranges(
+                "let value = 1;\n",
+                "let value = 2;\n",
+                IntralineSide::Before
+            ),
+            vec![range(0, 12..13)]
+        );
+    }
+
+    #[test]
+    fn repeated_trailing_char_replacement_stays_aligned_on_both_sides() {
+        // Replacing the first `b` in `aaabbb` with `c` (`aaacbb`) must highlight
+        // index 3 on both panes, not slide `b` to the end of the run (index 5).
+        assert_eq!(
+            adaptive_intraline_ranges("aaabbb\n", "aaacbb\n", IntralineSide::Before),
+            vec![range(0, 3..4)]
+        );
+        assert_eq!(
+            adaptive_intraline_ranges("aaabbb\n", "aaacbb\n", IntralineSide::After),
+            vec![range(0, 3..4)]
+        );
+
+        // And symmetrically in the reverse edit direction (`aaacbb` -> `aaabbb`).
+        assert_eq!(
+            adaptive_intraline_ranges("aaacbb\n", "aaabbb\n", IntralineSide::Before),
+            vec![range(0, 3..4)]
+        );
+        assert_eq!(
+            adaptive_intraline_ranges("aaacbb\n", "aaabbb\n", IntralineSide::After),
+            vec![range(0, 3..4)]
+        );
+    }
+
+    #[test]
+    fn word_diff_fallback_aligns_both_sides() {
+        // Char ratio is < 0.55, so this falls back to word diff and aligns
+        // both replaced words (`zzzzzzzz`/`yyyyyyyy` and `p`/`q`) on both sides.
+        assert_eq!(
+            adaptive_intraline_ranges(
+                "a b c zzzzzzzz p q q\n",
+                "a b c yyyyyyyy q q q\n",
+                IntralineSide::After
+            ),
+            vec![range(0, 6..14), range(0, 15..16)]
+        );
+        assert_eq!(
+            adaptive_intraline_ranges(
+                "a b c zzzzzzzz p q q\n",
+                "a b c yyyyyyyy q q q\n",
+                IntralineSide::Before
+            ),
+            vec![range(0, 6..14), range(0, 15..16)]
+        );
+    }
+
+    #[test]
+    fn repeated_trailing_line_replacement_does_not_shift_to_last_line() {
+        assert_eq!(
+            adaptive_intraline_ranges(
+                "same\nbbbc\nbbbb\n",
+                "same\nbbbb\nbbbb\n",
+                IntralineSide::Before
+            ),
+            vec![range(1, 3..4)]
+        );
+        assert_eq!(
+            adaptive_intraline_ranges(
+                "same\nbbbc\nbbbb\n",
+                "same\nbbbb\nbbbb\n",
+                IntralineSide::After
+            ),
+            vec![range(1, 3..4)]
         );
     }
 
@@ -783,9 +1040,18 @@ mod tests {
         assert_eq!(
             adaptive_intraline_ranges(
                 "same\nlet value = 1;\nnext\n",
-                "same\ninserted\nlet value = 2;\nnext\n"
+                "same\ninserted\nlet value = 2;\nnext\n",
+                IntralineSide::After
             ),
             vec![range(1, 0..9), range(2, 12..13)]
+        );
+        assert_eq!(
+            adaptive_intraline_ranges(
+                "same\nlet value = 1;\nnext\n",
+                "same\ninserted\nlet value = 2;\nnext\n",
+                IntralineSide::Before
+            ),
+            vec![range(1, 12..13)]
         );
     }
 
@@ -794,14 +1060,22 @@ mod tests {
         let before = (0..24).map(|i| format!("before {i}\n")).collect::<String>();
         let after = (0..24).map(|i| format!("after {i}\n")).collect::<String>();
 
-        assert!(adaptive_intraline_ranges(&before, &after).is_empty());
+        assert!(adaptive_intraline_ranges(&before, &after, IntralineSide::After).is_empty());
+        assert!(adaptive_intraline_ranges(&before, &after, IntralineSide::Before).is_empty());
     }
 
     #[test]
     fn dense_rewrites_skip_intraline_ranges() {
         assert!(adaptive_intraline_ranges(
             "aaaaaaaaaaaaaaaaaaaaaaaa\n",
-            "bbbbbbbbbbbbbbbbbbbbbbbb\n"
+            "bbbbbbbbbbbbbbbbbbbbbbbb\n",
+            IntralineSide::After
+        )
+        .is_empty());
+        assert!(adaptive_intraline_ranges(
+            "aaaaaaaaaaaaaaaaaaaaaaaa\n",
+            "bbbbbbbbbbbbbbbbbbbbbbbb\n",
+            IntralineSide::Before
         )
         .is_empty());
     }
